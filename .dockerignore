@@ -1,0 +1,5 @@
+.git
+build
+reference
+.cache
+*.tar.gz

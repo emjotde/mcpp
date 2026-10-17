@@ -26,6 +26,7 @@ struct Entry {
     std::string target;
     std::string revision;
     bool hidden{false};
+    bool target_is_directory{false};
 };
 
 enum class SortField {

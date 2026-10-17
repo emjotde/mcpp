@@ -56,18 +56,66 @@ void ViewerModel::scroll_lines(
     if (!open()) {
         return;
     }
-    const auto approximate =
-        static_cast<std::int64_t>(amount) *
-        static_cast<std::int64_t>(80U);
-    const auto next =
-        static_cast<std::int64_t>(offset_) + approximate;
-    offset_ = static_cast<std::uint64_t>(
-        std::clamp<std::int64_t>(
-            next,
-            0,
-            static_cast<std::int64_t>(size_)
-        )
-    );
+    if (hex_) {
+        const auto next =
+            static_cast<std::int64_t>(offset_) +
+            static_cast<std::int64_t>(amount) * 16;
+        offset_ = static_cast<std::uint64_t>(
+            std::clamp<std::int64_t>(
+                next,
+                0,
+                static_cast<std::int64_t>(size_)
+            )
+        );
+        return;
+    }
+    if (offset_ < window_offset_ ||
+        offset_ > window_offset_ + window_.size()) {
+        load_window(offset_, window_size, {});
+    }
+    if (amount > 0) {
+        for (int line = 0; line < amount && offset_ < size_; ++line) {
+            const auto local = static_cast<std::size_t>(
+                offset_ - window_offset_
+            );
+            const auto next = window_.find('\n', local);
+            if (next == std::string::npos) {
+                const auto new_offset =
+                    std::min<std::uint64_t>(
+                        size_,
+                        window_offset_ + window_.size()
+                    );
+                if (new_offset == offset_) {
+                    break;
+                }
+                offset_ = new_offset;
+                load_window(offset_, window_size, {});
+            } else {
+                offset_ = window_offset_ + next + 1U;
+            }
+        }
+    } else {
+        for (int line = 0; line > amount && offset_ > 0U; --line) {
+            if (offset_ <= window_offset_ + 1U) {
+                const auto begin =
+                    offset_ > window_size
+                        ? offset_ - window_size
+                        : 0U;
+                load_window(begin, window_size, {});
+            }
+            const auto local = static_cast<std::size_t>(
+                offset_ - window_offset_
+            );
+            const auto before =
+                local > 1U
+                    ? window_.rfind('\n', local - 2U)
+                    : std::string::npos;
+            offset_ =
+                before == std::string::npos
+                    ? window_offset_
+                    : window_offset_ + before + 1U;
+        }
+    }
     static_cast<void>(viewport_lines);
 }
 
@@ -215,6 +263,7 @@ std::optional<std::uint64_t> ViewerModel::find(
         case_sensitive ? std::string(needle)
                        : lowercase(std::string(needle));
     constexpr std::uint64_t chunk_size = 256U * 1024U;
+    std::string overlap;
     for (auto cursor = offset_; cursor < size_;
          cursor += chunk_size) {
         cancellation.throw_if_requested();
@@ -226,14 +275,20 @@ std::optional<std::uint64_t> ViewerModel::find(
             output,
             cancellation
         );
-        auto chunk = std::move(output).str();
+        auto chunk = overlap + std::move(output).str();
         const auto haystack =
             case_sensitive ? chunk : lowercase(std::move(chunk));
         const auto found = haystack.find(sought);
         if (found != std::string::npos) {
-            offset_ = cursor + found;
+            offset_ =
+                cursor - overlap.size() + found;
             return offset_;
         }
+        const auto keep = std::min(
+            sought.size() > 0U ? sought.size() - 1U : 0U,
+            haystack.size()
+        );
+        overlap = haystack.substr(haystack.size() - keep);
     }
     return std::nullopt;
 }

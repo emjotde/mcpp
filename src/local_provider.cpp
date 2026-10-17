@@ -76,6 +76,31 @@ std::string identity_name(
     return std::to_string(gid);
 }
 
+bool rename_no_replace(
+    const std::filesystem::path& source,
+    const std::filesystem::path& destination
+) {
+    if (syscall(
+            SYS_renameat2,
+            AT_FDCWD,
+            source.c_str(),
+            AT_FDCWD,
+            destination.c_str(),
+            RENAME_NOREPLACE
+        ) == 0) {
+        return true;
+    }
+    if (errno == EEXIST) {
+        return false;
+    }
+    throw std::filesystem::filesystem_error(
+        "rename",
+        source,
+        destination,
+        std::error_code(errno, std::generic_category())
+    );
+}
+
 }  // namespace
 
 LocalProvider::LocalProvider(std::filesystem::path root) {
@@ -145,6 +170,27 @@ std::string LocalProvider::normalize(const std::string_view path) const {
     return resolve(path).string();
 }
 
+std::filesystem::path LocalProvider::resolve_follow(
+    const std::string_view path
+) const {
+    const auto lexical = resolve(path);
+    std::error_code error;
+    const auto canonical =
+        std::filesystem::weakly_canonical(lexical, error);
+    if (error) {
+        throw std::runtime_error(
+            "cannot resolve local path: " + lexical.string()
+        );
+    }
+    if (!path_is_within(root_, canonical)) {
+        throw std::invalid_argument(
+            "path resolves outside provider root: " +
+            lexical.string()
+        );
+    }
+    return canonical;
+}
+
 std::string LocalProvider::join(
     const std::string_view directory,
     const std::string_view name
@@ -194,6 +240,9 @@ Entry LocalProvider::make_entry(
         if (error) {
             result.target.clear();
         }
+        error.clear();
+        result.target_is_directory =
+            directory_entry.is_directory(error) && !error;
     } else if (std::filesystem::is_directory(status)) {
         result.kind = EntryKind::directory;
     } else if (std::filesystem::is_regular_file(status)) {
@@ -213,6 +262,9 @@ Entry LocalProvider::make_entry(
 
     struct stat native_status {};
     if (lstat(directory_entry.path().c_str(), &native_status) == 0) {
+        result.size = static_cast<std::uint64_t>(
+            std::max<off_t>(native_status.st_size, 0)
+        );
         result.owner = identity_name(
             native_status.st_uid,
             native_status.st_gid,
@@ -238,7 +290,7 @@ std::vector<Entry> LocalProvider::list(
     const ListRequest& request,
     const Cancellation& cancellation
 ) const {
-    const auto directory = resolve(path);
+    const auto directory = resolve_follow(path);
     std::vector<Entry> entries;
     std::error_code error;
     for (std::filesystem::directory_iterator iterator(
@@ -269,9 +321,14 @@ std::vector<Entry> LocalProvider::list(
     }
 
     const auto compare = [&](const Entry& left, const Entry& right) {
-        if ((left.kind == EntryKind::directory) !=
-            (right.kind == EntryKind::directory)) {
-            return left.kind == EntryKind::directory;
+        const auto left_directory =
+            left.kind == EntryKind::directory ||
+            left.target_is_directory;
+        const auto right_directory =
+            right.kind == EntryKind::directory ||
+            right.target_is_directory;
+        if (left_directory != right_directory) {
+            return left_directory;
         }
         int comparison = 0;
         switch (request.sort) {
@@ -349,6 +406,17 @@ bool LocalProvider::exists(const std::string_view path) const {
            status.type() != std::filesystem::file_type::not_found;
 }
 
+SpaceInfo LocalProvider::space(const std::string_view path) const {
+    const auto information = std::filesystem::space(
+        resolve_follow(path)
+    );
+    return {
+        .capacity = information.capacity,
+        .free = information.free,
+        .available = information.available,
+    };
+}
+
 void LocalProvider::read(
     const std::string_view path,
     const std::uint64_t offset,
@@ -356,7 +424,7 @@ void LocalProvider::read(
     std::ostream& output,
     const Cancellation& cancellation
 ) const {
-    std::ifstream input(resolve(path), std::ios::binary);
+    std::ifstream input(resolve_follow(path), std::ios::binary);
     if (!input) {
         throw std::runtime_error("cannot open file for reading");
     }
@@ -424,12 +492,22 @@ void LocalProvider::write(
         destination_permissions =
             std::filesystem::symlink_status(destination).permissions();
     }
-    static_cast<void>(fchmod(
-        descriptor,
-        static_cast<mode_t>(
-            static_cast<unsigned int>(destination_permissions) & 07777U
-        )
-    ));
+    if (fchmod(
+            descriptor,
+            static_cast<mode_t>(
+                static_cast<unsigned int>(destination_permissions) &
+                07777U
+            )
+        ) != 0) {
+        const auto failure = errno;
+        static_cast<void>(close(descriptor));
+        std::error_code ignored;
+        std::filesystem::remove(temporary, ignored);
+        throw std::runtime_error(
+            "cannot set temporary output permissions: " +
+            std::string(std::strerror(failure))
+        );
+    }
     std::array<char, 64U * 1024U> buffer{};
     std::uint64_t written = 0;
     try {
@@ -584,8 +662,43 @@ void LocalProvider::rename(
         );
     }
     if (overwrite) {
-        std::error_code ignored;
-        std::filesystem::remove_all(destination_path, ignored);
+        std::optional<std::filesystem::path> backup;
+        if (exists(destination_path.string())) {
+            for (unsigned int attempt = 0; attempt < 100U; ++attempt) {
+                const auto candidate =
+                    destination_path.parent_path() /
+                    (
+                        ".mcpp-replaced-" +
+                        std::to_string(getpid()) + "-" +
+                        std::to_string(attempt)
+                    );
+                if (rename_no_replace(
+                        destination_path,
+                        candidate
+                    )) {
+                    backup = candidate;
+                    break;
+                }
+            }
+            if (!backup) {
+                throw std::runtime_error(
+                    "cannot allocate rename backup"
+                );
+            }
+        }
+        try {
+            std::filesystem::rename(source_path, destination_path);
+        } catch (...) {
+            if (backup) {
+                std::filesystem::rename(*backup, destination_path);
+            }
+            throw;
+        }
+        if (backup) {
+            std::error_code ignored;
+            std::filesystem::remove_all(*backup, ignored);
+        }
+        return;
     }
     std::filesystem::rename(source_path, destination_path);
 }
@@ -605,22 +718,72 @@ void LocalProvider::copy_direct(
             "destination exists: " + destination_path.string()
         );
     }
-    auto options =
-        std::filesystem::copy_options::recursive |
-        std::filesystem::copy_options::copy_symlinks;
-    options |= overwrite
-                   ? std::filesystem::copy_options::overwrite_existing
-                   : std::filesystem::copy_options::none;
-    std::filesystem::copy(source_path, destination_path, options);
-    if (progress) {
-        const auto entry = stat(destination_path.string(), cancellation);
-        progress({
-            .bytes_done = entry.size,
-            .bytes_total = entry.size,
-            .files_done = 1,
-            .files_total = 1,
-            .current_path = destination_path.string(),
-        });
+    const auto source_entry = stat(source_path.string(), cancellation);
+    if (source_entry.kind == EntryKind::directory) {
+        const bool created = !exists(destination_path.string());
+        create_directory(destination_path.string());
+        try {
+            for (const auto& child :
+                 list(
+                     source_path.string(),
+                     {.show_hidden = true},
+                     cancellation
+                 )) {
+                copy_direct(
+                    child.path,
+                    join(destination_path.string(), child.name),
+                    overwrite,
+                    cancellation,
+                    progress
+                );
+            }
+        } catch (...) {
+            if (created) {
+                std::error_code ignored;
+                std::filesystem::remove_all(
+                    destination_path,
+                    ignored
+                );
+            }
+            throw;
+        }
+        return;
+    }
+    if (source_entry.kind == EntryKind::symlink) {
+        if (overwrite) {
+            std::error_code ignored;
+            std::filesystem::remove(destination_path, ignored);
+        }
+        create_symlink(source_entry.target, destination_path.string());
+        if (progress) {
+            progress({
+                .files_done = 1,
+                .files_total = 1,
+                .current_path = destination_path.string(),
+            });
+        }
+        return;
+    }
+    std::ifstream input(source_path, std::ios::binary);
+    if (!input) {
+        throw std::runtime_error(
+            "cannot open copy source: " + source_path.string()
+        );
+    }
+    write(
+        destination_path.string(),
+        input,
+        source_entry.size,
+        overwrite,
+        std::nullopt,
+        cancellation,
+        progress
+    );
+    if (source_entry.permissions != std::filesystem::perms::unknown) {
+        set_permissions(
+            destination_path.string(),
+            source_entry.permissions
+        );
     }
 }
 
@@ -633,6 +796,40 @@ void LocalProvider::set_permissions(
         permissions,
         std::filesystem::perm_options::replace
     );
+}
+
+void LocalProvider::set_owner(
+    const std::string_view path,
+    const std::optional<std::string> owner,
+    const std::optional<std::string> group
+) {
+    uid_t uid = static_cast<uid_t>(-1);
+    gid_t gid = static_cast<gid_t>(-1);
+    if (owner && !owner->empty()) {
+        const auto* entry = getpwnam(owner->c_str());
+        if (entry == nullptr) {
+            throw std::invalid_argument(
+                "unknown user: " + *owner
+            );
+        }
+        uid = entry->pw_uid;
+    }
+    if (group && !group->empty()) {
+        const auto* entry = getgrnam(group->c_str());
+        if (entry == nullptr) {
+            throw std::invalid_argument(
+                "unknown group: " + *group
+            );
+        }
+        gid = entry->gr_gid;
+    }
+    const auto target = resolve(path);
+    if (lchown(target.c_str(), uid, gid) != 0) {
+        throw std::runtime_error(
+            "cannot change owner for " + target.string() + ": " +
+            std::string(std::strerror(errno))
+        );
+    }
 }
 
 void LocalProvider::create_symlink(

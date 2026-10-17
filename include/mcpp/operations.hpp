@@ -48,6 +48,16 @@ public:
         const ProgressCallback& progress = {}
     ) const;
 
+    void move_exact(
+        Provider& source_provider,
+        const Entry& source,
+        Provider& destination_provider,
+        std::string_view destination,
+        const OperationOptions& options,
+        const Cancellation& cancellation,
+        const ProgressCallback& progress = {}
+    ) const;
+
     void remove(
         Provider& provider,
         const std::vector<Entry>& entries,

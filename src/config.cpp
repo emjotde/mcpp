@@ -68,12 +68,16 @@ Config Config::load(const std::filesystem::path& path) {
             result.directories_first = parse_bool(value);
         } else if (key == "sort") {
             result.sort = parse_sort(value);
+        } else if (key == "sort_descending") {
+            result.sort_descending = parse_bool(value);
         } else if (key == "theme") {
             result.theme = value;
         } else if (key == "left_path") {
             result.left_path = value;
         } else if (key == "right_path") {
             result.right_path = value;
+        } else if (key == "bookmark") {
+            result.bookmarks.push_back(value);
         }
     }
     return result;
@@ -95,9 +99,14 @@ void Config::save(const std::filesystem::path& path) const {
            << "directories_first="
            << (directories_first ? "true" : "false") << '\n'
            << "sort=" << sort_name(sort) << '\n'
+           << "sort_descending="
+           << (sort_descending ? "true" : "false") << '\n'
            << "theme=" << theme << '\n'
-           << "left_path=" << left_path.string() << '\n'
-           << "right_path=" << right_path.string() << '\n';
+           << "left_path=" << left_path << '\n'
+           << "right_path=" << right_path << '\n';
+    for (const auto& bookmark : bookmarks) {
+        output << "bookmark=" << bookmark << '\n';
+    }
     output.close();
     if (!output) {
         throw std::runtime_error("cannot close configuration");

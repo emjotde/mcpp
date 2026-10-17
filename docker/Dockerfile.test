@@ -1,0 +1,29 @@
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        build-essential \
+        ca-certificates \
+        cmake \
+        ninja-build \
+        util-linux \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN useradd --create-home --shell /bin/bash mcpp
+
+WORKDIR /home/mcpp/src
+COPY --chown=mcpp:mcpp . .
+RUN chown mcpp:mcpp /home/mcpp/src
+
+USER mcpp
+
+RUN cmake -S . -B build/container \
+        -G Ninja \
+        -DCMAKE_BUILD_TYPE=Debug \
+        -DMCPP_WARNINGS_AS_ERRORS=ON \
+        -DMCPP_BUILD_TESTS=ON \
+    && cmake --build build/container --parallel 12
+
+CMD ["ctest", "--test-dir", "build/container", "--output-on-failure"]

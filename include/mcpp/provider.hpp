@@ -54,6 +54,12 @@ struct TransferProgress {
     std::string current_path;
 };
 
+struct SpaceInfo {
+    std::uint64_t capacity{0};
+    std::uint64_t free{0};
+    std::uint64_t available{0};
+};
+
 using ProgressCallback = std::function<void(const TransferProgress&)>;
 
 class Provider {
@@ -88,6 +94,9 @@ public:
         const Cancellation& cancellation
     ) const = 0;
     [[nodiscard]] virtual bool exists(std::string_view path) const = 0;
+    [[nodiscard]] virtual SpaceInfo space(
+        std::string_view path
+    ) const = 0;
 
     virtual void read(
         std::string_view path,
@@ -128,6 +137,11 @@ public:
     virtual void set_permissions(
         std::string_view path,
         std::filesystem::perms permissions
+    ) = 0;
+    virtual void set_owner(
+        std::string_view path,
+        std::optional<std::string> owner,
+        std::optional<std::string> group
     ) = 0;
     virtual void create_symlink(
         std::string_view target,

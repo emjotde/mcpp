@@ -32,6 +32,8 @@ public:
     void newline();
     void backspace();
     void erase();
+    bool undo();
+    bool redo();
     void save(
         bool force,
         const Cancellation& cancellation = {}
@@ -42,6 +44,15 @@ public:
     );
 
 private:
+    struct Snapshot {
+        std::vector<std::string> lines;
+        std::size_t row{0};
+        std::size_t column{0};
+    };
+
+    void record_undo();
+    void restore(Snapshot snapshot);
+
     ProviderPtr provider_;
     std::string path_;
     std::string revision_;
@@ -49,6 +60,8 @@ private:
     std::size_t row_{0};
     std::size_t column_{0};
     bool dirty_{false};
+    std::vector<Snapshot> undo_;
+    std::vector<Snapshot> redo_;
 };
 
 }  // namespace mcpp

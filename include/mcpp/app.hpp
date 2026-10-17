@@ -15,8 +15,8 @@ namespace mcpp {
 class App {
 public:
     App(
-        std::filesystem::path left,
-        std::filesystem::path right,
+        std::string left,
+        std::string right,
         Config config = {}
     );
     ~App();
@@ -24,6 +24,9 @@ public:
     App(const App&) = delete;
     App& operator=(const App&) = delete;
 
+    void open_viewer(const std::string& path);
+    void open_editor(const std::string& path);
+    [[nodiscard]] std::string active_path() const;
     int run();
 
 private:

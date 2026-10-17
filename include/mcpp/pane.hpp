@@ -17,6 +17,8 @@ public:
     void page_cursor(int amount);
     bool enter(const Cancellation& cancellation = {});
     bool up(const Cancellation& cancellation = {});
+    bool history_back(const Cancellation& cancellation = {});
+    bool history_forward(const Cancellation& cancellation = {});
     void change_directory(
         std::string path,
         const Cancellation& cancellation = {}
@@ -24,6 +26,9 @@ public:
     void toggle_selected();
     void select_all();
     void clear_selection();
+    void select_paths(const std::vector<std::string>& paths);
+    void select_pattern(std::string_view pattern, bool selected);
+    void invert_selection();
     bool find(std::string_view needle, bool case_sensitive = false);
 
     [[nodiscard]] const ProviderPtr& provider() const noexcept;
@@ -41,6 +46,12 @@ public:
     [[nodiscard]] bool descending() const noexcept;
 
 private:
+    void navigate(
+        std::string path,
+        bool record,
+        const Cancellation& cancellation
+    );
+
     ProviderPtr provider_;
     std::string path_;
     std::vector<Entry> entries_;
@@ -49,6 +60,8 @@ private:
     bool show_hidden_{false};
     SortField sort_{SortField::name};
     bool descending_{false};
+    std::vector<std::string> history_;
+    std::size_t history_index_{0};
 };
 
 }  // namespace mcpp

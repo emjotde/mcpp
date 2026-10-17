@@ -32,6 +32,9 @@ public:
         const Cancellation& cancellation
     ) const override;
     [[nodiscard]] bool exists(std::string_view path) const override;
+    [[nodiscard]] SpaceInfo space(
+        std::string_view path
+    ) const override;
     void read(
         std::string_view path,
         std::uint64_t offset,
@@ -71,6 +74,11 @@ public:
         std::string_view path,
         std::filesystem::perms permissions
     ) override;
+    void set_owner(
+        std::string_view path,
+        std::optional<std::string> owner,
+        std::optional<std::string> group
+    ) override;
     void create_symlink(
         std::string_view target,
         std::string_view path
@@ -82,6 +90,9 @@ public:
 
 private:
     [[nodiscard]] std::filesystem::path resolve(
+        std::string_view path
+    ) const;
+    [[nodiscard]] std::filesystem::path resolve_follow(
         std::string_view path
     ) const;
     [[nodiscard]] Entry make_entry(

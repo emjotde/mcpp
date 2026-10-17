@@ -12,7 +12,6 @@ option(MCPP_BUILD_TESTS "Build mcpp tests" ON)
 option(MCPP_WARNINGS_AS_ERRORS "Treat mcpp warnings as errors" OFF)
 option(MCPP_ENABLE_ASAN "Enable AddressSanitizer" OFF)
 option(MCPP_ENABLE_UBSAN "Enable UndefinedBehaviorSanitizer" OFF)
-option(MCPP_ENABLE_SSH "Enable the libssh2 provider" OFF)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -38,7 +37,15 @@ function(mcpp_target_defaults target)
             -Wpedantic
             -Wconversion
             -Wshadow
+            -fstack-protector-strong
+            $<$<NOT:$<CONFIG:Debug>>:-D_FORTIFY_SOURCE=3>
             $<$<BOOL:${MCPP_WARNINGS_AS_ERRORS}>:-Werror>
+    )
+    target_link_options(
+        ${target}
+        PRIVATE
+            -Wl,-z,relro
+            -Wl,-z,now
     )
     if(MCPP_ENABLE_ASAN)
         target_compile_options(${target} PRIVATE -fsanitize=address -fno-omit-frame-pointer)
@@ -53,9 +60,13 @@ endfunction()
 add_library(
     mcpp_core
     src/config.cpp
+    src/compare.cpp
+    src/location.cpp
     src/local_provider.cpp
     src/operations.cpp
     src/pane.cpp
+    src/search.cpp
+    src/user_menu.cpp
     src/viewer.cpp
     src/editor.cpp
 )
@@ -71,10 +82,17 @@ mcpp_target_defaults(mcpp_ui)
 
 add_executable(mcpp src/main.cpp)
 target_link_libraries(mcpp PRIVATE mcpp_ui)
+set_target_properties(mcpp PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_link_options(mcpp PRIVATE -pie)
 mcpp_target_defaults(mcpp)
 
 install(TARGETS mcpp RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 install(FILES LICENSE DESTINATION ${CMAKE_INSTALL_DOCDIR})
+install(
+    FILES third_party/ftxui/LICENSE
+    DESTINATION ${CMAKE_INSTALL_DOCDIR}
+    RENAME FTXUI-LICENSE
+)
 
 if(MCPP_BUILD_TESTS)
     enable_testing()
@@ -82,6 +100,19 @@ if(MCPP_BUILD_TESTS)
     target_link_libraries(mcpp_tests PRIVATE mcpp_core)
     mcpp_target_defaults(mcpp_tests)
     add_test(NAME mcpp_tests COMMAND mcpp_tests)
+    find_program(MCPP_SCRIPT_EXECUTABLE script)
+    find_program(MCPP_TIMEOUT_EXECUTABLE timeout)
+    if(MCPP_SCRIPT_EXECUTABLE AND MCPP_TIMEOUT_EXECUTABLE)
+        add_test(
+            NAME mcpp_terminal
+            COMMAND
+                bash
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_terminal.sh
+                $<TARGET_FILE:mcpp>
+                ${MCPP_SCRIPT_EXECUTABLE}
+                ${MCPP_TIMEOUT_EXECUTABLE}
+        )
+    endif()
 endif()
 
 set(CPACK_PACKAGE_NAME "mcpp")

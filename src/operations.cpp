@@ -1,9 +1,12 @@
 #include "mcpp/operations.hpp"
 
+#include <cerrno>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
+#include <streambuf>
 #include <unistd.h>
 
 namespace mcpp {
@@ -73,22 +76,113 @@ bool should_overwrite(
     return false;
 }
 
-std::filesystem::path temporary_transfer_path() {
-    const auto base = std::filesystem::temp_directory_path();
-    for (unsigned int attempt = 0; attempt < 100U; ++attempt) {
-        const auto candidate =
-            base /
-            (
-                "mcpp-transfer-" + std::to_string(getpid()) + "-" +
-                std::to_string(attempt)
+class DescriptorBuffer final : public std::streambuf {
+public:
+    explicit DescriptorBuffer(const int descriptor)
+        : descriptor_(descriptor) {}
+
+protected:
+    std::streamsize xsputn(
+        const char* data,
+        const std::streamsize count
+    ) override {
+        std::streamsize offset = 0;
+        while (offset < count) {
+            const auto result = ::write(
+                descriptor_,
+                data + offset,
+                static_cast<std::size_t>(count - offset)
             );
-        std::error_code error;
-        if (!std::filesystem::exists(candidate, error)) {
-            return candidate;
+            if (result < 0 && errno == EINTR) {
+                continue;
+            }
+            if (result <= 0) {
+                return offset;
+            }
+            offset += result;
+        }
+        return count;
+    }
+
+    int overflow(const int character) override {
+        if (character == traits_type::eof()) {
+            return traits_type::not_eof(character);
+        }
+        const auto byte = static_cast<char>(character);
+        return xsputn(&byte, 1) == 1
+                   ? character
+                   : traits_type::eof();
+    }
+
+private:
+    int descriptor_;
+};
+
+class TemporaryTransferFile final {
+public:
+    TemporaryTransferFile() {
+        auto pattern =
+            (
+                std::filesystem::temp_directory_path() /
+                "mcpp-transfer-XXXXXX"
+            ).string();
+        auto buffer = std::vector<char>(
+            pattern.begin(),
+            pattern.end()
+        );
+        buffer.push_back('\0');
+        descriptor_ = mkstemp(buffer.data());
+        if (descriptor_ < 0) {
+            throw std::runtime_error(
+                "cannot create transfer temporary file: " +
+                std::string(std::strerror(errno))
+            );
+        }
+        path_ = buffer.data();
+    }
+
+    ~TemporaryTransferFile() {
+        if (descriptor_ >= 0) {
+            static_cast<void>(close(descriptor_));
+        }
+        std::error_code ignored;
+        std::filesystem::remove(path_, ignored);
+    }
+
+    TemporaryTransferFile(const TemporaryTransferFile&) = delete;
+    TemporaryTransferFile& operator=(
+        const TemporaryTransferFile&
+    ) = delete;
+
+    [[nodiscard]] int descriptor() const noexcept {
+        return descriptor_;
+    }
+
+    [[nodiscard]] const std::filesystem::path& path() const noexcept {
+        return path_;
+    }
+
+    void close_output() {
+        if (descriptor_ >= 0) {
+            if (fsync(descriptor_) != 0) {
+                throw std::runtime_error(
+                    "cannot commit transfer temporary file"
+                );
+            }
+            if (close(descriptor_) != 0) {
+                descriptor_ = -1;
+                throw std::runtime_error(
+                    "cannot commit transfer temporary file"
+                );
+            }
+            descriptor_ = -1;
         }
     }
-    throw std::runtime_error("cannot allocate transfer temporary file");
-}
+
+private:
+    std::filesystem::path path_;
+    int descriptor_{-1};
+};
 
 }  // namespace
 
@@ -146,12 +240,26 @@ void OperationEngine::copy_entry(
             destination_path,
             overwrite,
             cancellation,
-            {}
+            [&](const TransferProgress& direct) {
+                auto overall = state;
+                overall.bytes_done += direct.bytes_done;
+                overall.files_done += direct.files_done;
+                overall.current_path =
+                    direct.current_path.empty()
+                        ? source.path
+                        : direct.current_path;
+                emit_progress(progress, overall);
+            }
         );
-        if (source.kind != EntryKind::directory) {
-            state.bytes_done += source.size;
-            ++state.files_done;
-        }
+        TransferProgress completed;
+        accumulate_entry(
+            source_provider,
+            source,
+            cancellation,
+            completed
+        );
+        state.bytes_done += completed.bytes_total;
+        state.files_done += completed.files_total;
         emit_progress(progress, state);
         return;
     }
@@ -194,42 +302,33 @@ void OperationEngine::copy_entry(
             destination_path
         );
     } else {
-        const auto temporary = temporary_transfer_path();
-        try {
-            {
-                std::ofstream output(
-                    temporary,
-                    std::ios::binary | std::ios::trunc
-                );
-                if (!output) {
-                    throw std::runtime_error(
-                        "cannot create transfer temporary file"
-                    );
-                }
-                source_provider.read(
-                    source.path,
-                    0,
-                    source.size,
-                    output,
-                    cancellation
-                );
-            }
-            std::ifstream input(temporary, std::ios::binary);
-            destination_provider.write(
-                destination_path,
-                input,
-                source.size,
-                overwrite,
-                std::nullopt,
-                cancellation,
-                {}
+        TemporaryTransferFile temporary;
+        DescriptorBuffer buffer(temporary.descriptor());
+        std::ostream output(&buffer);
+        source_provider.read(
+            source.path,
+            0,
+            source.size,
+            output,
+            cancellation
+        );
+        output.flush();
+        if (!output.good()) {
+            throw std::runtime_error(
+                "failed while staging transfer data"
             );
-            std::filesystem::remove(temporary);
-        } catch (...) {
-            std::error_code ignored;
-            std::filesystem::remove(temporary, ignored);
-            throw;
         }
+        temporary.close_output();
+        std::ifstream input(temporary.path(), std::ios::binary);
+        destination_provider.write(
+            destination_path,
+            input,
+            source.size,
+            overwrite,
+            std::nullopt,
+            cancellation,
+            {}
+        );
     }
 
     if (options.preserve_permissions &&
@@ -290,16 +389,79 @@ void OperationEngine::move(
             source_provider.capabilities(),
             ProviderCapability::rename
         )) {
+        auto state = measure(source_provider, sources, cancellation);
         for (const auto& source : sources) {
             cancellation.throw_if_requested();
-            source_provider.rename(
-                source.path,
-                destination_provider.join(
-                    destination_directory,
-                    source.name
-                ),
-                options.overwrite
+            const auto destination = destination_provider.join(
+                destination_directory,
+                source.name
             );
+            bool overwrite = options.overwrite;
+            if (destination_provider.exists(destination) &&
+                !overwrite) {
+                if (!options.collision) {
+                    throw std::runtime_error(
+                        "destination exists: " + destination
+                    );
+                }
+                switch (options.collision(
+                    source,
+                    destination_provider.stat(destination, cancellation)
+                )) {
+                    case CollisionDecision::overwrite:
+                        overwrite = true;
+                        break;
+                    case CollisionDecision::skip:
+                        continue;
+                    case CollisionDecision::cancel:
+                        throw OperationCancelled{};
+                }
+            }
+            try {
+                source_provider.rename(
+                    source.path,
+                    destination,
+                    overwrite
+                );
+                TransferProgress completed;
+                accumulate_entry(
+                    destination_provider,
+                    destination_provider.stat(
+                        destination,
+                        cancellation
+                    ),
+                    cancellation,
+                    completed
+                );
+                state.bytes_done += completed.bytes_total;
+                state.files_done += completed.files_total;
+                state.current_path = source.path;
+                emit_progress(progress, state);
+            } catch (const std::filesystem::filesystem_error&) {
+                copy_entry(
+                    source_provider,
+                    source,
+                    destination_provider,
+                    destination,
+                    {
+                        .overwrite = overwrite,
+                        .preserve_permissions =
+                            options.preserve_permissions,
+                        .preserve_symlinks =
+                            options.preserve_symlinks,
+                        .collision = options.collision,
+                    },
+                    cancellation,
+                    state,
+                    progress
+                );
+                source_provider.remove(
+                    source.path,
+                    source.kind == EntryKind::directory,
+                    cancellation,
+                    {}
+                );
+            }
         }
         return;
     }
@@ -340,6 +502,84 @@ void OperationEngine::remove(
         state.current_path = entry.path;
         emit_progress(progress, state);
     }
+}
+
+void OperationEngine::move_exact(
+    Provider& source_provider,
+    const Entry& source,
+    Provider& destination_provider,
+    const std::string_view destination,
+    const OperationOptions& options,
+    const Cancellation& cancellation,
+    const ProgressCallback& progress
+) const {
+    cancellation.throw_if_requested();
+    bool overwrite = options.overwrite;
+    if (destination_provider.exists(destination) && !overwrite) {
+        if (!options.collision) {
+            throw std::runtime_error(
+                "destination exists: " + std::string(destination)
+            );
+        }
+        switch (options.collision(
+            source,
+            destination_provider.stat(destination, cancellation)
+        )) {
+            case CollisionDecision::overwrite:
+                overwrite = true;
+                break;
+            case CollisionDecision::skip:
+                return;
+            case CollisionDecision::cancel:
+                throw OperationCancelled{};
+        }
+    }
+    if (&source_provider == &destination_provider &&
+        has_capability(
+            source_provider.capabilities(),
+            ProviderCapability::rename
+        )) {
+        try {
+            source_provider.rename(
+                source.path,
+                destination,
+                overwrite
+            );
+            if (progress) {
+                progress({
+                    .bytes_done = source.size,
+                    .bytes_total = source.size,
+                    .files_done = 1,
+                    .files_total = 1,
+                    .current_path = source.path,
+                });
+            }
+            return;
+        } catch (const std::filesystem::filesystem_error&) {
+        }
+    }
+    auto state = measure(source_provider, {source}, cancellation);
+    copy_entry(
+        source_provider,
+        source,
+        destination_provider,
+        destination,
+        {
+            .overwrite = overwrite,
+            .preserve_permissions = options.preserve_permissions,
+            .preserve_symlinks = options.preserve_symlinks,
+            .collision = options.collision,
+        },
+        cancellation,
+        state,
+        progress
+    );
+    source_provider.remove(
+        source.path,
+        source.kind == EntryKind::directory,
+        cancellation,
+        {}
+    );
 }
 
 }  // namespace mcpp

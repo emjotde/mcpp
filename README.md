@@ -5,7 +5,26 @@ manager written in C++20. It provides a familiar two-pane workflow without
 using Midnight Commander source code or resources.
 
 The first provider is the local Linux filesystem. Planned providers are
-SSH/SFTP/SCP through libssh2 and Azure Blob Storage through azcpp.
+Azure Blob Storage through azcpp. SSH/SFTP work is currently paused.
+
+## Current functionality
+
+- Independent dual panes with keyboard and mouse focus
+- Directory history, quick change, hidden-file toggle, sorting, and hotlist
+- Selection, masks, inversion, and recursive search results
+- F2 rename, F3 range/hex viewer, and F4 conflict-aware editor
+- F5 copy, F6 move, F7 mkdir, F8 delete, F9 menu, and F10 quit
+- Asynchronous copy/move/delete progress and cancellation
+- Atomic no-clobber writes and symlink/root confinement
+- Mode, owner/group, file information, free-space display, and links
+- Directory comparison and quick-view panel
+- Local command line, history, and restored-terminal subshell
+- Persisted panel paths and preferences
+
+The implementation is behaviorally familiar but does not use Midnight
+Commander source code, resources, strings, tests, or artwork. A shallow MC
+checkout under ignored `reference/` is used only for black-box behavioral
+comparison.
 
 ## Build
 
@@ -17,10 +36,19 @@ cmake --build build/release --parallel
 ctest --test-dir build/release --output-on-failure
 ```
 
+The binary remains in the selected build directory; installation is not
+required.
+
 FTXUI is pinned as a Git submodule:
 
 ```bash
 git clone --recurse-submodules <repository>
+```
+
+Sandboxed destructive tests run without host mounts:
+
+```bash
+bash tests/run_container.sh
 ```
 
 ## Initial key map
