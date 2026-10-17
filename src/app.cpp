@@ -12,6 +12,7 @@
 #include <cerrno>
 #include <chrono>
 #include <cctype>
+#include <condition_variable>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
@@ -48,19 +49,16 @@ enum class Mode {
     search_results,
     bookmarks,
     information,
+    operation_dialog,
+    delete_dialog,
+    operation_progress,
+    conflict_dialog,
 };
 
 enum class PromptAction {
     none,
     rename,
-    copy,
-    move,
-    move_exact,
-    copy_overwrite,
-    move_overwrite,
-    move_exact_overwrite,
     mkdir,
-    remove,
     find,
     viewer_find,
     editor_find,
@@ -115,6 +113,21 @@ std::string display_text(const std::string_view value) {
         }
     }
     return result;
+}
+
+void erase_last_utf8(std::string& value) {
+    if (value.empty()) {
+        return;
+    }
+    auto begin = value.size() - 1U;
+    while (begin > 0U &&
+           (
+               static_cast<unsigned char>(value[begin]) &
+               0xC0U
+           ) == 0x80U) {
+        --begin;
+    }
+    value.erase(begin);
 }
 
 std::string format_time(
@@ -279,6 +292,19 @@ struct App::Impl {
     std::size_t pulldown_category{0};
     std::size_t pulldown_item{0};
     std::array<ftxui::Box, 5> top_menu_boxes{};
+    bool dialog_move{false};
+    bool dialog_exact{false};
+    std::string dialog_destination;
+    bool dialog_preserve_attributes{true};
+    bool dialog_preserve_symlinks{true};
+    std::size_t dialog_focus{1};
+    std::atomic_bool operation_paused{false};
+    std::atomic_bool operation_skip{false};
+    std::mutex operation_pause_mutex;
+    std::condition_variable operation_pause_condition;
+    std::string operation_label{"File operation"};
+    bool pending_move{false};
+    bool pending_exact{false};
 
     Impl(
         std::string left_path,
@@ -324,6 +350,14 @@ struct App::Impl {
         status = std::string("Error: ") + error.what();
     }
 
+    void post_ui(std::function<void()> task) {
+        if (terminal == nullptr) {
+            return;
+        }
+        terminal->Post(std::move(task));
+        terminal->PostEvent(ftxui::Event::Custom);
+    }
+
     void start_prompt(
         const PromptAction action,
         std::string title,
@@ -334,6 +368,75 @@ struct App::Impl {
         prompt_action = action;
         prompt_title = std::move(title);
         prompt_value = std::move(value);
+    }
+
+    void start_operation_dialog(
+        const bool move_operation,
+        const bool exact
+    ) {
+        const auto sources = active().selected_entries();
+        if (sources.empty()) {
+            throw std::runtime_error("no source selected");
+        }
+        dialog_move = move_operation;
+        dialog_exact = exact && sources.size() == 1U;
+        dialog_destination =
+            dialog_exact
+                ? passive().provider()->join(
+                      passive().path(),
+                      sources.front().name
+                  )
+                : passive().path();
+        dialog_preserve_attributes = true;
+        dialog_preserve_symlinks = true;
+        dialog_focus = 0;
+        mode = Mode::operation_dialog;
+    }
+
+    void confirm_operation_dialog() {
+        if (dialog_destination.empty()) {
+            throw std::runtime_error("destination is empty");
+        }
+        if (dialog_exact) {
+            if (config.confirm_overwrite &&
+                passive().provider()->exists(dialog_destination)) {
+                pending_destination = dialog_destination;
+                pending_move = dialog_move;
+                pending_exact = true;
+                dialog_focus = 0;
+                mode = Mode::conflict_dialog;
+                return;
+            }
+            run_operation(
+                dialog_move,
+                dialog_destination,
+                !config.confirm_overwrite,
+                true
+            );
+            return;
+        }
+        if (config.confirm_overwrite &&
+            has_collision(dialog_destination)) {
+            pending_destination = dialog_destination;
+            pending_move = dialog_move;
+            pending_exact = false;
+            dialog_focus = 0;
+            mode = Mode::conflict_dialog;
+            return;
+        }
+        run_operation(
+            dialog_move,
+            dialog_destination,
+            !config.confirm_overwrite
+        );
+    }
+
+    void start_delete_dialog() {
+        if (active().selected_entries().empty()) {
+            throw std::runtime_error("no source selected");
+        }
+        dialog_focus = config.confirm_delete ? 1U : 0U;
+        mode = Mode::delete_dialog;
     }
 
     void run_operation(
@@ -359,8 +462,8 @@ struct App::Impl {
         const auto source_index = active_index;
         const OperationOptions options{
             .overwrite = overwrite,
-            .preserve_permissions = true,
-            .preserve_symlinks = true,
+            .preserve_permissions = dialog_preserve_attributes,
+            .preserve_symlinks = dialog_preserve_symlinks,
             .collision =
                 [overwrite](const Entry&, const Entry&) {
                     return overwrite
@@ -369,6 +472,10 @@ struct App::Impl {
                 },
         };
         operation_running.store(true, std::memory_order_release);
+        operation_paused.store(false, std::memory_order_release);
+        operation_skip.store(false, std::memory_order_release);
+        mode = Mode::operation_progress;
+        operation_label = move_operation ? "Move" : "Copy";
         status = move_operation ? "Starting move" : "Starting copy";
         try {
             operation_thread = std::jthread(
@@ -388,10 +495,32 @@ struct App::Impl {
                         [this, move_operation](
                             const TransferProgress& value
                         ) {
+                            {
+                                std::unique_lock lock(
+                                    operation_pause_mutex
+                                );
+                                operation_pause_condition.wait(
+                                    lock,
+                                    [&] {
+                                        return !operation_paused.load(
+                                                   std::memory_order_acquire
+                                               ) ||
+                                               operation_cancellation
+                                                   .requested();
+                                    }
+                                );
+                            }
+                            operation_cancellation.throw_if_requested();
+                            if (operation_skip.exchange(
+                                    false,
+                                    std::memory_order_acq_rel
+                                )) {
+                                throw SkipCurrent{};
+                            }
                             if (terminal == nullptr) {
                                 return;
                             }
-                            terminal->Post([
+                            post_ui([
                                 this,
                                 move_operation,
                                 value
@@ -446,11 +575,16 @@ struct App::Impl {
                             callback
                         );
                     }
-                    terminal->Post([
+                    post_ui([
                         this,
                         move_operation,
                         source_index
                     ] {
+                        mode = Mode::panels;
+                        operation_running.store(
+                            false,
+                            std::memory_order_release
+                        );
                         try {
                             (source_index == 0 ? left : right)
                                 .clear_selection();
@@ -461,14 +595,11 @@ struct App::Impl {
                         } catch (const std::exception& error) {
                             set_error(error);
                         }
-                        operation_running.store(
-                            false,
-                            std::memory_order_release
-                        );
                     });
                 } catch (const OperationCancelled&) {
-                    terminal->Post([this] {
+                    post_ui([this] {
                         status = "Operation cancelled";
+                        mode = Mode::panels;
                         operation_running.store(
                             false,
                             std::memory_order_release
@@ -476,8 +607,9 @@ struct App::Impl {
                     });
                 } catch (const std::exception& error) {
                     const auto message = std::string(error.what());
-                    terminal->Post([this, message] {
+                    post_ui([this, message] {
                         status = "Error: " + message;
+                        mode = Mode::panels;
                         operation_running.store(
                             false,
                             std::memory_order_release
@@ -526,6 +658,10 @@ struct App::Impl {
         operation_cancellation = Cancellation{};
         progress = {};
         operation_running.store(true, std::memory_order_release);
+        operation_paused.store(false, std::memory_order_release);
+        operation_skip.store(false, std::memory_order_release);
+        mode = Mode::operation_progress;
+        operation_label = "Delete";
         status = "Starting delete";
         try {
             operation_thread = std::jthread(
@@ -536,7 +672,23 @@ struct App::Impl {
                         entries,
                         operation_cancellation,
                         [this](const TransferProgress& value) {
-                            terminal->Post([this, value] {
+                            {
+                                std::unique_lock lock(
+                                    operation_pause_mutex
+                                );
+                                operation_pause_condition.wait(
+                                    lock,
+                                    [&] {
+                                        return !operation_paused.load(
+                                                   std::memory_order_acquire
+                                               ) ||
+                                               operation_cancellation
+                                                   .requested();
+                                    }
+                                );
+                            }
+                            operation_cancellation.throw_if_requested();
+                            post_ui([this, value] {
                                 std::lock_guard lock(operation_mutex);
                                 progress = value;
                                 status =
@@ -550,7 +702,12 @@ struct App::Impl {
                             });
                         }
                     );
-                    terminal->Post([this, source_index] {
+                    post_ui([this, source_index] {
+                        mode = Mode::panels;
+                        operation_running.store(
+                            false,
+                            std::memory_order_release
+                        );
                         try {
                             (source_index == 0 ? left : right)
                                 .clear_selection();
@@ -559,14 +716,11 @@ struct App::Impl {
                         } catch (const std::exception& error) {
                             set_error(error);
                         }
-                        operation_running.store(
-                            false,
-                            std::memory_order_release
-                        );
                     });
                 } catch (const OperationCancelled&) {
-                    terminal->Post([this] {
+                    post_ui([this] {
                         status = "Delete cancelled";
+                        mode = Mode::panels;
                         operation_running.store(
                             false,
                             std::memory_order_release
@@ -574,8 +728,9 @@ struct App::Impl {
                     });
                 } catch (const std::exception& error) {
                     const auto message = std::string(error.what());
-                    terminal->Post([this, message] {
+                    post_ui([this, message] {
                         status = "Error: " + message;
+                        mode = Mode::panels;
                         operation_running.store(
                             false,
                             std::memory_order_release
@@ -683,101 +838,6 @@ struct App::Impl {
                     status = "Renamed";
                     break;
                 }
-                case PromptAction::copy:
-                    if (config.confirm_overwrite &&
-                        has_collision(prompt_value)) {
-                        pending_destination = prompt_value;
-                        mode_before_prompt = Mode::panels;
-                        mode = Mode::prompt;
-                        prompt_action =
-                            PromptAction::copy_overwrite;
-                        prompt_title =
-                            "Type yes to overwrite existing entries";
-                        prompt_value.clear();
-                        return;
-                    }
-                    run_operation(
-                        false,
-                        prompt_value,
-                        !config.confirm_overwrite
-                    );
-                    break;
-                case PromptAction::move:
-                    if (config.confirm_overwrite &&
-                        has_collision(prompt_value)) {
-                        pending_destination = prompt_value;
-                        mode_before_prompt = Mode::panels;
-                        mode = Mode::prompt;
-                        prompt_action =
-                            PromptAction::move_overwrite;
-                        prompt_title =
-                            "Type yes to overwrite existing entries";
-                        prompt_value.clear();
-                        return;
-                    }
-                    run_operation(
-                        true,
-                        prompt_value,
-                        !config.confirm_overwrite
-                    );
-                    break;
-                case PromptAction::move_exact:
-                    if (config.confirm_overwrite &&
-                        passive().provider()->exists(prompt_value)) {
-                        pending_destination = prompt_value;
-                        mode_before_prompt = Mode::panels;
-                        mode = Mode::prompt;
-                        prompt_action =
-                            PromptAction::move_exact_overwrite;
-                        prompt_title =
-                            "Type yes to overwrite existing entry";
-                        prompt_value.clear();
-                        return;
-                    }
-                    run_operation(
-                        true,
-                        prompt_value,
-                        !config.confirm_overwrite,
-                        true
-                    );
-                    break;
-                case PromptAction::copy_overwrite:
-                    if (prompt_value == "yes") {
-                        run_operation(
-                            false,
-                            pending_destination,
-                            true
-                        );
-                    } else {
-                        status = "Copy cancelled";
-                    }
-                    pending_destination.clear();
-                    break;
-                case PromptAction::move_overwrite:
-                    if (prompt_value == "yes") {
-                        run_operation(
-                            true,
-                            pending_destination,
-                            true
-                        );
-                    } else {
-                        status = "Move cancelled";
-                    }
-                    pending_destination.clear();
-                    break;
-                case PromptAction::move_exact_overwrite:
-                    if (prompt_value == "yes") {
-                        run_operation(
-                            true,
-                            pending_destination,
-                            true,
-                            true
-                        );
-                    } else {
-                        status = "Move cancelled";
-                    }
-                    pending_destination.clear();
-                    break;
                 case PromptAction::mkdir:
                     active().provider()->create_directory(
                         active().provider()->join(
@@ -787,11 +847,6 @@ struct App::Impl {
                     );
                     active().refresh();
                     status = "Directory created";
-                    break;
-                case PromptAction::remove:
-                    if (prompt_value == "yes") {
-                        run_remove_operation();
-                    }
                     break;
                 case PromptAction::find:
                     status = active().find(prompt_value)
@@ -1306,11 +1361,7 @@ struct App::Impl {
                     }
                     break;
                 case 2:
-                    start_prompt(
-                        PromptAction::copy,
-                        "Copy to directory",
-                        passive().path()
-                    );
+                    start_operation_dialog(false, false);
                     return;
                 case 3:
                     start_prompt(
@@ -1321,33 +1372,21 @@ struct App::Impl {
                     return;
                 case 4: {
                     const auto sources = active().selected_entries();
-                    if (sources.size() == 1U) {
-                        start_prompt(
-                            PromptAction::move_exact,
-                            "Move or rename to",
-                            passive().provider()->join(
-                                passive().path(),
-                                sources.front().name
-                            )
-                        );
-                    } else {
-                        start_prompt(
-                            PromptAction::move,
-                            "Move to directory",
-                            passive().path()
-                        );
-                    }
+                    start_operation_dialog(
+                        true,
+                        sources.size() == 1U
+                    );
                     return;
                 }
                 case 5:
                     start_prompt(PromptAction::mkdir, "New directory");
                     return;
                 case 6:
-                    start_prompt(
-                        PromptAction::remove,
-                        "Type yes to delete",
-                        config.confirm_delete ? "" : "yes"
-                    );
+                    if (config.confirm_delete) {
+                        start_delete_dialog();
+                    } else {
+                        run_remove_operation();
+                    }
                     return;
                 case 7:
                     mode = Mode::information;
@@ -1502,6 +1541,173 @@ struct App::Impl {
                    ),
                    separator(),
                    text("Esc closes"),
+               }) |
+               borderStyled(LIGHT) | size(WIDTH, EQUAL, 72);
+    }
+
+    ftxui::Element render_operation_dialog() const {
+        using namespace ftxui;
+        const auto sources = active_index == 0
+                                 ? left.selected_entries()
+                                 : right.selected_entries();
+        const auto focused = [&](Element element, const std::size_t index) {
+            return dialog_focus == index
+                       ? element | inverted | focus
+                       : element;
+        };
+        return vbox({
+                   text(
+                       dialog_move ? "Move / Rename" : "Copy"
+                   ) | bold | center,
+                   separator(),
+                   text(
+                       std::to_string(sources.size()) +
+                       " selected item(s)"
+                   ),
+                   text(
+                       sources.size() == 1U
+                           ? "Source: " +
+                                 display_text(sources.front().name)
+                           : ""
+                   ),
+                   separator(),
+                   text("To:"),
+                   focused(
+                       text("> " + display_text(dialog_destination)),
+                       0
+                   ),
+                   separator(),
+                   focused(
+                       text(
+                           std::string(
+                               dialog_preserve_attributes
+                                   ? "[x] "
+                                   : "[ ] "
+                           ) + "Preserve permissions"
+                       ),
+                       1
+                   ),
+                   focused(
+                       text(
+                           std::string(
+                               dialog_preserve_symlinks
+                                   ? "[x] "
+                                   : "[ ] "
+                           ) + "Preserve symbolic links"
+                       ),
+                       2
+                   ),
+                   separator(),
+                   hbox({
+                       focused(text(" [ OK ] "), 3),
+                       text("  "),
+                       focused(text(" [ Cancel ] "), 4),
+                   }) | center,
+               }) |
+               borderStyled(LIGHT) | size(WIDTH, EQUAL, 68);
+    }
+
+    ftxui::Element render_delete_dialog() const {
+        using namespace ftxui;
+        const auto entries = active_index == 0
+                                 ? left.selected_entries()
+                                 : right.selected_entries();
+        const auto focused = [&](Element element, const std::size_t index) {
+            return dialog_focus == index
+                       ? element | inverted | focus
+                       : element;
+        };
+        return vbox({
+                   text("Delete") | bold | center,
+                   separator(),
+                   text(
+                       "Delete " + std::to_string(entries.size()) +
+                       " selected item(s)?"
+                   ),
+                   text(
+                       entries.size() == 1U
+                           ? display_text(entries.front().name)
+                           : ""
+                   ),
+                   separator(),
+                   hbox({
+                       focused(text(" [ Yes ] "), 0),
+                       text("  "),
+                       focused(text(" [ No ] "), 1),
+                   }) | center,
+               }) |
+               borderStyled(LIGHT) | size(WIDTH, EQUAL, 54);
+    }
+
+    ftxui::Element render_operation_progress() {
+        using namespace ftxui;
+        TransferProgress current;
+        {
+            std::lock_guard lock(operation_mutex);
+            current = progress;
+        }
+        const auto byte_ratio =
+            current.bytes_total == 0U
+                ? 0.0F
+                : static_cast<float>(current.bytes_done) /
+                      static_cast<float>(current.bytes_total);
+        const auto file_ratio =
+            current.files_total == 0U
+                ? 0.0F
+                : static_cast<float>(current.files_done) /
+                      static_cast<float>(current.files_total);
+        return vbox({
+                   text(
+                       operation_label + " progress"
+                   ) | bold | center,
+                   separator(),
+                   text(display_text(current.current_path)),
+                   text(
+                       "File bytes: " +
+                       format_size(current.bytes_done) + " / " +
+                       format_size(current.bytes_total)
+                   ),
+                   gauge(std::clamp(byte_ratio, 0.0F, 1.0F)),
+                   text(
+                       "Files: " +
+                       std::to_string(current.files_done) + " / " +
+                       std::to_string(current.files_total)
+                   ),
+                   gauge(std::clamp(file_ratio, 0.0F, 1.0F)),
+                   separator(),
+                   text(
+                       operation_paused.load(std::memory_order_acquire)
+                           ? "Space Continue   S Skip   Esc Abort"
+                           : "Space Pause      S Skip   Esc Abort"
+                   ) | center,
+               }) |
+               borderStyled(LIGHT) | size(WIDTH, EQUAL, 72);
+    }
+
+    ftxui::Element render_conflict_dialog() const {
+        using namespace ftxui;
+        const auto focused = [&](Element element, const std::size_t index) {
+            return dialog_focus == index
+                       ? element | inverted | focus
+                       : element;
+        };
+        return vbox({
+                   text("Destination exists") | bold | center,
+                   separator(),
+                   text(display_text(pending_destination)),
+                   text(
+                       pending_exact
+                           ? "Replace this destination?"
+                           : "Some destination entries already exist."
+                   ),
+                   separator(),
+                   hbox({
+                       focused(text(" [ Overwrite ] "), 0),
+                       text(" "),
+                       focused(text(" [ Skip ] "), 1),
+                       text(" "),
+                       focused(text(" [ Cancel ] "), 2),
+                   }) | center,
                }) |
                borderStyled(LIGHT) | size(WIDTH, EQUAL, 72);
     }
@@ -1731,6 +1937,26 @@ struct App::Impl {
                 document,
                 centered_modal(render_information()),
             });
+        } else if (mode == Mode::operation_dialog) {
+            document = dbox({
+                document,
+                centered_modal(render_operation_dialog()),
+            });
+        } else if (mode == Mode::delete_dialog) {
+            document = dbox({
+                document,
+                centered_modal(render_delete_dialog()),
+            });
+        } else if (mode == Mode::operation_progress) {
+            document = dbox({
+                document,
+                centered_modal(render_operation_progress()),
+            });
+        } else if (mode == Mode::conflict_dialog) {
+            document = dbox({
+                document,
+                centered_modal(render_conflict_dialog()),
+            });
         } else if (mode == Mode::pulldown) {
             static constexpr std::array<int, 5> offsets{
                 0, 6, 12, 21, 30
@@ -1768,19 +1994,7 @@ struct App::Impl {
             return true;
         }
         if (event == ftxui::Event::Backspace) {
-            if (!prompt_value.empty()) {
-                auto begin = prompt_value.size() - 1U;
-                while (begin > 0U &&
-                       (
-                           static_cast<unsigned char>(
-                               prompt_value[begin]
-                           ) &
-                           0xC0U
-                       ) == 0x80U) {
-                    --begin;
-                }
-                prompt_value.erase(begin);
-            }
+            erase_last_utf8(prompt_value);
             return true;
         }
         if (event.is_character()) {
@@ -1884,155 +2098,6 @@ struct App::Impl {
             editor.insert(event.character());
         } else {
             return false;
-        }
-        return true;
-    }
-
-    bool handle_internal_menu_legacy(const ftxui::Event& event) {
-        if (event == ftxui::Event::Escape ||
-            event == ftxui::Event::F2) {
-            mode = Mode::panels;
-            return true;
-        }
-
-        if (!event.is_character()) {
-            return false;
-        }
-        const auto key = event.character();
-        mode = Mode::panels;
-        try {
-            if (key == "h") {
-                active().set_show_hidden(!active().show_hidden());
-            } else if (key == "n") {
-                sort_active(SortField::name);
-            } else if (key == "e") {
-                sort_active(SortField::extension);
-            } else if (key == "s") {
-                sort_active(SortField::size);
-            } else if (key == "t") {
-                sort_active(SortField::modified);
-            } else if (key == "/") {
-                start_prompt(PromptAction::find, "Find name");
-            } else if (key == "f") {
-                start_prompt(
-                    PromptAction::recursive_search,
-                    "Recursive name pattern",
-                    "*"
-                );
-            } else if (key == "d") {
-                const DirectoryComparator comparator;
-                const auto differences = comparator.compare(
-                    *left.provider(),
-                    left.path(),
-                    *right.provider(),
-                    right.path(),
-                    true,
-                    operation_cancellation
-                );
-                std::vector<std::string> left_paths;
-                std::vector<std::string> right_paths;
-                for (const auto& difference : differences) {
-                    if (difference.relative_path.find('/') !=
-                        std::string::npos) {
-                        continue;
-                    }
-                    if (difference.kind !=
-                        DifferenceKind::right_only) {
-                        left_paths.push_back(left.provider()->join(
-                            left.path(),
-                            difference.relative_path
-                        ));
-                    }
-                    if (difference.kind !=
-                        DifferenceKind::left_only) {
-                        right_paths.push_back(right.provider()->join(
-                            right.path(),
-                            difference.relative_path
-                        ));
-                    }
-                }
-                left.select_paths(left_paths);
-                right.select_paths(right_paths);
-                status =
-                    std::to_string(differences.size()) +
-                    " difference(s)";
-            } else if (key == "+") {
-                start_prompt(
-                    PromptAction::select_pattern,
-                    "Select name pattern",
-                    "*"
-                );
-            } else if (key == "-") {
-                start_prompt(
-                    PromptAction::unselect_pattern,
-                    "Unselect name pattern",
-                    "*"
-                );
-            } else if (key == "*") {
-                active().invert_selection();
-                status = "Selection inverted";
-            } else if (key == "i") {
-                mode = Mode::information;
-            } else if (key == "b") {
-                if (std::find(
-                        config.bookmarks.begin(),
-                        config.bookmarks.end(),
-                        active().path()
-                    ) == config.bookmarks.end()) {
-                    config.bookmarks.push_back(active().path());
-                }
-                status = "Added to hotlist";
-            } else if (key == "B") {
-                bookmark_cursor = 0;
-                mode = Mode::bookmarks;
-            } else if (key == "g") {
-                start_prompt(
-                    PromptAction::quick_cd,
-                    "Change directory",
-                    active().path()
-                );
-            } else if (key == "c") {
-                start_prompt(
-                    PromptAction::chmod,
-                    "Octal permissions",
-                    "0644"
-                );
-            } else if (key == "o") {
-                const auto* entry = active().current();
-                start_prompt(
-                    PromptAction::chown,
-                    "Owner:group (blank keeps current)",
-                    entry == nullptr
-                        ? ""
-                        : entry->owner + ":" + entry->group
-                );
-            } else if (key == "l") {
-                start_prompt(
-                    PromptAction::symlink,
-                    "Symbolic link name"
-                );
-            } else if (key == "L") {
-                start_prompt(
-                    PromptAction::hardlink,
-                    "Hard link name"
-                );
-            } else if (key == "r") {
-                refresh();
-            } else if (key == "v") {
-                detailed_view = !detailed_view;
-                status = detailed_view
-                             ? "Full panel view"
-                             : "Brief panel view";
-            } else if (key == "q") {
-                quick_view = !quick_view;
-                quick_viewer.close();
-                quick_view_path.clear();
-                status = quick_view
-                             ? "Quick view enabled"
-                             : "Quick view disabled";
-            }
-        } catch (const std::exception& error) {
-            set_error(error);
         }
         return true;
     }
@@ -2218,6 +2283,166 @@ struct App::Impl {
         return false;
     }
 
+    bool handle_operation_dialog(const ftxui::Event& event) {
+        if (event == ftxui::Event::Escape ||
+            (event == ftxui::Event::Return && dialog_focus == 4U)) {
+            mode = Mode::panels;
+            status = "Operation cancelled";
+            return true;
+        }
+        if (event == ftxui::Event::Tab) {
+            dialog_focus = (dialog_focus + 1U) % 5U;
+            return true;
+        }
+        if (event == ftxui::Event::TabReverse) {
+            dialog_focus = (dialog_focus + 4U) % 5U;
+            return true;
+        }
+        if (event == ftxui::Event::ArrowDown) {
+            dialog_focus = std::min<std::size_t>(4U, dialog_focus + 1U);
+            return true;
+        }
+        if (event == ftxui::Event::ArrowUp) {
+            dialog_focus =
+                dialog_focus == 0U ? 0U : dialog_focus - 1U;
+            return true;
+        }
+        if (event == ftxui::Event::Character(' ') &&
+            (dialog_focus == 1U || dialog_focus == 2U)) {
+            if (dialog_focus == 1U) {
+                dialog_preserve_attributes =
+                    !dialog_preserve_attributes;
+            } else {
+                dialog_preserve_symlinks =
+                    !dialog_preserve_symlinks;
+            }
+            return true;
+        }
+        if (event == ftxui::Event::Backspace &&
+            dialog_focus == 0U) {
+            erase_last_utf8(dialog_destination);
+            return true;
+        }
+        if (event.is_character() && dialog_focus == 0U) {
+            dialog_destination += event.character();
+            return true;
+        }
+        if (event == ftxui::Event::Return) {
+            try {
+                confirm_operation_dialog();
+            } catch (const std::exception& error) {
+                set_error(error);
+                mode = Mode::panels;
+            }
+            return true;
+        }
+        return false;
+    }
+
+    bool handle_delete_dialog(const ftxui::Event& event) {
+        if (event == ftxui::Event::Escape) {
+            mode = Mode::panels;
+            status = "Delete cancelled";
+            return true;
+        }
+        if (event == ftxui::Event::ArrowLeft ||
+            event == ftxui::Event::ArrowRight ||
+            event == ftxui::Event::Tab ||
+            event == ftxui::Event::TabReverse) {
+            dialog_focus = 1U - std::min<std::size_t>(1U, dialog_focus);
+            return true;
+        }
+        if (event == ftxui::Event::Return) {
+            if (dialog_focus == 0U) {
+                try {
+                    run_remove_operation();
+                } catch (const std::exception& error) {
+                    set_error(error);
+                    mode = Mode::panels;
+                }
+            } else {
+                mode = Mode::panels;
+                status = "Delete cancelled";
+            }
+            return true;
+        }
+        return false;
+    }
+
+    bool handle_operation_progress(const ftxui::Event& event) {
+        if (event == ftxui::Event::Escape ||
+            event == ftxui::Event::F10 ||
+            event == ftxui::Event::CtrlC ||
+            event == ftxui::Event::Character('a')) {
+            operation_cancellation.request();
+            operation_pause_condition.notify_all();
+            status = "Cancelling operation";
+            return true;
+        }
+        if (event == ftxui::Event::Character(' ') ||
+            event == ftxui::Event::Character('p')) {
+            const auto paused = !operation_paused.load(
+                std::memory_order_acquire
+            );
+            operation_paused.store(paused, std::memory_order_release);
+            if (!paused) {
+                operation_pause_condition.notify_all();
+            }
+            status = paused ? "Operation paused" : "Operation resumed";
+            return true;
+        }
+        if (event == ftxui::Event::Character('s') &&
+            operation_label != "Delete") {
+            operation_skip.store(true, std::memory_order_release);
+            operation_paused.store(false, std::memory_order_release);
+            operation_pause_condition.notify_all();
+            status = "Skipping current entry";
+            return true;
+        }
+        return false;
+    }
+
+    bool handle_conflict_dialog(const ftxui::Event& event) {
+        if (event == ftxui::Event::Escape) {
+            mode = Mode::panels;
+            status = "Operation cancelled";
+            pending_destination.clear();
+            return true;
+        }
+        if (event == ftxui::Event::ArrowLeft ||
+            event == ftxui::Event::TabReverse) {
+            dialog_focus = (dialog_focus + 2U) % 3U;
+            return true;
+        }
+        if (event == ftxui::Event::ArrowRight ||
+            event == ftxui::Event::Tab) {
+            dialog_focus = (dialog_focus + 1U) % 3U;
+            return true;
+        }
+        if (event != ftxui::Event::Return) {
+            return false;
+        }
+        if (dialog_focus == 2U) {
+            mode = Mode::panels;
+            status = "Operation cancelled";
+            pending_destination.clear();
+            return true;
+        }
+        try {
+            run_operation(
+                pending_move,
+                pending_destination,
+                dialog_focus == 0U,
+                pending_exact
+            );
+        } catch (const std::exception& error) {
+            set_error(error);
+            mode = Mode::panels;
+        }
+        pending_destination.clear();
+        return true;
+    }
+
     bool handle_panels(ftxui::Event event) {
         if (command_mode) {
             if (event == ftxui::Event::Escape) {
@@ -2401,40 +2626,24 @@ struct App::Impl {
                     mode = Mode::editor;
                 }
             } else if (event == ftxui::Event::F5) {
-                start_prompt(
-                    PromptAction::copy,
-                    "Copy to directory",
-                    passive().path()
-                );
+                start_operation_dialog(false, false);
             } else if (event == ftxui::Event::F6) {
                 const auto sources = active().selected_entries();
-                if (sources.size() == 1U) {
-                    start_prompt(
-                        PromptAction::move_exact,
-                        "Move or rename to",
-                        passive().provider()->join(
-                            passive().path(),
-                            sources.front().name
-                        )
-                    );
-                } else {
-                    start_prompt(
-                        PromptAction::move,
-                        "Move to directory",
-                        passive().path()
-                    );
-                }
+                start_operation_dialog(
+                    true,
+                    sources.size() == 1U
+                );
             } else if (event == ftxui::Event::F7) {
                 start_prompt(
                     PromptAction::mkdir,
                     "New directory"
                 );
             } else if (event == ftxui::Event::F8) {
-                start_prompt(
-                    PromptAction::remove,
-                    "Type yes to delete",
-                    config.confirm_delete ? "" : "yes"
-                );
+                if (config.confirm_delete) {
+                    start_delete_dialog();
+                } else {
+                    run_remove_operation();
+                }
             } else if (event == ftxui::Event::F9) {
                 pulldown_category = 0;
                 pulldown_item = 0;
@@ -2497,6 +2706,18 @@ struct App::Impl {
                 return true;
             }
             return false;
+        }
+        if (mode == Mode::operation_dialog) {
+            return handle_operation_dialog(event);
+        }
+        if (mode == Mode::delete_dialog) {
+            return handle_delete_dialog(event);
+        }
+        if (mode == Mode::operation_progress) {
+            return handle_operation_progress(event);
+        }
+        if (mode == Mode::conflict_dialog) {
+            return handle_conflict_dialog(event);
         }
         return handle_panels(event);
     }

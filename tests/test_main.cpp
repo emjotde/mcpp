@@ -651,6 +651,172 @@ void test_operations() {
         "skipped move keeps destination"
     );
 
+    write_file(source_dir / "skip-current.txt", "skip");
+    write_file(source_dir / "copy-current.txt", "copy");
+    const auto skip_current = provider.stat(
+        (source_dir / "skip-current.txt").string(),
+        {}
+    );
+    const auto copy_current = provider.stat(
+        (source_dir / "copy-current.txt").string(),
+        {}
+    );
+    const auto controlled_destination =
+        temporary.path() / "controlled";
+    std::filesystem::create_directory(controlled_destination);
+    operations.copy(
+        provider,
+        {skip_current, copy_current},
+        provider,
+        controlled_destination.string(),
+        {
+            .overwrite = false,
+            .preserve_permissions = true,
+            .preserve_symlinks = true,
+            .collision = {},
+        },
+        {},
+        [&](const mcpp::TransferProgress& value) {
+            if (value.current_path == skip_current.path) {
+                throw mcpp::SkipCurrent{};
+            }
+        }
+    );
+    check(
+        !std::filesystem::exists(
+            controlled_destination / "skip-current.txt"
+        ),
+        "skip-current omits selected source"
+    );
+    check_equal(
+        read_file(controlled_destination / "copy-current.txt"),
+        std::string("copy"),
+        "skip-current continues later sources"
+    );
+
+    write_file(source_dir / "exact-skip.txt", "keep");
+    const auto exact_skip = provider.stat(
+        (source_dir / "exact-skip.txt").string(),
+        {}
+    );
+    operations.move_exact(
+        provider,
+        exact_skip,
+        provider,
+        (moved_dir / "exact-skip.txt").string(),
+        {},
+        {},
+        [](const mcpp::TransferProgress& value) {
+            if (value.files_done == 0U) {
+                throw mcpp::SkipCurrent{};
+            }
+        }
+    );
+    check(
+        std::filesystem::exists(exact_skip.path) &&
+            !std::filesystem::exists(
+                moved_dir / "exact-skip.txt"
+            ),
+        "exact move skips before rename"
+    );
+
+    const auto tree = source_dir / "skip-tree";
+    write_file(tree / "a.txt", "skip");
+    write_file(tree / "b.txt", "copy");
+    const auto tree_destination = temporary.path() / "tree-destination";
+    std::filesystem::create_directory(tree_destination);
+    bool skipped_child = false;
+    operations.move(
+        provider,
+        {provider.stat(tree.string(), {})},
+        second_provider,
+        tree_destination.string(),
+        {
+            .overwrite = false,
+            .preserve_permissions = false,
+            .preserve_symlinks = true,
+            .collision = {},
+        },
+        {},
+        [&](const mcpp::TransferProgress& value) {
+            if (!skipped_child &&
+                value.current_path == (tree / "a.txt").string()) {
+                skipped_child = true;
+                throw mcpp::SkipCurrent{};
+            }
+        }
+    );
+    check(
+        std::filesystem::exists(tree / "a.txt") &&
+            std::filesystem::exists(tree / "b.txt"),
+        "partial directory move keeps source tree"
+    );
+    check(
+        !std::filesystem::exists(
+            tree_destination / "skip-tree" / "a.txt"
+        ) &&
+            read_file(
+                tree_destination / "skip-tree" / "b.txt"
+            ) == "copy",
+        "directory skip continues with later children"
+    );
+
+    const auto direct_tree = source_dir / "direct-tree";
+    write_file(direct_tree / "a.txt", "skip");
+    write_file(direct_tree / "b.txt", "copy");
+    const auto direct_destination =
+        destination_dir / "direct-tree";
+    bool direct_skipped = false;
+    const auto direct_complete = provider.copy_direct(
+        direct_tree.string(),
+        direct_destination.string(),
+        false,
+        {},
+        [&](const mcpp::TransferProgress& value) {
+            if (!direct_skipped &&
+                std::filesystem::path(value.current_path).filename() ==
+                    "a.txt") {
+                direct_skipped = true;
+                throw mcpp::SkipCurrent{};
+            }
+        }
+    );
+    check(
+        !direct_complete &&
+            !std::filesystem::exists(
+                direct_destination / "a.txt"
+            ) &&
+            read_file(direct_destination / "b.txt") == "copy",
+        "direct directory copy reports skipped children"
+    );
+
+    const auto link_target = source_dir / "link-target.txt";
+    const std::string link_content(64U, 'x');
+    write_file(link_target, link_content);
+    const auto link = source_dir / "data-link";
+    std::filesystem::create_symlink(
+        link_target.filename(),
+        link
+    );
+    operations.copy(
+        provider,
+        {provider.stat(link.string(), {})},
+        provider,
+        controlled_destination.string(),
+        {
+            .overwrite = false,
+            .preserve_permissions = true,
+            .preserve_symlinks = false,
+            .collision = {},
+        },
+        {}
+    );
+    check_equal(
+        read_file(controlled_destination / "data-link"),
+        link_content,
+        "dereferenced symlink copy is complete"
+    );
+
     const auto fifo = source_dir / "pipe";
     check(::mkfifo(fifo.c_str(), 0600) == 0, "create FIFO fixture");
     const auto fifo_entry = provider.stat(fifo.string(), {});

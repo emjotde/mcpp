@@ -31,6 +31,10 @@ public:
         std::string_view path,
         const Cancellation& cancellation
     ) const override;
+    [[nodiscard]] Entry stat_follow(
+        std::string_view path,
+        const Cancellation& cancellation
+    ) const override;
     [[nodiscard]] bool exists(std::string_view path) const override;
     [[nodiscard]] SpaceInfo space(
         std::string_view path
@@ -63,7 +67,7 @@ public:
         std::string_view destination,
         bool overwrite
     ) override;
-    void copy_direct(
+    bool copy_direct(
         std::string_view source,
         std::string_view destination,
         bool overwrite,

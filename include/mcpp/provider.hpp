@@ -15,6 +15,12 @@
 
 namespace mcpp {
 
+class SkipCurrent final : public std::runtime_error {
+public:
+    SkipCurrent()
+        : std::runtime_error("skip current entry") {}
+};
+
 enum class ProviderCapability : std::uint32_t {
     none = 0,
     read = 1U << 0U,
@@ -93,6 +99,10 @@ public:
         std::string_view path,
         const Cancellation& cancellation
     ) const = 0;
+    [[nodiscard]] virtual Entry stat_follow(
+        std::string_view path,
+        const Cancellation& cancellation
+    ) const = 0;
     [[nodiscard]] virtual bool exists(std::string_view path) const = 0;
     [[nodiscard]] virtual SpaceInfo space(
         std::string_view path
@@ -127,7 +137,7 @@ public:
         std::string_view destination,
         bool overwrite
     ) = 0;
-    virtual void copy_direct(
+    virtual bool copy_direct(
         std::string_view source,
         std::string_view destination,
         bool overwrite,

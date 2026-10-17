@@ -570,6 +570,21 @@ Entry LocalProvider::stat(
     return make_entry(std::filesystem::directory_entry(resolved));
 }
 
+Entry LocalProvider::stat_follow(
+    const std::string_view path,
+    const Cancellation& cancellation
+) const {
+    cancellation.throw_if_requested();
+    const auto original = resolve(path);
+    auto result = make_entry(
+        std::filesystem::directory_entry(resolve_follow(path))
+    );
+    result.name = original.filename().string();
+    result.path = original.string();
+    result.hidden = result.name.starts_with('.');
+    return result;
+}
+
 bool LocalProvider::exists(const std::string_view path) const {
     std::error_code error;
     const auto status = std::filesystem::symlink_status(
@@ -936,7 +951,7 @@ void LocalProvider::rename(
     }
 }
 
-void LocalProvider::copy_direct(
+bool LocalProvider::copy_direct(
     const std::string_view source,
     const std::string_view destination,
     const bool overwrite,
@@ -954,6 +969,7 @@ void LocalProvider::copy_direct(
     const auto source_entry = stat(source_path.string(), cancellation);
     if (source_entry.kind == EntryKind::directory) {
         const bool created = !exists(destination_path.string());
+        bool copied_all = true;
         create_directory(destination_path.string());
         try {
             for (const auto& child :
@@ -962,13 +978,19 @@ void LocalProvider::copy_direct(
                      {.show_hidden = true},
                      cancellation
                  )) {
-                copy_direct(
-                    child.path,
-                    join(destination_path.string(), child.name),
-                    overwrite,
-                    cancellation,
-                    progress
-                );
+                try {
+                    copied_all =
+                        copy_direct(
+                            child.path,
+                            join(destination_path.string(), child.name),
+                            overwrite,
+                            cancellation,
+                            progress
+                        ) && copied_all;
+                } catch (const SkipCurrent&) {
+                    copied_all = false;
+                    continue;
+                }
             }
         } catch (...) {
             if (created) {
@@ -980,7 +1002,7 @@ void LocalProvider::copy_direct(
             }
             throw;
         }
-        return;
+        return copied_all;
     }
     if (source_entry.kind == EntryKind::symlink) {
         if (overwrite) {
@@ -995,7 +1017,7 @@ void LocalProvider::copy_direct(
                 .current_path = destination_path.string(),
             });
         }
-        return;
+        return true;
     }
     if (source_entry.kind != EntryKind::file) {
         throw std::runtime_error(
@@ -1026,6 +1048,7 @@ void LocalProvider::copy_direct(
             source_entry.permissions
         );
     }
+    return true;
 }
 
 void LocalProvider::set_permissions(

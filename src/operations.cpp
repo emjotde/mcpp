@@ -44,6 +44,33 @@ void accumulate_entry(
     result.bytes_total += entry.size;
 }
 
+void accumulate_removal(
+    Provider& provider,
+    const Entry& entry,
+    const Cancellation& cancellation,
+    TransferProgress& result
+) {
+    cancellation.throw_if_requested();
+    ++result.files_total;
+    if (entry.kind != EntryKind::directory) {
+        result.bytes_total += entry.size;
+        return;
+    }
+    for (const auto& child :
+         provider.list(
+             entry.path,
+             {.show_hidden = true},
+             cancellation
+         )) {
+        accumulate_removal(
+            provider,
+            child,
+            cancellation,
+            result
+        );
+    }
+}
+
 bool should_overwrite(
     Provider& source_provider,
     const Entry& source,
@@ -237,11 +264,13 @@ bool OperationEngine::copy_entry(
     emit_progress(progress, state);
 
     if (&source_provider == &destination_provider &&
+        options.preserve_permissions &&
+        options.preserve_symlinks &&
         has_capability(
             source_provider.capabilities(),
             ProviderCapability::direct_copy
         )) {
-        source_provider.copy_direct(
+        const bool copied_all = source_provider.copy_direct(
             source.path,
             destination_path,
             overwrite,
@@ -257,20 +286,29 @@ bool OperationEngine::copy_entry(
                 emit_progress(progress, overall);
             }
         );
-        TransferProgress completed;
-        accumulate_entry(
-            source_provider,
-            source,
-            cancellation,
-            completed
-        );
-        state.bytes_done += completed.bytes_total;
-        state.files_done += completed.files_total;
-        emit_progress(progress, state);
-        return true;
+        if (copied_all) {
+            TransferProgress completed;
+            accumulate_entry(
+                source_provider,
+                source,
+                cancellation,
+                completed
+            );
+            state.bytes_done += completed.bytes_total;
+            state.files_done += completed.files_total;
+            emit_progress(progress, state);
+        }
+        return copied_all;
     }
 
-    if (source.kind == EntryKind::directory) {
+    auto effective_source = source;
+    if (source.kind == EntryKind::symlink &&
+        !options.preserve_symlinks) {
+        effective_source =
+            source_provider.stat_follow(source.path, cancellation);
+    }
+
+    if (effective_source.kind == EntryKind::directory) {
         if (!destination_exists) {
             destination_provider.create_directory(destination_path);
         }
@@ -281,20 +319,24 @@ bool OperationEngine::copy_entry(
                  {.show_hidden = true},
                  cancellation
              )) {
-            copied_all =
-                copy_entry(
-                source_provider,
-                child,
-                destination_provider,
-                destination_provider.join(
-                    destination_path,
-                    child.name
-                ),
-                options,
-                cancellation,
-                state,
-                progress
-            ) && copied_all;
+            try {
+                copied_all =
+                    copy_entry(
+                    source_provider,
+                    child,
+                    destination_provider,
+                    destination_provider.join(
+                        destination_path,
+                        child.name
+                    ),
+                    options,
+                    cancellation,
+                    state,
+                    progress
+                ) && copied_all;
+            } catch (const SkipCurrent&) {
+                copied_all = false;
+            }
         }
         return copied_all;
     }
@@ -316,7 +358,7 @@ bool OperationEngine::copy_entry(
         source_provider.read(
             source.path,
             0,
-            source.size,
+            effective_source.size,
             output,
             cancellation
         );
@@ -331,7 +373,7 @@ bool OperationEngine::copy_entry(
         destination_provider.write(
             destination_path,
             input,
-            source.size,
+            effective_source.size,
             overwrite,
             std::nullopt,
             cancellation,
@@ -344,13 +386,14 @@ bool OperationEngine::copy_entry(
             destination_provider.capabilities(),
             ProviderCapability::permissions
         ) &&
-        source.permissions != std::filesystem::perms::unknown) {
+        effective_source.permissions !=
+            std::filesystem::perms::unknown) {
         destination_provider.set_permissions(
             destination_path,
-            source.permissions
+            effective_source.permissions
         );
     }
-    state.bytes_done += source.size;
+    state.bytes_done += effective_source.size;
     ++state.files_done;
     emit_progress(progress, state);
     return true;
@@ -366,21 +409,24 @@ void OperationEngine::copy(
     const ProgressCallback& progress
 ) const {
     auto state = measure(source_provider, sources, cancellation);
-    emit_progress(progress, state);
     for (const auto& source : sources) {
-        static_cast<void>(copy_entry(
-            source_provider,
-            source,
-            destination_provider,
-            destination_provider.join(
-                destination_directory,
-                source.name
-            ),
-            options,
-            cancellation,
-            state,
-            progress
-        ));
+        try {
+            static_cast<void>(copy_entry(
+                source_provider,
+                source,
+                destination_provider,
+                destination_provider.join(
+                    destination_directory,
+                    source.name
+                ),
+                options,
+                cancellation,
+                state,
+                progress
+            ));
+        } catch (const SkipCurrent&) {
+            continue;
+        }
     }
 }
 
@@ -401,6 +447,12 @@ void OperationEngine::move(
         auto state = measure(source_provider, sources, cancellation);
         for (const auto& source : sources) {
             cancellation.throw_if_requested();
+            state.current_path = source.path;
+            try {
+                emit_progress(progress, state);
+            } catch (const SkipCurrent&) {
+                continue;
+            }
             const auto destination = destination_provider.join(
                 destination_directory,
                 source.name
@@ -445,32 +497,39 @@ void OperationEngine::move(
                 state.bytes_done += completed.bytes_total;
                 state.files_done += completed.files_total;
                 state.current_path = source.path;
-                emit_progress(progress, state);
+                try {
+                    emit_progress(progress, state);
+                } catch (const SkipCurrent&) {
+                }
             } catch (const std::filesystem::filesystem_error&) {
-                const auto copied = copy_entry(
-                    source_provider,
-                    source,
-                    destination_provider,
-                    destination,
-                    {
-                        .overwrite = overwrite,
-                        .preserve_permissions =
-                            options.preserve_permissions,
-                        .preserve_symlinks =
-                            options.preserve_symlinks,
-                        .collision = options.collision,
-                    },
-                    cancellation,
-                    state,
-                    progress
-                );
-                if (copied) {
-                    source_provider.remove(
-                        source.path,
-                        source.kind == EntryKind::directory,
+                try {
+                    const auto copied = copy_entry(
+                        source_provider,
+                        source,
+                        destination_provider,
+                        destination,
+                        {
+                            .overwrite = overwrite,
+                            .preserve_permissions =
+                                options.preserve_permissions,
+                            .preserve_symlinks =
+                                options.preserve_symlinks,
+                            .collision = options.collision,
+                        },
                         cancellation,
-                        {}
+                        state,
+                        progress
                     );
+                    if (copied) {
+                        source_provider.remove(
+                            source.path,
+                            source.kind == EntryKind::directory,
+                            cancellation,
+                            {}
+                        );
+                    }
+                } catch (const SkipCurrent&) {
+                    continue;
                 }
             }
         }
@@ -478,26 +537,30 @@ void OperationEngine::move(
     }
     auto state = measure(source_provider, sources, cancellation);
     for (const auto& source : sources) {
-        const auto copied = copy_entry(
-            source_provider,
-            source,
-            destination_provider,
-            destination_provider.join(
-                destination_directory,
-                source.name
-            ),
-            options,
-            cancellation,
-            state,
-            progress
-        );
-        if (copied) {
-            source_provider.remove(
-                source.path,
-                source.kind == EntryKind::directory,
+        try {
+            const auto copied = copy_entry(
+                source_provider,
+                source,
+                destination_provider,
+                destination_provider.join(
+                    destination_directory,
+                    source.name
+                ),
+                options,
                 cancellation,
-                {}
+                state,
+                progress
             );
+            if (copied) {
+                source_provider.remove(
+                    source.path,
+                    source.kind == EntryKind::directory,
+                    cancellation,
+                    {}
+                );
+            }
+        } catch (const SkipCurrent&) {
+            continue;
         }
     }
 }
@@ -509,18 +572,29 @@ void OperationEngine::remove(
     const ProgressCallback& progress
 ) const {
     TransferProgress state;
-    state.files_total = entries.size();
+    for (const auto& entry : entries) {
+        accumulate_removal(provider, entry, cancellation, state);
+    }
     for (const auto& entry : entries) {
         cancellation.throw_if_requested();
+        bool reported = false;
         provider.remove(
             entry.path,
             entry.kind == EntryKind::directory,
             cancellation,
-            {}
+            [&](const TransferProgress& current) {
+                reported = true;
+                ++state.files_done;
+                state.bytes_done += current.bytes_done;
+                state.current_path = current.current_path;
+                emit_progress(progress, state);
+            }
         );
-        ++state.files_done;
-        state.current_path = entry.path;
-        emit_progress(progress, state);
+        if (!reported) {
+            ++state.files_done;
+            state.current_path = entry.path;
+            emit_progress(progress, state);
+        }
     }
 }
 
@@ -559,6 +633,13 @@ void OperationEngine::move_exact(
                 throw OperationCancelled{};
         }
     }
+    auto state = measure(source_provider, {source}, cancellation);
+    state.current_path = source.path;
+    try {
+        emit_progress(progress, state);
+    } catch (const SkipCurrent&) {
+        return;
+    }
     if (&source_provider == &destination_provider &&
         has_capability(
             source_provider.capabilities(),
@@ -570,35 +651,36 @@ void OperationEngine::move_exact(
                 destination,
                 overwrite
             );
-            if (progress) {
-                progress({
-                    .bytes_done = source.size,
-                    .bytes_total = source.size,
-                    .files_done = 1,
-                    .files_total = 1,
-                    .current_path = source.path,
-                });
+            state.bytes_done = state.bytes_total;
+            state.files_done = state.files_total;
+            try {
+                emit_progress(progress, state);
+            } catch (const SkipCurrent&) {
             }
             return;
         } catch (const std::filesystem::filesystem_error&) {
         }
     }
-    auto state = measure(source_provider, {source}, cancellation);
-    const auto copied = copy_entry(
-        source_provider,
-        source,
-        destination_provider,
-        destination,
-        {
-            .overwrite = overwrite,
-            .preserve_permissions = options.preserve_permissions,
-            .preserve_symlinks = options.preserve_symlinks,
-            .collision = options.collision,
-        },
-        cancellation,
-        state,
-        progress
-    );
+    bool copied = false;
+    try {
+        copied = copy_entry(
+            source_provider,
+            source,
+            destination_provider,
+            destination,
+            {
+                .overwrite = overwrite,
+                .preserve_permissions = options.preserve_permissions,
+                .preserve_symlinks = options.preserve_symlinks,
+                .collision = options.collision,
+            },
+            cancellation,
+            state,
+            progress
+        );
+    } catch (const SkipCurrent&) {
+        return;
+    }
     if (copied) {
         source_provider.remove(
             source.path,
