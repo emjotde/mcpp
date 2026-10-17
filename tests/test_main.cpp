@@ -366,6 +366,16 @@ void test_pane() {
         "pane selection"
     );
     pane.clear_selection();
+    pane.select_pattern("*.TXT", true);
+    check(
+        std::ranges::none_of(
+            pane.entries(),
+            [&](const auto& entry) {
+                return pane.is_selected(entry);
+            }
+        ),
+        "pane selection masks are case-sensitive"
+    );
     pane.select_pattern("*.txt", true);
     check_equal(
         pane.selected_entries().size(),
@@ -433,6 +443,11 @@ void test_pane() {
         "pane history target"
     );
     check(pane.history_forward(), "pane history forward");
+    check_equal(
+        pane.current()->name,
+        std::string("sub-link"),
+        "pane history restores child cursor"
+    );
     check(pane.find("sub-link"), "find symlink directory");
     check(pane.enter(), "enter symlink directory");
     check_equal(
@@ -979,6 +994,12 @@ void test_viewer_editor() {
     const auto lines = viewer.lines(80, 10);
     check_equal(lines.size(), std::size_t{3}, "viewer lines");
     check_equal(lines[1], std::string("beta"), "viewer content");
+    check(viewer.wrap(), "viewer wraps by default");
+    check_equal(
+        viewer.view_end(),
+        viewer.size(),
+        "viewer reports displayed end"
+    );
     const auto match = viewer.find("gamma", true);
     check(match.has_value(), "viewer find");
     viewer.toggle_hex();
@@ -1018,6 +1039,80 @@ void test_viewer_editor() {
         wrapped_wide[1],
         std::string("abc"),
         "viewer retains text after UTF-8 wrap"
+    );
+    const auto wrapped_path = temporary.path() / "wrapped.txt";
+    write_file(
+        wrapped_path,
+        "abcdefghijklmnopqrstuvwxyzABCDEFGHI\nend\n"
+    );
+    mcpp::ViewerModel wrapped_viewer;
+    wrapped_viewer.open(provider, wrapped_path.string());
+    const auto first_wrapped_page = wrapped_viewer.lines(10, 2);
+    check_equal(
+        first_wrapped_page[0],
+        std::string("abcdefghij"),
+        "wrapped viewer first visual row"
+    );
+    check_equal(
+        first_wrapped_page[1],
+        std::string("klmnopqrst"),
+        "wrapped viewer second visual row"
+    );
+    check_equal(
+        wrapped_viewer.view_end(),
+        std::uint64_t{20},
+        "wrapped viewer reports displayed bytes only"
+    );
+    wrapped_viewer.page(1, 10, 2);
+    check_equal(
+        wrapped_viewer.lines(10, 2)[0],
+        std::string("uvwxyzABCD"),
+        "wrapped viewer page continues without skipping"
+    );
+    wrapped_viewer.page(-1, 10, 2);
+    check_equal(
+        wrapped_viewer.offset(),
+        std::uint64_t{0},
+        "wrapped viewer page up restores prior offset"
+    );
+    wrapped_viewer.scroll_lines(1, 10);
+    check_equal(
+        wrapped_viewer.lines(10, 2)[0],
+        std::string("klmnopqrst"),
+        "wrapped viewer scrolls by visual row"
+    );
+    const auto exact_width_path =
+        temporary.path() / "exact-width.txt";
+    write_file(exact_width_path, "abcdefghij\nnext\n");
+    mcpp::ViewerModel exact_width_viewer;
+    exact_width_viewer.open(provider, exact_width_path.string());
+    static_cast<void>(exact_width_viewer.lines(10, 1));
+    exact_width_viewer.scroll_lines(1, 10);
+    check_equal(
+        exact_width_viewer.lines(10, 1)[0],
+        std::string("next"),
+        "exact-width viewer row consumes its newline"
+    );
+    const auto hex_scroll_path =
+        temporary.path() / "hex-scroll.txt";
+    write_file(
+        hex_scroll_path,
+        "0123456789abcdef0123456789abcdef"
+    );
+    mcpp::ViewerModel hex_scroll_viewer;
+    hex_scroll_viewer.open(provider, hex_scroll_path.string());
+    hex_scroll_viewer.scroll_lines(3, 8);
+    check_equal(
+        hex_scroll_viewer.offset(),
+        std::uint64_t{24},
+        "viewer reaches wrapped byte offset"
+    );
+    hex_scroll_viewer.toggle_hex();
+    hex_scroll_viewer.scroll_lines(-1, 8);
+    check_equal(
+        hex_scroll_viewer.offset(),
+        std::uint64_t{8},
+        "hex viewer scrolls backward by sixteen bytes"
     );
 
     mcpp::EditorModel editor;
@@ -1357,14 +1452,56 @@ void test_viewer_editor() {
         std::string("abc"),
         "zero-width column delete keeps text"
     );
-    write_file(column_block_path, "abcd\n\tfoo\n");
+    write_file(column_block_path, "abcdefgh\n\tfoo\n");
     editor.open(provider, column_block_path.string());
-    editor.move(0, 2);
+    editor.set_tab_width(8);
+    editor.move(0, 6);
     editor.paste_column("X\nY");
     check_equal(
         editor.lines()[1],
-        std::string("  Y\tfoo"),
-        "column paste pads inside tab"
+        std::string("      Y\tfoo"),
+        "column paste uses configured tab width"
+    );
+    check_equal(
+        editor.tab_width(),
+        std::size_t{8},
+        "editor reports configured tab width"
+    );
+    write_file(column_block_path, "é\tX\nabcdefgh\n");
+    editor.open(provider, column_block_path.string());
+    editor.move(0, 2);
+    editor.move(1, 0);
+    check_equal(
+        editor.column(),
+        std::size_t{8},
+        "vertical move preserves UTF-8 tab display column"
+    );
+    editor.move(-1, 0);
+    check_equal(
+        editor.column(),
+        std::size_t{3},
+        "vertical move returns to configured tab boundary"
+    );
+    editor.set_tab_width(4);
+    const auto indent_path = temporary.path() / "indent.txt";
+    write_file(indent_path, "    alpha");
+    editor.open(provider, indent_path.string());
+    editor.end();
+    editor.newline(true);
+    editor.insert('x');
+    check_equal(
+        editor.lines()[1],
+        std::string("    x"),
+        "auto-indent copies leading whitespace"
+    );
+    editor.open(provider, indent_path.string());
+    editor.end();
+    editor.newline(false);
+    editor.insert('x');
+    check_equal(
+        editor.lines()[1],
+        std::string("x"),
+        "disabled auto-indent starts at column zero"
     );
     write_file(overwrite_path, "abcdef");
     editor.open(provider, overwrite_path.string());
@@ -1594,6 +1731,10 @@ void test_config() {
     config.theme = "blue";
     config.editor_syntax = false;
     config.editor_line_numbers = false;
+    config.editor_tab_width = 8;
+    config.editor_indent_width = 2;
+    config.editor_auto_indent = false;
+    config.editor_show_whitespace = true;
     config.bookmarks = {
         "/one",
         "/two\nconfirm_delete=true",
@@ -1608,6 +1749,21 @@ void test_config() {
     check(
         !loaded.editor_syntax && !loaded.editor_line_numbers,
         "config editor display settings"
+    );
+    check_equal(
+        loaded.editor_tab_width,
+        std::size_t{8},
+        "config editor tab width"
+    );
+    check_equal(
+        loaded.editor_indent_width,
+        std::size_t{2},
+        "config editor indent width"
+    );
+    check(
+        !loaded.editor_auto_indent &&
+            loaded.editor_show_whitespace,
+        "config editor whitespace settings"
     );
     check_equal(
         loaded.bookmarks.size(),
@@ -1652,6 +1808,48 @@ void test_editor_clipboard() {
         mcpp::load_editor_clipboard(path),
         std::string("alpha\nbeta"),
         "persistent editor clipboard"
+    );
+    mcpp::save_editor_clipboard(path, "left\nright", true);
+    bool column = false;
+    check_equal(
+        mcpp::load_editor_clipboard(path, &column),
+        std::string("left\nright"),
+        "persistent column clipboard"
+    );
+    check(column, "persistent clipboard column metadata");
+    const std::string maximum_clipboard(
+        16U * 1024U * 1024U,
+        'x'
+    );
+    mcpp::save_editor_clipboard(
+        path,
+        maximum_clipboard,
+        true
+    );
+    bool maximum_column = false;
+    const auto loaded_maximum =
+        mcpp::load_editor_clipboard(path, &maximum_column);
+    check_equal(
+        loaded_maximum.size(),
+        maximum_clipboard.size(),
+        "maximum clipboard payload remains loadable"
+    );
+    check(
+        maximum_column,
+        "maximum clipboard retains column metadata"
+    );
+    bool oversized_rejected = false;
+    try {
+        mcpp::save_editor_clipboard(
+            path,
+            std::string(maximum_clipboard.size() + 1U, 'x')
+        );
+    } catch (const std::runtime_error&) {
+        oversized_rejected = true;
+    }
+    check(
+        oversized_rejected,
+        "oversized clipboard is rejected before saving"
     );
     struct stat status {};
     check(

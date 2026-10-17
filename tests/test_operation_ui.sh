@@ -30,6 +30,10 @@ printf '\033[B\033[2~\033[2~\033[15~\r ' >&3
 sleep 1
 printf 's' >&3
 sleep 3
+redraw_complete=false
+if grep -aFq 'Copy complete' "$temporary/output"; then
+    redraw_complete=true
+fi
 printf '\033[21~' >&3
 set +e
 wait "$runner"
@@ -40,6 +44,11 @@ exec 3>&-
 if ((status != 0)); then
     printf 'operation UI test failed with status %d\n' "$status" >&2
     cat "$temporary/error" >&2
+    exit 1
+fi
+
+if [[ "$redraw_complete" != true ]]; then
+    printf 'operation completion did not redraw without input\n' >&2
     exit 1
 fi
 

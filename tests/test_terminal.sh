@@ -25,13 +25,19 @@ printf '\033[12~\033\033[20~\033[C\033[B\033' >&3
 sleep 1
 printf '\033[B\033[13~' >&3
 sleep 1
-printf '\033[13~\033[14~\033[FZ\033[12~\033[21~' >&3
+printf '\033[18~missing-value\r' >&3
+sleep 1
+printf '\r\033[13~\033[14~\033[FZ\033[12~\033[21~' >&3
 sleep 1
 printf '\033[18~created\r' >&3
 sleep 1
 printf '\033[15~\r' >&3
 sleep 1
 printf 'touch cmd-created.txt\r' >&3
+sleep 1
+printf 'x\177\017' >&3
+sleep 1
+printf 'printf "C_O_SHELL\\n"\rexit\r' >&3
 sleep 1
 printf ' \t\033[21~' >&3
 set +e
@@ -54,6 +60,21 @@ if ! grep -aFq $'\033[?1049l\r\033[0m\r' \
     exit 1
 fi
 
+if ! grep -aFq 'UnWrap' "$temporary/output-clean" ||
+   ! grep -aFq 'Goto' "$temporary/output-clean" ||
+   ! grep -aFq 'Search' "$temporary/output-clean" ||
+   ! grep -aFq 'Raw' "$temporary/output-clean" ||
+   ! grep -aFq 'Format' "$temporary/output-clean"; then
+    printf 'mcpp viewer did not render the MC-style keybar\n' >&2
+    exit 1
+fi
+
+if ! grep -aFq 'Search string not found' \
+    "$temporary/output-clean"; then
+    printf 'mcpp viewer did not report a failed search\n' >&2
+    exit 1
+fi
+
 if [[ ! -d "$temporary/left/created" ]]; then
     printf 'mcpp F7 did not create the requested directory\n' >&2
     exit 1
@@ -66,6 +87,11 @@ fi
 
 if [[ ! -f "$temporary/left/cmd-created.txt" ]]; then
     printf 'mcpp command line did not run in the active directory\n' >&2
+    exit 1
+fi
+
+if ! grep -aFq 'C_O_SHELL' "$temporary/output-clean"; then
+    printf 'mcpp Ctrl-O did not open an interactive shell\n' >&2
     exit 1
 fi
 

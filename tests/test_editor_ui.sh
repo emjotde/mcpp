@@ -80,3 +80,62 @@ if ((direct_status != 0)); then
     cat "$temporary/direct-error" >&2
     exit 1
 fi
+
+printf 'a b\tc  \n' >"$temporary/options.txt"
+mkfifo "$temporary/options-input"
+printf -v options_command 'XDG_CONFIG_HOME=%q %q -e %q' \
+    "$temporary/options-config" \
+    "$binary" "$temporary/options.txt"
+"$timeout_command" 12s "$script_command" \
+    -qefc "$options_command" /dev/null \
+    <"$temporary/options-input" \
+    >"$temporary/options-output" 2>"$temporary/options-error" &
+options_runner=$!
+exec 5>"$temporary/options-input"
+sleep 1
+printf '\033[20~\033[C\033[C\033[C\033[C\033[C\033[C\r\r' >&5
+sleep 0.5
+printf '8\t2\t\t \t\r' >&5
+sleep 0.5
+printf '\033[20~\033[C\033[C\033[C\033[C\033[C\033[C\033[F\r' >&5
+sleep 0.5
+printf '\033[B\tX\033[A\033[F\tY\033[12~' >&5
+sleep 0.5
+printf '\033[21~' >&5
+set +e
+wait "$options_runner"
+options_status=$?
+set -e
+exec 5>&-
+
+if ((options_status != 0)); then
+    printf 'editor options workflow failed with status %d\n' \
+        "$options_status" >&2
+    cat "$temporary/options-error" >&2
+    exit 1
+fi
+
+if [[ "$(cat "$temporary/options.txt")" != \
+      $'a b\tc       Y\n  X' ]]; then
+    printf 'configured editor indentation was not applied\n' >&2
+    exit 1
+fi
+
+if ! grep -aFq 'Editor options' "$temporary/options-output" ||
+   ! grep -aFq '<--->' "$temporary/options-output" ||
+   ! grep -aFq 'c..' "$temporary/options-output"; then
+    printf 'editor options or whitespace markers were not rendered\n' >&2
+    exit 1
+fi
+
+options_config="$temporary/options-config/mcpp/config"
+for expected in \
+    'editor_tab_width=8' \
+    'editor_indent_width=2' \
+    'editor_auto_indent=true' \
+    'editor_show_whitespace=true'; do
+    if ! grep -Fq "$expected" "$options_config"; then
+        printf 'saved editor option missing: %s\n' "$expected" >&2
+        exit 1
+    fi
+done

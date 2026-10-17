@@ -17,12 +17,13 @@ Azure Blob Storage through azcpp. SSH/SFTP work is currently paused.
 - Asynchronous copy/move/delete progress and cancellation
 - Atomic no-clobber writes and symlink/root confinement
 - Mode, owner/group, file information, free-space display, and links
-- Directory comparison and quick-view panel
+- Directory comparison and fixed-width, focusable quick-view panel
 - Local command line, history, and restored-terminal subshell
 - Persisted panel paths and preferences
 - MC-style visual state cues using a grayscale-only palette
 - Toggleable VS Code Dark+-style syntax colors within grayscale UI chrome
 - Toggleable editor line-number gutter and mcedit-style position header
+- Persisted editor tab width, indentation, auto-indent, and whitespace markers
 - Persistent linear/column blocks and atomic cross-session editor clipboard
 
 The implementation is behaviorally familiar but does not use Midnight
@@ -62,12 +63,13 @@ The current parity gaps against GNU Midnight Commander are documented in
 
 | Key | Action |
 |---|---|
-| `Tab` | Switch pane |
+| `Tab` | Switch pane, or focus/unfocus quick view |
 | `Enter` | Enter directory |
-| `Left` / `Ctrl-PageUp` | Parent directory |
-| `Right` / `Ctrl-PageDown` | Enter selected directory |
+| `Ctrl-PageUp` | Parent directory |
+| `Ctrl-PageDown` | Enter selected directory |
 | `Insert` | Toggle selection |
 | `Ctrl-S` / `Alt-S` | Incremental panel search |
+| `Ctrl-X Q` | Toggle quick view |
 | `F3` | View |
 | `F4` | Edit |
 | `F5` | Copy |

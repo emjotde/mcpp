@@ -133,6 +133,15 @@ if(MCPP_BUILD_TESTS)
                 ${MCPP_SCRIPT_EXECUTABLE}
                 ${MCPP_TIMEOUT_EXECUTABLE}
         )
+        add_test(
+            NAME mcpp_shortcuts
+            COMMAND
+                bash
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_shortcuts.sh
+                $<TARGET_FILE:mcpp>
+                ${MCPP_SCRIPT_EXECUTABLE}
+                ${MCPP_TIMEOUT_EXECUTABLE}
+        )
     endif()
 endif()
 

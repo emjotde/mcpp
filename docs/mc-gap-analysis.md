@@ -1,24 +1,28 @@
 # mcpp versus GNU Midnight Commander: gap analysis
 
-Review date: 2026-10-16
+Review date: 2026-10-17
 
 Compared versions:
 
 - GNU Midnight Commander 4.8.30, installed at `/usr/bin/mc`
-- mcpp commit `60a821e`
+- mcpp working tree based on commit `37263dc`
 
 ## Conclusion
 
-mcpp is an early local-filesystem prototype with a recognizable orthodox
-two-pane layout. It is not yet a functional clone of GNU Midnight Commander.
+mcpp now provides a comparable Linux local-filesystem workflow for the common
+commander, viewer, and editor paths covered below. It is not a complete clone
+of GNU Midnight Commander.
 
-The default panel screen is now visually close at 120x35, but most MC depth is
-missing behind that screen. The largest gaps are file-operation semantics and
-dialogs, panel modes, input editing, viewer/editor behavior, persistent
-subshell integration, configuration, help, jobs, archive/VFS support, and
-failure handling.
+A ten-topic GNU Screen audit captured 115 matched MC/mcpp pairs covering panel
+navigation, menus, selection, Quick view, viewer, editor, operations,
+metadata/links, and terminal layouts. The comparison drove fixes for menu
+activation, shortcuts, focused Quick view, viewer paging/chrome, selection
+masks, editor indentation/clipboard behavior, operation cancellation redraw,
+terminal sizing, and shell transitions.
 
-mcpp should not currently be presented as having broad MC parity.
+The largest remaining gaps are advanced panel modes, richer operation and
+metadata dialogs, persistent subshell integration, help/jobs, multi-buffer
+editing, macros, archive/VFS support, and SSH/cloud providers.
 
 ## Review method
 
@@ -31,10 +35,11 @@ The review used:
 3. MC's manual sections for panels, menus, operations, search, hotlist,
    options, viewer, editor, subshell, and VFS.
 4. Behavioral inspection of the upstream source dispatch and operation code.
-5. Side-by-side pseudo-terminal sessions at 120x35 and 60x15.
-6. Direct comparisons of the default screen, F5 copy dialog, F2/F9 menus,
-   F3 viewer, and editor behavior.
-7. Review of mcpp source, unit tests, sanitizer runs, and Docker tests.
+5. Side-by-side GNU Screen sessions at 80x24, 100x30, 120x34-40,
+   72x22, and resized layouts.
+6. A ten-topic matrix of 115 matched hardcopy pairs, with raw captures and
+   per-topic findings retained as audit artifacts.
+7. Review of mcpp source plus Debug, Release, ASan, and UBSan test matrices.
 
 MC source was inspected only to understand behavior. No MC code or resources
 were reused.
@@ -176,7 +181,7 @@ These are useful foundations, not parity.
 | Directory sizes | On demand | Shows directory inode size | Missing |
 | Tree panel | Dynamic/static tree | No | Missing |
 | Info panel | Full panel mode | Small modal | Partial |
-| Quick-view panel | Viewer-capable panel | Read-only preview | Partial |
+| Quick-view panel | Viewer-capable panel | Fixed-width preview with Tab/mouse focus and scrolling | Partial |
 | Panelize | Find/external command results become panel | Separate results screen | Missing |
 | Horizontal split and resizing | Yes | No | Missing |
 | Swap/synchronize panes | Yes | No | Missing |
@@ -188,12 +193,12 @@ At 60x15, both programs keep panel navigation and current-item information
 usable. mcpp keeps all ten compact key labels visible, while MC drops later
 labels when necessary.
 
-The follow-up source and side-by-side review aligned Left/Right and
-Ctrl-PageUp/Down directory traversal, parent-row cursor restoration,
+The follow-up source and side-by-side review aligned Ctrl-PageUp/Down
+directory traversal, parent-row cursor restoration,
 Alt-Y/Alt-U history movement, Shift-Up/Down marking, pointed-pane mouse
 wheel behavior, Space command-line input, and incremental quick search.
-Remaining navigation differences are MC's directory-history popup, other-pane
-sync/change-directory commands, multi-column horizontal movement, panel
+Remaining navigation differences are MC's directory-history popup,
+multi-column horizontal movement, panel
 filters, directory-size calculation, extension/executable Enter actions, and
 tree/panelize modes.
 
@@ -202,7 +207,7 @@ tree/panelize modes.
 | Capability | MC | mcpp | Status |
 |---|---|---|---|
 | F2 user menu | Local/user/system lookup, conditions, multiline commands | One global `key|label|command` file | Partial |
-| F9 pull-down | Full Left/File/Command/Options/Right menus | Small subset | Partial |
+| F9 pull-down | Full Left/File/Command/Options/Right menus | Matching menu rows with implemented actions enabled and unavailable rows faded | Partial |
 | Dialog widgets | Buttons, checkboxes, radio, tab order, hotkeys | Buttons, checks, radio-like modes, tab order | Partial |
 | Input editing | Cursor, words, kill/yank, selection, history, completion | Append/backspace only | Missing |
 | Mouse in menus/dialogs | Yes | Panel rows and commander pull-downs; editor/dialog mouse incomplete | Partial |
@@ -243,8 +248,8 @@ Further missing operation behavior:
 
 | Capability | MC viewer | mcpp viewer |
 |---|---|---|
-| Dedicated full-screen UI/keybar | Yes | Main commander chrome remains |
-| File offset/size/percentage | Yes | No |
+| Dedicated full-screen UI/keybar | Yes | Yes; unavailable actions are faded |
+| File offset/size/percentage | Yes | Displayed end, size, and percentage |
 | Wrap | Yes | Yes |
 | Hex view | Yes | Basic |
 | Hex editing/save | Yes | No |
@@ -258,8 +263,9 @@ Further missing operation behavior:
 | Viewer history/screen selector | Yes | No |
 | Horizontal scrolling | Yes | No |
 
-The mcpp viewer currently renders inside a rounded box and retains the main
-menu, hint, prompt, and file-manager keybar, unlike MC's dedicated viewer.
+The mcpp viewer uses the same full-screen shape as `mcview`: a status line,
+file content, and a viewer-specific function-key bar. Goto, raw/nroff,
+formatting, bookmarks, and horizontal scrolling remain unavailable.
 
 ### Editor
 
@@ -311,12 +317,12 @@ workflow.
 | Delete word/line/to-EOL | Dedicated bindings | Line and EOL; word deletion missing |
 | Desired column on vertical move | Preserved across short lines | Preserved across short lines |
 | Page Up/Down | Uses the visible editor height | Uses the visible editor height | Close |
-| Tab handling | Configurable real/fake tabs and tab width | Advances to fixed four-column fake-tab stops |
-| Existing tabs | Configurable width | Displayed at fixed four-cell stops |
-| Auto-indent | Configurable | No |
+| Tab handling | Configurable real/fake tabs and tab width | Configurable space indentation stops |
+| Existing tabs | Configurable width | Configurable width |
+| Auto-indent | Configurable | Configurable |
 | Literal insertion | `Ctrl-Q` | No |
 | Completion | `Alt-Tab` | No |
-| Matching bracket | `Alt-B` | No |
+| Matching bracket | `Alt-B` | Same |
 | Paragraph formatting/sort/filter | Yes | No |
 
 Paired checks now produce the same results for overwrite insertion,
@@ -337,8 +343,8 @@ supports:
 - mouse drag block selection.
 
 mcpp supports copy/cut/paste through `Ctrl-Insert`, `Shift-Delete`, and
-`Shift-Insert`, keeps column-mode metadata in-process, and safely persists the
-clip text in a mode-0600 atomic cache file across processes.
+`Shift-Insert` and safely persists both clip text and column-mode metadata in
+a mode-0600 atomic cache file across processes.
 
 #### Search and replace
 
@@ -377,8 +383,9 @@ rather than silently performing the old conflicting search action.
 #### Menus, status, and options
 
 mcpp shows the same seven top-level editor menu names. File, Edit, and Search
-contain a working subset, and Command can toggle syntax highlighting; Format,
-Window, and Options remain placeholders. mcedit additionally exposes
+contain a working subset, and Command can toggle syntax highlighting; Format
+and Window remain placeholders. Options provides general indentation and
+whitespace settings plus persistent Save Setup. mcedit additionally exposes
 open/new/history, insert/copy file, persistent clip-file operations,
 bookmarks, syntax selection and encoding, macros, spell checking, literal
 insertion, formatting, external filters, multiple windows, general editor
@@ -392,13 +399,13 @@ bytes, and Unicode character value. It provides
 built-in VS Code Dark+-style highlighting for common C-family, Rust, Go,
 JavaScript, Python, shell, JSON, Markdown, and configuration files, but no
 external rule database or syntax chooser. Line numbers are toggleable with
-Alt-N. Whitespace markers, bookmarks, codepages, spell checking, macros, and
-session recovery are absent.
+Alt-N. Visible tabs and trailing spaces are configurable, and Tab uses the
+fake-indent width in leading indentation and the real tab width after text.
+Bookmarks, codepages, spell checking, macros, and session recovery are absent.
 
-The next editor work should focus on column blocks, configurable indentation,
-and file lifecycle. Multi-buffer windows follow those basics. Macros, spell
-checking, and code navigation are later parity work, not requirements for a
-dependable basic editor.
+The next editor work should focus on mouse drag selection, editor/file
+history, and multi-buffer windows. Macros, spell checking, and code navigation
+are later parity work, not requirements for a dependable basic editor.
 
 ### Command line and subshell
 

@@ -2,6 +2,7 @@
 
 #include "mcpp/entry.hpp"
 
+#include <cstddef>
 #include <filesystem>
 #include <string>
 #include <vector>
@@ -17,7 +18,11 @@ struct Config {
     bool sort_descending{false};
     std::string theme{"grayscale"};
     bool editor_syntax{true};
-    bool editor_line_numbers{true};
+    bool editor_line_numbers{false};
+    std::size_t editor_tab_width{8};
+    std::size_t editor_indent_width{4};
+    bool editor_auto_indent{true};
+    bool editor_show_whitespace{false};
     std::vector<std::string> bookmarks;
 
     static Config load(const std::filesystem::path& path);

@@ -22,12 +22,7 @@ bool wildcard_match(
     while (value_index < value.size()) {
         if (pattern_index < pattern.size() &&
             (pattern[pattern_index] == '?' ||
-             std::tolower(static_cast<unsigned char>(
-                 pattern[pattern_index]
-             )) ==
-                 std::tolower(static_cast<unsigned char>(
-                     value[value_index]
-                 )))) {
+             pattern[pattern_index] == value[value_index])) {
             ++pattern_index;
             ++value_index;
         } else if (pattern_index < pattern.size() &&
@@ -155,8 +150,19 @@ bool Pane::up(const Cancellation& cancellation) {
     if (target == path_) {
         return false;
     }
-    const auto old_name = provider_->basename(path_);
+    const auto child_path = path_;
     navigate(target, true, cancellation);
+    restore_child_cursor(child_path);
+    return true;
+}
+
+void Pane::restore_child_cursor(
+    const std::string_view child_path
+) {
+    if (provider_->parent(child_path) != path_) {
+        return;
+    }
+    const auto old_name = provider_->basename(child_path);
     const auto match = std::find_if(
         entries_.begin(),
         entries_.end(),
@@ -169,7 +175,6 @@ bool Pane::up(const Cancellation& cancellation) {
             std::distance(entries_.begin(), match)
         );
     }
-    return true;
 }
 
 void Pane::change_directory(
@@ -227,9 +232,11 @@ bool Pane::history_back(const Cancellation& cancellation) {
     if (history_index_ == 0U) {
         return false;
     }
+    const auto child_path = path_;
     --history_index_;
     try {
         navigate(history_[history_index_], false, cancellation);
+        restore_child_cursor(child_path);
     } catch (...) {
         ++history_index_;
         throw;
@@ -241,9 +248,11 @@ bool Pane::history_forward(const Cancellation& cancellation) {
     if (history_index_ + 1U >= history_.size()) {
         return false;
     }
+    const auto child_path = path_;
     ++history_index_;
     try {
         navigate(history_[history_index_], false, cancellation);
+        restore_child_cursor(child_path);
     } catch (...) {
         --history_index_;
         throw;

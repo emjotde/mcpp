@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <charconv>
 #include <cerrno>
 #include <chrono>
 #include <cctype>
@@ -45,6 +46,7 @@ namespace {
 enum class Mode {
     panels,
     viewer,
+    viewer_message,
     editor,
     editor_menu,
     editor_help,
@@ -53,6 +55,7 @@ enum class Mode {
     editor_replace_dialog,
     editor_replace_confirm,
     editor_close_dialog,
+    editor_options_dialog,
     prompt,
     help,
     user_menu,
@@ -71,6 +74,7 @@ enum class PromptAction {
     rename,
     mkdir,
     viewer_find,
+    quick_viewer_find,
     editor_open,
     editor_new,
     editor_save_as,
@@ -224,13 +228,13 @@ std::uint32_t utf8_codepoint(
 
 std::size_t editor_offset_for_width(
     const std::string_view value,
-    const std::size_t target_width
+    const std::size_t target_width,
+    const std::size_t tab_width
 ) {
     std::size_t offset = 0;
     std::size_t width = 0;
     while (offset < value.size()) {
         if (value[offset] == '\t') {
-            constexpr std::size_t tab_width = 4U;
             const auto glyph_width =
                 tab_width - width % tab_width;
             if (width + glyph_width > target_width) {
@@ -258,14 +262,14 @@ std::size_t editor_offset_for_width(
 
 std::size_t editor_display_width(
     const std::string_view value,
-    const std::size_t byte_offset
+    const std::size_t byte_offset,
+    const std::size_t tab_width
 ) {
     std::size_t offset = 0;
     std::size_t width = 0;
     const auto end = std::min(byte_offset, value.size());
     while (offset < end) {
         if (value[offset] == '\t') {
-            constexpr std::size_t tab_width = 4U;
             width += tab_width - width % tab_width;
             ++offset;
             continue;
@@ -286,16 +290,34 @@ std::size_t editor_display_width(
 
 std::string editor_display_text(
     const std::string_view value,
-    std::size_t display_column
+    std::size_t display_column,
+    const std::size_t tab_width,
+    const bool show_tabs,
+    const bool show_spaces
 ) {
     std::string result;
     for (std::size_t offset = 0; offset < value.size();) {
         if (value[offset] == '\t') {
-            constexpr std::size_t tab_width = 4U;
             const auto spaces =
                 tab_width - display_column % tab_width;
-            result.append(spaces, ' ');
+            if (show_tabs) {
+                if (spaces == 1U) {
+                    result += '>';
+                } else {
+                    result += '<';
+                    result.append(spaces - 2U, '-');
+                    result += '>';
+                }
+            } else {
+                result.append(spaces, ' ');
+            }
             display_column += spaces;
+            ++offset;
+            continue;
+        }
+        if (value[offset] == ' ' && show_spaces) {
+            result += '.';
+            ++display_column;
             ++offset;
             continue;
         }
@@ -361,6 +383,31 @@ std::string truncate_text(
         return value.substr(0, width);
     }
     return value.substr(0, width - 3U) + "...";
+}
+
+std::string command_text(
+    const std::string& value,
+    const std::size_t width
+) {
+    if (static_cast<std::size_t>(
+            std::max(0, ftxui::string_width(value))
+        ) <= width) {
+        return value;
+    }
+    if (width == 0U) {
+        return {};
+    }
+    std::size_t offset = 0;
+    while (offset < value.size() &&
+           static_cast<std::size_t>(
+               std::max(
+                   0,
+                   ftxui::string_width(value.substr(offset))
+               )
+           ) >= width) {
+        offset = next_utf8(value, offset);
+    }
+    return "<" + value.substr(offset);
 }
 
 std::string type_prefix(const Entry& entry) {
@@ -514,11 +561,16 @@ struct App::Impl {
     Cancellation operation_cancellation;
     TransferProgress progress;
     ViewerModel viewer;
+    std::string viewer_message_title{"Viewer"};
+    std::string viewer_message;
     EditorModel editor;
     bool exit_after_editor{false};
     SyntaxHighlighter syntax_highlighter;
     bool editor_syntax{true};
     bool editor_line_numbers{true};
+    std::size_t editor_indent_width{4};
+    bool editor_auto_indent{true};
+    bool editor_show_whitespace{false};
     std::uint64_t syntax_change_id{
         std::numeric_limits<std::uint64_t>::max()
     };
@@ -552,7 +604,15 @@ struct App::Impl {
     std::size_t editor_replacements{0};
     std::size_t editor_menu_category{0};
     std::size_t editor_menu_item{0};
+    bool editor_menu_dropped{false};
     std::size_t editor_close_choice{0};
+    std::size_t editor_options_focus{0};
+    std::array<bool, 2> editor_options_touched{};
+    std::string editor_options_tab_width;
+    std::string editor_options_indent_width;
+    bool editor_options_auto_indent{true};
+    bool editor_options_show_whitespace{false};
+    std::string editor_options_error;
     bool editor_shift_marking{false};
     bool editor_column_marking{false};
     std::string editor_message_title{"Editor error"};
@@ -563,6 +623,7 @@ struct App::Impl {
     std::mutex operation_mutex;
     std::string command_line;
     bool command_mode{false};
+    bool panel_ctrl_x{false};
     bool panel_search_mode{false};
     std::string panel_search;
     std::vector<std::string> command_history;
@@ -576,9 +637,11 @@ struct App::Impl {
     std::size_t search_cursor{0};
     std::size_t bookmark_cursor{0};
     bool detailed_view{true};
-    bool quick_view{false};
+    std::optional<int> quick_view_panel;
+    bool quick_view_focused{false};
     ViewerModel quick_viewer;
     std::string quick_view_path;
+    ftxui::Box quick_view_box;
     std::chrono::steady_clock::time_point last_click{};
     int last_click_pane{-1};
     std::size_t last_click_index{
@@ -586,6 +649,7 @@ struct App::Impl {
     };
     std::size_t pulldown_category{0};
     std::size_t pulldown_item{0};
+    bool pulldown_dropped{false};
     std::array<ftxui::Box, 5> top_menu_boxes{};
     std::vector<ftxui::Box> pulldown_item_boxes;
     bool dialog_move{false};
@@ -623,6 +687,10 @@ struct App::Impl {
         right.set_sort(config.sort, config.sort_descending);
         editor_syntax = config.editor_syntax;
         editor_line_numbers = config.editor_line_numbers;
+        editor.set_tab_width(config.editor_tab_width);
+        editor_indent_width = config.editor_indent_width;
+        editor_auto_indent = config.editor_auto_indent;
+        editor_show_whitespace = config.editor_show_whitespace;
     }
 
     Pane& active() {
@@ -639,12 +707,31 @@ struct App::Impl {
         );
     }
 
+    static int panel_width(const int index) {
+        const auto width = std::max(2, ftxui::Terminal::Size().dimx);
+        const auto left_width = width / 2;
+        return index == 0
+                   ? left_width
+                   : width - left_width;
+    }
+
+    std::pair<std::size_t, std::size_t>
+    quick_view_dimensions() const {
+        const auto width = quick_view_panel
+                               ? panel_width(*quick_view_panel)
+                               : panel_width(1 - active_index);
+        return {
+            static_cast<std::size_t>(std::max(1, width - 2)),
+            panel_visible_rows() + 2U,
+        };
+    }
+
     static std::pair<std::size_t, std::size_t>
     viewer_dimensions() {
         const auto size = ftxui::Terminal::Size();
         return {
-            static_cast<std::size_t>(std::max(1, size.dimx - 2)),
-            static_cast<std::size_t>(std::max(1, size.dimy - 10)),
+            static_cast<std::size_t>(std::max(1, size.dimx)),
+            static_cast<std::size_t>(std::max(1, size.dimy - 2)),
         };
     }
 
@@ -668,6 +755,42 @@ struct App::Impl {
         quick_view_path.clear();
     }
 
+    void close_quick_view() {
+        if (quick_view_panel && quick_view_focused) {
+            active_index = *quick_view_panel;
+        }
+        quick_view_panel.reset();
+        quick_view_focused = false;
+        quick_viewer.close();
+        quick_view_path.clear();
+    }
+
+    void show_quick_view(const int panel_index) {
+        quick_view_panel = panel_index;
+        if (active_index == panel_index) {
+            active_index = 1 - panel_index;
+        }
+        quick_view_focused = false;
+        quick_viewer.close();
+        quick_view_path.clear();
+    }
+
+    void toggle_quick_view() {
+        if (quick_view_panel) {
+            close_quick_view();
+        } else {
+            show_quick_view(1 - active_index);
+        }
+    }
+
+    void swap_panels() {
+        std::swap(left, right);
+        active_index = 1 - active_index;
+        if (quick_view_panel) {
+            quick_view_panel = 1 - *quick_view_panel;
+        }
+    }
+
     void sort_active(const SortField field) {
         const auto descending =
             active().sort_field() == field
@@ -675,6 +798,15 @@ struct App::Impl {
                 : false;
         active().set_sort(field, descending);
         status = descending ? "Sort descending" : "Sort ascending";
+    }
+
+    void store_editor_options_in_config() {
+        config.editor_syntax = editor_syntax;
+        config.editor_line_numbers = editor_line_numbers;
+        config.editor_tab_width = editor.tab_width();
+        config.editor_indent_width = editor_indent_width;
+        config.editor_auto_indent = editor_auto_indent;
+        config.editor_show_whitespace = editor_show_whitespace;
     }
 
     void set_error(const std::exception& error) {
@@ -685,7 +817,14 @@ struct App::Impl {
         if (terminal == nullptr) {
             return;
         }
-        terminal->Post(std::move(task));
+        auto* app = terminal;
+        app->Post([
+            app,
+            task = std::move(task)
+        ]() mutable {
+            task();
+            app->RequestAnimationFrame();
+        });
     }
 
     void request_operation_cancel() {
@@ -824,7 +963,7 @@ struct App::Impl {
         if (active().selected_entries().empty()) {
             throw std::runtime_error("no source selected");
         }
-        dialog_focus = config.confirm_delete ? 1U : 0U;
+        dialog_focus = 0;
         mode = Mode::delete_dialog;
     }
 
@@ -1113,6 +1252,9 @@ struct App::Impl {
         }
         int child_status = 0;
         terminal->WithRestoredIO([&] {
+            if (interactive) {
+                std::cout << "\033[H\033[2J" << std::flush;
+            }
             const auto child = fork();
             if (child < 0) {
                 throw std::runtime_error("failed to fork shell");
@@ -1230,9 +1372,21 @@ struct App::Impl {
                     return;
                 }
                 case PromptAction::viewer_find:
-                    status = viewer.find(prompt_value, false)
+                    if (viewer.find(prompt_value, false)) {
+                        status = "Match found";
+                    } else {
+                        viewer_message_title = "Search";
+                        viewer_message = "Search string not found";
+                        mode = Mode::viewer_message;
+                        prompt_action = PromptAction::none;
+                        prompt_value.clear();
+                        return;
+                    }
+                    break;
+                case PromptAction::quick_viewer_find:
+                    status = quick_viewer.find(prompt_value, false)
                                  ? "Match found"
-                                 : "No match";
+                                 : "Search string not found";
                     break;
                 case PromptAction::select_pattern:
                     active().select_pattern(prompt_value, true);
@@ -1392,6 +1546,14 @@ struct App::Impl {
                 show_editor_error(error);
                 return;
             }
+            if (mode_before_prompt == Mode::viewer) {
+                viewer_message_title = "Viewer error";
+                viewer_message = error.what();
+                prompt_action = PromptAction::none;
+                prompt_value.clear();
+                mode = Mode::viewer_message;
+                return;
+            }
             set_error(error);
         }
         mode = mode_before_prompt;
@@ -1402,14 +1564,15 @@ struct App::Impl {
     ftxui::Element render_pane(
         Pane& pane,
         const bool focused,
+        const int panel_width_value,
         ftxui::Box& pane_box,
         std::vector<ftxui::Box>& entry_boxes
     ) {
         using namespace ftxui;
-        const auto terminal_size = Terminal::Size();
-        const auto panel_width = std::max(30, terminal_size.dimx / 2);
-        const auto inner_width = std::max(28, panel_width - 2);
-        const auto name_width = std::max(10, inner_width - 24);
+        const auto inner_width = std::max(1, panel_width_value - 2);
+        const bool show_details =
+            detailed_view && inner_width >= 28;
+        const auto name_width = std::max(1, inner_width - 22);
         const auto visible_rows = panel_visible_rows();
         Elements rows;
         const auto& entries = pane.entries();
@@ -1420,7 +1583,7 @@ struct App::Impl {
             const auto& entry = entries[index];
             auto name = type_prefix(entry) + display_text(entry.name);
             auto row =
-                detailed_view
+                show_details
                     ? hbox({
                           text(
                               truncate_text(
@@ -1465,7 +1628,7 @@ struct App::Impl {
         }
         while (rows.size() < visible_rows) {
             rows.push_back(
-                detailed_view
+                show_details
                     ? hbox({
                           text("") | size(WIDTH, EQUAL, name_width),
                           separator(),
@@ -1505,7 +1668,9 @@ struct App::Impl {
         }
         auto title = text(" " + truncate_text(
             pane.path(),
-            static_cast<std::size_t>(std::max(8, panel_width - 8))
+            static_cast<std::size_t>(
+                std::max(1, panel_width_value - 8)
+            )
         ) + " ");
         if (focused) {
             title = title | color(Color::Grey100) | bold;
@@ -1513,7 +1678,7 @@ struct App::Impl {
             title = title | color(Color::Grey58);
         }
         auto header =
-            detailed_view
+            show_details
                 ? hbox({
                       text(" Name") |
                           size(WIDTH, EQUAL, name_width),
@@ -1553,7 +1718,9 @@ struct App::Impl {
                    }),
                });
         return window(title, content, LIGHT) |
-               flex | reflect(pane_box);
+               size(WIDTH, EQUAL, panel_width_value) |
+               yflex |
+               reflect(pane_box);
     }
 
     ftxui::Element render_viewer() {
@@ -1564,19 +1731,126 @@ struct App::Impl {
         for (const auto& row : rows) {
             elements.push_back(text(row));
         }
+        const auto key_width =
+            std::max(3, Terminal::Size().dimx / 10);
+        const auto key = [key_width](
+                             const std::string& number,
+                             const std::string& label,
+                             const bool enabled
+                         ) {
+            const auto label_width = static_cast<std::size_t>(
+                std::max(
+                    0,
+                    key_width -
+                        static_cast<int>(number.size()) - 1
+                )
+            );
+            auto description = hbox({
+                text(label.substr(0, label_width)),
+                text(" "),
+            });
+            description =
+                enabled
+                    ? description |
+                          color(Color::Grey85) |
+                          bgcolor(Color::Grey11)
+                    : description |
+                          color(Color::Grey50) |
+                          bgcolor(Color::Grey11) |
+                          dim;
+            return hbox({
+                       text(number) |
+                           color(Color::Grey0) |
+                           bgcolor(Color::Grey85),
+                       std::move(description),
+                   }) |
+                   size(WIDTH, EQUAL, key_width);
+        };
+        const auto percent =
+            viewer.size() == 0U
+                ? 100U
+                : static_cast<unsigned int>(
+                      std::min<std::uint64_t>(
+                          100U,
+                          viewer.view_end() * 100U / viewer.size()
+                      )
+                  );
+        const auto screen_width =
+            static_cast<std::size_t>(
+                std::max(1, Terminal::Size().dimx)
+            );
+        Element header;
+        if (screen_width > 40U) {
+            const auto status_column = screen_width - 32U;
+            std::ostringstream position;
+            position << std::setw(9) << viewer.view_end()
+                     << "/" << viewer.size() << " ";
+            std::ostringstream percentage;
+            percentage << std::setw(3) << percent << "%";
+            header = hbox({
+                text(truncate_text(
+                    viewer.path(),
+                    screen_width - 34U
+                )) |
+                    size(
+                        WIDTH,
+                        EQUAL,
+                        static_cast<int>(status_column)
+                    ),
+                text(position.str()) | flex,
+                text(percentage.str()) |
+                    size(WIDTH, EQUAL, 4),
+            });
+        } else {
+            std::ostringstream percentage;
+            percentage << std::setw(3) << percent << "%";
+            header = hbox({
+                text(truncate_text(
+                    viewer.path(),
+                    screen_width > 5U ? screen_width - 5U : 1U
+                )) |
+                    flex,
+                screen_width > 26U
+                    ? text(percentage.str())
+                    : text(""),
+            });
+        }
         return vbox({
-                   text(
-                       "View: " + viewer.path() +
-                       (viewer.hex() ? " [hex]" : "") +
-                       (viewer.wrap() ? " [wrap]" : "")
-                   ) |
-                       bold,
+            std::move(header) |
+                color(Color::Grey11) |
+                bgcolor(Color::Grey62),
+            vbox(std::move(elements)) | flex,
+            hbox({
+                text(" "),
+                key("1", "Help", false),
+                key(
+                    "2",
+                    viewer.wrap() ? "UnWrap" : "Wrap",
+                    true
+                ),
+                key("3", "Quit", true),
+                key("4", viewer.hex() ? "Text" : "Hex", true),
+                key("5", "Goto", false),
+                key("6", "", false),
+                key("7", "Search", true),
+                key("8", "Raw", false),
+                key("9", "Format", false),
+                key("10", "Quit", true),
+            }),
+        });
+    }
+
+    ftxui::Element render_viewer_message() const {
+        using namespace ftxui;
+        return vbox({
+                   text(viewer_message_title) | bold | center,
                    separator(),
-                   vbox(std::move(elements)) | yframe | flex,
+                   paragraph(display_text(viewer_message)),
                    separator(),
-                   text("F2 Wrap  F4 Hex  / Search  F3/Esc Close"),
+                   text("[ OK ]") | inverted | center,
                }) |
-               border;
+               borderStyled(LIGHT) |
+               size(WIDTH, LESS_THAN, 72);
     }
 
     static ftxui::Element style_syntax(
@@ -1622,12 +1896,25 @@ struct App::Impl {
             selected_begin = selected->first;
             selected_end = selected->second;
         }
+        auto trailing_whitespace = line.size();
+        while (trailing_whitespace > 0U &&
+               (
+                   line[trailing_whitespace - 1U] == ' ' ||
+                   line[trailing_whitespace - 1U] == '\t'
+               )) {
+            --trailing_whitespace;
+        }
 
         const auto visible_begin =
-            editor_offset_for_width(line, first_column);
+            editor_offset_for_width(
+                line,
+                first_column,
+                editor.tab_width()
+            );
         auto visible_end = editor_offset_for_width(
             line,
-            first_column + viewport_width
+            first_column + viewport_width,
+            editor.tab_width()
         );
         if (visible_end == visible_begin &&
             visible_end < line.size()) {
@@ -1643,6 +1930,11 @@ struct App::Impl {
             ),
             std::clamp(
                 selected_end,
+                visible_begin,
+                visible_end
+            ),
+            std::clamp(
+                trailing_whitespace,
                 visible_begin,
                 visible_end
             ),
@@ -1684,7 +1976,11 @@ struct App::Impl {
 
         Elements segments;
         auto display_begin =
-            editor_display_width(line, visible_begin);
+            editor_display_width(
+                line,
+                visible_begin,
+                editor.tab_width()
+            );
         std::size_t syntax_index = 0;
         if (editor_syntax && index < syntax_spans.size()) {
             while (syntax_index < syntax_spans[index].size() &&
@@ -1703,7 +1999,11 @@ struct App::Impl {
             }
             auto displayed = editor_display_text(
                 std::string_view(line).substr(begin, end - begin),
-                display_begin
+                display_begin,
+                editor.tab_width(),
+                editor_show_whitespace,
+                editor_show_whitespace &&
+                    begin >= trailing_whitespace
             );
             const auto display_width = static_cast<std::size_t>(
                 std::max(0, string_width(displayed))
@@ -1727,7 +2027,12 @@ struct App::Impl {
             if (cursor && line[begin] == '\t') {
                 segments.push_back(
                     focusCursorBlock(
-                        text(" ") |
+                        text(
+                            editor_show_whitespace &&
+                                    !displayed.empty()
+                                ? displayed.substr(0U, 1U)
+                                : " "
+                        ) |
                         color(Color::Grey0) |
                         bgcolor(Color::Grey85) |
                         bold
@@ -1783,18 +2088,24 @@ struct App::Impl {
                 index <= selected->second.row) {
                 const auto first_display = editor_display_width(
                     editor.lines()[selected->first.row],
-                    selected->first.column
+                    selected->first.column,
+                    editor.tab_width()
                 );
                 const auto second_display = editor_display_width(
                     editor.lines()[selected->second.row],
-                    selected->second.column
+                    selected->second.column,
+                    editor.tab_width()
                 );
                 const auto selection_left =
                     std::min(first_display, second_display);
                 const auto selection_right =
                     std::max(first_display, second_display);
                 const auto line_width =
-                    editor_display_width(line, line.size());
+                    editor_display_width(
+                        line,
+                        line.size(),
+                        editor.tab_width()
+                    );
                 if (line_width < selection_left) {
                     segments.push_back(
                         text(std::string(
@@ -1870,8 +2181,11 @@ struct App::Impl {
                 : 0U;
         const auto end = std::min(lines.size(), first + visible_rows);
         const auto& current_line = lines[editor.row()];
-        const auto cursor_width =
-            editor_display_width(current_line, editor.column());
+        const auto cursor_width = editor_display_width(
+            current_line,
+            editor.column(),
+            editor.tab_width()
+        );
         const auto content_width = static_cast<std::size_t>(
             std::max(
                 1,
@@ -1892,11 +2206,13 @@ struct App::Impl {
         for (std::size_t index = first; index < end; ++index) {
             const auto visible_begin = editor_offset_for_width(
                 lines[index],
-                first_column
+                first_column,
+                editor.tab_width()
             );
             const auto aligned_column = editor_display_width(
                 lines[index],
-                visible_begin
+                visible_begin,
+                editor.tab_width()
             );
             editor_line_first_columns.push_back(
                 visible_begin < lines[index].size() &&
@@ -1991,6 +2307,7 @@ struct App::Impl {
             header,
             vbox(std::move(elements)) | flex,
             hbox({
+                text(" "),
                 key("1", "Help"),
                 key("2", "Save"),
                 key("3", "Mark"),
@@ -2103,7 +2420,7 @@ struct App::Impl {
                 {"Buffer list...", -1},
             },
             {
-                {"General...", -1},
+                {"General...", 0},
                 {"Save mode...", -1},
                 {"Learn keys...", -1},
                 {"Syntax highlighting...", -1},
@@ -2111,7 +2428,7 @@ struct App::Impl {
                 {"Syntax file", -1},
                 {"Menu file", -1},
                 {"", -2},
-                {"Save setup", 0},
+                {"Save setup", 1},
             },
         }};
         return menus;
@@ -2342,6 +2659,72 @@ struct App::Impl {
                size(WIDTH, EQUAL, 72);
     }
 
+    ftxui::Element render_editor_options_dialog() const {
+        using namespace ftxui;
+        const auto focused = [&](Element element,
+                                 const std::size_t index) {
+            return editor_options_focus == index
+                       ? element | inverted | focus
+                       : element;
+        };
+        const auto checked = [](const bool value) {
+            return std::string(value ? "[x] " : "[ ] ");
+        };
+        Elements rows{
+            text("Editor options") | bold | center,
+            separator(),
+            text("Tabulation") | bold,
+            focused(
+                text(
+                    "Tab spacing:        " +
+                    editor_options_tab_width
+                ),
+                0
+            ),
+            focused(
+                text(
+                    "Indent spacing:     " +
+                    editor_options_indent_width
+                ),
+                1
+            ),
+            separator(),
+            text("Other options") | bold,
+            focused(
+                text(
+                    checked(editor_options_auto_indent) +
+                    "Return does autoindent"
+                ),
+                2
+            ),
+            focused(
+                text(
+                    checked(editor_options_show_whitespace) +
+                    "Show whitespace"
+                ),
+                3
+            ),
+        };
+        if (!editor_options_error.empty()) {
+            rows.push_back(
+                text(editor_options_error) |
+                color(Color::Grey100) |
+                bgcolor(Color::Grey23)
+            );
+        }
+        rows.push_back(separator());
+        rows.push_back(
+            hbox({
+                focused(text(" [ OK ] "), 4),
+                text("  "),
+                focused(text(" [ Cancel ] "), 5),
+            }) | center
+        );
+        return vbox(std::move(rows)) |
+               borderStyled(LIGHT) |
+               size(WIDTH, EQUAL, 52);
+    }
+
     ftxui::Element render_editor_replace_confirm() const {
         using namespace ftxui;
         const auto button = [&](const std::string& label,
@@ -2486,7 +2869,7 @@ struct App::Impl {
                 {"Background jobs               C-x j", -1},
                 {"Screen list                   M-`", -1},
                 {"", -2},
-                {"Undelete files", -1},
+                {"Undelete files (ext2fs only)", -1},
                 {"", -2},
                 {"Edit extension file", -1},
                 {"Edit menu file", -1},
@@ -2574,7 +2957,24 @@ struct App::Impl {
         }
         if (pulldown_category == 0U ||
             pulldown_category == 4U) {
-            active_index = pulldown_category == 0U ? 0 : 1;
+            const auto panel_index =
+                pulldown_category == 0U ? 0 : 1;
+            if (action == 10) {
+                show_quick_view(panel_index);
+                mode = Mode::panels;
+                return;
+            }
+            if (action == 12) {
+                if (quick_view_panel == panel_index) {
+                    close_quick_view();
+                }
+                mode = Mode::panels;
+                return;
+            }
+            if (quick_view_panel == panel_index) {
+                close_quick_view();
+            }
+            active_index = panel_index;
             switch (action) {
                 case 0:
                     detailed_view = false;
@@ -2609,17 +3009,9 @@ struct App::Impl {
                 case 9:
                     sort_active(SortField::extension);
                     break;
-                case 10:
-                    quick_view = !quick_view;
-                    quick_viewer.close();
-                    quick_view_path.clear();
-                    break;
                 case 11:
                     mode = Mode::information;
                     return;
-                case 12:
-                    detailed_view = !detailed_view;
-                    break;
                 default:
                     break;
             }
@@ -2676,13 +3068,27 @@ struct App::Impl {
                 case 7:
                     mode = Mode::information;
                     return;
-                case 8:
+                case 8: {
+                    std::ostringstream permissions;
+                    permissions
+                        << std::oct
+                        << std::setfill('0')
+                        << std::setw(4)
+                        << (
+                               entry == nullptr
+                                   ? 0644U
+                                   : static_cast<unsigned int>(
+                                         entry->permissions
+                                     ) &
+                                         07777U
+                           );
                     start_prompt(
                         PromptAction::chmod,
                         "Octal permissions",
-                        "0644"
+                        permissions.str()
                     );
                     return;
+                }
                 case 9:
                     start_prompt(
                         PromptAction::chown,
@@ -2759,9 +3165,33 @@ struct App::Impl {
                         left.path(),
                         *right.provider(),
                         right.path(),
-                        true,
+                        false,
                         operation_cancellation
                     );
+                    std::vector<std::string> left_marks;
+                    std::vector<std::string> right_marks;
+                    for (const auto& difference : differences) {
+                        if (difference.kind !=
+                            DifferenceKind::right_only) {
+                            left_marks.push_back(
+                                left.provider()->join(
+                                    left.path(),
+                                    difference.relative_path
+                                )
+                            );
+                        }
+                        if (difference.kind !=
+                            DifferenceKind::left_only) {
+                            right_marks.push_back(
+                                right.provider()->join(
+                                    right.path(),
+                                    difference.relative_path
+                                )
+                            );
+                        }
+                    }
+                    left.select_paths(left_marks);
+                    right.select_paths(right_marks);
                     status =
                         std::to_string(differences.size()) +
                         " difference(s)";
@@ -2782,8 +3212,7 @@ struct App::Impl {
                     refresh();
                     break;
                 case 5:
-                    std::swap(left, right);
-                    active_index = 1 - active_index;
+                    swap_panels();
                     break;
                 case 6:
                     passive().change_directory(active().path());
@@ -2804,9 +3233,7 @@ struct App::Impl {
         if (pulldown_category == 3U) {
             switch (action) {
                 case 0:
-                    quick_view = !quick_view;
-                    quick_viewer.close();
-                    quick_view_path.clear();
+                    toggle_quick_view();
                     break;
                 case 1:
                     config.confirm_delete = !config.confirm_delete;
@@ -2816,6 +3243,7 @@ struct App::Impl {
                         !config.confirm_overwrite;
                     break;
                 case 3:
+                    store_editor_options_in_config();
                     config.save(default_config_path());
                     status = "Setup saved";
                     break;
@@ -2824,6 +3252,26 @@ struct App::Impl {
             }
             mode = Mode::panels;
         }
+    }
+
+    void execute_pulldown_action(
+        const std::size_t category,
+        const int action
+    ) {
+        const auto& items = pulldown_items()[category];
+        const auto item = std::ranges::find(
+            items,
+            action,
+            &MenuRow::action
+        );
+        if (item == items.end()) {
+            return;
+        }
+        pulldown_category = category;
+        pulldown_item = static_cast<std::size_t>(
+            std::distance(items.begin(), item)
+        );
+        execute_pulldown();
     }
 
     ftxui::Element render_bookmarks() const {
@@ -3083,18 +3531,28 @@ struct App::Impl {
                border;
     }
 
-    ftxui::Element render_quick_view() {
+    ftxui::Element render_quick_view(const int width) {
         using namespace ftxui;
+        const auto [content_width, content_height] =
+            quick_view_dimensions();
+        const auto frame = [&](Element title, Element content) {
+            return window(
+                       std::move(title),
+                       std::move(content),
+                       LIGHT
+                   ) |
+                   size(WIDTH, EQUAL, width) |
+                   yflex |
+                   reflect(quick_view_box);
+        };
         const auto* entry = active().current();
         if (entry == nullptr || !can_open_file(*entry)) {
             quick_viewer.close();
             quick_view_path.clear();
-            return vbox({
-                       text("Quick view") | bold | center,
-                       separator(),
-                       text("<select a regular file>") | dim | center,
-                   }) |
-                   border | flex;
+            return frame(
+                text(" Quick view ") | bold,
+                text("<select a regular file>") | dim | center
+            );
         }
         if (entry->path != quick_view_path) {
             try {
@@ -3103,21 +3561,58 @@ struct App::Impl {
             } catch (const std::exception& error) {
                 set_error(error);
                 quick_view_path.clear();
-                return text("<preview unavailable>") |
-                       border | center | flex;
+                return frame(
+                    text(" Quick view ") | bold,
+                    text("<preview unavailable>") | center
+                );
             }
         }
         Elements rows;
-        for (const auto& line : quick_viewer.lines(80, 40)) {
+        for (const auto& line : quick_viewer.lines(
+                 content_width,
+                 content_height
+             )) {
             rows.push_back(text(line));
         }
-        return vbox({
-                   text("Quick view: " + display_text(entry->name)) |
-                       bold,
-                   separator(),
-                   vbox(std::move(rows)) | yframe | flex,
-               }) |
-               border | flex;
+        auto title =
+            text("Quick view: " + display_text(entry->name)) |
+            bold;
+        if (quick_view_focused) {
+            title = title | color(Color::Grey100);
+        } else {
+            title = title | color(Color::Grey58);
+        }
+        const auto percent =
+            quick_viewer.size() == 0U
+                ? 100U
+                : static_cast<unsigned int>(
+                      std::min<std::uint64_t>(
+                          100U,
+                          quick_viewer.view_end() * 100U /
+                              quick_viewer.size()
+                      )
+                  );
+        return frame(
+            hbox({
+                text(" "),
+                std::move(title),
+                text(" "),
+            }),
+            vbox({
+                vbox(std::move(rows)) | yframe | flex,
+                hbox({
+                    filler(),
+                    text(
+                        std::to_string(quick_viewer.view_end()) +
+                        "/" +
+                        std::to_string(quick_viewer.size()) +
+                        "  " +
+                        std::to_string(percent) + "%"
+                    ),
+                }) |
+                    color(Color::Grey50),
+            })
+        );
     }
 
     ftxui::Element render() {
@@ -3134,53 +3629,68 @@ struct App::Impl {
             mode == Mode::editor_replace_dialog ||
             mode == Mode::editor_replace_confirm ||
             mode == Mode::editor_close_dialog ||
+            mode == Mode::editor_options_dialog ||
             (
                 mode == Mode::prompt &&
                 mode_before_prompt == Mode::editor
             );
+        const bool viewer_context =
+            mode == Mode::viewer ||
+            mode == Mode::viewer_message ||
+            (
+                mode == Mode::prompt &&
+                mode_before_prompt == Mode::viewer
+            );
         Element body;
-        if (editor_context) {
+        const auto left_width = panel_width(0);
+        const auto right_width = panel_width(1);
+        if (editor_context || viewer_context) {
             body = emptyElement();
-        } else if (quick_view) {
-            body =
-                active_index == 0
-                    ? hbox({
-                          render_pane(
-                              left,
-                              true,
-                              left_box,
-                              left_entry_boxes
-                          ),
-                          render_quick_view(),
-                      })
-                    : hbox({
-                          render_quick_view(),
-                          render_pane(
-                              right,
-                              true,
-                              right_box,
-                              right_entry_boxes
-                          ),
-                      });
+        } else if (quick_view_panel) {
+            if (*quick_view_panel == 1) {
+                right_entry_boxes.clear();
+                body = hbox({
+                    render_pane(
+                        left,
+                        !quick_view_focused,
+                        left_width,
+                        left_box,
+                        left_entry_boxes
+                    ),
+                    render_quick_view(right_width),
+                });
+            } else {
+                left_entry_boxes.clear();
+                body = hbox({
+                    render_quick_view(left_width),
+                    render_pane(
+                        right,
+                        !quick_view_focused,
+                        right_width,
+                        right_box,
+                        right_entry_boxes
+                    ),
+                });
+            }
         } else {
             body = hbox({
                 render_pane(
                     left,
                     active_index == 0,
+                    left_width,
                     left_box,
                     left_entry_boxes
                 ),
                 render_pane(
                     right,
                     active_index == 1,
+                    right_width,
                     right_box,
                     right_entry_boxes
                 ),
             });
         }
-        if (mode == Mode::viewer) {
-            body = render_viewer();
-        } else if (mode == Mode::search_results) {
+        if (mode == Mode::search_results) {
             body = render_search_results();
         }
         std::string progress_text;
@@ -3197,7 +3707,8 @@ struct App::Impl {
             std::max(3, Terminal::Size().dimx / 10);
         const auto key = [key_width](
                              const std::string& number,
-                             const std::string& label
+                             const std::string& label,
+                             const bool enabled = true
                          ) {
             const auto label_width = static_cast<std::size_t>(
                 std::max(
@@ -3206,16 +3717,24 @@ struct App::Impl {
                         static_cast<int>(number.size()) - 1
                 )
             );
+            auto description = hbox({
+                text(label.substr(0, label_width)),
+                text(" "),
+            });
+            description =
+                enabled
+                    ? description |
+                          color(Color::Grey85) |
+                          bgcolor(Color::Grey11)
+                    : description |
+                          color(Color::Grey50) |
+                          bgcolor(Color::Grey11) |
+                          dim;
             return hbox({
                        text(number) |
                            color(Color::Grey0) |
                            bgcolor(Color::Grey85),
-                       hbox({
-                           text(label.substr(0, label_width)),
-                           text(" "),
-                       }) |
-                           color(Color::Grey85) |
-                           bgcolor(Color::Grey11),
+                       std::move(description),
                    }) |
                    size(WIDTH, EQUAL, key_width);
         };
@@ -3236,7 +3755,7 @@ struct App::Impl {
                 ? "Hint: Tab changes your current panel."
                 : status + progress_text;
         static const std::array<std::string, 5> menu_names{
-            " Left     ",
+            "  Left     ",
             "File     ",
             "Command     ",
             "Options     ",
@@ -3256,31 +3775,71 @@ struct App::Impl {
                 std::move(item) | reflect(top_menu_boxes[index])
             );
         }
+        auto keybar = hbox({
+            text(" "),
+            key("1", "Help"),
+            key("2", "Menu"),
+            key("3", "View"),
+            key("4", "Edit"),
+            key("5", "Copy"),
+            key("6", "RenMov"),
+            key("7", "Mkdir"),
+            key("8", "Delete"),
+            key("9", "PullDn"),
+            key("10", "Quit"),
+        });
+        if (quick_view_panel && quick_view_focused) {
+            keybar = hbox({
+                text(" "),
+                key("1", "Help", false),
+                key(
+                    "2",
+                    quick_viewer.hex()
+                        ? "Edit"
+                        : quick_viewer.wrap()
+                              ? "UnWrap"
+                              : "Wrap",
+                    !quick_viewer.hex()
+                ),
+                key("3", "View"),
+                key(
+                    "4",
+                    quick_viewer.hex() ? "Ascii" : "Hex"
+                ),
+                key("5", "Goto", false),
+                key(
+                    "6",
+                    quick_viewer.hex() ? "Save" : "",
+                    false
+                ),
+                key(
+                    "7",
+                    quick_viewer.hex() ? "HxSrch" : "Search"
+                ),
+                key("8", "Raw", false),
+                key("9", "PullDn"),
+                key("10", "Quit"),
+            });
+        }
         auto document = vbox({
             gray_menu(hbox(std::move(menu_elements))),
             body | flex,
             text(hint) |
                 color(Color::Grey11) |
                 bgcolor(Color::Grey62),
-            text(
+            text(command_text(
                 command_mode
                     ? prompt + " " + command_line
-                    : prompt
-            ),
-            hbox({
-                key("1", "Help"),
-                key("2", "Menu"),
-                key("3", "View"),
-                key("4", "Edit"),
-                key("5", "Copy"),
-                key("6", "RenMov"),
-                key("7", "Mkdir"),
-                key("8", "Delete"),
-                key("9", "PullDn"),
-                key("10", "Quit"),
-            }),
+                    : prompt,
+                static_cast<std::size_t>(
+                    std::max(1, Terminal::Size().dimx)
+                )
+            )),
+            std::move(keybar),
         });
-        if (editor_context) {
+        if (viewer_context) {
+            document = render_viewer();
+        } else if (editor_context) {
             document = render_editor();
         }
         const auto centered_modal = [](Element element) {
@@ -3336,7 +3895,20 @@ struct App::Impl {
                 document,
                 centered_modal(render_editor_close_dialog()),
             });
-        } else if (mode == Mode::editor_menu) {
+        } else if (mode == Mode::editor_options_dialog) {
+            document = dbox({
+                document,
+                centered_modal(render_editor_options_dialog()),
+            });
+        } else if (mode == Mode::viewer_message) {
+            document = dbox({
+                document,
+                centered_modal(render_viewer_message()),
+            });
+        } else if (
+            mode == Mode::editor_menu &&
+            editor_menu_dropped
+        ) {
             static constexpr std::array<int, 7> offsets{
                 0, 9, 18, 29, 41, 52, 63
             };
@@ -3398,7 +3970,10 @@ struct App::Impl {
                 document,
                 centered_modal(render_conflict_dialog()),
             });
-        } else if (mode == Mode::pulldown) {
+        } else if (
+            mode == Mode::pulldown &&
+            pulldown_dropped
+        ) {
             static constexpr std::array<int, 5> offsets{
                 0, 9, 18, 30, 42
             };
@@ -3448,7 +4023,8 @@ struct App::Impl {
     }
 
     bool handle_viewer(const ftxui::Event& event) {
-        const auto viewport_lines = viewer_dimensions().second;
+        const auto [viewport_width, viewport_lines] =
+            viewer_dimensions();
         if (event == ftxui::Event::Escape ||
             event == ftxui::Event::F3 ||
             event == ftxui::Event::F10) {
@@ -3457,19 +4033,19 @@ struct App::Impl {
             return true;
         }
         if (event == ftxui::Event::ArrowDown) {
-            viewer.scroll_lines(1, viewport_lines);
+            viewer.scroll_lines(1, viewport_width);
             return true;
         }
         if (event == ftxui::Event::ArrowUp) {
-            viewer.scroll_lines(-1, viewport_lines);
+            viewer.scroll_lines(-1, viewport_width);
             return true;
         }
         if (event == ftxui::Event::PageDown) {
-            viewer.page(1, viewport_lines);
+            viewer.page(1, viewport_width, viewport_lines);
             return true;
         }
         if (event == ftxui::Event::PageUp) {
-            viewer.page(-1, viewport_lines);
+            viewer.page(-1, viewport_width, viewport_lines);
             return true;
         }
         if (event == ftxui::Event::F2) {
@@ -3480,7 +4056,8 @@ struct App::Impl {
             viewer.toggle_hex();
             return true;
         }
-        if (event == ftxui::Event::Character('/')) {
+        if (event == ftxui::Event::F7 ||
+            event == ftxui::Event::Character('/')) {
             start_prompt(PromptAction::viewer_find, "Find in file");
             return true;
         }
@@ -3499,6 +4076,19 @@ struct App::Impl {
     void show_editor_error(const std::exception& error) {
         status = "Error: " + std::string(error.what());
         show_editor_message("Editor error", error.what());
+    }
+
+    void start_editor_options_dialog() {
+        editor_options_tab_width =
+            std::to_string(editor.tab_width());
+        editor_options_indent_width =
+            std::to_string(editor_indent_width);
+        editor_options_auto_indent = editor_auto_indent;
+        editor_options_show_whitespace = editor_show_whitespace;
+        editor_options_error.clear();
+        editor_options_focus = 0;
+        editor_options_touched = {};
+        mode = Mode::editor_options_dialog;
     }
 
     void start_editor_search_dialog(const bool replace) {
@@ -3576,7 +4166,8 @@ struct App::Impl {
             try {
                 save_editor_clipboard(
                     editor_clipboard_path(),
-                    editor_clipboard
+                    editor_clipboard,
+                    editor_clipboard_column
                 );
                 if (cut) {
                     static_cast<void>(editor.delete_selection());
@@ -3595,11 +4186,13 @@ struct App::Impl {
     void paste_editor_clipboard() {
         try {
             const auto path = editor_clipboard_path();
-            const auto persisted = load_editor_clipboard(path);
+            bool persisted_column = false;
+            const auto persisted = load_editor_clipboard(
+                path,
+                &persisted_column
+            );
             if (std::filesystem::exists(path)) {
-                if (persisted != editor_clipboard) {
-                    editor_clipboard_column = false;
-                }
+                editor_clipboard_column = persisted_column;
                 editor_clipboard = persisted;
             }
             if (editor_clipboard.empty()) {
@@ -3792,9 +4385,12 @@ struct App::Impl {
             return;
         }
         if (category == 6U && item == 0) {
+            start_editor_options_dialog();
+            return;
+        }
+        if (category == 6U && item == 1) {
             try {
-                config.editor_syntax = editor_syntax;
-                config.editor_line_numbers = editor_line_numbers;
+                store_editor_options_in_config();
                 config.save(default_config_path());
                 status = "Setup saved";
             } catch (const std::exception& error) {
@@ -3865,19 +4461,30 @@ struct App::Impl {
             return true;
         }
         if (event == ftxui::Event::ArrowUp) {
+            if (!editor_menu_dropped) {
+                editor_menu_dropped = true;
+                reset_editor_menu_item();
+            }
             move_editor_menu_item(-1);
             return true;
         }
         if (event == ftxui::Event::ArrowDown) {
+            if (!editor_menu_dropped) {
+                editor_menu_dropped = true;
+                reset_editor_menu_item();
+                return true;
+            }
             move_editor_menu_item(1);
             return true;
         }
         if (event == ftxui::Event::Home) {
+            editor_menu_dropped = true;
             editor_menu_item = 0;
             reset_editor_menu_item();
             return true;
         }
         if (event == ftxui::Event::End) {
+            editor_menu_dropped = true;
             const auto& items =
                 editor_menu_items()[editor_menu_category];
             editor_menu_item = items.empty() ? 0U : items.size() - 1U;
@@ -3888,10 +4495,146 @@ struct App::Impl {
             return true;
         }
         if (event == ftxui::Event::Return) {
+            if (!editor_menu_dropped) {
+                editor_menu_dropped = true;
+                reset_editor_menu_item();
+                return true;
+            }
             execute_editor_menu_item();
             return true;
         }
         return false;
+    }
+
+    bool handle_editor_options_dialog(const ftxui::Event& event) {
+        const auto move_focus = [&](const int direction) {
+            editor_options_focus =
+                direction > 0
+                    ? (editor_options_focus + 1U) % 6U
+                    : (editor_options_focus + 5U) % 6U;
+        };
+        if (event == ftxui::Event::Escape) {
+            mode = Mode::editor;
+            return true;
+        }
+        if (event == ftxui::Event::Tab ||
+            event == ftxui::Event::ArrowDown) {
+            move_focus(1);
+            return true;
+        }
+        if (event == ftxui::Event::TabReverse ||
+            event == ftxui::Event::ArrowUp) {
+            move_focus(-1);
+            return true;
+        }
+        if ((event == ftxui::Event::ArrowLeft ||
+             event == ftxui::Event::ArrowRight) &&
+            editor_options_focus >= 4U) {
+            editor_options_focus =
+                editor_options_focus == 4U ? 5U : 4U;
+            return true;
+        }
+        if (editor_options_focus <= 1U) {
+            auto& value =
+                editor_options_focus == 0U
+                    ? editor_options_tab_width
+                    : editor_options_indent_width;
+            if (event == ftxui::Event::Backspace) {
+                editor_options_touched[editor_options_focus] = true;
+                if (!value.empty()) {
+                    value.pop_back();
+                }
+                editor_options_error.clear();
+                return true;
+            }
+            if (event.is_character() &&
+                event.character().size() == 1U &&
+                std::isdigit(
+                    static_cast<unsigned char>(
+                        event.character().front()
+                    )
+                ) != 0) {
+                if (!editor_options_touched[editor_options_focus]) {
+                    value.clear();
+                    editor_options_touched[editor_options_focus] =
+                        true;
+                }
+                if (value.size() < 2U) {
+                    value += event.character();
+                }
+                editor_options_error.clear();
+                return true;
+            }
+            if (event == ftxui::Event::Return) {
+                move_focus(1);
+                return true;
+            }
+        }
+        if (editor_options_focus == 2U &&
+            (
+                event == ftxui::Event::Character(' ') ||
+                event == ftxui::Event::Return
+            )) {
+            editor_options_auto_indent =
+                !editor_options_auto_indent;
+            return true;
+        }
+        if (editor_options_focus == 3U &&
+            (
+                event == ftxui::Event::Character(' ') ||
+                event == ftxui::Event::Return
+            )) {
+            editor_options_show_whitespace =
+                !editor_options_show_whitespace;
+            return true;
+        }
+        if (event != ftxui::Event::Return) {
+            return false;
+        }
+        if (editor_options_focus == 5U) {
+            mode = Mode::editor;
+            return true;
+        }
+        if (editor_options_focus != 4U) {
+            return false;
+        }
+        const auto parse_width = [](const std::string& value) {
+            std::size_t parsed = 0;
+            const auto result = std::from_chars(
+                value.data(),
+                value.data() + value.size(),
+                parsed
+            );
+            return result.ec == std::errc{} &&
+                           result.ptr == value.data() + value.size() &&
+                           parsed >= 1U &&
+                           parsed <= 32U
+                       ? std::optional<std::size_t>{parsed}
+                       : std::nullopt;
+        };
+        const auto tab_width =
+            parse_width(editor_options_tab_width);
+        if (!tab_width) {
+            editor_options_error =
+                "Tab spacing must be between 1 and 32";
+            editor_options_focus = 0;
+            return true;
+        }
+        const auto indent_width =
+            parse_width(editor_options_indent_width);
+        if (!indent_width) {
+            editor_options_error =
+                "Indent spacing must be between 1 and 32";
+            editor_options_focus = 1;
+            return true;
+        }
+        editor.set_tab_width(*tab_width);
+        editor_indent_width = *indent_width;
+        editor_auto_indent = editor_options_auto_indent;
+        editor_show_whitespace = editor_options_show_whitespace;
+        status = "Editor options updated";
+        mode = Mode::editor;
+        return true;
     }
 
     bool handle_editor_close_dialog(const ftxui::Event& event) {
@@ -4281,7 +5024,8 @@ struct App::Impl {
                     );
                     const auto column = editor_offset_for_width(
                         editor.lines()[row],
-                        editor_line_first_columns[index] + cell
+                        editor_line_first_columns[index] + cell,
+                        editor.tab_width()
                     );
                     if (mouse.shift) {
                         editor.begin_mark();
@@ -4477,6 +5221,7 @@ struct App::Impl {
         if (event == ftxui::Event::F9) {
             editor_menu_category = 0;
             editor_menu_item = 0;
+            editor_menu_dropped = false;
             mode = Mode::editor_menu;
             return true;
         }
@@ -4605,17 +5350,30 @@ struct App::Impl {
                 static_cast<int>(editor_page_rows())
             );
         } else if (event == ftxui::Event::Tab) {
-            constexpr std::size_t tab_width = 4U;
+            const auto& line = editor.lines()[editor.row()];
             const auto display_column = editor_display_width(
-                editor.lines()[editor.row()],
-                editor.column()
+                line,
+                editor.column(),
+                editor.tab_width()
             );
+            const bool in_indentation = std::all_of(
+                line.begin(),
+                line.begin() +
+                    static_cast<std::ptrdiff_t>(editor.column()),
+                [](const char character) {
+                    return character == ' ' || character == '\t';
+                }
+            );
+            const auto spacing =
+                in_indentation
+                    ? editor_indent_width
+                    : editor.tab_width();
             editor.insert(std::string(
-                tab_width - display_column % tab_width,
+                spacing - display_column % spacing,
                 ' '
             ));
         } else if (event == ftxui::Event::Return) {
-            editor.newline();
+            editor.newline(editor_auto_indent);
         } else if (event == ftxui::Event::Backspace) {
             editor.backspace();
         } else if (event == ftxui::Event::Delete) {
@@ -4725,13 +5483,15 @@ struct App::Impl {
                         )) {
                         pulldown_category = index;
                         reset_pulldown_item();
+                        pulldown_dropped = true;
                         return true;
                     }
                 }
                 for (std::size_t index = 0;
                      index < pulldown_item_boxes.size();
                      ++index) {
-                    if (!pulldown_item_boxes[index].Contain(
+                    if (!pulldown_dropped ||
+                        !pulldown_item_boxes[index].Contain(
                             mouse.x,
                             mouse.y
                         )) {
@@ -4759,14 +5519,28 @@ struct App::Impl {
             return true;
         }
         if (event == ftxui::Event::ArrowDown) {
+            if (!pulldown_dropped) {
+                pulldown_dropped = true;
+                reset_pulldown_item();
+                return true;
+            }
             move_pulldown_item(1);
             return true;
         }
         if (event == ftxui::Event::ArrowUp) {
+            if (!pulldown_dropped) {
+                pulldown_dropped = true;
+                reset_pulldown_item();
+            }
             move_pulldown_item(-1);
             return true;
         }
         if (event == ftxui::Event::Return) {
+            if (!pulldown_dropped) {
+                pulldown_dropped = true;
+                reset_pulldown_item();
+                return true;
+            }
             try {
                 execute_pulldown();
             } catch (const std::exception& error) {
@@ -5091,8 +5865,54 @@ struct App::Impl {
                 panel_search_mode = false;
             }
         }
+        if (panel_ctrl_x) {
+            panel_ctrl_x = false;
+            status = "Ready";
+            try {
+                if (event == ftxui::Event::q) {
+                    toggle_quick_view();
+                } else if (event == ftxui::Event::i) {
+                    execute_pulldown_action(
+                        active_index == 0 ? 0U : 4U,
+                        11
+                    );
+                } else if (event == ftxui::Event::c) {
+                    execute_pulldown_action(1U, 8);
+                } else if (event == ftxui::Event::l) {
+                    execute_pulldown_action(1U, 11);
+                } else if (event == ftxui::Event::s) {
+                    execute_pulldown_action(1U, 12);
+                } else if (event == ftxui::Event::v) {
+                    execute_pulldown_action(1U, 13);
+                } else if (event == ftxui::Event::o) {
+                    execute_pulldown_action(1U, 9);
+                } else if (event == ftxui::Event::d) {
+                    execute_pulldown_action(2U, 1);
+                } else if (event != ftxui::Event::Escape) {
+                    status = "Unknown C-x command";
+                } else {
+                    status = "Ready";
+                }
+            } catch (const std::exception& error) {
+                set_error(error);
+            }
+            return true;
+        }
+        if (event == ftxui::Event::CtrlX) {
+            panel_ctrl_x = true;
+            status = "C-x";
+            return true;
+        }
+        const bool selection_shortcut =
+            command_line.empty() &&
+            (
+                event == ftxui::Event::Character('+') ||
+                event == ftxui::Event::Character('-') ||
+                event == ftxui::Event::Character('*')
+            );
         const bool panel_shortcut =
             event.is_mouse() ||
+            selection_shortcut ||
             event == ftxui::Event::Tab ||
             event == ftxui::Event::ArrowUp ||
             event == ftxui::Event::ArrowDown ||
@@ -5109,7 +5929,10 @@ struct App::Impl {
             event == ftxui::Event::Special("\x1B[6;5~") ||
             event == ftxui::Event::CtrlS ||
             event == ftxui::Event::AltS ||
+            event == ftxui::Event::CtrlO ||
             event == ftxui::Event::CtrlU ||
+            event == ftxui::Event::Special("\x1C") ||
+            event == ftxui::Event::Special("\x1B?") ||
             event == ftxui::Event::AltC ||
             event == ftxui::Event::Special("\x1B.") ||
             event == ftxui::Event::F1 ||
@@ -5172,19 +5995,52 @@ struct App::Impl {
                             )) {
                             pulldown_category = index;
                             reset_pulldown_item();
+                            pulldown_dropped = true;
                             mode = Mode::pulldown;
                             return true;
                         }
                     }
                 }
+                if (quick_view_panel &&
+                    quick_view_box.Contain(mouse.x, mouse.y)) {
+                    const auto viewport_width =
+                        quick_view_dimensions().first;
+                    if (mouse.button == ftxui::Mouse::WheelUp) {
+                        quick_viewer.scroll_lines(
+                            -3,
+                            viewport_width
+                        );
+                    } else if (
+                        mouse.button == ftxui::Mouse::WheelDown
+                    ) {
+                        quick_viewer.scroll_lines(
+                            3,
+                            viewport_width
+                        );
+                    } else if (
+                        mouse.button == ftxui::Mouse::Left &&
+                        mouse.motion == ftxui::Mouse::Pressed
+                    ) {
+                        quick_view_focused = true;
+                    } else {
+                        return false;
+                    }
+                    return true;
+                }
                 Pane* pane = nullptr;
                 int pane_index = active_index;
                 std::vector<ftxui::Box>* boxes = nullptr;
-                if (left_box.Contain(mouse.x, mouse.y)) {
+                if (
+                    quick_view_panel != 0 &&
+                    left_box.Contain(mouse.x, mouse.y)
+                ) {
                     pane_index = 0;
                     pane = &left;
                     boxes = &left_entry_boxes;
-                } else if (right_box.Contain(mouse.x, mouse.y)) {
+                } else if (
+                    quick_view_panel != 1 &&
+                    right_box.Contain(mouse.x, mouse.y)
+                ) {
                     pane_index = 1;
                     pane = &right;
                     boxes = &right_entry_boxes;
@@ -5207,6 +6063,7 @@ struct App::Impl {
                 }
                 if (pane != nullptr && boxes != nullptr) {
                     active_index = pane_index;
+                    quick_view_focused = false;
                     for (std::size_t index = 0;
                          index < boxes->size();
                          ++index) {
@@ -5235,8 +6092,65 @@ struct App::Impl {
                 }
                 return pane != nullptr;
             }
+            if (quick_view_panel && quick_view_focused) {
+                const auto [viewport_width, viewport_lines] =
+                    quick_view_dimensions();
+                if (event == ftxui::Event::F1 ||
+                    event == ftxui::Event::F5 ||
+                    event == ftxui::Event::F6 ||
+                    event == ftxui::Event::F8) {
+                    status = "No command for this quick-view key";
+                    return true;
+                }
+                if (event == ftxui::Event::F2) {
+                    quick_viewer.set_wrap(!quick_viewer.wrap());
+                    return true;
+                }
+                if (event == ftxui::Event::F4) {
+                    quick_viewer.toggle_hex();
+                    return true;
+                }
+                if (event == ftxui::Event::F7) {
+                    start_prompt(
+                        PromptAction::quick_viewer_find,
+                        "Find in file"
+                    );
+                    return true;
+                }
+                if (event == ftxui::Event::ArrowDown) {
+                    quick_viewer.scroll_lines(1, viewport_width);
+                    return true;
+                }
+                if (event == ftxui::Event::ArrowUp) {
+                    quick_viewer.scroll_lines(-1, viewport_width);
+                    return true;
+                }
+                if (event == ftxui::Event::PageDown) {
+                    quick_viewer.page(
+                        1,
+                        viewport_width,
+                        viewport_lines
+                    );
+                    return true;
+                }
+                if (event == ftxui::Event::PageUp) {
+                    quick_viewer.page(
+                        -1,
+                        viewport_width,
+                        viewport_lines
+                    );
+                    return true;
+                }
+            }
             if (event == ftxui::Event::Tab) {
-                active_index = 1 - active_index;
+                if (quick_view_panel) {
+                    quick_view_focused = !quick_view_focused;
+                    status = quick_view_focused
+                                 ? "Quick view focused"
+                                 : "File listing focused";
+                } else {
+                    active_index = 1 - active_index;
+                }
             } else if (
                 event == ftxui::Event::Special("\x1B[1;2A")
             ) {
@@ -5250,10 +6164,15 @@ struct App::Impl {
             } else if (event == ftxui::Event::ArrowUp) {
                 active().move_cursor(-1);
             } else if (event == ftxui::Event::ArrowLeft ||
-                       event == ftxui::Event::Special("\x1B[5;5~")) {
+                       event == ftxui::Event::ArrowRight) {
+                return true;
+            } else if (
+                event == ftxui::Event::Special("\x1B[5;5~")
+            ) {
                 static_cast<void>(active().up());
-            } else if (event == ftxui::Event::ArrowRight ||
-                       event == ftxui::Event::Special("\x1B[6;5~")) {
+            } else if (
+                event == ftxui::Event::Special("\x1B[6;5~")
+            ) {
                 static_cast<void>(active().enter());
             } else if (event == ftxui::Event::PageDown) {
                 active().page_cursor(
@@ -5290,8 +6209,15 @@ struct App::Impl {
                 refresh();
                 status = "Refreshed";
             } else if (event == ftxui::Event::CtrlU) {
-                std::swap(left, right);
-                active_index = 1 - active_index;
+                swap_panels();
+            } else if (
+                event == ftxui::Event::Special("\x1C")
+            ) {
+                execute_pulldown_action(2U, 7);
+            } else if (
+                event == ftxui::Event::Special("\x1B?")
+            ) {
+                execute_pulldown_action(2U, 0);
             } else if (event == ftxui::Event::AltC) {
                 start_prompt(
                     PromptAction::quick_cd,
@@ -5350,8 +6276,14 @@ struct App::Impl {
                     run_remove_operation();
                 }
             } else if (event == ftxui::Event::F9) {
-                pulldown_category = 0;
+                const auto menu_panel =
+                    quick_view_panel && quick_view_focused
+                        ? *quick_view_panel
+                        : active_index;
+                pulldown_category =
+                    menu_panel == 0 ? 0U : 4U;
                 reset_pulldown_item();
+                pulldown_dropped = false;
                 mode = Mode::pulldown;
             } else if (event == ftxui::Event::F10) {
                 if (operation_running.load(
@@ -5362,6 +6294,24 @@ struct App::Impl {
                     return true;
                 }
                 exit_terminal();
+            } else if (
+                selection_shortcut &&
+                event == ftxui::Event::Character('+')
+            ) {
+                command_mode = false;
+                execute_pulldown_action(1U, 15);
+            } else if (
+                selection_shortcut &&
+                event == ftxui::Event::Character('-')
+            ) {
+                command_mode = false;
+                execute_pulldown_action(1U, 16);
+            } else if (
+                selection_shortcut &&
+                event == ftxui::Event::Character('*')
+            ) {
+                command_mode = false;
+                execute_pulldown_action(1U, 17);
             } else if (event.is_character()) {
                 command_mode = true;
                 command_line = event.character();
@@ -5380,6 +6330,15 @@ struct App::Impl {
         }
         if (mode == Mode::viewer) {
             return handle_viewer(event);
+        }
+        if (mode == Mode::viewer_message) {
+            if (event == ftxui::Event::Escape ||
+                event == ftxui::Event::Return ||
+                event == ftxui::Event::F10) {
+                mode = Mode::viewer;
+                return true;
+            }
+            return false;
         }
         if (mode == Mode::editor) {
             return handle_editor(event);
@@ -5414,6 +6373,9 @@ struct App::Impl {
         }
         if (mode == Mode::editor_close_dialog) {
             return handle_editor_close_dialog(event);
+        }
+        if (mode == Mode::editor_options_dialog) {
+            return handle_editor_options_dialog(event);
         }
         if (mode == Mode::help) {
             if (event == ftxui::Event::Escape ||
@@ -5557,9 +6519,7 @@ int App::run() {
     impl_->config.show_hidden = impl_->left.show_hidden();
     impl_->config.directories_first =
         impl_->left.directories_first();
-    impl_->config.editor_syntax = impl_->editor_syntax;
-    impl_->config.editor_line_numbers =
-        impl_->editor_line_numbers;
+    impl_->store_editor_options_in_config();
     impl_->config.sort = impl_->left.sort_field();
     impl_->config.sort_descending = impl_->left.descending();
     try {

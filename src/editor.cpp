@@ -51,13 +51,13 @@ std::size_t next_character(
 
 std::size_t display_column(
     const std::string_view line,
-    const std::size_t byte_column
+    const std::size_t byte_column,
+    const std::size_t tab_width
 ) {
     std::size_t result = 0;
     for (std::size_t offset = 0;
          offset < std::min(byte_column, line.size());) {
         if (line[offset] == '\t') {
-            constexpr std::size_t tab_width = 4U;
             result += tab_width - result % tab_width;
             ++offset;
             continue;
@@ -78,7 +78,8 @@ std::size_t display_column(
 
 std::size_t byte_column(
     const std::string_view line,
-    const std::size_t target
+    const std::size_t target,
+    const std::size_t tab_width
 ) {
     std::size_t display = 0;
     std::size_t offset = 0;
@@ -86,7 +87,6 @@ std::size_t byte_column(
         std::size_t width = 0;
         std::size_t next = offset + 1U;
         if (line[offset] == '\t') {
-            constexpr std::size_t tab_width = 4U;
             width = tab_width - display % tab_width;
         } else {
             next = next_character(line, offset);
@@ -110,10 +110,12 @@ std::size_t byte_column(
 
 std::size_t prepare_column_insertion(
     std::string& line,
-    const std::size_t target
+    const std::size_t target,
+    const std::size_t tab_width
 ) {
-    auto offset = byte_column(line, target);
-    const auto actual = display_column(line, offset);
+    auto offset = byte_column(line, target, tab_width);
+    const auto actual =
+        display_column(line, offset, tab_width);
     if (actual < target) {
         const auto padding = target - actual;
         line.insert(offset, padding, ' ');
@@ -343,17 +345,19 @@ EditorModel::selection_on_line(const std::size_t row) const {
     }
     const auto begin_display = display_column(
         lines_[selection_begin_->row],
-        selection_begin_->column
+        selection_begin_->column,
+        tab_width_
     );
     const auto end_display = display_column(
         lines_[selection_end_->row],
-        selection_end_->column
+        selection_end_->column,
+        tab_width_
     );
     const auto left = std::min(begin_display, end_display);
     const auto right = std::max(begin_display, end_display);
     return std::pair{
-        byte_column(lines_[row], left),
-        byte_column(lines_[row], right),
+        byte_column(lines_[row], left, tab_width_),
+        byte_column(lines_[row], right, tab_width_),
     };
 }
 
@@ -455,7 +459,7 @@ void EditorModel::replace_range(
     row_ = cursor.row;
     column_ = cursor.column;
     preferred_display_column_ =
-        display_column(lines_[row_], column_);
+        display_column(lines_[row_], column_, tab_width_);
     clear_selection();
 }
 
@@ -465,7 +469,7 @@ void EditorModel::move(const int rows, const int columns) {
     }
     if (rows != 0 && !preferred_display_column_) {
         preferred_display_column_ =
-            display_column(lines_[row_], column_);
+            display_column(lines_[row_], column_, tab_width_);
     }
     row_ = static_cast<std::size_t>(std::clamp<long long>(
         static_cast<long long>(row_) + rows,
@@ -477,7 +481,8 @@ void EditorModel::move(const int rows, const int columns) {
             ? std::min(column_, lines_[row_].size())
             : byte_column(
                   lines_[row_],
-                  *preferred_display_column_
+                  *preferred_display_column_,
+                  tab_width_
               );
     while (column_ > 0U &&
            column_ < lines_[row_].size() &&
@@ -510,7 +515,7 @@ void EditorModel::move(const int rows, const int columns) {
     }
     if (columns != 0) {
         preferred_display_column_ =
-            display_column(lines_[row_], column_);
+            display_column(lines_[row_], column_, tab_width_);
     }
     update_mark();
 }
@@ -556,7 +561,7 @@ void EditorModel::move_word(const int direction) {
         }
     }
     preferred_display_column_ =
-        display_column(lines_[row_], column_);
+        display_column(lines_[row_], column_, tab_width_);
     update_mark();
 }
 
@@ -567,14 +572,14 @@ void EditorModel::page(const int rows) {
 void EditorModel::home() {
     column_ = 0;
     preferred_display_column_ =
-        display_column(lines_[row_], column_);
+        display_column(lines_[row_], column_, tab_width_);
     update_mark();
 }
 
 void EditorModel::end() {
     column_ = lines_[row_].size();
     preferred_display_column_ =
-        display_column(lines_[row_], column_);
+        display_column(lines_[row_], column_, tab_width_);
     update_mark();
 }
 
@@ -595,7 +600,7 @@ void EditorModel::goto_line(const std::size_t line) {
         --column_;
     }
     preferred_display_column_ =
-        display_column(lines_[row_], column_);
+        display_column(lines_[row_], column_, tab_width_);
     update_mark();
 }
 
@@ -616,7 +621,7 @@ void EditorModel::set_position(EditorPosition destination) {
         --column_;
     }
     preferred_display_column_ =
-        display_column(lines_[row_], column_);
+        display_column(lines_[row_], column_, tab_width_);
     update_mark();
 }
 
@@ -770,6 +775,18 @@ void EditorModel::toggle_overwrite() noexcept {
     overwrite_ = !overwrite_;
 }
 
+void EditorModel::set_tab_width(const std::size_t width) {
+    tab_width_ = std::clamp(width, std::size_t{1}, std::size_t{32});
+    if (!lines_.empty()) {
+        preferred_display_column_ =
+            display_column(lines_[row_], column_, tab_width_);
+    }
+}
+
+std::size_t EditorModel::tab_width() const noexcept {
+    return tab_width_;
+}
+
 void EditorModel::insert(const char character) {
     insert(std::string_view(&character, 1U));
 }
@@ -809,22 +826,31 @@ void EditorModel::paste_column(const std::string_view text) {
     record_undo();
     const auto target_row = row_;
     const auto target_display =
-        display_column(lines_[row_], column_);
+        display_column(lines_[row_], column_, tab_width_);
     while (lines_.size() < target_row + block.size()) {
         lines_.emplace_back();
     }
     for (std::size_t index = 0; index < block.size(); ++index) {
         auto& line = lines_[target_row + index];
-        const auto width = display_column(line, line.size());
+        const auto width =
+            display_column(line, line.size(), tab_width_);
         if (width < target_display) {
             line.append(target_display - width, ' ');
         }
         const auto target =
-            prepare_column_insertion(line, target_display);
+            prepare_column_insertion(
+                line,
+                target_display,
+                tab_width_
+            );
         line.insert(target, block[index]);
     }
     row_ = target_row;
-    column_ = byte_column(lines_[row_], target_display);
+    column_ = byte_column(
+        lines_[row_],
+        target_display,
+        tab_width_
+    );
     preferred_display_column_ = target_display;
     clear_selection();
     dirty_ = true;
@@ -887,7 +913,7 @@ void EditorModel::insert_text(
     row_ = cursor.row;
     column_ = cursor.column;
     preferred_display_column_ =
-        display_column(lines_[row_], column_);
+        display_column(lines_[row_], column_, tab_width_);
     if (anchor_offset) {
         auto adjusted_anchor = *anchor_offset;
         const auto removed = end_offset - begin_offset;
@@ -956,8 +982,24 @@ void EditorModel::insert_text(
     ++change_id_;
 }
 
-void EditorModel::newline() {
-    insert("\n");
+void EditorModel::newline(const bool auto_indent) {
+    if (!auto_indent) {
+        insert("\n");
+        return;
+    }
+    const auto& line = lines_[row_];
+    std::size_t indentation = 0;
+    while (indentation < column_ &&
+           indentation < line.size() &&
+           (
+               line[indentation] == ' ' ||
+               line[indentation] == '\t'
+           )) {
+        ++indentation;
+    }
+    std::string text{"\n"};
+    text.append(line, 0, indentation);
+    insert(text);
 }
 
 void EditorModel::erase_text(
@@ -991,7 +1033,7 @@ void EditorModel::erase_text(
     row_ = cursor.row;
     column_ = cursor.column;
     preferred_display_column_ =
-        display_column(lines_[row_], column_);
+        display_column(lines_[row_], column_, tab_width_);
     if (anchor_offset) {
         auto adjusted_anchor = *anchor_offset;
         const auto removed = end_offset - begin_offset;
@@ -1120,14 +1162,16 @@ bool EditorModel::copy_selection() {
         clipboard_ = *block;
         const auto target_row = row_;
         const auto target_display =
-            display_column(lines_[row_], column_);
+            display_column(lines_[row_], column_, tab_width_);
         const auto begin_display = display_column(
             lines_[selection_begin_->row],
-            selection_begin_->column
+            selection_begin_->column,
+            tab_width_
         );
         const auto end_display = display_column(
             lines_[selection_end_->row],
-            selection_end_->column
+            selection_end_->column,
+            tab_width_
         );
         const auto width =
             std::max(begin_display, end_display) -
@@ -1139,14 +1183,16 @@ bool EditorModel::copy_selection() {
             .row = target_row,
             .column = byte_column(
                 lines_[target_row],
-                target_display
+                target_display,
+                tab_width_
             ),
         };
         selection_end_ = EditorPosition{
             .row = target_row + height - 1U,
             .column = byte_column(
                 lines_[target_row + height - 1U],
-                target_display + width
+                target_display + width,
+                tab_width_
             ),
         };
         column_selection_ = true;
@@ -1169,16 +1215,18 @@ bool EditorModel::move_selection() {
         }
         const auto begin_display = display_column(
             lines_[selection_begin_->row],
-            selection_begin_->column
+            selection_begin_->column,
+            tab_width_
         );
         const auto end_display = display_column(
             lines_[selection_end_->row],
-            selection_end_->column
+            selection_end_->column,
+            tab_width_
         );
         const auto left = std::min(begin_display, end_display);
         const auto right = std::max(begin_display, end_display);
         auto target_display =
-            display_column(lines_[row_], column_);
+            display_column(lines_[row_], column_, tab_width_);
         if (row_ >= selected->first.row &&
             row_ <= selected->second.row &&
             target_display >= left &&
@@ -1227,19 +1275,24 @@ bool EditorModel::move_selection() {
         for (std::size_t index = 0; index < block.size(); ++index) {
             auto& line = lines_[target_row + index];
             const auto line_width =
-                display_column(line, line.size());
+                display_column(line, line.size(), tab_width_);
             if (line_width < target_display) {
                 line.append(target_display - line_width, ' ');
             }
             line.insert(
                 prepare_column_insertion(
                     line,
-                    target_display
+                    target_display,
+                    tab_width_
                 ),
                 block[index]
             );
         }
-        column_ = byte_column(lines_[target_row], target_display);
+        column_ = byte_column(
+            lines_[target_row],
+            target_display,
+            tab_width_
+        );
         row_ = target_row;
         preferred_display_column_ = target_display;
         clear_selection();
@@ -1272,7 +1325,7 @@ bool EditorModel::move_selection() {
     row_ = cursor.row;
     column_ = cursor.column;
     preferred_display_column_ =
-        display_column(lines_[row_], column_);
+        display_column(lines_[row_], column_, tab_width_);
     clear_selection();
     dirty_ = true;
     ++change_id_;
@@ -1313,7 +1366,7 @@ bool EditorModel::delete_selection() {
         row_ = selected->first.row;
         column_ = ranges.front().first;
         preferred_display_column_ =
-            display_column(lines_[row_], column_);
+            display_column(lines_[row_], column_, tab_width_);
         clear_selection();
         dirty_ = true;
         ++change_id_;
@@ -1334,11 +1387,13 @@ std::optional<std::string> EditorModel::selected_text() const {
     if (column_selection_) {
         const auto begin_display = display_column(
             lines_[selection_begin_->row],
-            selection_begin_->column
+            selection_begin_->column,
+            tab_width_
         );
         const auto end_display = display_column(
             lines_[selection_end_->row],
-            selection_end_->column
+            selection_end_->column,
+            tab_width_
         );
         const auto width =
             std::max(begin_display, end_display) -
@@ -1357,8 +1412,16 @@ std::optional<std::string> EditorModel::selected_text() const {
                 range->second - range->first
             );
             const auto actual =
-                display_column(lines_[row], range->second) -
-                display_column(lines_[row], range->first);
+                display_column(
+                    lines_[row],
+                    range->second,
+                    tab_width_
+                ) -
+                display_column(
+                    lines_[row],
+                    range->first,
+                    tab_width_
+                );
             result.append(width - std::min(width, actual), ' ');
             if (row != selected->second.row) {
                 result += '\n';
@@ -1470,7 +1533,7 @@ void EditorModel::restore(Snapshot snapshot) {
     row_ = snapshot.row;
     column_ = snapshot.column;
     preferred_display_column_ =
-        display_column(lines_[row_], column_);
+        display_column(lines_[row_], column_, tab_width_);
     selection_begin_ = snapshot.selection_begin;
     selection_end_ = snapshot.selection_end;
     marking_ = snapshot.marking;
@@ -1645,7 +1708,7 @@ bool EditorModel::find(
     row_ = selection_begin_->row;
     column_ = selection_begin_->column;
     preferred_display_column_ =
-        display_column(lines_[row_], column_);
+        display_column(lines_[row_], column_, tab_width_);
     return true;
 }
 
@@ -1738,7 +1801,7 @@ std::size_t EditorModel::replace_all(
     row_ = destination.row;
     column_ = destination.column;
     preferred_display_column_ =
-        display_column(lines_[row_], column_);
+        display_column(lines_[row_], column_, tab_width_);
     clear_selection();
     dirty_ = true;
     ++change_id_;

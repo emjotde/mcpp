@@ -18,8 +18,12 @@ public:
         const Cancellation& cancellation = {}
     );
     void close();
-    void scroll_lines(int amount, std::size_t viewport_lines);
-    void page(int direction, std::size_t viewport_lines);
+    void scroll_lines(int amount, std::size_t viewport_width);
+    void page(
+        int direction,
+        std::size_t viewport_width,
+        std::size_t viewport_lines
+    );
     void toggle_hex();
     void set_wrap(bool value);
     [[nodiscard]] bool wrap() const noexcept;
@@ -27,6 +31,7 @@ public:
     [[nodiscard]] bool open() const noexcept;
     [[nodiscard]] std::uint64_t size() const noexcept;
     [[nodiscard]] std::uint64_t offset() const noexcept;
+    [[nodiscard]] std::uint64_t view_end() const noexcept;
     [[nodiscard]] const std::string& path() const noexcept;
     [[nodiscard]] std::vector<std::string> lines(
         std::size_t width,
@@ -51,10 +56,12 @@ private:
     std::string storage_path_;
     std::uint64_t size_{0};
     std::uint64_t offset_{0};
+    std::uint64_t view_end_{0};
     std::uint64_t window_offset_{0};
     std::string window_;
+    std::vector<std::uint64_t> previous_offsets_;
     bool hex_{false};
-    bool wrap_{false};
+    bool wrap_{true};
 };
 
 }  // namespace mcpp

@@ -1,5 +1,6 @@
 #include "mcpp/config.hpp"
 
+#include <charconv>
 #include <cerrno>
 #include <cstring>
 #include <cstdlib>
@@ -18,6 +19,25 @@ namespace {
 
 bool parse_bool(const std::string& value) {
     return value == "true" || value == "1" || value == "yes";
+}
+
+std::size_t parse_width(
+    const std::string_view value,
+    const std::size_t fallback
+) {
+    std::size_t parsed = 0;
+    const auto result = std::from_chars(
+        value.data(),
+        value.data() + value.size(),
+        parsed
+    );
+    if (result.ec != std::errc{} ||
+        result.ptr != value.data() + value.size() ||
+        parsed < 1U ||
+        parsed > 32U) {
+        return fallback;
+    }
+    return parsed;
 }
 
 std::string sort_name(const SortField field) {
@@ -121,6 +141,20 @@ Config Config::load(const std::filesystem::path& path) {
             result.editor_syntax = parse_bool(value);
         } else if (key == "editor_line_numbers") {
             result.editor_line_numbers = parse_bool(value);
+        } else if (key == "editor_tab_width") {
+            result.editor_tab_width = parse_width(
+                value,
+                result.editor_tab_width
+            );
+        } else if (key == "editor_indent_width") {
+            result.editor_indent_width = parse_width(
+                value,
+                result.editor_indent_width
+            );
+        } else if (key == "editor_auto_indent") {
+            result.editor_auto_indent = parse_bool(value);
+        } else if (key == "editor_show_whitespace") {
+            result.editor_show_whitespace = parse_bool(value);
         } else if (key == "bookmark") {
             result.bookmarks.push_back(decode_value(value));
         }
@@ -150,7 +184,13 @@ void Config::save(const std::filesystem::path& path) const {
            << "editor_syntax="
            << (editor_syntax ? "true" : "false") << '\n'
            << "editor_line_numbers="
-           << (editor_line_numbers ? "true" : "false") << '\n';
+           << (editor_line_numbers ? "true" : "false") << '\n'
+           << "editor_tab_width=" << editor_tab_width << '\n'
+           << "editor_indent_width=" << editor_indent_width << '\n'
+           << "editor_auto_indent="
+           << (editor_auto_indent ? "true" : "false") << '\n'
+           << "editor_show_whitespace="
+           << (editor_show_whitespace ? "true" : "false") << '\n';
     for (const auto& bookmark : bookmarks) {
         output << "bookmark=" << encode_value(bookmark) << '\n';
     }

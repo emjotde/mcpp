@@ -25,7 +25,25 @@ std::string lowercase(std::string value) {
     return value;
 }
 
-void append_text_line(
+std::size_t next_utf8(
+    const std::string_view value,
+    const std::size_t offset
+) {
+    if (offset >= value.size()) {
+        return value.size();
+    }
+    auto next = offset + 1U;
+    while (next < value.size() &&
+           (
+               static_cast<unsigned char>(value[next]) &
+               0xC0U
+           ) == 0x80U) {
+        ++next;
+    }
+    return next;
+}
+
+std::size_t append_text_line(
     std::vector<std::string>& output,
     const std::string_view line,
     const std::size_t width,
@@ -34,10 +52,11 @@ void append_text_line(
 ) {
     if (width == 0U) {
         output.emplace_back(line);
-        return;
+        return line.size();
     }
     std::string current;
     std::size_t current_width = 0;
+    std::size_t consumed = 0;
     for (const auto& glyph : ftxui::Utf8ToGlyphs(line)) {
         if (glyph.empty()) {
             continue;
@@ -54,8 +73,11 @@ void append_text_line(
         if (current_width + glyph_width > width &&
             !current.empty()) {
             output.push_back(std::move(current));
-            if (!wrap || output.size() >= height) {
-                return;
+            if (!wrap) {
+                return line.size();
+            }
+            if (output.size() >= height) {
+                return consumed;
             }
             current.clear();
             current_width = 0;
@@ -67,10 +89,12 @@ void append_text_line(
         }
         current += displayed;
         current_width += glyph_width;
+        consumed += glyph.size();
     }
     if (output.size() < height) {
         output.push_back(std::move(current));
     }
+    return consumed;
 }
 
 }  // namespace
@@ -89,6 +113,8 @@ void ViewerModel::open(
     storage_path_ = entry.path;
     size_ = entry.size;
     offset_ = 0;
+    view_end_ = 0;
+    previous_offsets_.clear();
     load_window(0, window_size, cancellation);
 }
 
@@ -99,6 +125,8 @@ void ViewerModel::close() {
     window_.clear();
     size_ = 0;
     offset_ = 0;
+    view_end_ = 0;
+    previous_offsets_.clear();
 }
 
 bool ViewerModel::open() const noexcept {
@@ -107,22 +135,9 @@ bool ViewerModel::open() const noexcept {
 
 void ViewerModel::scroll_lines(
     const int amount,
-    const std::size_t viewport_lines
+    const std::size_t viewport_width
 ) {
     if (!open()) {
-        return;
-    }
-    if (hex_) {
-        const auto next =
-            static_cast<std::int64_t>(offset_) +
-            static_cast<std::int64_t>(amount) * 16;
-        offset_ = static_cast<std::uint64_t>(
-            std::clamp<std::int64_t>(
-                next,
-                0,
-                static_cast<std::int64_t>(size_)
-            )
-        );
         return;
     }
     if (offset_ < window_offset_ ||
@@ -130,28 +145,112 @@ void ViewerModel::scroll_lines(
         load_window(offset_, window_size, {});
     }
     if (amount > 0) {
-        for (int line = 0; line < amount && offset_ < size_; ++line) {
-            const auto local = static_cast<std::size_t>(
-                offset_ - window_offset_
-            );
-            const auto next = window_.find('\n', local);
-            if (next == std::string::npos) {
-                const auto new_offset =
-                    std::min<std::uint64_t>(
-                        size_,
-                        window_offset_ + window_.size()
-                    );
-                if (new_offset == offset_) {
-                    break;
-                }
-                offset_ = new_offset;
-                load_window(offset_, window_size, {});
+        for (int line = 0;
+             line < amount && offset_ < size_;
+             ++line) {
+            auto next_offset = offset_;
+            if (hex_) {
+                next_offset =
+                    std::min<std::uint64_t>(size_, offset_ + 16U);
+            } else if (!wrap_) {
+                const auto local = static_cast<std::size_t>(
+                    offset_ - window_offset_
+                );
+                const auto next = window_.find('\n', local);
+                next_offset =
+                    next == std::string::npos
+                        ? std::min<std::uint64_t>(
+                              size_,
+                              window_offset_ + window_.size()
+                          )
+                        : window_offset_ + next + 1U;
             } else {
-                offset_ = window_offset_ + next + 1U;
+                const auto width = std::max<std::size_t>(
+                    1U,
+                    viewport_width
+                );
+                std::size_t display_width = 0;
+                while (next_offset < size_) {
+                    if (next_offset < window_offset_ ||
+                        next_offset >=
+                            window_offset_ + window_.size()) {
+                        load_window(next_offset, window_size, {});
+                        if (window_.empty()) {
+                            next_offset = size_;
+                            break;
+                        }
+                    }
+                    const auto local = static_cast<std::size_t>(
+                        next_offset - window_offset_
+                    );
+                    if (window_[local] == '\n') {
+                        ++next_offset;
+                        break;
+                    }
+                    const auto next_local =
+                        next_utf8(window_, local);
+                    const auto glyph = std::string_view(window_).substr(
+                        local,
+                        next_local - local
+                    );
+                    auto glyph_width = static_cast<std::size_t>(
+                        std::max(0, ftxui::string_width(glyph))
+                    );
+                    if (glyph == "\t") {
+                        constexpr std::size_t tab_width = 8U;
+                        glyph_width =
+                            tab_width -
+                            display_width % tab_width;
+                    }
+                    if (display_width > 0U &&
+                        display_width + glyph_width > width) {
+                        break;
+                    }
+                    next_offset += next_local - local;
+                    display_width += glyph_width;
+                    if (display_width >= width) {
+                        if (next_offset < size_) {
+                            if (next_offset < window_offset_ ||
+                                next_offset >=
+                                    window_offset_ +
+                                        window_.size()) {
+                                load_window(
+                                    next_offset,
+                                    window_size,
+                                    {}
+                                );
+                            }
+                            const auto next_byte =
+                                static_cast<std::size_t>(
+                                    next_offset - window_offset_
+                                );
+                            if (next_byte < window_.size() &&
+                                window_[next_byte] == '\n') {
+                                ++next_offset;
+                            }
+                        }
+                        break;
+                    }
+                }
             }
+            if (next_offset <= offset_) {
+                break;
+            }
+            previous_offsets_.push_back(offset_);
+            offset_ = next_offset;
         }
     } else {
         for (int line = 0; line > amount && offset_ > 0U; --line) {
+            if (hex_) {
+                offset_ =
+                    offset_ >= 16U ? offset_ - 16U : 0U;
+                continue;
+            }
+            if (!previous_offsets_.empty()) {
+                offset_ = previous_offsets_.back();
+                previous_offsets_.pop_back();
+                continue;
+            }
             if (offset_ <= window_offset_ + 1U) {
                 const auto begin =
                     offset_ > window_size
@@ -172,25 +271,27 @@ void ViewerModel::scroll_lines(
                     : window_offset_ + before + 1U;
         }
     }
-    static_cast<void>(viewport_lines);
 }
 
 void ViewerModel::page(
     const int direction,
+    const std::size_t viewport_width,
     const std::size_t viewport_lines
 ) {
     scroll_lines(
         direction * static_cast<int>(viewport_lines),
-        viewport_lines
+        viewport_width
     );
 }
 
 void ViewerModel::toggle_hex() {
     hex_ = !hex_;
+    previous_offsets_.clear();
 }
 
 void ViewerModel::set_wrap(const bool value) {
     wrap_ = value;
+    previous_offsets_.clear();
 }
 
 bool ViewerModel::wrap() const noexcept {
@@ -207,6 +308,10 @@ std::uint64_t ViewerModel::size() const noexcept {
 
 std::uint64_t ViewerModel::offset() const noexcept {
     return offset_;
+}
+
+std::uint64_t ViewerModel::view_end() const noexcept {
+    return view_end_;
 }
 
 const std::string& ViewerModel::path() const noexcept {
@@ -239,6 +344,7 @@ std::vector<std::string> ViewerModel::lines(
     const Cancellation& cancellation
 ) {
     if (!open()) {
+        view_end_ = 0;
         return {};
     }
     if (offset_ < window_offset_ ||
@@ -286,14 +392,34 @@ std::vector<std::string> ViewerModel::lines(
             }
             result.push_back(line.str());
         }
+        view_end_ = std::min<std::uint64_t>(
+            size_,
+            offset_ + result.size() * bytes_per_line
+        );
         return result;
     }
 
     std::istringstream input(window_.substr(local));
     std::string line;
+    std::size_t consumed = 0;
     while (result.size() < height && std::getline(input, line)) {
-        append_text_line(result, line, width, height, wrap_);
+        const auto displayed = append_text_line(
+            result,
+            line,
+            width,
+            height,
+            wrap_
+        );
+        consumed += displayed;
+        if (displayed < line.size()) {
+            break;
+        }
+        if (local + consumed < window_.size() &&
+            window_[local + consumed] == '\n') {
+            ++consumed;
+        }
     }
+    view_end_ = std::min<std::uint64_t>(size_, offset_ + consumed);
     return result;
 }
 
@@ -328,6 +454,7 @@ std::optional<std::uint64_t> ViewerModel::find(
         if (found != std::string::npos) {
             offset_ =
                 cursor - overlap.size() + found;
+            previous_offsets_.clear();
             return offset_;
         }
         const auto keep = std::min(

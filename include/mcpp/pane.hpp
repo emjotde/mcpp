@@ -58,6 +58,7 @@ private:
         bool record,
         const Cancellation& cancellation
     );
+    void restore_child_cursor(std::string_view child_path);
 
     ProviderPtr provider_;
     std::string path_;

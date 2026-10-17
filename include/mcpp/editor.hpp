@@ -67,10 +67,12 @@ public:
     void select_all();
     [[nodiscard]] bool match_bracket();
     void toggle_overwrite() noexcept;
+    void set_tab_width(std::size_t width);
+    [[nodiscard]] std::size_t tab_width() const noexcept;
     void insert(char character);
     void insert(std::string_view text);
     void paste(std::string_view text);
-    void newline();
+    void newline(bool auto_indent = false);
     void backspace();
     void erase();
     void delete_line();
@@ -200,6 +202,7 @@ private:
     bool column_selection_{false};
     bool overwrite_{false};
     bool new_file_{false};
+    std::size_t tab_width_{8};
     std::string clipboard_;
     std::vector<Snapshot> undo_;
     std::vector<Snapshot> redo_;
