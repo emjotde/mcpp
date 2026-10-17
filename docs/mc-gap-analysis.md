@@ -21,8 +21,8 @@ masks, editor indentation/clipboard behavior, operation cancellation redraw,
 terminal sizing, and shell transitions.
 
 The largest remaining gaps are advanced panel modes, richer operation and
-metadata dialogs, persistent subshell integration, help/jobs, multi-buffer
-editing, macros, archive/VFS support, and SSH/cloud providers.
+metadata dialogs, persistent subshell integration, help/jobs, macros,
+archive/VFS support, and SSH/cloud providers.
 
 ## Review method
 
@@ -176,13 +176,13 @@ These are useful foundations, not parity.
 | User-defined panel format | Yes | No | Missing |
 | Sort modes | 8 plus unsorted/natural options | Name, extension, size, mtime | Partial |
 | Reverse sorting | Yes | Yes | Working |
-| Panel filters | Glob/regex, files-only, case options | No | Missing |
+| Panel filters | Glob/regex, files-only, case options | Case-sensitive glob filter | Partial |
 | Quick search | Incremental panel search | Incremental Ctrl-S/Alt-S search | Working |
 | Directory sizes | On demand | Shows directory inode size | Missing |
-| Tree panel | Dynamic/static tree | No | Missing |
-| Info panel | Full panel mode | Small modal | Partial |
+| Tree panel | Dynamic/static global tree | Lazy global tree with current-directory ancestry, async expansion, mouse/keyboard navigation, and explicit collapse controls | Close |
+| Info panel | Full panel mode | Live metadata panel | Close |
 | Quick-view panel | Viewer-capable panel | Fixed-width preview with Tab/mouse focus and scrolling | Partial |
-| Panelize | Find/external command results become panel | Separate results screen | Missing |
+| Panelize | Find/external command results become panel | Asynchronous cancellable name results become panel | Partial |
 | Horizontal split and resizing | Yes | No | Missing |
 | Swap/synchronize panes | Yes | No | Missing |
 | File highlighting | Rules, types, permissions | Built-in grayscale type/mode cues | Partial |
@@ -198,9 +198,8 @@ directory traversal, parent-row cursor restoration,
 Alt-Y/Alt-U history movement, Shift-Up/Down marking, pointed-pane mouse
 wheel behavior, Space command-line input, and incremental quick search.
 Remaining navigation differences are MC's directory-history popup,
-multi-column horizontal movement, panel
-filters, directory-size calculation, extension/executable Enter actions, and
-tree/panelize modes.
+multi-column horizontal movement, richer panel-filter options,
+directory-size calculation, and extension/executable Enter actions.
 
 ### Menus and input widgets
 
@@ -294,7 +293,7 @@ What is already close:
 | Existing file | Yes | Yes | Close |
 | New/open another file | File menu and `Ctrl-N` | Single-buffer File menu and `Ctrl-N` | Partial |
 | Multiple files/windows | Multiple movable/resizable windows | One buffer | Missing |
-| File history | Persistent history dialog | No | Missing |
+| File history | Persistent history dialog | Persistent 20-file history | Close |
 | Save/save-as | Confirmation, overwrite handling, save modes | Save and no-clobber save-as | Partial |
 | Insert/copy block to file | Yes | No | Missing |
 | Concurrent-edit lock | Lock file and user decision | Revision conflict detected only at save | Partial |
@@ -304,8 +303,8 @@ What is already close:
 
 The mcpp safety baseline is good: writes are atomic, stale revisions are
 rejected, and symlink targets are resolved once when opened. It does not yet
-offer mcedit's save-mode choices, lock interaction, recovery, or multi-file
-workflow.
+offer mcedit's save-mode choices, lock interaction, or recovery workflow.
+Multiple open buffers can be listed and switched from the Window menu.
 
 #### Editing and navigation
 
@@ -383,12 +382,13 @@ rather than silently performing the old conflicting search action.
 #### Menus, status, and options
 
 mcpp shows the same seven top-level editor menu names. File, Edit, and Search
-contain a working subset, and Command can toggle syntax highlighting; Format
-and Window remain placeholders. Options provides general indentation and
+contain a working subset, and Command can toggle syntax highlighting. Window
+supports next/previous/list buffer actions; Format remains a placeholder.
+Options provides general indentation and
 whitespace settings plus persistent Save Setup. mcedit additionally exposes
-open/new/history, insert/copy file, persistent clip-file operations,
+insert/copy file,
 bookmarks, syntax selection and encoding, macros, spell checking, literal
-insertion, formatting, external filters, multiple windows, general editor
+insertion, formatting, external filters, richer window management,
 options, save modes, and key learning. mcpp editor menus also lack mouse item
 activation and menu hotkeys.
 
@@ -403,9 +403,9 @@ Alt-N. Visible tabs and trailing spaces are configurable, and Tab uses the
 fake-indent width in leading indentation and the real tab width after text.
 Bookmarks, codepages, spell checking, macros, and session recovery are absent.
 
-The next editor work should focus on mouse drag selection, editor/file
-history, and multi-buffer windows. Macros, spell checking, and code navigation
-are later parity work, not requirements for a dependable basic editor.
+The next editor work should focus on mouse drag selection and richer
+multi-window commands. Macros, spell checking, and code navigation are later
+parity work, not requirements for a dependable basic editor.
 
 ### Command line and subshell
 

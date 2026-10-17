@@ -26,7 +26,9 @@ exec 3>"$temporary/input"
 sleep 1
 # Select both files, start copy, pause at the first progress checkpoint,
 # skip that entry, and allow the next entry to complete.
-printf '\033[B\033[2~\033[2~\033[15~\r ' >&3
+printf '\033[B\033[2~\033[2~\033[15~' >&3
+sleep 0.5
+printf '\r ' >&3
 sleep 1
 printf 's' >&3
 sleep 3
@@ -51,6 +53,20 @@ if [[ "$redraw_complete" != true ]]; then
     printf 'operation completion did not redraw without input\n' >&2
     exit 1
 fi
+
+for expected in \
+    'Source mask:' \
+    'Run in background' \
+    'Speed:' \
+    'ETA:' \
+    '[ Pause ]' \
+    '[ Skip ]' \
+    '[ Abort ]'; do
+    if ! grep -aFq "$expected" "$temporary/output"; then
+        printf 'operation UI did not render: %s\n' "$expected" >&2
+        exit 1
+    fi
+done
 
 if [[ -e "$temporary/right/a.bin" ]] ||
    [[ ! -f "$temporary/right/b.bin" ]]; then

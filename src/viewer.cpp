@@ -48,7 +48,8 @@ std::size_t append_text_line(
     const std::string_view line,
     const std::size_t width,
     const std::size_t height,
-    const bool wrap
+    const bool wrap,
+    const std::size_t horizontal_offset
 ) {
     if (width == 0U) {
         output.emplace_back(line);
@@ -57,6 +58,7 @@ std::size_t append_text_line(
     std::string current;
     std::size_t current_width = 0;
     std::size_t consumed = 0;
+    std::size_t source_width = 0;
     for (const auto& glyph : ftxui::Utf8ToGlyphs(line)) {
         if (glyph.empty()) {
             continue;
@@ -67,15 +69,42 @@ std::size_t append_text_line(
         );
         if (glyph == "\t") {
             constexpr std::size_t tab_width = 8U;
-            glyph_width = tab_width - current_width % tab_width;
+            glyph_width =
+                tab_width -
+                (wrap ? current_width : source_width) %
+                    tab_width;
             displayed.assign(glyph_width, ' ');
+        }
+        if (!wrap) {
+            const auto glyph_begin = source_width;
+            source_width += glyph_width;
+            consumed += glyph.size();
+            if (source_width <= horizontal_offset) {
+                continue;
+            }
+            if (glyph_begin < horizontal_offset) {
+                if (glyph == "\t") {
+                    const auto skipped =
+                        horizontal_offset - glyph_begin;
+                    displayed.erase(
+                        0,
+                        std::min(skipped, displayed.size())
+                    );
+                    glyph_width = displayed.size();
+                } else {
+                    continue;
+                }
+            }
+            if (current_width + glyph_width > width) {
+                break;
+            }
+            current += displayed;
+            current_width += glyph_width;
+            continue;
         }
         if (current_width + glyph_width > width &&
             !current.empty()) {
             output.push_back(std::move(current));
-            if (!wrap) {
-                return line.size();
-            }
             if (output.size() >= height) {
                 return consumed;
             }
@@ -94,7 +123,7 @@ std::size_t append_text_line(
     if (output.size() < height) {
         output.push_back(std::move(current));
     }
-    return consumed;
+    return wrap ? consumed : line.size();
 }
 
 }  // namespace
@@ -115,6 +144,9 @@ void ViewerModel::open(
     offset_ = 0;
     view_end_ = 0;
     previous_offsets_.clear();
+    horizontal_offset_ = 0;
+    last_search_.clear();
+    next_search_offset_ = 0;
     load_window(0, window_size, cancellation);
 }
 
@@ -127,6 +159,9 @@ void ViewerModel::close() {
     offset_ = 0;
     view_end_ = 0;
     previous_offsets_.clear();
+    horizontal_offset_ = 0;
+    last_search_.clear();
+    next_search_offset_ = 0;
 }
 
 bool ViewerModel::open() const noexcept {
@@ -284,14 +319,29 @@ void ViewerModel::page(
     );
 }
 
+void ViewerModel::scroll_columns(const int amount) {
+    if (wrap_ || hex_ || amount == 0) {
+        return;
+    }
+    const auto next =
+        static_cast<long long>(horizontal_offset_) + amount;
+    horizontal_offset_ = static_cast<std::size_t>(
+        std::max<long long>(0, next)
+    );
+}
+
 void ViewerModel::toggle_hex() {
     hex_ = !hex_;
     previous_offsets_.clear();
+    horizontal_offset_ = 0;
 }
 
 void ViewerModel::set_wrap(const bool value) {
     wrap_ = value;
     previous_offsets_.clear();
+    if (wrap_) {
+        horizontal_offset_ = 0;
+    }
 }
 
 bool ViewerModel::wrap() const noexcept {
@@ -312,6 +362,10 @@ std::uint64_t ViewerModel::offset() const noexcept {
 
 std::uint64_t ViewerModel::view_end() const noexcept {
     return view_end_;
+}
+
+std::size_t ViewerModel::horizontal_offset() const noexcept {
+    return horizontal_offset_;
 }
 
 const std::string& ViewerModel::path() const noexcept {
@@ -408,7 +462,8 @@ std::vector<std::string> ViewerModel::lines(
             line,
             width,
             height,
-            wrap_
+            wrap_,
+            horizontal_offset_
         );
         consumed += displayed;
         if (displayed < line.size()) {
@@ -431,39 +486,85 @@ std::optional<std::uint64_t> ViewerModel::find(
     if (!open() || needle.empty()) {
         return std::nullopt;
     }
+    const auto requested = std::string(needle);
     const auto sought =
-        case_sensitive ? std::string(needle)
-                       : lowercase(std::string(needle));
+        case_sensitive ? requested : lowercase(requested);
+    const bool repeat =
+        requested == last_search_ &&
+        case_sensitive == last_search_case_sensitive_;
+    const auto search_begin =
+        repeat ? std::min(next_search_offset_, size_) : offset_;
     constexpr std::uint64_t chunk_size = 256U * 1024U;
-    std::string overlap;
-    for (auto cursor = offset_; cursor < size_;
-         cursor += chunk_size) {
-        cancellation.throw_if_requested();
-        std::ostringstream output;
-        provider_->read(
-            storage_path_,
-            cursor,
-            std::min(chunk_size, size_ - cursor),
-            output,
-            cancellation
-        );
-        auto chunk = overlap + std::move(output).str();
-        const auto haystack =
-            case_sensitive ? chunk : lowercase(std::move(chunk));
-        const auto found = haystack.find(sought);
-        if (found != std::string::npos) {
-            offset_ =
-                cursor - overlap.size() + found;
-            previous_offsets_.clear();
-            return offset_;
+    const auto search_range = [&](const std::uint64_t begin,
+                                  const std::uint64_t end)
+        -> std::optional<std::uint64_t> {
+        std::string overlap;
+        for (auto cursor = begin; cursor < end;
+             cursor += chunk_size) {
+            cancellation.throw_if_requested();
+            std::ostringstream output;
+            provider_->read(
+                storage_path_,
+                cursor,
+                std::min(chunk_size, end - cursor),
+                output,
+                cancellation
+            );
+            auto chunk = overlap + std::move(output).str();
+            const auto haystack =
+                case_sensitive
+                    ? chunk
+                    : lowercase(std::move(chunk));
+            const auto found = haystack.find(sought);
+            if (found != std::string::npos) {
+                return cursor - overlap.size() + found;
+            }
+            const auto keep = std::min(
+                sought.size() - 1U,
+                haystack.size()
+            );
+            overlap = haystack.substr(haystack.size() - keep);
         }
-        const auto keep = std::min(
-            sought.size() > 0U ? sought.size() - 1U : 0U,
-            haystack.size()
-        );
-        overlap = haystack.substr(haystack.size() - keep);
+        return std::nullopt;
+    };
+    auto found = search_range(search_begin, size_);
+    if (!found && search_begin > 0U) {
+        found = search_range(0U, search_begin);
     }
-    return std::nullopt;
+    if (!found) {
+        last_search_ = requested;
+        last_search_case_sensitive_ = case_sensitive;
+        next_search_offset_ = 0;
+        return std::nullopt;
+    }
+    last_search_ = requested;
+    last_search_case_sensitive_ = case_sensitive;
+    next_search_offset_ = std::min<std::uint64_t>(
+        size_,
+        *found + std::max<std::size_t>(1U, requested.size())
+    );
+    const auto prefix_begin =
+        *found > chunk_size ? *found - chunk_size : 0U;
+    std::ostringstream prefix_output;
+    provider_->read(
+        storage_path_,
+        prefix_begin,
+        *found - prefix_begin,
+        prefix_output,
+        cancellation
+    );
+    const auto prefix = std::move(prefix_output).str();
+    const auto newline = prefix.rfind('\n');
+    offset_ =
+        newline == std::string::npos
+            ? prefix_begin
+            : prefix_begin + newline + 1U;
+    if (hex_) {
+        offset_ = *found;
+    }
+    previous_offsets_.clear();
+    horizontal_offset_ = 0;
+    return *found;
 }
 
 }  // namespace mcpp

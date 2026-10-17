@@ -38,13 +38,13 @@ printf '\033[14~\033[12~' >&3
 sleep 0.4
 printf '\033[12~' >&3
 sleep 0.4
-printf '\033[20~\r\r' >&3
+printf '\033[20~\r\033[A\r' >&3
 sleep 0.4
 printf '\030q\t\t' >&3
 sleep 0.4
 printf '\030q\t\030i' >&3
 sleep 0.4
-printf '\033' >&3
+printf '\030i' >&3
 sleep 0.4
 printf '\030c' >&3
 sleep 0.4
@@ -106,7 +106,9 @@ printf '\033[20~\033[D\r\r' >&3
 sleep 0.4
 printf '\t\030q' >&3
 sleep 0.4
-printf '\030q\033[21~' >&3
+printf '\030q' >&3
+sleep 0.4
+printf '\033[21~' >&3
 
 set +e
 wait "$runner"
@@ -126,7 +128,7 @@ for expected in \
     'line009-' \
     'Ascii' \
     'HxSrch' \
-    'File information' \
+    'Filesystem:' \
     'Octal permissions' \
     '> 0640' \
     'Hard link name' \

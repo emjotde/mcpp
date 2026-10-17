@@ -157,6 +157,8 @@ Config Config::load(const std::filesystem::path& path) {
             result.editor_show_whitespace = parse_bool(value);
         } else if (key == "bookmark") {
             result.bookmarks.push_back(decode_value(value));
+        } else if (key == "editor_history") {
+            result.editor_history.push_back(decode_value(value));
         }
     }
     return result;
@@ -193,6 +195,10 @@ void Config::save(const std::filesystem::path& path) const {
            << (editor_show_whitespace ? "true" : "false") << '\n';
     for (const auto& bookmark : bookmarks) {
         output << "bookmark=" << encode_value(bookmark) << '\n';
+    }
+    for (const auto& history_path : editor_history) {
+        output << "editor_history="
+               << encode_value(history_path) << '\n';
     }
     if (!output) {
         throw std::runtime_error("cannot serialize configuration");

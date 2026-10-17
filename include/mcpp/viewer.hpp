@@ -24,6 +24,7 @@ public:
         std::size_t viewport_width,
         std::size_t viewport_lines
     );
+    void scroll_columns(int amount);
     void toggle_hex();
     void set_wrap(bool value);
     [[nodiscard]] bool wrap() const noexcept;
@@ -32,6 +33,7 @@ public:
     [[nodiscard]] std::uint64_t size() const noexcept;
     [[nodiscard]] std::uint64_t offset() const noexcept;
     [[nodiscard]] std::uint64_t view_end() const noexcept;
+    [[nodiscard]] std::size_t horizontal_offset() const noexcept;
     [[nodiscard]] const std::string& path() const noexcept;
     [[nodiscard]] std::vector<std::string> lines(
         std::size_t width,
@@ -60,8 +62,12 @@ private:
     std::uint64_t window_offset_{0};
     std::string window_;
     std::vector<std::uint64_t> previous_offsets_;
+    std::size_t horizontal_offset_{0};
     bool hex_{false};
     bool wrap_{true};
+    std::string last_search_;
+    bool last_search_case_sensitive_{false};
+    std::uint64_t next_search_offset_{0};
 };
 
 }  // namespace mcpp

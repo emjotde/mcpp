@@ -20,8 +20,10 @@
 #include <cstring>
 #include <ctime>
 #include <functional>
+#include <fnmatch.h>
 #include <iomanip>
 #include <iostream>
+#include <iterator>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -56,6 +58,8 @@ enum class Mode {
     editor_replace_confirm,
     editor_close_dialog,
     editor_options_dialog,
+    editor_history,
+    editor_buffer_list,
     prompt,
     help,
     user_menu,
@@ -88,6 +92,8 @@ enum class PromptAction {
     chmod,
     chown,
     recursive_search,
+    panel_filter,
+    panelize_search,
 };
 
 std::string format_size(const std::uint64_t size) {
@@ -152,6 +158,18 @@ std::string display_text(const std::string_view value) {
         }
     }
     return result;
+}
+
+std::string lowercase_text(std::string value) {
+    std::transform(
+        value.begin(),
+        value.end(),
+        value.begin(),
+        [](const unsigned char character) {
+            return static_cast<char>(std::tolower(character));
+        }
+    );
+    return value;
 }
 
 void erase_last_utf8(std::string& value) {
@@ -410,6 +428,27 @@ std::string command_text(
     return "<" + value.substr(offset);
 }
 
+std::string middle_truncate(
+    const std::string& value,
+    const std::size_t width
+) {
+    if (value.size() <= width) {
+        return value;
+    }
+    if (width <= 3U) {
+        return value.substr(0, width);
+    }
+    auto left = (width - 1U) / 2U;
+    if (const auto separator = value.rfind('/', left);
+        separator != std::string::npos && separator > 0U) {
+        left = separator + 1U;
+    }
+    const auto right =
+        width > left + 1U ? width - left - 1U : 0U;
+    return value.substr(0, left) + "~" +
+           value.substr(value.size() - right);
+}
+
 std::string type_prefix(const Entry& entry) {
     switch (entry.kind) {
         case EntryKind::directory:
@@ -437,6 +476,21 @@ ftxui::Element gray_dialog(ftxui::Element element) {
     return std::move(element) |
            color(Color::Grey11) |
            bgcolor(Color::Grey82);
+}
+
+ftxui::Element mnemonic_label(
+    const std::string& label,
+    const std::size_t index
+) {
+    using namespace ftxui;
+    if (index >= label.size()) {
+        return text(label);
+    }
+    return hbox({
+        text(label.substr(0, index)),
+        text(label.substr(index, 1U)) | underlined | bold,
+        text(label.substr(index + 1U)),
+    });
 }
 
 ftxui::Element gray_menu(ftxui::Element element) {
@@ -540,6 +594,16 @@ struct MenuRow {
     int action{-1};
 };
 
+struct TreeNode {
+    std::string path;
+    std::size_t depth{0};
+    bool expanded{false};
+    bool loaded{false};
+    bool inaccessible{false};
+    bool has_children{false};
+    bool loading{false};
+};
+
 }  // namespace
 
 struct App::Impl {
@@ -561,9 +625,13 @@ struct App::Impl {
     Cancellation operation_cancellation;
     TransferProgress progress;
     ViewerModel viewer;
+    std::string viewer_search_needle;
     std::string viewer_message_title{"Viewer"};
     std::string viewer_message;
     EditorModel editor;
+    std::vector<EditorModel> editor_buffers;
+    std::vector<std::string> editor_history;
+    std::size_t editor_list_cursor{0};
     bool exit_after_editor{false};
     SyntaxHighlighter syntax_highlighter;
     bool editor_syntax{true};
@@ -620,6 +688,7 @@ struct App::Impl {
     ftxui::App* terminal{nullptr};
     std::jthread operation_thread;
     std::atomic_bool operation_running{false};
+    std::chrono::steady_clock::time_point operation_started{};
     std::mutex operation_mutex;
     std::string command_line;
     bool command_mode{false};
@@ -639,9 +708,22 @@ struct App::Impl {
     bool detailed_view{true};
     std::optional<int> quick_view_panel;
     bool quick_view_focused{false};
+    std::optional<int> information_panel;
+    bool information_panel_focused{false};
+    std::optional<int> tree_panel;
+    bool tree_panel_focused{false};
+    std::vector<TreeNode> tree_nodes;
+    std::size_t tree_cursor{0};
+    bool tree_search_mode{false};
+    std::string tree_search;
+    bool tree_dynamic{false};
     ViewerModel quick_viewer;
+    std::string quick_view_search_needle;
     std::string quick_view_path;
     ftxui::Box quick_view_box;
+    ftxui::Box information_panel_box;
+    ftxui::Box tree_panel_box;
+    std::vector<ftxui::Box> tree_row_boxes;
     std::chrono::steady_clock::time_point last_click{};
     int last_click_pane{-1};
     std::size_t last_click_index{
@@ -655,16 +737,31 @@ struct App::Impl {
     bool dialog_move{false};
     bool dialog_exact{false};
     std::string dialog_destination;
+    std::string dialog_source_mask{"*"};
     bool dialog_preserve_attributes{true};
     bool dialog_preserve_symlinks{true};
+    bool dialog_background{false};
     std::size_t dialog_focus{1};
     std::atomic_bool operation_paused{false};
     std::atomic_bool operation_skip{false};
     std::mutex operation_pause_mutex;
     std::condition_variable operation_pause_condition;
+    std::jthread traversal_thread;
+    std::atomic_bool traversal_running{false};
+    Cancellation traversal_cancellation;
+    std::jthread tree_thread;
+    std::atomic_bool tree_expansion_running{false};
+    Cancellation tree_expansion_cancellation;
     std::string operation_label{"File operation"};
     bool pending_move{false};
     bool pending_exact{false};
+    bool pending_background{false};
+    int rendered_width{0};
+    int rendered_height{0};
+    std::optional<Entry> tree_operation_source;
+    ProviderPtr tree_operation_source_provider;
+    ProviderPtr tree_operation_destination_provider;
+    int tree_operation_source_index{0};
     bool exiting{false};
 
     Impl(
@@ -691,6 +788,7 @@ struct App::Impl {
         editor_indent_width = config.editor_indent_width;
         editor_auto_indent = config.editor_auto_indent;
         editor_show_whitespace = config.editor_show_whitespace;
+        editor_history = config.editor_history;
     }
 
     Pane& active() {
@@ -753,10 +851,35 @@ struct App::Impl {
         right.refresh();
         quick_viewer.close();
         quick_view_path.clear();
+        if (tree_panel) {
+            const auto panel_index = *tree_panel;
+            auto& pane = panel_index == 0 ? left : right;
+            const auto selected =
+                tree_cursor < tree_nodes.size()
+                    ? tree_nodes[tree_cursor].path
+                    : pane.path();
+            std::size_t current_path = 0;
+            tree_nodes = build_tree_nodes(pane, current_path);
+            tree_cursor = current_path;
+            const auto match = std::find_if(
+                tree_nodes.begin(),
+                tree_nodes.end(),
+                [&](const TreeNode& node) {
+                    return node.path == selected;
+                }
+            );
+            if (match != tree_nodes.end()) {
+                tree_cursor = static_cast<std::size_t>(
+                    std::distance(tree_nodes.begin(), match)
+                );
+            }
+        }
     }
 
-    void close_quick_view() {
-        if (quick_view_panel && quick_view_focused) {
+    void close_quick_view(const bool restore_focus = true) {
+        if (restore_focus &&
+            quick_view_panel &&
+            quick_view_focused) {
             active_index = *quick_view_panel;
         }
         quick_view_panel.reset();
@@ -766,6 +889,13 @@ struct App::Impl {
     }
 
     void show_quick_view(const int panel_index) {
+        if (information_panel) {
+            information_panel.reset();
+            information_panel_focused = false;
+        }
+        tree_panel.reset();
+        tree_panel_focused = false;
+        tree_nodes.clear();
         quick_view_panel = panel_index;
         if (active_index == panel_index) {
             active_index = 1 - panel_index;
@@ -783,11 +913,401 @@ struct App::Impl {
         }
     }
 
+    void close_information_panel(
+        const bool restore_focus = true
+    ) {
+        if (restore_focus &&
+            information_panel &&
+            information_panel_focused) {
+            active_index = *information_panel;
+        }
+        information_panel.reset();
+        information_panel_focused = false;
+    }
+
+    void show_information_panel(const int panel_index) {
+        if (quick_view_panel) {
+            close_quick_view(false);
+        }
+        tree_panel.reset();
+        tree_panel_focused = false;
+        tree_nodes.clear();
+        information_panel = panel_index;
+        if (active_index == panel_index) {
+            active_index = 1 - panel_index;
+        }
+        information_panel_focused = false;
+    }
+
+    void toggle_information_panel() {
+        if (information_panel) {
+            close_information_panel();
+        } else {
+            show_information_panel(1 - active_index);
+        }
+    }
+
+    void close_tree_panel(const bool restore_focus = true) {
+        if (tree_expansion_running.load(
+                std::memory_order_acquire
+            )) {
+            tree_expansion_cancellation.request();
+        }
+        if (restore_focus && tree_panel && tree_panel_focused) {
+            active_index = *tree_panel;
+            auto& pane =
+                active_index == 0 ? left : right;
+            pane.move_cursor(
+                -static_cast<int>(pane.cursor())
+            );
+        }
+        tree_panel.reset();
+        tree_panel_focused = false;
+        tree_nodes.clear();
+        tree_row_boxes.clear();
+        tree_cursor = 0;
+        tree_search_mode = false;
+        tree_search.clear();
+    }
+
+    std::vector<TreeNode> tree_children(
+        Pane& pane,
+        const std::string& path,
+        const std::size_t depth
+    ) {
+        Cancellation traversal;
+        std::vector<TreeNode> children;
+        for (const auto& entry : pane.provider()->list(
+                 path,
+                 {
+                     .show_hidden = true,
+                     .directories_first = true,
+                 },
+                 traversal
+             )) {
+            if (entry.kind == EntryKind::directory) {
+                children.push_back({
+                    .path = entry.path,
+                    .depth = depth,
+                });
+            }
+        }
+        return children;
+    }
+
+    std::vector<TreeNode> build_tree_nodes(
+        Pane& pane,
+        std::size_t& selected
+    ) {
+        auto root = pane.path();
+        for (std::size_t guard = 0; guard < 1024U; ++guard) {
+            const auto parent = pane.provider()->parent(root);
+            if (parent == root) {
+                break;
+            }
+            root = parent;
+        }
+        std::vector<std::string> ancestry;
+        for (auto path = pane.path(); path != root;) {
+            ancestry.push_back(path);
+            const auto parent = pane.provider()->parent(path);
+            if (parent == path) {
+                break;
+            }
+            path = parent;
+        }
+        std::reverse(ancestry.begin(), ancestry.end());
+        std::vector<TreeNode> nodes{{
+            .path = root,
+            .depth = 0,
+            .expanded = !ancestry.empty(),
+            .loaded = !ancestry.empty(),
+            .has_children = !ancestry.empty(),
+        }};
+        std::size_t depth = 1U;
+        for (const auto& path : ancestry) {
+            const bool current = path == pane.path();
+            nodes.push_back({
+                .path = path,
+                .depth = depth++,
+                .expanded = !current,
+                .loaded = !current,
+                .has_children = !current,
+            });
+        }
+        selected = nodes.size() - 1U;
+        return nodes;
+    }
+
+    void expand_tree_node(const std::size_t index) {
+        if (!tree_panel || index >= tree_nodes.size()) {
+            return;
+        }
+        if (tree_nodes[index].expanded) {
+            const auto depth = tree_nodes[index].depth;
+            auto end = index + 1U;
+            while (end < tree_nodes.size() &&
+                   tree_nodes[end].depth > depth) {
+                ++end;
+            }
+            tree_nodes.erase(
+                tree_nodes.begin() +
+                    static_cast<std::ptrdiff_t>(index + 1U),
+                tree_nodes.begin() +
+                    static_cast<std::ptrdiff_t>(end)
+            );
+            tree_nodes[index].expanded = false;
+            return;
+        }
+        if (tree_nodes[index].loaded &&
+            !tree_nodes[index].has_children &&
+            !tree_nodes[index].inaccessible) {
+            status = "Tree branch has no children";
+            return;
+        }
+        if (tree_expansion_running.load(
+                std::memory_order_acquire
+            )) {
+            status = "Tree expansion already running";
+            return;
+        }
+        if (tree_thread.joinable()) {
+            tree_thread.join();
+        }
+        const auto panel_index = *tree_panel;
+        const auto provider =
+            (panel_index == 0 ? left : right).provider();
+        const auto path = tree_nodes[index].path;
+        const auto depth = tree_nodes[index].depth + 1U;
+        tree_nodes[index].loading = true;
+        tree_nodes[index].inaccessible = false;
+        tree_expansion_cancellation = Cancellation{};
+        tree_expansion_running.store(
+            true,
+            std::memory_order_release
+        );
+        status = "Expanding tree...";
+        try {
+            tree_thread = std::jthread([
+                this,
+                provider,
+                path,
+                depth,
+                panel_index
+            ] {
+                try {
+                    std::vector<TreeNode> children;
+                    for (const auto& entry : provider->list(
+                             path,
+                             {
+                                 .show_hidden = true,
+                                 .directories_first = true,
+                             },
+                             tree_expansion_cancellation
+                         )) {
+                        if (entry.kind == EntryKind::directory) {
+                            children.push_back({
+                                .path = entry.path,
+                                .depth = depth,
+                            });
+                        }
+                    }
+                    post_ui([
+                        this,
+                        children = std::move(children),
+                        path,
+                        panel_index
+                    ]() mutable {
+                        tree_expansion_running.store(
+                            false,
+                            std::memory_order_release
+                        );
+                        if (!tree_panel ||
+                            *tree_panel != panel_index) {
+                            return;
+                        }
+                        const auto match = std::find_if(
+                            tree_nodes.begin(),
+                            tree_nodes.end(),
+                            [&](const TreeNode& node) {
+                                return node.path == path;
+                            }
+                        );
+                        if (match == tree_nodes.end() ||
+                            !match->loading) {
+                            return;
+                        }
+                        const auto node_index =
+                            static_cast<std::size_t>(
+                                std::distance(
+                                    tree_nodes.begin(),
+                                    match
+                                )
+                            );
+                        auto& node = tree_nodes[node_index];
+                        node.loaded = true;
+                        node.inaccessible = false;
+                        node.loading = false;
+                        node.has_children = !children.empty();
+                        node.expanded = !children.empty();
+                        tree_nodes.insert(
+                            tree_nodes.begin() +
+                                static_cast<std::ptrdiff_t>(
+                                    node_index + 1U
+                                ),
+                            std::make_move_iterator(children.begin()),
+                            std::make_move_iterator(children.end())
+                        );
+                        status = "Ready";
+                    });
+                } catch (const OperationCancelled&) {
+                    post_ui([this] {
+                        tree_expansion_running.store(
+                            false,
+                            std::memory_order_release
+                        );
+                    });
+                } catch (const std::exception& error) {
+                    const auto message = std::string(error.what());
+                    post_ui([this, path, panel_index, message] {
+                        tree_expansion_running.store(
+                            false,
+                            std::memory_order_release
+                        );
+                        if (!tree_panel ||
+                            *tree_panel != panel_index) {
+                            return;
+                        }
+                        const auto match = std::find_if(
+                            tree_nodes.begin(),
+                            tree_nodes.end(),
+                            [&](const TreeNode& node) {
+                                return node.path == path;
+                            }
+                        );
+                        if (match != tree_nodes.end()) {
+                            match->loaded = true;
+                            match->inaccessible = true;
+                            match->expanded = false;
+                            match->loading = false;
+                        }
+                        status = "Tree: " + message;
+                    });
+                }
+            });
+        } catch (...) {
+            tree_expansion_running.store(
+                false,
+                std::memory_order_release
+            );
+            tree_nodes[index].loading = false;
+            throw;
+        }
+    }
+
+    void show_tree_panel(const int panel_index) {
+        auto& pane = panel_index == 0 ? left : right;
+        std::size_t selected = 0;
+        auto nodes = build_tree_nodes(pane, selected);
+        const bool was_active = active_index == panel_index;
+        if (quick_view_panel) {
+            close_quick_view(false);
+        }
+        if (information_panel) {
+            close_information_panel(false);
+        }
+        tree_nodes = std::move(nodes);
+        tree_cursor = selected;
+        tree_panel = panel_index;
+        if (was_active) {
+            active_index = 1 - panel_index;
+        }
+        tree_panel_focused = false;
+    }
+
+    std::vector<Entry> current_operation_sources() const {
+        if (tree_operation_source) {
+            return {*tree_operation_source};
+        }
+        return active_index == 0
+                   ? left.selected_entries()
+                   : right.selected_entries();
+    }
+
+    void clear_tree_operation_context() {
+        tree_operation_source.reset();
+        tree_operation_source_provider.reset();
+        tree_operation_destination_provider.reset();
+    }
+
+    bool prepare_tree_operation(
+        const bool move_operation,
+        const bool remove_operation
+    ) {
+        if (!tree_panel || tree_cursor >= tree_nodes.size()) {
+            return false;
+        }
+        if (tree_cursor == 0U) {
+            status = "Cannot operate on the tree root";
+            return false;
+        }
+        const auto panel_index = *tree_panel;
+        auto& pane = panel_index == 0 ? left : right;
+        tree_operation_source = pane.provider()->stat(
+            tree_nodes[tree_cursor].path,
+            {}
+        );
+        tree_operation_source_provider = pane.provider();
+        tree_operation_destination_provider = active().provider();
+        tree_operation_source_index = panel_index;
+        if (remove_operation) {
+            dialog_focus = 0;
+            mode = Mode::delete_dialog;
+            return true;
+        }
+        dialog_move = move_operation;
+        dialog_exact = move_operation;
+        dialog_destination =
+            move_operation
+                ? active().provider()->join(
+                      active().path(),
+                      tree_operation_source->name
+                  )
+                : active().path();
+        dialog_source_mask = "*";
+        dialog_preserve_attributes = true;
+        dialog_preserve_symlinks = true;
+        dialog_background = false;
+        dialog_focus = 0;
+        mode = Mode::operation_dialog;
+        return true;
+    }
+
+    void sync_dynamic_tree() {
+        if (!tree_dynamic ||
+            tree_cursor >= tree_nodes.size()) {
+            return;
+        }
+        try {
+            active().change_directory(
+                tree_nodes[tree_cursor].path
+            );
+        } catch (const std::exception& error) {
+            set_error(error);
+        }
+    }
+
     void swap_panels() {
         std::swap(left, right);
         active_index = 1 - active_index;
         if (quick_view_panel) {
             quick_view_panel = 1 - *quick_view_panel;
+        }
+        if (information_panel) {
+            information_panel = 1 - *information_panel;
+        }
+        if (tree_panel) {
+            tree_panel = 1 - *tree_panel;
         }
     }
 
@@ -807,6 +1327,7 @@ struct App::Impl {
         config.editor_indent_width = editor_indent_width;
         config.editor_auto_indent = editor_auto_indent;
         config.editor_show_whitespace = editor_show_whitespace;
+        config.editor_history = editor_history;
     }
 
     void set_error(const std::exception& error) {
@@ -825,6 +1346,142 @@ struct App::Impl {
             task();
             app->RequestAnimationFrame();
         });
+    }
+
+    void start_traversal(
+        std::string pattern,
+        const bool panelize
+    ) {
+        if (traversal_running.load(std::memory_order_acquire)) {
+            throw std::runtime_error(
+                "a recursive search is already running"
+            );
+        }
+        if (operation_running.load(std::memory_order_acquire)) {
+            throw std::runtime_error(
+                "cannot search during a file operation"
+            );
+        }
+        if (traversal_thread.joinable()) {
+            traversal_thread.join();
+        }
+        const auto panel_index = active_index;
+        const auto provider = active().provider();
+        const auto root = active().path();
+        const auto include_hidden = active().show_hidden();
+        traversal_cancellation = Cancellation{};
+        traversal_running.store(true, std::memory_order_release);
+        status = panelize ? "Panelizing..." : "Searching...";
+        try {
+            traversal_thread = std::jthread([
+                this,
+                pattern = std::move(pattern),
+                panelize,
+                panel_index,
+                provider,
+                root,
+                include_hidden
+            ] {
+                try {
+                    const SearchEngine search;
+                    auto entries = search.search(
+                        *provider,
+                        root,
+                        {
+                            .name_pattern =
+                                pattern.empty() ? "*" : pattern,
+                            .content = {},
+                            .case_sensitive = panelize,
+                            .recursive = true,
+                            .include_hidden = include_hidden,
+                        },
+                        traversal_cancellation,
+                        [this, panelize](
+                            const TransferProgress& value
+                        ) {
+                            if (value.files_done % 128U != 0U) {
+                                return;
+                            }
+                            post_ui([this, panelize, value] {
+                                status =
+                                    (
+                                        panelize
+                                            ? "Panelizing "
+                                            : "Searching "
+                                    ) +
+                                    std::to_string(value.files_done) +
+                                    " entries";
+                            });
+                        }
+                    );
+                    post_ui([
+                        this,
+                        entries = std::move(entries),
+                        panelize,
+                        panel_index,
+                        root
+                    ]() mutable {
+                        traversal_running.store(
+                            false,
+                            std::memory_order_release
+                        );
+                        if (panelize) {
+                            auto& pane =
+                                panel_index == 0 ? left : right;
+                            if (pane.path() != root) {
+                                status =
+                                    "Panelize results discarded: "
+                                    "panel directory changed";
+                                return;
+                            }
+                            const auto count = entries.size();
+                            pane.set_panelized(std::move(entries));
+                            status =
+                                std::to_string(count) +
+                                " panelized result(s)";
+                        } else {
+                            search_results = std::move(entries);
+                            search_cursor = 0;
+                            if (mode == Mode::panels) {
+                                mode = Mode::search_results;
+                            }
+                            status =
+                                std::to_string(
+                                    search_results.size()
+                                ) +
+                                (
+                                    mode == Mode::search_results
+                                        ? " search result(s)"
+                                        : " search result(s) ready"
+                                );
+                        }
+                    });
+                } catch (const OperationCancelled&) {
+                    post_ui([this] {
+                        traversal_running.store(
+                            false,
+                            std::memory_order_release
+                        );
+                        status = "Search cancelled";
+                    });
+                } catch (const std::exception& error) {
+                    const auto message = std::string(error.what());
+                    post_ui([this, message] {
+                        traversal_running.store(
+                            false,
+                            std::memory_order_release
+                        );
+                        status = "Search error: " + message;
+                    });
+                }
+            });
+        } catch (...) {
+            traversal_running.store(
+                false,
+                std::memory_order_release
+            );
+            throw;
+        }
     }
 
     void request_operation_cancel() {
@@ -872,6 +1529,7 @@ struct App::Impl {
     ) {
         mode = Mode::panels;
         operation_running.store(false, std::memory_order_release);
+        clear_tree_operation_context();
         try {
             if (clear_selection) {
                 (*clear_selection == 0 ? left : right)
@@ -902,6 +1560,7 @@ struct App::Impl {
         const bool move_operation,
         const bool exact
     ) {
+        clear_tree_operation_context();
         const auto sources = active().selected_entries();
         if (sources.empty()) {
             throw std::runtime_error("no source selected");
@@ -917,6 +1576,8 @@ struct App::Impl {
                 : passive().path();
         dialog_preserve_attributes = true;
         dialog_preserve_symlinks = true;
+        dialog_background = false;
+        dialog_source_mask = "*";
         dialog_focus = 0;
         mode = Mode::operation_dialog;
     }
@@ -926,11 +1587,16 @@ struct App::Impl {
             throw std::runtime_error("destination is empty");
         }
         if (dialog_exact) {
+            const auto destination_provider =
+                tree_operation_source
+                    ? tree_operation_destination_provider
+                    : passive().provider();
             if (config.confirm_overwrite &&
-                passive().provider()->exists(dialog_destination)) {
+                destination_provider->exists(dialog_destination)) {
                 pending_destination = dialog_destination;
                 pending_move = dialog_move;
                 pending_exact = true;
+                pending_background = dialog_background;
                 dialog_focus = 0;
                 mode = Mode::conflict_dialog;
                 return;
@@ -941,6 +1607,11 @@ struct App::Impl {
                 !config.confirm_overwrite,
                 true
             );
+            if (dialog_background) {
+                mode = Mode::panels;
+                status =
+                    operation_label + " running in background";
+            }
             return;
         }
         if (config.confirm_overwrite &&
@@ -948,6 +1619,7 @@ struct App::Impl {
             pending_destination = dialog_destination;
             pending_move = dialog_move;
             pending_exact = false;
+            pending_background = dialog_background;
             dialog_focus = 0;
             mode = Mode::conflict_dialog;
             return;
@@ -957,9 +1629,14 @@ struct App::Impl {
             dialog_destination,
             !config.confirm_overwrite
         );
+        if (dialog_background) {
+            mode = Mode::panels;
+            status = operation_label + " running in background";
+        }
     }
 
     void start_delete_dialog() {
+        clear_tree_operation_context();
         if (active().selected_entries().empty()) {
             throw std::runtime_error("no source selected");
         }
@@ -976,18 +1653,44 @@ struct App::Impl {
         if (operation_running.load(std::memory_order_acquire)) {
             throw std::runtime_error("an operation is already running");
         }
-        const auto sources = active().selected_entries();
+        if (traversal_running.load(std::memory_order_acquire)) {
+            throw std::runtime_error(
+                "cannot start an operation while search is running"
+            );
+        }
+        auto sources = current_operation_sources();
+        std::erase_if(
+            sources,
+            [&](const Entry& entry) {
+                return fnmatch(
+                           dialog_source_mask.c_str(),
+                           entry.name.c_str(),
+                           0
+                       ) != 0;
+            }
+        );
         if (sources.empty()) {
-            throw std::runtime_error("no source selected");
+            throw std::runtime_error(
+                "source mask matches no selected entries"
+            );
         }
         if (operation_thread.joinable()) {
             operation_thread.join();
         }
         operation_cancellation = Cancellation{};
         progress = {};
-        const auto source_provider = active().provider();
-        const auto destination_provider = passive().provider();
-        const auto source_index = active_index;
+        const auto source_provider =
+            tree_operation_source
+                ? tree_operation_source_provider
+                : active().provider();
+        const auto destination_provider =
+            tree_operation_source
+                ? tree_operation_destination_provider
+                : passive().provider();
+        const auto source_index =
+            tree_operation_source
+                ? tree_operation_source_index
+                : active_index;
         const OperationOptions options{
             .overwrite = overwrite,
             .preserve_permissions = dialog_preserve_attributes,
@@ -1000,6 +1703,7 @@ struct App::Impl {
                 },
         };
         operation_running.store(true, std::memory_order_release);
+        operation_started = std::chrono::steady_clock::now();
         operation_paused.store(false, std::memory_order_release);
         operation_skip.store(false, std::memory_order_release);
         mode = Mode::operation_progress;
@@ -1138,13 +1842,24 @@ struct App::Impl {
     }
 
     bool has_collision(const std::string& destination) {
-        const auto sources = active().selected_entries();
+        const auto sources = current_operation_sources();
+        const auto provider =
+            tree_operation_source
+                ? tree_operation_destination_provider
+                : passive().provider();
         return std::any_of(
             sources.begin(),
             sources.end(),
             [&](const Entry& entry) {
-                return passive().provider()->exists(
-                    passive().provider()->join(
+                if (fnmatch(
+                        dialog_source_mask.c_str(),
+                        entry.name.c_str(),
+                        0
+                    ) != 0) {
+                    return false;
+                }
+                return provider->exists(
+                    provider->join(
                         destination,
                         entry.name
                     )
@@ -1157,18 +1872,30 @@ struct App::Impl {
         if (operation_running.load(std::memory_order_acquire)) {
             throw std::runtime_error("an operation is already running");
         }
-        const auto entries = active().selected_entries();
+        if (traversal_running.load(std::memory_order_acquire)) {
+            throw std::runtime_error(
+                "cannot delete while search is running"
+            );
+        }
+        const auto entries = current_operation_sources();
         if (entries.empty()) {
             throw std::runtime_error("no source selected");
         }
         if (operation_thread.joinable()) {
             operation_thread.join();
         }
-        const auto provider = active().provider();
-        const auto source_index = active_index;
+        const auto provider =
+            tree_operation_source
+                ? tree_operation_source_provider
+                : active().provider();
+        const auto source_index =
+            tree_operation_source
+                ? tree_operation_source_index
+                : active_index;
         operation_cancellation = Cancellation{};
         progress = {};
         operation_running.store(true, std::memory_order_release);
+        operation_started = std::chrono::steady_clock::now();
         operation_paused.store(false, std::memory_order_release);
         operation_skip.store(false, std::memory_order_release);
         mode = Mode::operation_progress;
@@ -1248,6 +1975,11 @@ struct App::Impl {
         if (operation_running.load(std::memory_order_acquire)) {
             throw std::runtime_error(
                 "cannot launch a command while a file operation is running"
+            );
+        }
+        if (traversal_running.load(std::memory_order_acquire)) {
+            throw std::runtime_error(
+                "cannot launch a command while search is running"
             );
         }
         int child_status = 0;
@@ -1346,32 +2078,21 @@ struct App::Impl {
                     status = "Directory created";
                     break;
                 case PromptAction::recursive_search: {
-                    const SearchEngine search;
-                    search_results = search.search(
-                        *active().provider(),
-                        active().path(),
-                        {
-                            .name_pattern =
-                                prompt_value.empty()
-                                    ? "*"
-                                    : prompt_value,
-                            .content = {},
-                            .case_sensitive = false,
-                            .recursive = true,
-                            .include_hidden = active().show_hidden(),
-                        },
-                        operation_cancellation
-                    );
-                    search_cursor = 0;
-                    mode = Mode::search_results;
-                    status =
-                        std::to_string(search_results.size()) +
-                        " search result(s)";
-                    prompt_action = PromptAction::none;
-                    prompt_value.clear();
-                    return;
+                    start_traversal(prompt_value, false);
+                    break;
+                }
+                case PromptAction::panel_filter:
+                    active().set_filter(prompt_value);
+                    status = prompt_value.empty()
+                                 ? "Panel filter cleared"
+                                 : "Panel filter: " + prompt_value;
+                    break;
+                case PromptAction::panelize_search: {
+                    start_traversal(prompt_value, true);
+                    break;
                 }
                 case PromptAction::viewer_find:
+                    viewer_search_needle = prompt_value;
                     if (viewer.find(prompt_value, false)) {
                         status = "Match found";
                     } else {
@@ -1384,6 +2105,7 @@ struct App::Impl {
                     }
                     break;
                 case PromptAction::quick_viewer_find:
+                    quick_view_search_needle = prompt_value;
                     status = quick_viewer.find(prompt_value, false)
                                  ? "Match found"
                                  : "Search string not found";
@@ -1398,11 +2120,6 @@ struct App::Impl {
                     break;
                 case PromptAction::editor_open:
                 case PromptAction::editor_new: {
-                    if (editor.dirty()) {
-                        throw std::runtime_error(
-                            "save or discard current changes first"
-                        );
-                    }
                     auto path = std::filesystem::path(prompt_value);
                     if (path.is_relative()) {
                         path =
@@ -1410,17 +2127,12 @@ struct App::Impl {
                                 .parent_path() /
                             path;
                     }
-                    if (prompt_action == PromptAction::editor_open) {
-                        editor.open(
-                            active().provider(),
-                            path.string()
-                        );
-                    } else {
-                        editor.create(
-                            active().provider(),
-                            path.string()
-                        );
-                    }
+                    open_editor_buffer(
+                        active().provider(),
+                        path.string(),
+                        prompt_action ==
+                            PromptAction::editor_new
+                    );
                     status =
                         prompt_action == PromptAction::editor_open
                             ? "File opened"
@@ -1430,6 +2142,7 @@ struct App::Impl {
                 case PromptAction::editor_save_as:
                     if (!prompt_value.empty()) {
                         editor.save_as(prompt_value, false);
+                        remember_editor_path(editor.path());
                         status = "Saved as " + editor.path();
                     }
                     break;
@@ -1466,11 +2179,25 @@ struct App::Impl {
                             destination
                         );
                     } else {
+                        auto target = entry->path;
+                        if (prompt_action ==
+                            PromptAction::relative_symlink) {
+                            const auto relative =
+                                std::filesystem::path(entry->path)
+                                    .lexically_relative(
+                                        std::filesystem::path(
+                                            destination
+                                        ).parent_path()
+                                    );
+                            if (relative.empty()) {
+                                throw std::runtime_error(
+                                    "cannot form relative link target"
+                                );
+                            }
+                            target = relative.string();
+                        }
                         active().provider()->create_symlink(
-                            prompt_action ==
-                                    PromptAction::relative_symlink
-                                ? entry->name
-                                : entry->path,
+                            target,
                             destination
                         );
                     }
@@ -1640,7 +2367,7 @@ struct App::Impl {
             );
         }
         const auto* current = pane.current();
-        const auto info =
+        auto info =
             current == nullptr
                 ? std::string{}
                 : inner_width < 50
@@ -1651,6 +2378,12 @@ struct App::Impl {
                             format_size(current->size) +
                             "  " + current->owner + ":" +
                             current->group;
+        if (pane.marked_count() > 0U) {
+            info =
+                std::to_string(pane.marked_count()) +
+                " selected, " +
+                format_size(pane.marked_size());
+        }
         std::string available;
         try {
             const auto disk = pane.provider()->space(pane.path());
@@ -1667,7 +2400,8 @@ struct App::Impl {
         } catch (...) {
         }
         auto title = text(" " + truncate_text(
-            pane.path(),
+            pane.path() +
+                (pane.panelized() ? " [panelized]" : ""),
             static_cast<std::size_t>(
                 std::max(1, panel_width_value - 8)
             )
@@ -2235,9 +2969,15 @@ struct App::Impl {
             "File     ", "Edit     ", "Search     ", "Command     ",
             "Format     ", "Window     ", "Options"
         };
+        static constexpr std::array<std::size_t, 7> mnemonic_indices{
+            0, 0, 0, 0, 3, 0, 0
+        };
         Elements menu;
         for (std::size_t index = 0; index < menu_names.size(); ++index) {
-            auto item = text(menu_names[index]);
+            auto item = mnemonic_label(
+                menu_names[index],
+                mnemonic_indices[index]
+            );
             if (index == editor_menu_category) {
                 item = item |
                        color(Color::Grey100) |
@@ -2260,20 +3000,26 @@ struct App::Impl {
             << character
             << " U+" << std::uppercase << std::hex
             << std::setw(4) << character << std::dec;
+        const auto block_flag =
+            editor.selection().has_value()
+               ? editor.column_selection() ? 'C' : 'B'
+               : '-';
+        const std::string editor_flags{
+            ' ',
+            '[',
+            block_flag,
+            editor.dirty() ? 'M' : '-',
+            '-',
+            editor.overwrite() ? 'O' : '-',
+            ']',
+            ' ',
+        };
         auto header =
             mode == Mode::editor_menu
                 ? hbox(std::move(menu))
                 : hbox({
                       text(display_text(editor.path())) | bold | flex,
-                      text(
-                          editor.dirty()
-                              ? editor.overwrite()
-                                    ? " [-M-O] "
-                                    : " [-M--] "
-                              : editor.overwrite()
-                                    ? " [---O] "
-                                    : " [----] "
-                      ),
+                      text(editor_flags),
                       text(editor_status.str()),
                   });
         header = gray_menu(std::move(header));
@@ -2331,7 +3077,7 @@ struct App::Impl {
                 {"Open file...", 0},
                 {"New  C-n", 1},
                 {"Close", 2},
-                {"History...  M-E", -1},
+                {"History...  M-E", 5},
                 {"", -2},
                 {"Save  F2", 3},
                 {"Save as...  F12", 4},
@@ -2415,9 +3161,9 @@ struct App::Impl {
                 {"Resize window", -1},
                 {"Toggle fullscreen", -1},
                 {"", -2},
-                {"Next buffer", -1},
-                {"Previous buffer", -1},
-                {"Buffer list...", -1},
+                {"Next buffer", 0},
+                {"Previous buffer", 1},
+                {"Buffer list...", 2},
             },
             {
                 {"General...", 0},
@@ -2725,6 +3471,61 @@ struct App::Impl {
                size(WIDTH, EQUAL, 52);
     }
 
+    ftxui::Element render_editor_list(const bool history) const {
+        using namespace ftxui;
+        Elements rows;
+        if (history) {
+            for (std::size_t index = 0;
+                 index < editor_history.size();
+                 ++index) {
+                auto row = text(
+                    std::to_string(index + 1U) + " " +
+                    display_text(editor_history[index])
+                );
+                if (index == editor_list_cursor) {
+                    row = row | inverted | focus;
+                }
+                rows.push_back(std::move(row));
+            }
+        } else {
+            std::vector<std::string> paths{editor.path()};
+            for (const auto& buffer : editor_buffers) {
+                paths.push_back(buffer.path());
+            }
+            for (std::size_t index = 0;
+                 index < paths.size();
+                 ++index) {
+                auto row = text(
+                    (
+                        index == 0U ? "* " : "  "
+                    ) +
+                    display_text(paths[index])
+                );
+                if (index == editor_list_cursor) {
+                    row = row | inverted | focus;
+                }
+                rows.push_back(std::move(row));
+            }
+        }
+        if (rows.empty()) {
+            rows.push_back(text("<empty>") | dim);
+        }
+        return vbox({
+                   text(
+                       history ? "Editor history" : "Buffer list"
+                   ) |
+                       bold |
+                       center,
+                   separator(),
+                   vbox(std::move(rows)) | yframe | flex,
+                   separator(),
+                   text("Enter selects; Esc closes") | center,
+               }) |
+               borderStyled(LIGHT) |
+               size(WIDTH, EQUAL, 72) |
+               size(HEIGHT, LESS_THAN, 20);
+    }
+
     ftxui::Element render_editor_replace_confirm() const {
         using namespace ftxui;
         const auto button = [&](const std::string& label,
@@ -2812,17 +3613,17 @@ struct App::Impl {
                 {"File listing", 12},
                 {"Quick view         C-x q", 10},
                 {"Info               C-x i", 11},
-                {"Tree", -1},
+                {"Tree", 14},
                 {"", -2},
                 {"Listing format...", -1},
                 {"Sort order...", -1},
-                {"Filter...", -1},
+                {"Filter...", 13},
                 {"Encoding...        M-e", -1},
                 {"", -2},
                 {"FTP link...", -1},
                 {"Shell link...", -1},
                 {"SFTP link...", -1},
-                {"Panelize", -1},
+                {"Panelize", 15},
                 {"", -2},
                 {"Rescan             C-r", 7},
             },
@@ -2859,7 +3660,7 @@ struct App::Impl {
                 {"Switch panels on/off          C-o", 3},
                 {"Compare directories           C-x d", 1},
                 {"Compare files                 C-x C-d", -1},
-                {"External panelize             C-x !", -1},
+                {"External panelize             C-x !", 9},
                 {"Show directory sizes          C-Space", -1},
                 {"", -2},
                 {"Command history               M-h", -1},
@@ -2891,17 +3692,17 @@ struct App::Impl {
                 {"File listing", 12},
                 {"Quick view         C-x q", 10},
                 {"Info               C-x i", 11},
-                {"Tree", -1},
+                {"Tree", 14},
                 {"", -2},
                 {"Listing format...", -1},
                 {"Sort order...", -1},
-                {"Filter...", -1},
+                {"Filter...", 13},
                 {"Encoding...        M-e", -1},
                 {"", -2},
                 {"FTP link...", -1},
                 {"Shell link...", -1},
                 {"SFTP link...", -1},
-                {"Panelize", -1},
+                {"Panelize", 15},
                 {"", -2},
                 {"Rescan             C-r", 7},
             },
@@ -2964,15 +3765,55 @@ struct App::Impl {
                 mode = Mode::panels;
                 return;
             }
+            if (action == 11) {
+                show_information_panel(panel_index);
+                mode = Mode::panels;
+                return;
+            }
+            if (action == 14) {
+                show_tree_panel(panel_index);
+                mode = Mode::panels;
+                return;
+            }
+            if (action == 15) {
+                if (quick_view_panel == panel_index) {
+                    close_quick_view(false);
+                }
+                if (information_panel == panel_index) {
+                    close_information_panel(false);
+                }
+                if (tree_panel == panel_index) {
+                    close_tree_panel(false);
+                }
+                active_index = panel_index;
+                start_prompt(
+                    PromptAction::panelize_search,
+                    "Panelize name pattern",
+                    "*"
+                );
+                return;
+            }
             if (action == 12) {
                 if (quick_view_panel == panel_index) {
                     close_quick_view();
+                }
+                if (information_panel == panel_index) {
+                    close_information_panel();
+                }
+                if (tree_panel == panel_index) {
+                    close_tree_panel();
                 }
                 mode = Mode::panels;
                 return;
             }
             if (quick_view_panel == panel_index) {
                 close_quick_view();
+            }
+            if (information_panel == panel_index) {
+                close_information_panel();
+            }
+            if (tree_panel == panel_index) {
+                close_tree_panel();
             }
             active_index = panel_index;
             switch (action) {
@@ -3009,8 +3850,12 @@ struct App::Impl {
                 case 9:
                     sort_active(SortField::extension);
                     break;
-                case 11:
-                    mode = Mode::information;
+                case 13:
+                    start_prompt(
+                        PromptAction::panel_filter,
+                        "Panel filter",
+                        active().filter()
+                    );
                     return;
                 default:
                     break;
@@ -3025,6 +3870,7 @@ struct App::Impl {
                     if (entry != nullptr &&
                         can_open_file(*entry)) {
                         viewer.open(active().provider(), entry->path);
+                        viewer_search_needle.clear();
                         mode = Mode::viewer;
                         return;
                     }
@@ -3032,7 +3878,11 @@ struct App::Impl {
                 case 1:
                     if (entry != nullptr &&
                         can_open_file(*entry)) {
-                        editor.open(active().provider(), entry->path);
+                        open_editor_buffer(
+                            active().provider(),
+                            entry->path,
+                            false
+                        );
                         mode = Mode::editor;
                         return;
                     }
@@ -3160,13 +4010,14 @@ struct App::Impl {
                     return;
                 case 1: {
                     const DirectoryComparator comparator;
+                    Cancellation comparison;
                     const auto differences = comparator.compare(
                         *left.provider(),
                         left.path(),
                         *right.provider(),
                         right.path(),
                         false,
-                        operation_cancellation
+                        comparison
                     );
                     std::vector<std::string> left_marks;
                     std::vector<std::string> right_marks;
@@ -3223,6 +4074,13 @@ struct App::Impl {
                     return;
                 case 8:
                     mode = Mode::user_menu;
+                    return;
+                case 9:
+                    start_prompt(
+                        PromptAction::panelize_search,
+                        "Panelize name pattern",
+                        "*"
+                    );
                     return;
                 default:
                     break;
@@ -3336,9 +4194,7 @@ struct App::Impl {
 
     ftxui::Element render_operation_dialog() const {
         using namespace ftxui;
-        const auto sources = active_index == 0
-                                 ? left.selected_entries()
-                                 : right.selected_entries();
+        const auto sources = current_operation_sources();
         const auto focused = [&](Element element, const std::size_t index) {
             return dialog_focus == index
                        ? element | inverted | focus
@@ -3365,6 +4221,11 @@ struct App::Impl {
                        text("> " + display_text(dialog_destination)),
                        0
                    ),
+                   text("Source mask:"),
+                   focused(
+                       text("> " + display_text(dialog_source_mask)),
+                       1
+                   ),
                    separator(),
                    focused(
                        text(
@@ -3374,7 +4235,7 @@ struct App::Impl {
                                    : "[ ] "
                            ) + "Preserve permissions"
                        ),
-                       1
+                       2
                    ),
                    focused(
                        text(
@@ -3384,13 +4245,21 @@ struct App::Impl {
                                    : "[ ] "
                            ) + "Preserve symbolic links"
                        ),
-                       2
+                       3
+                   ),
+                   focused(
+                       text(
+                           std::string(
+                               dialog_background ? "[x] " : "[ ] "
+                           ) + "Run in background"
+                       ),
+                       4
                    ),
                    separator(),
                    hbox({
-                       focused(text(" [ OK ] "), 3),
-                       text("  "),
-                       focused(text(" [ Cancel ] "), 4),
+                       focused(text(" [ OK ] "), 5),
+                       text(" "),
+                       focused(text(" [ Cancel ] "), 6),
                    }) | center,
                }) |
                borderStyled(LIGHT) | size(WIDTH, EQUAL, 68);
@@ -3398,9 +4267,7 @@ struct App::Impl {
 
     ftxui::Element render_delete_dialog() const {
         using namespace ftxui;
-        const auto entries = active_index == 0
-                                 ? left.selected_entries()
-                                 : right.selected_entries();
+        const auto entries = current_operation_sources();
         const auto focused = [&](Element element, const std::size_t index) {
             return dialog_focus == index
                        ? element | inverted | focus
@@ -3445,6 +4312,26 @@ struct App::Impl {
                 ? 0.0F
                 : static_cast<float>(current.files_done) /
                       static_cast<float>(current.files_total);
+        const auto elapsed = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - operation_started
+        ).count();
+        const auto bytes_per_second =
+            elapsed > 0.0
+                ? static_cast<std::uint64_t>(
+                      static_cast<double>(current.bytes_done) /
+                      elapsed
+                  )
+                : 0U;
+        std::string eta{"calculating"};
+        if (bytes_per_second > 0U &&
+            current.bytes_total >= current.bytes_done) {
+            const auto seconds =
+                (current.bytes_total - current.bytes_done) /
+                bytes_per_second;
+            eta =
+                std::to_string(seconds / 60U) + "m " +
+                std::to_string(seconds % 60U) + "s";
+        }
         return vbox({
                    text(
                        operation_label + " progress"
@@ -3467,12 +4354,24 @@ struct App::Impl {
                    gauge(std::clamp(file_ratio, 0.0F, 1.0F)) |
                        color(Color::Grey11) |
                        bgcolor(Color::Grey70),
-                   separator(),
                    text(
-                       operation_paused.load(std::memory_order_acquire)
-                           ? "Space Continue   S Skip   Esc Abort"
-                           : "Space Pause      S Skip   Esc Abort"
-                   ) | center,
+                       "Speed: " +
+                       format_size(bytes_per_second) +
+                       "/s   ETA: " + eta
+                   ),
+                   separator(),
+                   hbox({
+                       text(
+                           operation_paused.load(
+                               std::memory_order_acquire
+                           )
+                               ? " [ Continue ] "
+                               : " [ Pause ] "
+                       ) |
+                           inverted,
+                       text("  [ Skip ] ") | inverted,
+                       text("  [ Abort ] ") | inverted,
+                   }) | center,
                }) |
                borderStyled(LIGHT) | size(WIDTH, EQUAL, 72);
     }
@@ -3495,9 +4394,9 @@ struct App::Impl {
                    ),
                    separator(),
                    hbox({
-                       focused(text(" [ Overwrite ] "), 0),
+                       focused(text(" [ Overwrite all ] "), 0),
                        text(" "),
-                       focused(text(" [ Skip ] "), 1),
+                       focused(text(" [ Skip all ] "), 1),
                        text(" "),
                        focused(text(" [ Cancel ] "), 2),
                    }) | center,
@@ -3557,6 +4456,7 @@ struct App::Impl {
         if (entry->path != quick_view_path) {
             try {
                 quick_viewer.open(active().provider(), entry->path);
+                quick_view_search_needle.clear();
                 quick_view_path = entry->path;
             } catch (const std::exception& error) {
                 set_error(error);
@@ -3615,11 +4515,262 @@ struct App::Impl {
         );
     }
 
+    ftxui::Element render_information_panel(const int width) {
+        using namespace ftxui;
+        const auto* entry = active().current();
+        Elements rows;
+        rows.push_back(
+            text("Location: " + display_text(active().path()))
+        );
+        rows.push_back(separator());
+        if (entry == nullptr) {
+            rows.push_back(text("<no selected entry>") | dim);
+        } else {
+            const auto kind =
+                entry->kind == EntryKind::directory
+                    ? "directory"
+                    : entry->kind == EntryKind::file
+                          ? "file"
+                          : entry->kind == EntryKind::symlink
+                                ? "symbolic link"
+                                : "other";
+            rows.push_back(
+                text("Name: " + display_text(entry->name))
+            );
+            rows.push_back(
+                text("Type: " + std::string(kind))
+            );
+            rows.push_back(
+                text("Size: " + format_size(entry->size))
+            );
+            rows.push_back(
+                text("Mode: " + permission_text(*entry))
+            );
+            rows.push_back(
+                text(
+                    "Owner: " + entry->owner + ":" +
+                    entry->group
+                )
+            );
+            rows.push_back(
+                text(
+                    "Modified: " +
+                    format_time(entry->modified)
+                )
+            );
+            if (!entry->target.empty()) {
+                rows.push_back(
+                    text(
+                        "Target: " +
+                        display_text(entry->target)
+                    )
+                );
+            }
+        }
+        rows.push_back(separator());
+        try {
+            const auto space =
+                active().provider()->space(active().path());
+            rows.push_back(
+                text(
+                    "Filesystem: " +
+                    format_size(space.available) + " free / " +
+                    format_size(space.capacity)
+                )
+            );
+        } catch (const std::exception&) {
+            rows.push_back(text("Filesystem: unavailable") | dim);
+        }
+        auto title = text(" Info ");
+        title = information_panel_focused
+                    ? title | color(Color::Grey100) | bold
+                    : title | color(Color::Grey58);
+        return window(
+                   std::move(title),
+                   vbox(std::move(rows)),
+                   LIGHT
+               ) |
+               size(WIDTH, EQUAL, width) |
+               yflex |
+               reflect(information_panel_box);
+    }
+
+    ftxui::Element render_tree_panel(const int width) {
+        using namespace ftxui;
+        Elements rows;
+        tree_row_boxes.clear();
+        tree_row_boxes.resize(tree_nodes.size());
+        const auto visible_rows = panel_visible_rows();
+        const auto first =
+            tree_nodes.size() <= visible_rows
+                ? 0U
+                : std::min(
+                      tree_nodes.size() - visible_rows,
+                      tree_cursor > visible_rows / 2U
+                          ? tree_cursor - visible_rows / 2U
+                          : 0U
+                  );
+        const auto end = std::min(
+            tree_nodes.size(),
+            first + visible_rows
+        );
+        const auto is_last_sibling = [&](const std::size_t index) {
+            const auto depth = tree_nodes[index].depth;
+            for (auto next = index + 1U;
+                 next < tree_nodes.size();
+                 ++next) {
+                if (tree_nodes[next].depth < depth) {
+                    break;
+                }
+                if (tree_nodes[next].depth == depth) {
+                    return false;
+                }
+            }
+            return true;
+        };
+        for (std::size_t index = first;
+             index < end;
+             ++index) {
+            const auto& node = tree_nodes[index];
+            const auto name =
+                node.depth == 0U
+                    ? node.path
+                    : std::filesystem::path(node.path)
+                          .filename()
+                          .string();
+            std::string connector =
+                node.depth == 0U ? std::string{} : " ";
+            for (std::size_t depth = 1U;
+                 depth < node.depth;
+                 ++depth) {
+                auto ancestor = index;
+                while (ancestor > 0U) {
+                    --ancestor;
+                    if (tree_nodes[ancestor].depth == depth) {
+                        break;
+                    }
+                }
+                connector += is_last_sibling(ancestor)
+                                 ? "   "
+                                 : "│  ";
+            }
+            if (node.depth > 0U) {
+                connector +=
+                    is_last_sibling(index) ? "└─ " : "├─ ";
+            }
+            if (node.inaccessible) {
+                connector += "! ";
+            } else if (node.loading) {
+                connector += "… ";
+            }
+            const auto minimum_name_width =
+                std::min(12, std::max(1, string_width(name)));
+            const auto maximum_connector_width =
+                std::max(
+                    0,
+                    width - 2 - minimum_name_width
+                );
+            if (string_width(connector) >
+                maximum_connector_width) {
+                if (maximum_connector_width <= 1) {
+                    connector.clear();
+                } else {
+                    std::size_t offset = 0;
+                    while (offset < connector.size() &&
+                           string_width(
+                               connector.substr(offset)
+                           ) >= maximum_connector_width) {
+                        offset = next_utf8(connector, offset);
+                    }
+                    connector =
+                        "~" + connector.substr(offset);
+                }
+            }
+            const auto available_name_width =
+                static_cast<std::size_t>(
+                    std::max(
+                        1,
+                        width - 2 -
+                            std::max(
+                                0,
+                                string_width(connector)
+                            )
+                    )
+                );
+            auto row = text(
+                connector +
+                middle_truncate(
+                    display_text(name),
+                    available_name_width
+                )
+            );
+            if (index == tree_cursor) {
+                row = row | focus;
+                row = tree_panel_focused
+                          ? row | inverted
+                          : row | color(Color::Grey70);
+            }
+            rows.push_back(
+                std::move(row) | reflect(tree_row_boxes[index])
+            );
+        }
+        if (rows.empty()) {
+            rows.push_back(text("<empty tree>") | dim);
+        }
+        while (rows.size() < visible_rows) {
+            rows.push_back(text(""));
+        }
+        auto title_text = text(" Directory tree ");
+        title_text = tree_panel_focused
+                         ? title_text |
+                               color(Color::Grey100) |
+                               bold
+                         : title_text | color(Color::Grey58);
+        auto title = hbox({
+                         filler(),
+                         std::move(title_text),
+                         filler(),
+                     }) |
+                     size(WIDTH, EQUAL, std::max(1, width - 2));
+        return window(
+                   std::move(title),
+                   vbox({
+                       vbox(std::move(rows)) | flex,
+                       separator(),
+                       text(
+                           tree_cursor < tree_nodes.size()
+                               ? middle_truncate(
+                                     tree_nodes[tree_cursor].path,
+                                     static_cast<std::size_t>(
+                                         std::max(1, width - 2)
+                                     )
+                                 )
+                               : std::string{}
+                       ) |
+                           color(Color::Grey50),
+                   }),
+                   LIGHT
+               ) |
+               size(WIDTH, EQUAL, width) |
+               yflex |
+               reflect(tree_panel_box);
+    }
+
     ftxui::Element render() {
         using namespace ftxui;
         if (exiting) {
             return filler();
         }
+        const auto terminal_dimensions = Terminal::Size();
+        if (rendered_width != 0 &&
+            (
+                rendered_width != terminal_dimensions.dimx ||
+                rendered_height != terminal_dimensions.dimy
+            )) {
+            std::cout << "\033[H\033[2J" << std::flush;
+        }
+        rendered_width = terminal_dimensions.dimx;
+        rendered_height = terminal_dimensions.dimy;
         const bool editor_context =
             mode == Mode::editor ||
             mode == Mode::editor_menu ||
@@ -3630,6 +4781,8 @@ struct App::Impl {
             mode == Mode::editor_replace_confirm ||
             mode == Mode::editor_close_dialog ||
             mode == Mode::editor_options_dialog ||
+            mode == Mode::editor_history ||
+            mode == Mode::editor_buffer_list ||
             (
                 mode == Mode::prompt &&
                 mode_before_prompt == Mode::editor
@@ -3646,6 +4799,58 @@ struct App::Impl {
         const auto right_width = panel_width(1);
         if (editor_context || viewer_context) {
             body = emptyElement();
+        } else if (tree_panel) {
+            if (*tree_panel == 1) {
+                right_entry_boxes.clear();
+                body = hbox({
+                    render_pane(
+                        left,
+                        !tree_panel_focused,
+                        left_width,
+                        left_box,
+                        left_entry_boxes
+                    ),
+                    render_tree_panel(right_width),
+                });
+            } else {
+                left_entry_boxes.clear();
+                body = hbox({
+                    render_tree_panel(left_width),
+                    render_pane(
+                        right,
+                        !tree_panel_focused,
+                        right_width,
+                        right_box,
+                        right_entry_boxes
+                    ),
+                });
+            }
+        } else if (information_panel) {
+            if (*information_panel == 1) {
+                right_entry_boxes.clear();
+                body = hbox({
+                    render_pane(
+                        left,
+                        !information_panel_focused,
+                        left_width,
+                        left_box,
+                        left_entry_boxes
+                    ),
+                    render_information_panel(right_width),
+                });
+            } else {
+                left_entry_boxes.clear();
+                body = hbox({
+                    render_information_panel(left_width),
+                    render_pane(
+                        right,
+                        !information_panel_focused,
+                        right_width,
+                        right_box,
+                        right_entry_boxes
+                    ),
+                });
+            }
         } else if (quick_view_panel) {
             if (*quick_view_panel == 1) {
                 right_entry_boxes.clear();
@@ -3752,7 +4957,10 @@ struct App::Impl {
             hostname.data() + ":" + active().path() + "$";
         const auto hint =
             status == "Ready"
-                ? "Hint: Tab changes your current panel."
+                ? tree_panel && tree_panel_focused
+                      ? "Tree: Enter open/expand  Space toggle  "
+                        "+/- branch  Tab panel"
+                      : "Hint: Tab changes your current panel."
                 : status + progress_text;
         static const std::array<std::string, 5> menu_names{
             "  Left     ",
@@ -3761,9 +4969,15 @@ struct App::Impl {
             "Options     ",
             "Right "
         };
+        static constexpr std::array<std::size_t, 5> mnemonic_indices{
+            2, 0, 0, 0, 0
+        };
         Elements menu_elements;
         for (std::size_t index = 0; index < menu_names.size(); ++index) {
-            auto item = text(menu_names[index]);
+            auto item = mnemonic_label(
+                menu_names[index],
+                mnemonic_indices[index]
+            );
             if (mode == Mode::pulldown &&
                 index == pulldown_category) {
                 item = item |
@@ -3820,6 +5034,23 @@ struct App::Impl {
                 key("9", "PullDn"),
                 key("10", "Quit"),
             });
+        } else if (tree_panel && tree_panel_focused) {
+            Elements tree_keys{
+                text(" "),
+                key("1", "Help", false),
+                key("2", "Rescan"),
+                key("3", "Forget"),
+                key("4", tree_dynamic ? "Static" : "Dynamc"),
+                key("5", "Copy"),
+                key("6", "RenMov"),
+                key("7", "", false),
+                key("8", "Rmdir"),
+                key("9", "PullDn"),
+            };
+            if (Terminal::Size().dimx >= 80) {
+                tree_keys.push_back(key("10", "Quit"));
+            }
+            keybar = hbox(std::move(tree_keys));
         }
         auto document = vbox({
             gray_menu(hbox(std::move(menu_elements))),
@@ -3854,15 +5085,75 @@ struct App::Impl {
             });
         };
         if (mode == Mode::prompt) {
-            auto prompt_dialog = vbox({
-                              text(prompt_title) | bold,
-                              separator(),
-                              text("> " + prompt_value),
-                              separator(),
-                              text("Enter confirms; Esc cancels") | dim,
-                          }) |
+            Elements prompt_rows{
+                text(prompt_title) | bold | center,
+                separator(),
+            };
+            const auto* prompt_entry = active().current();
+            if (
+                prompt_action == PromptAction::chmod ||
+                prompt_action == PromptAction::chown ||
+                prompt_action == PromptAction::hardlink ||
+                prompt_action == PromptAction::symlink ||
+                prompt_action == PromptAction::relative_symlink ||
+                prompt_action == PromptAction::rename
+            ) {
+                prompt_rows.push_back(
+                    text(
+                        "Source: " +
+                        (
+                           prompt_entry == nullptr
+                               ? std::string{"<none>"}
+                               : display_text(prompt_entry->path)
+                        )
+                    )
+                );
+            }
+            if (prompt_action == PromptAction::chmod &&
+                prompt_entry != nullptr) {
+                prompt_rows.push_back(
+                    text(
+                        "Current: " +
+                        permission_text(*prompt_entry)
+                    )
+                );
+            }
+            const auto field_label =
+                prompt_action == PromptAction::chmod
+                    ? "Octal mode:"
+                    : prompt_action == PromptAction::chown
+                          ? "Owner:group:"
+                          : prompt_action == PromptAction::hardlink
+                               ? "Hard link name:"
+                               : (
+                                     prompt_action ==
+                                             PromptAction::symlink ||
+                                     prompt_action ==
+                                         PromptAction::relative_symlink
+                                 )
+                                     ? "Symbolic link name:"
+                                     : prompt_action ==
+                                               PromptAction::rename
+                                           ? "New name:"
+                                           : prompt_action ==
+                                                     PromptAction::mkdir
+                                                 ? "Directory name:"
+                                                 : "Value:";
+            prompt_rows.push_back(text(field_label));
+            prompt_rows.push_back(
+                text("> " + display_text(prompt_value)) |
+                inverted
+            );
+            prompt_rows.push_back(separator());
+            prompt_rows.push_back(
+                hbox({
+                    text(" [ OK ] ") | inverted,
+                    text("  [ Cancel ] "),
+                }) | center
+            );
+            auto prompt_dialog = vbox(std::move(prompt_rows)) |
                           borderStyled(LIGHT) |
-                          size(WIDTH, EQUAL, 56);
+                          size(WIDTH, EQUAL, 72);
             document = dbox({
                 document,
                 centered_modal(std::move(prompt_dialog)),
@@ -3904,6 +5195,16 @@ struct App::Impl {
             document = dbox({
                 document,
                 centered_modal(render_viewer_message()),
+            });
+        } else if (mode == Mode::editor_history) {
+            document = dbox({
+                document,
+                centered_modal(render_editor_list(true)),
+            });
+        } else if (mode == Mode::editor_buffer_list) {
+            document = dbox({
+                document,
+                centered_modal(render_editor_list(false)),
             });
         } else if (
             mode == Mode::editor_menu &&
@@ -4040,6 +5341,14 @@ struct App::Impl {
             viewer.scroll_lines(-1, viewport_width);
             return true;
         }
+        if (event == ftxui::Event::ArrowLeft) {
+            viewer.scroll_columns(-1);
+            return true;
+        }
+        if (event == ftxui::Event::ArrowRight) {
+            viewer.scroll_columns(1);
+            return true;
+        }
         if (event == ftxui::Event::PageDown) {
             viewer.page(1, viewport_width, viewport_lines);
             return true;
@@ -4058,7 +5367,28 @@ struct App::Impl {
         }
         if (event == ftxui::Event::F7 ||
             event == ftxui::Event::Character('/')) {
-            start_prompt(PromptAction::viewer_find, "Find in file");
+            start_prompt(
+                PromptAction::viewer_find,
+                "Find in file",
+                viewer_search_needle
+            );
+            return true;
+        }
+        if (event == ftxui::Event::Special("\x1B[31~") ||
+            event == ftxui::Event::Special("\x1B[18;2~")) {
+            if (viewer_search_needle.empty()) {
+                start_prompt(
+                    PromptAction::viewer_find,
+                    "Find in file"
+                );
+            } else if (!viewer.find(
+                           viewer_search_needle,
+                           false
+                       )) {
+                viewer_message_title = "Search";
+                viewer_message = "Search string not found";
+                mode = Mode::viewer_message;
+            }
             return true;
         }
         return false;
@@ -4124,9 +5454,73 @@ struct App::Impl {
         editor_search_change_id = editor.change_id();
     }
 
+    void reset_editor_view_state() {
+        editor_shift_marking = false;
+        editor_column_marking = false;
+        syntax_change_id =
+            std::numeric_limits<std::uint64_t>::max();
+        syntax_path.clear();
+        syntax_spans.clear();
+    }
+
+    void remember_editor_path(const std::string& path) {
+        if (path.empty()) {
+            return;
+        }
+        std::erase(editor_history, path);
+        editor_history.insert(editor_history.begin(), path);
+        if (editor_history.size() > 20U) {
+            editor_history.resize(20U);
+        }
+    }
+
+    void open_editor_buffer(
+        const ProviderPtr& provider,
+        const std::string& path,
+        const bool create
+    ) {
+        EditorModel next;
+        next.set_tab_width(editor.tab_width());
+        if (create) {
+            next.create(provider, path);
+        } else {
+            next.open(provider, path);
+        }
+        if (editor.open()) {
+            editor_buffers.push_back(std::move(editor));
+        }
+        editor = std::move(next);
+        remember_editor_path(editor.path());
+        reset_editor_view_state();
+    }
+
+    bool switch_editor_buffer(const bool forward) {
+        if (editor_buffers.empty()) {
+            status = "No other editor buffer";
+            return false;
+        }
+        if (forward) {
+            editor_buffers.push_back(std::move(editor));
+            editor = std::move(editor_buffers.front());
+            editor_buffers.erase(editor_buffers.begin());
+        } else {
+            editor_buffers.insert(
+                editor_buffers.begin(),
+                std::move(editor)
+            );
+            editor = std::move(editor_buffers.back());
+            editor_buffers.pop_back();
+        }
+        remember_editor_path(editor.path());
+        reset_editor_view_state();
+        status = "Buffer: " + editor.path();
+        return true;
+    }
+
     void save_editor() {
         try {
             editor.save(false);
+            remember_editor_path(editor.path());
             status = "Saved";
         } catch (const std::exception& error) {
             show_editor_error(error);
@@ -4134,9 +5528,16 @@ struct App::Impl {
     }
 
     void close_editor() {
-        editor_shift_marking = false;
-        editor_column_marking = false;
+        reset_editor_view_state();
         editor.close();
+        if (!editor_buffers.empty()) {
+            editor = std::move(editor_buffers.back());
+            editor_buffers.pop_back();
+            remember_editor_path(editor.path());
+            mode = Mode::editor;
+            status = "Buffer: " + editor.path();
+            return;
+        }
         mode = Mode::panels;
         if (exit_after_editor) {
             exit_terminal();
@@ -4267,12 +5668,15 @@ struct App::Impl {
                 request_editor_close();
             } else if (item == 3U) {
                 save_editor();
-            } else {
+            } else if (item == 4U) {
                 start_prompt(
                     PromptAction::editor_save_as,
                     "Save as",
                     editor.path()
                 );
+            } else {
+                editor_list_cursor = 0;
+                mode = Mode::editor_history;
             }
             return;
         }
@@ -4381,6 +5785,17 @@ struct App::Impl {
                 status = editor_syntax
                              ? "Syntax highlighting enabled"
                              : "Syntax highlighting disabled";
+            }
+            return;
+        }
+        if (category == 5U) {
+            if (item == 0U) {
+                static_cast<void>(switch_editor_buffer(true));
+            } else if (item == 1U) {
+                static_cast<void>(switch_editor_buffer(false));
+            } else {
+                editor_list_cursor = 0;
+                mode = Mode::editor_buffer_list;
             }
             return;
         }
@@ -4637,6 +6052,92 @@ struct App::Impl {
         return true;
     }
 
+    bool handle_editor_list(const ftxui::Event& event) {
+        const bool history = mode == Mode::editor_history;
+        const auto count =
+            history
+                ? editor_history.size()
+                : editor_buffers.size() + 1U;
+        if (event == ftxui::Event::Escape ||
+            event == ftxui::Event::F10) {
+            mode = Mode::editor;
+            return true;
+        }
+        if (event == ftxui::Event::ArrowUp) {
+            if (editor_list_cursor > 0U) {
+                --editor_list_cursor;
+            }
+            return true;
+        }
+        if (event == ftxui::Event::ArrowDown) {
+            if (editor_list_cursor + 1U < count) {
+                ++editor_list_cursor;
+            }
+            return true;
+        }
+        if (event == ftxui::Event::Home) {
+            editor_list_cursor = 0;
+            return true;
+        }
+        if (event == ftxui::Event::End && count > 0U) {
+            editor_list_cursor = count - 1U;
+            return true;
+        }
+        if (history &&
+            event == ftxui::Event::Delete &&
+            editor_list_cursor < editor_history.size()) {
+            editor_history.erase(
+                editor_history.begin() +
+                static_cast<std::ptrdiff_t>(
+                    editor_list_cursor
+                )
+            );
+            if (editor_list_cursor >= editor_history.size() &&
+                editor_list_cursor > 0U) {
+                --editor_list_cursor;
+            }
+            return true;
+        }
+        if (event != ftxui::Event::Return || count == 0U) {
+            return false;
+        }
+        if (history) {
+            if (editor_list_cursor >= editor_history.size()) {
+                return true;
+            }
+            const auto path = editor_history[editor_list_cursor];
+            if (path == editor.path()) {
+                mode = Mode::editor;
+                return true;
+            }
+            try {
+                open_editor_buffer(
+                    active().provider(),
+                    path,
+                    false
+                );
+                mode = Mode::editor;
+                status = "File opened";
+            } catch (const std::exception& error) {
+                show_editor_error(error);
+            }
+            return true;
+        }
+        if (editor_list_cursor == 0U) {
+            mode = Mode::editor;
+            return true;
+        }
+        std::swap(
+            editor,
+            editor_buffers[editor_list_cursor - 1U]
+        );
+        remember_editor_path(editor.path());
+        reset_editor_view_state();
+        mode = Mode::editor;
+        status = "Buffer: " + editor.path();
+        return true;
+    }
+
     bool handle_editor_close_dialog(const ftxui::Event& event) {
         if (event == ftxui::Event::Escape) {
             mode = Mode::editor;
@@ -4697,7 +6198,7 @@ struct App::Impl {
         };
         const auto& order = replace ? replace_focus : search_focus;
         const auto move_focus = [&](const int amount) {
-            const auto current = std::find(
+            const auto current = std::ranges::find(
                 order.begin(),
                 order.end(),
                 editor_dialog_focus
@@ -5246,6 +6747,11 @@ struct App::Impl {
             );
             return true;
         }
+        if (event == ftxui::Event::Special("\x1B" "E")) {
+            editor_list_cursor = 0;
+            mode = Mode::editor_history;
+            return true;
+        }
         if (event == ftxui::Event::CtrlN) {
             start_prompt(
                 PromptAction::editor_new,
@@ -5430,6 +6936,31 @@ struct App::Impl {
 
     void reset_pulldown_item() {
         const auto& items = pulldown_items()[pulldown_category];
+        if (pulldown_category == 0U ||
+            pulldown_category == 4U) {
+            const auto panel_index =
+                pulldown_category == 0U ? 0 : 1;
+            const auto action =
+                tree_panel == panel_index
+                    ? 14
+                    : information_panel == panel_index
+                          ? 11
+                          : quick_view_panel == panel_index
+                                ? 10
+                                : 12;
+            const auto current = std::ranges::find(
+                items.begin(),
+                items.end(),
+                action,
+                &MenuRow::action
+            );
+            if (current != items.end()) {
+                pulldown_item = static_cast<std::size_t>(
+                    std::distance(items.begin(), current)
+                );
+                return;
+            }
+        }
         const auto match = std::find_if(
             items.begin(),
             items.end(),
@@ -5503,6 +7034,8 @@ struct App::Impl {
                     } catch (const std::exception& error) {
                         set_error(error);
                         mode = Mode::panels;
+                        clear_tree_operation_context();
+                        clear_tree_operation_context();
                     }
                     return true;
                 }
@@ -5546,6 +7079,7 @@ struct App::Impl {
             } catch (const std::exception& error) {
                 set_error(error);
                 mode = Mode::panels;
+                clear_tree_operation_context();
             }
             return true;
         }
@@ -5629,21 +7163,25 @@ struct App::Impl {
 
     bool handle_operation_dialog(const ftxui::Event& event) {
         if (event == ftxui::Event::Escape ||
-            (event == ftxui::Event::Return && dialog_focus == 4U)) {
+            (event == ftxui::Event::Return && dialog_focus == 6U)) {
             mode = Mode::panels;
             status = "Operation cancelled";
+            clear_tree_operation_context();
             return true;
         }
         if (event == ftxui::Event::Tab) {
-            dialog_focus = (dialog_focus + 1U) % 5U;
+            dialog_focus = (dialog_focus + 1U) % 7U;
             return true;
         }
         if (event == ftxui::Event::TabReverse) {
-            dialog_focus = (dialog_focus + 4U) % 5U;
+            dialog_focus = (dialog_focus + 6U) % 7U;
             return true;
         }
         if (event == ftxui::Event::ArrowDown) {
-            dialog_focus = std::min<std::size_t>(4U, dialog_focus + 1U);
+            dialog_focus = std::min<std::size_t>(
+                6U,
+                dialog_focus + 1U
+            );
             return true;
         }
         if (event == ftxui::Event::ArrowUp) {
@@ -5652,23 +7190,38 @@ struct App::Impl {
             return true;
         }
         if (event == ftxui::Event::Character(' ') &&
-            (dialog_focus == 1U || dialog_focus == 2U)) {
-            if (dialog_focus == 1U) {
+            (
+                dialog_focus == 2U ||
+                dialog_focus == 3U ||
+                dialog_focus == 4U
+            )) {
+            if (dialog_focus == 2U) {
                 dialog_preserve_attributes =
                     !dialog_preserve_attributes;
-            } else {
+            } else if (dialog_focus == 3U) {
                 dialog_preserve_symlinks =
                     !dialog_preserve_symlinks;
+            } else {
+                dialog_background = !dialog_background;
             }
             return true;
         }
         if (event == ftxui::Event::Backspace &&
-            dialog_focus == 0U) {
-            erase_last_utf8(dialog_destination);
+            (dialog_focus == 0U || dialog_focus == 1U)) {
+            erase_last_utf8(
+                dialog_focus == 0U
+                    ? dialog_destination
+                    : dialog_source_mask
+            );
             return true;
         }
-        if (event.is_character() && dialog_focus == 0U) {
-            dialog_destination += event.character();
+        if (event.is_character() &&
+            (dialog_focus == 0U || dialog_focus == 1U)) {
+            auto& value =
+                dialog_focus == 0U
+                    ? dialog_destination
+                    : dialog_source_mask;
+            value += event.character();
             return true;
         }
         if (event == ftxui::Event::Return) {
@@ -5677,6 +7230,7 @@ struct App::Impl {
             } catch (const std::exception& error) {
                 set_error(error);
                 mode = Mode::panels;
+                clear_tree_operation_context();
             }
             return true;
         }
@@ -5687,6 +7241,7 @@ struct App::Impl {
         if (event == ftxui::Event::Escape) {
             mode = Mode::panels;
             status = "Delete cancelled";
+            clear_tree_operation_context();
             return true;
         }
         if (event == ftxui::Event::ArrowLeft ||
@@ -5703,10 +7258,12 @@ struct App::Impl {
                 } catch (const std::exception& error) {
                     set_error(error);
                     mode = Mode::panels;
+                    clear_tree_operation_context();
                 }
             } else {
                 mode = Mode::panels;
                 status = "Delete cancelled";
+                clear_tree_operation_context();
             }
             return true;
         }
@@ -5766,6 +7323,8 @@ struct App::Impl {
             mode = Mode::panels;
             status = "Operation cancelled";
             pending_destination.clear();
+            pending_background = false;
+            clear_tree_operation_context();
             return true;
         }
         if (event == ftxui::Event::ArrowLeft ||
@@ -5785,6 +7344,8 @@ struct App::Impl {
             mode = Mode::panels;
             status = "Operation cancelled";
             pending_destination.clear();
+            pending_background = false;
+            clear_tree_operation_context();
             return true;
         }
         try {
@@ -5794,11 +7355,17 @@ struct App::Impl {
                 dialog_focus == 0U,
                 pending_exact
             );
+            if (pending_background) {
+                mode = Mode::panels;
+                status = operation_label + " running in background";
+            }
         } catch (const std::exception& error) {
             set_error(error);
             mode = Mode::panels;
+            clear_tree_operation_context();
         }
         pending_destination.clear();
+        pending_background = false;
         return true;
     }
 
@@ -5809,6 +7376,84 @@ struct App::Impl {
                 event.mouse().motion == ftxui::Mouse::Released
             )) {
             return false;
+        }
+        if (traversal_running.load(std::memory_order_acquire)) {
+            if (event == ftxui::Event::CtrlC) {
+                traversal_cancellation.request();
+                status = "Cancelling search";
+                return true;
+            }
+            if (event.is_mouse() ||
+                event == ftxui::Event::CtrlX ||
+                event == ftxui::Event::CtrlU ||
+                event == ftxui::Event::CtrlO ||
+                event == ftxui::Event::AltC ||
+                event == ftxui::Event::Return ||
+                event == ftxui::Event::Insert ||
+                event == ftxui::Event::F1 ||
+                event == ftxui::Event::F2 ||
+                event == ftxui::Event::F3 ||
+                event == ftxui::Event::F4 ||
+                event == ftxui::Event::F5 ||
+                event == ftxui::Event::F6 ||
+                event == ftxui::Event::F7 ||
+                event == ftxui::Event::F8 ||
+                event == ftxui::Event::F9) {
+                status = "Search running; Ctrl-C cancels";
+                return true;
+            }
+        }
+        const auto find_tree = [&](const bool include_current) {
+            if (tree_search.empty() || tree_nodes.empty()) {
+                return false;
+            }
+            const auto sought = lowercase_text(tree_search);
+            const auto first = include_current ? 0U : 1U;
+            for (std::size_t offset = first;
+                 offset < tree_nodes.size() + first;
+                 ++offset) {
+                const auto index =
+                    (tree_cursor + offset) % tree_nodes.size();
+                const auto name = lowercase_text(
+                    std::filesystem::path(tree_nodes[index].path)
+                        .filename()
+                        .string()
+                );
+                if (name.starts_with(sought)) {
+                    tree_cursor = index;
+                    sync_dynamic_tree();
+                    return true;
+                }
+            }
+            return false;
+        };
+        if (tree_search_mode) {
+            bool continue_event = false;
+            if (event == ftxui::Event::Escape ||
+                event == ftxui::Event::Return) {
+                tree_search_mode = false;
+                status = "Ready";
+                return true;
+            }
+            if (event == ftxui::Event::Backspace) {
+                erase_last_utf8(tree_search);
+                static_cast<void>(find_tree(true));
+            } else if (event == ftxui::Event::CtrlS ||
+                       event == ftxui::Event::AltS) {
+                static_cast<void>(find_tree(false));
+            } else if (event.is_character()) {
+                tree_search += event.character();
+                static_cast<void>(find_tree(true));
+            } else {
+                tree_search_mode = false;
+                status = "Ready";
+                tree_search.clear();
+                continue_event = true;
+            }
+            if (!continue_event) {
+                status = "Tree search: " + tree_search;
+                return true;
+            }
         }
         bool panel_search_confirmed = false;
         if (panel_search_mode) {
@@ -5872,10 +7517,7 @@ struct App::Impl {
                 if (event == ftxui::Event::q) {
                     toggle_quick_view();
                 } else if (event == ftxui::Event::i) {
-                    execute_pulldown_action(
-                        active_index == 0 ? 0U : 4U,
-                        11
-                    );
+                    toggle_information_panel();
                 } else if (event == ftxui::Event::c) {
                     execute_pulldown_action(1U, 8);
                 } else if (event == ftxui::Event::l) {
@@ -5888,6 +7530,10 @@ struct App::Impl {
                     execute_pulldown_action(1U, 9);
                 } else if (event == ftxui::Event::d) {
                     execute_pulldown_action(2U, 1);
+                } else if (
+                    event == ftxui::Event::Character('!')
+                ) {
+                    execute_pulldown_action(2U, 9);
                 } else if (event != ftxui::Event::Escape) {
                     status = "Unknown C-x command";
                 } else {
@@ -5923,12 +7569,18 @@ struct App::Impl {
             event == ftxui::Event::Home ||
             event == ftxui::Event::End ||
             event == ftxui::Event::Insert ||
+            event == ftxui::Event::CtrlA ||
+            event ==
+                ftxui::Event::Special("\x1B[1;2A") ||
+            event ==
+                ftxui::Event::Special("\x1B[1;2B") ||
             event == ftxui::Event::Special("\x1B[1;2A") ||
             event == ftxui::Event::Special("\x1B[1;2B") ||
             event == ftxui::Event::Special("\x1B[5;5~") ||
             event == ftxui::Event::Special("\x1B[6;5~") ||
             event == ftxui::Event::CtrlS ||
             event == ftxui::Event::AltS ||
+            event == ftxui::Event::CtrlC ||
             event == ftxui::Event::CtrlO ||
             event == ftxui::Event::CtrlU ||
             event == ftxui::Event::Special("\x1C") ||
@@ -5981,6 +7633,23 @@ struct App::Impl {
             }
             return true;
         }
+        if (traversal_running.load(std::memory_order_acquire) &&
+            (
+                event == ftxui::Event::Return ||
+                event == ftxui::Event::CtrlO ||
+                event == ftxui::Event::F1 ||
+                event == ftxui::Event::F2 ||
+                event == ftxui::Event::F3 ||
+                event == ftxui::Event::F4 ||
+                event == ftxui::Event::F5 ||
+                event == ftxui::Event::F6 ||
+                event == ftxui::Event::F7 ||
+                event == ftxui::Event::F8 ||
+                event == ftxui::Event::F9
+            )) {
+            status = "Search running; Ctrl-C cancels";
+            return true;
+        }
         try {
             if (event.is_mouse()) {
                 const auto& mouse = event.mouse();
@@ -6027,11 +7696,75 @@ struct App::Impl {
                     }
                     return true;
                 }
+                if (information_panel &&
+                    information_panel_box.Contain(
+                        mouse.x,
+                        mouse.y
+                    ) &&
+                    mouse.button == ftxui::Mouse::Left &&
+                    mouse.motion == ftxui::Mouse::Pressed) {
+                    information_panel_focused = true;
+                    return true;
+                }
+                if (tree_panel &&
+                    tree_panel_box.Contain(mouse.x, mouse.y)) {
+                    const bool was_focused = tree_panel_focused;
+                    tree_panel_focused = true;
+                    if (mouse.button == ftxui::Mouse::WheelUp ||
+                        mouse.button == ftxui::Mouse::WheelDown) {
+                        return true;
+                    }
+                    if (mouse.button != ftxui::Mouse::Left ||
+                        mouse.motion != ftxui::Mouse::Pressed) {
+                        return false;
+                    }
+                    for (std::size_t index = 0;
+                         index < tree_row_boxes.size();
+                         ++index) {
+                        if (tree_row_boxes[index].y_min <=
+                                tree_panel_box.y_min ||
+                            tree_row_boxes[index].y_max >=
+                                tree_panel_box.y_max ||
+                            !tree_row_boxes[index].Contain(
+                                mouse.x,
+                                mouse.y
+                            )) {
+                            continue;
+                        }
+                        const auto now =
+                            std::chrono::steady_clock::now();
+                        const bool double_click =
+                            last_click_pane ==
+                                10 + *tree_panel &&
+                            last_click_index == index &&
+                            now - last_click <
+                                std::chrono::milliseconds(400);
+                        last_click = now;
+                        last_click_pane = 10 + *tree_panel;
+                        last_click_index = index;
+                        if (was_focused &&
+                            double_click &&
+                            index < tree_nodes.size()) {
+                            tree_cursor = index;
+                            active().change_directory(
+                                tree_nodes[tree_cursor].path
+                            );
+                            if (!tree_nodes[tree_cursor].expanded &&
+                                !tree_nodes[tree_cursor].loading) {
+                                expand_tree_node(tree_cursor);
+                            }
+                        }
+                        return true;
+                    }
+                    return true;
+                }
                 Pane* pane = nullptr;
                 int pane_index = active_index;
                 std::vector<ftxui::Box>* boxes = nullptr;
                 if (
                     quick_view_panel != 0 &&
+                    information_panel != 0 &&
+                    tree_panel != 0 &&
                     left_box.Contain(mouse.x, mouse.y)
                 ) {
                     pane_index = 0;
@@ -6039,6 +7772,8 @@ struct App::Impl {
                     boxes = &left_entry_boxes;
                 } else if (
                     quick_view_panel != 1 &&
+                    information_panel != 1 &&
+                    tree_panel != 1 &&
                     right_box.Contain(mouse.x, mouse.y)
                 ) {
                     pane_index = 1;
@@ -6064,6 +7799,8 @@ struct App::Impl {
                 if (pane != nullptr && boxes != nullptr) {
                     active_index = pane_index;
                     quick_view_focused = false;
+                    information_panel_focused = false;
+                    tree_panel_focused = false;
                     for (std::size_t index = 0;
                          index < boxes->size();
                          ++index) {
@@ -6092,13 +7829,54 @@ struct App::Impl {
                 }
                 return pane != nullptr;
             }
+            if (information_panel &&
+                information_panel_focused &&
+                (
+                    event == ftxui::Event::F2 ||
+                    event == ftxui::Event::F3 ||
+                    event == ftxui::Event::F4 ||
+                    event == ftxui::Event::F5 ||
+                    event == ftxui::Event::F6 ||
+                    event == ftxui::Event::F7 ||
+                    event == ftxui::Event::F8 ||
+                    event == ftxui::Event::Insert ||
+                    event == ftxui::Event::CtrlA ||
+                    event ==
+                        ftxui::Event::Special("\x1B[1;2A") ||
+                    event ==
+                        ftxui::Event::Special("\x1B[1;2B") ||
+                    event == ftxui::Event::ArrowUp ||
+                    event == ftxui::Event::ArrowDown ||
+                    event == ftxui::Event::ArrowLeft ||
+                    event == ftxui::Event::ArrowRight ||
+                    event == ftxui::Event::PageUp ||
+                    event == ftxui::Event::PageDown ||
+                    event == ftxui::Event::Home ||
+                    event == ftxui::Event::End ||
+                    event == ftxui::Event::Return ||
+                    event == ftxui::Event::Character('+') ||
+                    event == ftxui::Event::Character('-') ||
+                    event == ftxui::Event::Character('*')
+                )) {
+                status = "No command for this Info-panel key";
+                return true;
+            }
             if (quick_view_panel && quick_view_focused) {
                 const auto [viewport_width, viewport_lines] =
                     quick_view_dimensions();
                 if (event == ftxui::Event::F1 ||
                     event == ftxui::Event::F5 ||
                     event == ftxui::Event::F6 ||
-                    event == ftxui::Event::F8) {
+                    event == ftxui::Event::F8 ||
+                    event == ftxui::Event::Insert ||
+                    event == ftxui::Event::CtrlA ||
+                    event ==
+                        ftxui::Event::Special("\x1B[1;2A") ||
+                    event ==
+                        ftxui::Event::Special("\x1B[1;2B") ||
+                    event == ftxui::Event::Character('+') ||
+                    event == ftxui::Event::Character('-') ||
+                    event == ftxui::Event::Character('*')) {
                     status = "No command for this quick-view key";
                     return true;
                 }
@@ -6113,7 +7891,8 @@ struct App::Impl {
                 if (event == ftxui::Event::F7) {
                     start_prompt(
                         PromptAction::quick_viewer_find,
-                        "Find in file"
+                        "Find in file",
+                        quick_view_search_needle
                     );
                     return true;
                 }
@@ -6123,6 +7902,14 @@ struct App::Impl {
                 }
                 if (event == ftxui::Event::ArrowUp) {
                     quick_viewer.scroll_lines(-1, viewport_width);
+                    return true;
+                }
+                if (event == ftxui::Event::ArrowLeft) {
+                    quick_viewer.scroll_columns(-1);
+                    return true;
+                }
+                if (event == ftxui::Event::ArrowRight) {
+                    quick_viewer.scroll_columns(1);
                     return true;
                 }
                 if (event == ftxui::Event::PageDown) {
@@ -6142,12 +7929,235 @@ struct App::Impl {
                     return true;
                 }
             }
+            if (tree_panel && tree_panel_focused) {
+                if (event == ftxui::Event::CtrlS ||
+                    event == ftxui::Event::AltS) {
+                    tree_search_mode = true;
+                    tree_search.clear();
+                    status = "Tree search: ";
+                    return true;
+                }
+                if (event == ftxui::Event::Character(' ') ||
+                    event == ftxui::Event::Character('+')) {
+                    if (tree_cursor < tree_nodes.size() &&
+                        tree_nodes[tree_cursor].loading) {
+                        if (event == ftxui::Event::Character(' ')) {
+                            tree_expansion_cancellation.request();
+                            tree_nodes[tree_cursor].loading = false;
+                            status = "Tree branch collapsed";
+                        } else {
+                            status = "Tree branch is loading";
+                        }
+                        return true;
+                    }
+                    const bool was_expanded =
+                        tree_cursor < tree_nodes.size() &&
+                        tree_nodes[tree_cursor].expanded;
+                    if (tree_cursor < tree_nodes.size() &&
+                        (
+                            event == ftxui::Event::Character(' ') ||
+                            !tree_nodes[tree_cursor].expanded
+                        )) {
+                        expand_tree_node(tree_cursor);
+                    }
+                    status =
+                        was_expanded &&
+                                event ==
+                                    ftxui::Event::Character('+')
+                            ? "Tree branch already expanded"
+                            : was_expanded
+                                  ? "Tree branch collapsed"
+                                  : "Expanding tree branch";
+                    return true;
+                }
+                if (event == ftxui::Event::Character('-')) {
+                    if (tree_cursor < tree_nodes.size() &&
+                        tree_nodes[tree_cursor].loading) {
+                        tree_expansion_cancellation.request();
+                        tree_nodes[tree_cursor].loading = false;
+                        status = "Tree branch collapsed";
+                        return true;
+                    }
+                    if (tree_cursor < tree_nodes.size() &&
+                        tree_nodes[tree_cursor].expanded) {
+                        expand_tree_node(tree_cursor);
+                    }
+                    status = "Tree branch collapsed";
+                    return true;
+                }
+                if (event == ftxui::Event::F1 ||
+                    event == ftxui::Event::F7 ||
+                    event == ftxui::Event::Insert ||
+                    event == ftxui::Event::CtrlA ||
+                    event ==
+                        ftxui::Event::Special("\x1B[1;2A") ||
+                    event ==
+                        ftxui::Event::Special("\x1B[1;2B") ||
+                    event == ftxui::Event::Character('*')) {
+                    status =
+                        "This tree command is not implemented";
+                    return true;
+                }
+                if (event == ftxui::Event::F2) {
+                    refresh();
+                    status = "Tree refreshed";
+                    return true;
+                }
+                if (event == ftxui::Event::F3) {
+                    if (tree_cursor > 0U &&
+                        tree_cursor < tree_nodes.size()) {
+                        const auto depth =
+                            tree_nodes[tree_cursor].depth;
+                        auto end = tree_cursor + 1U;
+                        while (end < tree_nodes.size() &&
+                               tree_nodes[end].depth > depth) {
+                            ++end;
+                        }
+                        tree_nodes.erase(
+                            tree_nodes.begin() +
+                                static_cast<std::ptrdiff_t>(
+                                    tree_cursor
+                                ),
+                            tree_nodes.begin() +
+                                static_cast<std::ptrdiff_t>(end)
+                        );
+                        if (tree_cursor >= tree_nodes.size()) {
+                            --tree_cursor;
+                        }
+                    }
+                    return true;
+                }
+                if (event == ftxui::Event::F4) {
+                    tree_dynamic = !tree_dynamic;
+                    status = tree_dynamic
+                                 ? "Dynamic tree navigation"
+                                 : "Static tree navigation";
+                    return true;
+                }
+                if (event == ftxui::Event::F5) {
+                    static_cast<void>(
+                        prepare_tree_operation(false, false)
+                    );
+                    return true;
+                }
+                if (event == ftxui::Event::F6) {
+                    static_cast<void>(
+                        prepare_tree_operation(true, false)
+                    );
+                    return true;
+                }
+                if (event == ftxui::Event::F8) {
+                    if (prepare_tree_operation(false, true) &&
+                        !config.confirm_delete) {
+                        run_remove_operation();
+                    }
+                    return true;
+                }
+                if (event == ftxui::Event::ArrowUp) {
+                    if (tree_cursor > 0U) {
+                        --tree_cursor;
+                    }
+                    sync_dynamic_tree();
+                    return true;
+                }
+                if (event == ftxui::Event::ArrowDown) {
+                    if (tree_cursor + 1U < tree_nodes.size()) {
+                        ++tree_cursor;
+                    }
+                    sync_dynamic_tree();
+                    return true;
+                }
+                if (event == ftxui::Event::Home) {
+                    tree_cursor = 0;
+                    sync_dynamic_tree();
+                    return true;
+                }
+                if (event == ftxui::Event::End) {
+                    tree_cursor =
+                        tree_nodes.empty()
+                            ? 0U
+                            : tree_nodes.size() - 1U;
+                    sync_dynamic_tree();
+                    return true;
+                }
+                if (event == ftxui::Event::ArrowRight) {
+                    if (tree_cursor < tree_nodes.size() &&
+                        !tree_nodes[tree_cursor].expanded) {
+                        expand_tree_node(tree_cursor);
+                    } else if (
+                        tree_cursor + 1U < tree_nodes.size() &&
+                        tree_nodes[tree_cursor + 1U].depth >
+                            tree_nodes[tree_cursor].depth
+                    ) {
+                        ++tree_cursor;
+                        sync_dynamic_tree();
+                    }
+                    return true;
+                }
+                if (event == ftxui::Event::ArrowLeft) {
+                    if (tree_cursor < tree_nodes.size() &&
+                        tree_nodes[tree_cursor].depth > 0U) {
+                        const auto depth =
+                            tree_nodes[tree_cursor].depth;
+                        while (tree_cursor > 0U) {
+                            --tree_cursor;
+                            if (tree_nodes[tree_cursor].depth <
+                                depth) {
+                                break;
+                            }
+                        }
+                        sync_dynamic_tree();
+                    }
+                    return true;
+                }
+                if (event == ftxui::Event::PageUp) {
+                    tree_cursor =
+                        tree_cursor > panel_visible_rows()
+                            ? tree_cursor - panel_visible_rows()
+                            : 0U;
+                    sync_dynamic_tree();
+                    return true;
+                }
+                if (event == ftxui::Event::PageDown) {
+                    tree_cursor = std::min(
+                        tree_nodes.empty()
+                            ? 0U
+                            : tree_nodes.size() - 1U,
+                        tree_cursor + panel_visible_rows()
+                    );
+                    sync_dynamic_tree();
+                    return true;
+                }
+                if (event == ftxui::Event::Return &&
+                    tree_cursor < tree_nodes.size()) {
+                    active().change_directory(
+                        tree_nodes[tree_cursor].path
+                    );
+                    if (!tree_nodes[tree_cursor].expanded &&
+                        !tree_nodes[tree_cursor].loading) {
+                        expand_tree_node(tree_cursor);
+                    }
+                    status =
+                        "Directory changed: " +
+                        tree_nodes[tree_cursor].path;
+                    return true;
+                }
+            }
             if (event == ftxui::Event::Tab) {
                 if (quick_view_panel) {
                     quick_view_focused = !quick_view_focused;
                     status = quick_view_focused
                                  ? "Quick view focused"
                                  : "File listing focused";
+                } else if (information_panel) {
+                    information_panel_focused =
+                        !information_panel_focused;
+                    status = information_panel_focused
+                                 ? "Info panel focused"
+                                 : "File listing focused";
+                } else if (tree_panel) {
+                    tree_panel_focused = !tree_panel_focused;
+                    status = "Ready";
                 } else {
                     active_index = 1 - active_index;
                 }
@@ -6236,6 +8246,12 @@ struct App::Impl {
                        )) {
                 request_operation_cancel();
                 status = "Cancelling operation";
+            } else if (event == ftxui::Event::CtrlC &&
+                       traversal_running.load(
+                           std::memory_order_acquire
+                       )) {
+                traversal_cancellation.request();
+                status = "Cancelling search";
             } else if (event == ftxui::Event::CtrlO) {
                 const auto result = run_process("", true);
                 status = "Subshell exited " +
@@ -6248,12 +8264,17 @@ struct App::Impl {
                 const auto* entry = active().current();
                 if (entry != nullptr && can_open_file(*entry)) {
                     viewer.open(active().provider(), entry->path);
+                    viewer_search_needle.clear();
                     mode = Mode::viewer;
                 }
             } else if (event == ftxui::Event::F4) {
                 const auto* entry = active().current();
                 if (entry != nullptr && can_open_file(*entry)) {
-                    editor.open(active().provider(), entry->path);
+                    open_editor_buffer(
+                        active().provider(),
+                        entry->path,
+                        false
+                    );
                     mode = Mode::editor;
                 }
             } else if (event == ftxui::Event::F5) {
@@ -6279,6 +8300,11 @@ struct App::Impl {
                 const auto menu_panel =
                     quick_view_panel && quick_view_focused
                         ? *quick_view_panel
+                        : information_panel &&
+                                  information_panel_focused
+                              ? *information_panel
+                              : tree_panel && tree_panel_focused
+                                    ? *tree_panel
                         : active_index;
                 pulldown_category =
                     menu_panel == 0 ? 0U : 4U;
@@ -6286,6 +8312,13 @@ struct App::Impl {
                 pulldown_dropped = false;
                 mode = Mode::pulldown;
             } else if (event == ftxui::Event::F10) {
+                if (traversal_running.load(
+                        std::memory_order_acquire
+                    )) {
+                    traversal_cancellation.request();
+                    status = "Cancel search before quitting";
+                    return true;
+                }
                 if (operation_running.load(
                         std::memory_order_acquire
                     )) {
@@ -6377,6 +8410,10 @@ struct App::Impl {
         if (mode == Mode::editor_options_dialog) {
             return handle_editor_options_dialog(event);
         }
+        if (mode == Mode::editor_history ||
+            mode == Mode::editor_buffer_list) {
+            return handle_editor_list(event);
+        }
         if (mode == Mode::help) {
             if (event == ftxui::Event::Escape ||
                 event == ftxui::Event::F1) {
@@ -6443,6 +8480,7 @@ void App::open_viewer(const std::string& path) {
                   path
               );
     impl_->viewer.open(impl_->active().provider(), resolved);
+    impl_->viewer_search_needle.clear();
     impl_->mode = Mode::viewer;
 }
 
@@ -6454,7 +8492,11 @@ void App::open_editor(const std::string& path) {
                   impl_->active().path(),
                   path
               );
-    impl_->editor.open(impl_->active().provider(), resolved);
+    impl_->open_editor_buffer(
+        impl_->active().provider(),
+        resolved,
+        false
+    );
     impl_->exit_after_editor = true;
     impl_->mode = Mode::editor;
 }
@@ -6492,6 +8534,22 @@ int App::run() {
             }
             if (implementation->operation_thread.joinable()) {
                 implementation->operation_thread.join();
+            }
+            if (implementation->traversal_running.load(
+                    std::memory_order_acquire
+                )) {
+                implementation->traversal_cancellation.request();
+            }
+            if (implementation->traversal_thread.joinable()) {
+                implementation->traversal_thread.join();
+            }
+            if (implementation->tree_expansion_running.load(
+                    std::memory_order_acquire
+                )) {
+                implementation->tree_expansion_cancellation.request();
+            }
+            if (implementation->tree_thread.joinable()) {
+                implementation->tree_thread.join();
             }
             implementation->terminal = nullptr;
         }

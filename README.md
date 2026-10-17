@@ -10,14 +10,15 @@ Azure Blob Storage through azcpp. SSH/SFTP work is currently paused.
 ## Current functionality
 
 - Independent dual panes with keyboard and mouse focus
-- Directory history, quick change, hidden-file toggle, sorting, and hotlist
+- Directory history, quick change, hidden-file toggle, filtering, sorting,
+  tree view, hotlist, and panelized search results
 - Selection, masks, inversion, and recursive search results
 - F2 rename, F3 range/hex viewer, and F4 conflict-aware editor
 - F5 copy, F6 move, F7 mkdir, F8 delete, F9 menu, and F10 quit
 - Asynchronous copy/move/delete progress and cancellation
 - Atomic no-clobber writes and symlink/root confinement
 - Mode, owner/group, file information, free-space display, and links
-- Directory comparison and fixed-width, focusable quick-view panel
+- Directory comparison plus fixed-width Quick view and live Info panels
 - Local command line, history, and restored-terminal subshell
 - Persisted panel paths and preferences
 - MC-style visual state cues using a grayscale-only palette
@@ -25,6 +26,7 @@ Azure Blob Storage through azcpp. SSH/SFTP work is currently paused.
 - Toggleable editor line-number gutter and mcedit-style position header
 - Persisted editor tab width, indentation, auto-indent, and whitespace markers
 - Persistent linear/column blocks and atomic cross-session editor clipboard
+- Persistent editor history and switchable multi-buffer editing
 
 The implementation is behaviorally familiar but does not use Midnight
 Commander source code, resources, strings, tests, or artwork. A shallow MC
@@ -70,6 +72,8 @@ The current parity gaps against GNU Midnight Commander are documented in
 | `Insert` | Toggle selection |
 | `Ctrl-S` / `Alt-S` | Incremental panel search |
 | `Ctrl-X Q` | Toggle quick view |
+| Tree `Enter` | Open selected directory and expand its branch |
+| Tree `Space` / `+` / `-` | Toggle, expand, or collapse branch |
 | `F3` | View |
 | `F4` | Edit |
 | `F5` | Copy |

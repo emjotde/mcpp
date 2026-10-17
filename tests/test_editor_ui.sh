@@ -139,3 +139,51 @@ for expected in \
         exit 1
     fi
 done
+
+printf 'buffer one\n' >"$temporary/buffer-one.txt"
+mkfifo "$temporary/buffer-input"
+printf -v buffer_command 'XDG_CONFIG_HOME=%q %q -e %q' \
+    "$temporary/buffer-config" \
+    "$binary" "$temporary/buffer-one.txt"
+"$timeout_command" 15s "$script_command" \
+    -qefc "$buffer_command" /dev/null \
+    <"$temporary/buffer-input" \
+    >"$temporary/buffer-output" 2>"$temporary/buffer-error" &
+buffer_runner=$!
+exec 6>"$temporary/buffer-input"
+sleep 1
+printf '\016\rbuffer-two\033[12~' >&6
+sleep 0.5
+printf '\033[20~\033[C\033[C\033[C\033[C\033[C\r\r' >&6
+sleep 0.5
+printf '\033[20~\033[C\033[C\033[C\033[C\033[C\r\033[B\033[B\r' >&6
+sleep 0.5
+printf '\033' >&6
+sleep 0.3
+printf '\033[21~' >&6
+sleep 0.5
+printf '\033[21~' >&6
+set +e
+wait "$buffer_runner"
+buffer_status=$?
+set -e
+exec 6>&-
+
+if ((buffer_status != 0)); then
+    printf 'editor multi-buffer workflow failed with status %d\n' \
+        "$buffer_status" >&2
+    cat "$temporary/buffer-error" >&2
+    exit 1
+fi
+
+if [[ "$(cat "$temporary/new-file")" != "buffer-two" ]]; then
+    printf 'editor new buffer did not save independently\n' >&2
+    exit 1
+fi
+
+if ! grep -aFq 'Buffer list' "$temporary/buffer-output" ||
+   ! grep -aFq 'buffer-one.txt' "$temporary/buffer-output" ||
+   ! grep -aFq 'new-file' "$temporary/buffer-output"; then
+    printf 'editor buffer list did not show both buffers\n' >&2
+    exit 1
+fi

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <set>
 #include <sstream>
 
 namespace mcpp {
@@ -100,56 +101,6 @@ bool content_matches(
     return false;
 }
 
-void search_directory(
-    Provider& provider,
-    const std::string& path,
-    const SearchOptions& options,
-    const Cancellation& cancellation,
-    const ProgressCallback& progress,
-    TransferProgress& state,
-    std::vector<Entry>& result
-) {
-    for (const auto& entry :
-         provider.list(
-             path,
-             {.show_hidden = options.include_hidden},
-             cancellation
-         )) {
-        cancellation.throw_if_requested();
-        ++state.files_done;
-        state.current_path = entry.path;
-        if (progress) {
-            progress(state);
-        }
-        if (wildcard_match(
-                options.name_pattern,
-                entry.name,
-                options.case_sensitive
-            ) &&
-            (entry.kind != EntryKind::file ||
-             content_matches(
-                 provider,
-                 entry,
-                 options,
-                 cancellation
-             ))) {
-            result.push_back(entry);
-        }
-        if (options.recursive &&
-            entry.kind == EntryKind::directory) {
-            search_directory(
-                provider,
-                entry.path,
-                options,
-                cancellation,
-                progress,
-                state,
-                result
-            );
-        }
-    }
-}
-
 }  // namespace
 
 std::vector<Entry> SearchEngine::search(
@@ -161,15 +112,66 @@ std::vector<Entry> SearchEngine::search(
 ) const {
     std::vector<Entry> result;
     TransferProgress state;
-    search_directory(
-        provider,
-        provider.normalize(root),
-        options,
-        cancellation,
-        progress,
-        state,
-        result
+    const auto normalized_root = provider.normalize(root);
+    std::vector<std::string> pending{normalized_root};
+    std::set<std::string, std::less<>> visited;
+    const auto root_entry = provider.stat(
+        normalized_root,
+        cancellation
     );
+    visited.insert(
+        root_entry.revision.empty()
+            ? normalized_root
+            : root_entry.revision
+    );
+    while (!pending.empty()) {
+        cancellation.throw_if_requested();
+        auto path = std::move(pending.back());
+        pending.pop_back();
+        auto entries = provider.list(
+            path,
+            {.show_hidden = options.include_hidden},
+            cancellation
+        );
+        std::vector<std::string> children;
+        for (const auto& entry : entries) {
+            cancellation.throw_if_requested();
+            ++state.files_done;
+            state.current_path = entry.path;
+            if (progress) {
+                progress(state);
+            }
+            if (wildcard_match(
+                    options.name_pattern,
+                    entry.name,
+                    options.case_sensitive
+                ) &&
+                (entry.kind != EntryKind::file ||
+                 content_matches(
+                     provider,
+                     entry,
+                     options,
+                     cancellation
+                 ))) {
+                result.push_back(entry);
+            }
+            if (options.recursive &&
+                entry.kind == EntryKind::directory) {
+                const auto identity =
+                    entry.revision.empty()
+                        ? provider.normalize(entry.path)
+                        : entry.revision;
+                if (visited.insert(identity).second) {
+                    children.push_back(entry.path);
+                }
+            }
+        }
+        for (auto child = children.rbegin();
+             child != children.rend();
+             ++child) {
+            pending.push_back(std::move(*child));
+        }
+    }
     return result;
 }
 

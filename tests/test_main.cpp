@@ -395,6 +395,60 @@ void test_pane() {
         "pane invert selection"
     );
     pane.clear_selection();
+    pane.set_filter("one*");
+    check(
+        std::ranges::none_of(
+            pane.entries(),
+            [](const auto& entry) {
+                return entry.name == "two.txt";
+            }
+        ),
+        "pane filter hides non-matching files"
+    );
+    check(
+        std::ranges::any_of(
+            pane.entries(),
+            [](const auto& entry) {
+                return entry.name == "sub";
+            }
+        ),
+        "pane filter keeps directories"
+    );
+    pane.set_filter("");
+    auto panelized_entries = pane.entries();
+    std::erase_if(
+        panelized_entries,
+        [](const auto& entry) {
+            return entry.name != "one.txt" &&
+                   entry.name != "two.txt";
+        }
+    );
+    pane.set_panelized(std::move(panelized_entries));
+    check(
+        pane.panelized() && pane.entries().size() == 2U,
+        "pane accepts panelized results"
+    );
+    pane.refresh();
+    check_equal(
+        pane.entries().size(),
+        std::size_t{2},
+        "panelized refresh preserves result set"
+    );
+    pane.toggle_selected(0);
+    pane.set_filter("two*");
+    check(
+        pane.entries().size() == 1U &&
+            pane.entries().front().name == "two.txt",
+        "panelized filter applies to source results"
+    );
+    check_equal(
+        pane.marked_count(),
+        std::size_t{0},
+        "panelized refresh prunes stale selections"
+    );
+    pane.set_filter("");
+    pane.change_directory(temporary.path().string());
+    check(!pane.panelized(), "directory change clears panelization");
     check(pane.find("two"), "pane find");
     check_equal(
         pane.current()->name,
@@ -1093,6 +1147,20 @@ void test_viewer_editor() {
         std::string("next"),
         "exact-width viewer row consumes its newline"
     );
+    exact_width_viewer.set_wrap(false);
+    exact_width_viewer.scroll_lines(-1, 10);
+    exact_width_viewer.scroll_columns(3);
+    check_equal(
+        exact_width_viewer.lines(5, 1)[0],
+        std::string("defgh"),
+        "unwrapped viewer scrolls horizontally"
+    );
+    exact_width_viewer.scroll_columns(-2);
+    check_equal(
+        exact_width_viewer.horizontal_offset(),
+        std::size_t{1},
+        "viewer tracks horizontal offset"
+    );
     const auto hex_scroll_path =
         temporary.path() / "hex-scroll.txt";
     write_file(
@@ -1113,6 +1181,36 @@ void test_viewer_editor() {
         hex_scroll_viewer.offset(),
         std::uint64_t{8},
         "hex viewer scrolls backward by sixteen bytes"
+    );
+    const auto repeat_search_path =
+        temporary.path() / "viewer-search.txt";
+    write_file(
+        repeat_search_path,
+        "prefix needle suffix\nsecond needle\n"
+    );
+    mcpp::ViewerModel repeat_search_viewer;
+    repeat_search_viewer.open(provider, repeat_search_path.string());
+    const auto first_viewer_match =
+        repeat_search_viewer.find("needle", true);
+    check(first_viewer_match.has_value(), "viewer first search");
+    check_equal(
+        repeat_search_viewer.lines(80, 1)[0],
+        std::string("prefix needle suffix"),
+        "viewer search retains line prefix"
+    );
+    const auto second_viewer_match =
+        repeat_search_viewer.find("needle", true);
+    check(
+        second_viewer_match.has_value() &&
+            *second_viewer_match > *first_viewer_match,
+        "viewer search repeats forward"
+    );
+    const auto wrapped_viewer_match =
+        repeat_search_viewer.find("needle", true);
+    check_equal(
+        wrapped_viewer_match,
+        first_viewer_match,
+        "viewer search wraps to beginning"
     );
 
     mcpp::EditorModel editor;
@@ -1739,6 +1837,7 @@ void test_config() {
         "/one",
         "/two\nconfirm_delete=true",
     };
+    config.editor_history = {"/edited/one", "/edited/two"};
     config.save(path);
     const auto loaded = mcpp::Config::load(path);
     check(loaded.show_hidden, "config hidden");
@@ -1775,6 +1874,10 @@ void test_config() {
             loaded.bookmarks[1] ==
                 "/two\nconfirm_delete=true",
         "config escapes record separators"
+    );
+    check(
+        loaded.editor_history == config.editor_history,
+        "config editor history"
     );
     struct stat status {};
     check(
@@ -1900,6 +2003,31 @@ void test_search_compare() {
     );
     check_equal(results.size(), std::size_t{1}, "search result count");
     check_equal(results[0].name, std::string("a.txt"), "search result");
+
+    auto deep = left / "deep";
+    std::filesystem::create_directories(deep);
+    for (int depth = 0; depth < 128; ++depth) {
+        deep /= "d";
+        std::filesystem::create_directory(deep);
+    }
+    write_file(deep / "leaf.match", "deep");
+    const auto deep_results = search.search(
+        provider,
+        left.string(),
+        {
+            .name_pattern = "leaf.match",
+            .content = {},
+            .case_sensitive = true,
+            .recursive = true,
+            .include_hidden = false,
+        },
+        {}
+    );
+    check_equal(
+        deep_results.size(),
+        std::size_t{1},
+        "iterative search handles deep trees"
+    );
 
     const mcpp::DirectoryComparator comparator;
     const auto differences = comparator.compare(

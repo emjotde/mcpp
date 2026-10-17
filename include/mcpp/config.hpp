@@ -24,6 +24,7 @@ struct Config {
     bool editor_auto_indent{true};
     bool editor_show_whitespace{false};
     std::vector<std::string> bookmarks;
+    std::vector<std::string> editor_history;
 
     static Config load(const std::filesystem::path& path);
     void save(const std::filesystem::path& path) const;

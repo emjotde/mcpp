@@ -27,6 +27,8 @@ public:
     void select_all();
     void clear_selection();
     void select_paths(const std::vector<std::string>& paths);
+    void set_panelized(std::vector<Entry> entries);
+    [[nodiscard]] bool panelized() const noexcept;
     void select_pattern(std::string_view pattern, bool selected);
     void invert_selection();
     bool find(
@@ -43,11 +45,15 @@ public:
     [[nodiscard]] const Entry* current() const noexcept;
     [[nodiscard]] std::vector<Entry> selected_entries() const;
     [[nodiscard]] bool is_selected(const Entry& entry) const;
+    [[nodiscard]] std::size_t marked_count() const noexcept;
+    [[nodiscard]] std::uint64_t marked_size() const noexcept;
 
     void set_show_hidden(bool value);
     [[nodiscard]] bool show_hidden() const noexcept;
     void set_directories_first(bool value);
     [[nodiscard]] bool directories_first() const noexcept;
+    void set_filter(std::string pattern);
+    [[nodiscard]] const std::string& filter() const noexcept;
     void set_sort(SortField field, bool descending);
     [[nodiscard]] SortField sort_field() const noexcept;
     [[nodiscard]] bool descending() const noexcept;
@@ -67,8 +73,11 @@ private:
     std::size_t cursor_{0};
     bool show_hidden_{false};
     bool directories_first_{true};
+    std::string filter_;
     SortField sort_{SortField::name};
     bool descending_{false};
+    bool panelized_{false};
+    std::vector<Entry> panelized_entries_;
     std::vector<std::string> history_;
     std::size_t history_index_{0};
 };

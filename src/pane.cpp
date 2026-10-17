@@ -59,6 +59,51 @@ void Pane::refresh(const Cancellation& cancellation) {
     const auto previous = current() != nullptr
                               ? current()->path
                               : std::string{};
+    if (panelized_) {
+        std::vector<Entry> refreshed;
+        refreshed.reserve(panelized_entries_.size());
+        for (const auto& entry : panelized_entries_) {
+            if (!provider_->exists(entry.path)) {
+                continue;
+            }
+            auto current_entry =
+                provider_->stat(entry.path, cancellation);
+            current_entry.name = entry.name;
+            if (!filter_.empty() &&
+                current_entry.kind != EntryKind::directory &&
+                !current_entry.target_is_directory &&
+                !wildcard_match(filter_, current_entry.name)) {
+                continue;
+            }
+            refreshed.push_back(std::move(current_entry));
+        }
+        entries_ = std::move(refreshed);
+        std::erase_if(
+            selected_,
+            [&](const std::string& path) {
+                return std::ranges::none_of(
+                    entries_,
+                    [&](const Entry& entry) {
+                        return entry.path == path;
+                    }
+                );
+            }
+        );
+        cursor_ = 0;
+        const auto match = std::find_if(
+            entries_.begin(),
+            entries_.end(),
+            [&](const Entry& entry) {
+                return entry.path == previous;
+            }
+        );
+        if (match != entries_.end()) {
+            cursor_ = static_cast<std::size_t>(
+                std::distance(entries_.begin(), match)
+            );
+        }
+        return;
+    }
     entries_ = provider_->list(
         path_,
         {
@@ -69,6 +114,16 @@ void Pane::refresh(const Cancellation& cancellation) {
         },
         cancellation
     );
+    if (!filter_.empty()) {
+        std::erase_if(
+            entries_,
+            [&](const Entry& entry) {
+                return entry.kind != EntryKind::directory &&
+                       !entry.target_is_directory &&
+                       !wildcard_match(filter_, entry.name);
+            }
+        );
+    }
     const auto parent_path = provider_->parent(path_);
     if (parent_path != path_) {
         Entry parent_entry;
@@ -201,7 +256,11 @@ void Pane::navigate(
     const auto previous_entries = entries_;
     const auto previous_selected = selected_;
     const auto previous_cursor = cursor_;
+    const auto previous_panelized = panelized_;
+    const auto previous_panelized_entries = panelized_entries_;
     path_ = std::move(normalized);
+    panelized_ = false;
+    panelized_entries_.clear();
     selected_.clear();
     cursor_ = 0;
     try {
@@ -211,6 +270,8 @@ void Pane::navigate(
         entries_ = previous_entries;
         selected_ = previous_selected;
         cursor_ = previous_cursor;
+        panelized_ = previous_panelized;
+        panelized_entries_ = previous_panelized_entries;
         throw;
     }
     if (record) {
@@ -293,6 +354,28 @@ void Pane::clear_selection() {
 void Pane::select_paths(const std::vector<std::string>& paths) {
     selected_.clear();
     selected_.insert(paths.begin(), paths.end());
+}
+
+void Pane::set_panelized(std::vector<Entry> entries) {
+    panelized_entries_ = std::move(entries);
+    entries_ = panelized_entries_;
+    if (!filter_.empty()) {
+        std::erase_if(
+            entries_,
+            [&](const Entry& entry) {
+                return entry.kind != EntryKind::directory &&
+                       !entry.target_is_directory &&
+                       !wildcard_match(filter_, entry.name);
+            }
+        );
+    }
+    selected_.clear();
+    cursor_ = 0;
+    panelized_ = true;
+}
+
+bool Pane::panelized() const noexcept {
+    return panelized_;
 }
 
 void Pane::select_pattern(
@@ -406,6 +489,20 @@ bool Pane::is_selected(const Entry& entry) const {
     return selected_.contains(entry.path);
 }
 
+std::size_t Pane::marked_count() const noexcept {
+    return selected_.size();
+}
+
+std::uint64_t Pane::marked_size() const noexcept {
+    std::uint64_t size = 0;
+    for (const auto& entry : entries_) {
+        if (selected_.contains(entry.path)) {
+            size += entry.size;
+        }
+    }
+    return size;
+}
+
 void Pane::set_show_hidden(const bool value) {
     show_hidden_ = value;
     refresh();
@@ -422,6 +519,21 @@ void Pane::set_directories_first(const bool value) {
 
 bool Pane::directories_first() const noexcept {
     return directories_first_;
+}
+
+void Pane::set_filter(std::string pattern) {
+    const auto previous = filter_;
+    filter_ = std::move(pattern);
+    try {
+        refresh();
+    } catch (...) {
+        filter_ = previous;
+        throw;
+    }
+}
+
+const std::string& Pane::filter() const noexcept {
+    return filter_;
 }
 
 void Pane::set_sort(
