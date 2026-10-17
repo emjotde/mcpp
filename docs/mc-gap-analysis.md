@@ -381,8 +381,9 @@ column details, total lines/bytes, character code, and window state. mcpp
 reports path, modified/overwrite state, line/column, and bytes. It provides
 built-in VS Code Dark+-style highlighting for common C-family, Rust, Go,
 JavaScript, Python, shell, JSON, Markdown, and configuration files, but no
-external rule database or syntax chooser. Line numbers, whitespace markers,
-bookmarks, codepages, spell checking, macros, and session recovery are absent.
+external rule database or syntax chooser. Line numbers are toggleable with
+Alt-N. Whitespace markers, bookmarks, codepages, spell checking, macros, and
+session recovery are absent.
 
 The next editor work should focus on column blocks, configurable indentation,
 and file lifecycle. Multi-buffer windows follow those basics. Macros, spell

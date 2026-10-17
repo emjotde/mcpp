@@ -48,7 +48,7 @@ if ((status != 0)); then
 fi
 
 tr -d '\000' <"$temporary/output" >"$temporary/output-clean"
-if ! grep -aFq $'\033[?1049l\r\033[0m\r' \
+if ! grep -aFq $'\033[?1049l\r\033[0m' \
     "$temporary/output-clean"; then
     printf 'mcpp did not restore a clean terminal line on exit\n' >&2
     exit 1

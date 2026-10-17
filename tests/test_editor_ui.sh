@@ -56,3 +56,27 @@ if ! grep -Fq 'Save' "$temporary/output" ||
     printf 'mcpp editor chrome or close dialog was not rendered\n' >&2
     exit 1
 fi
+
+mkfifo "$temporary/direct-input"
+printf -v direct_command 'XDG_CONFIG_HOME=%q %q -e %q' \
+    "$temporary/direct-config" \
+    "$binary" "$temporary/left/a.txt"
+"$timeout_command" 8s "$script_command" \
+    -qefc "$direct_command" /dev/null \
+    <"$temporary/direct-input" \
+    >"$temporary/direct-output" 2>"$temporary/direct-error" &
+direct_runner=$!
+exec 4>"$temporary/direct-input"
+sleep 1
+printf '\033' >&4
+set +e
+wait "$direct_runner"
+direct_status=$?
+set -e
+exec 4>&-
+
+if ((direct_status != 0)); then
+    printf 'direct editor Escape did not exit cleanly\n' >&2
+    cat "$temporary/direct-error" >&2
+    exit 1
+fi

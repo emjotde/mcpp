@@ -69,18 +69,13 @@ enum class PromptAction {
     none,
     rename,
     mkdir,
-    find,
     viewer_find,
     editor_save_as,
     editor_goto,
     quick_cd,
     chmod,
     chown,
-    symlink,
-    hardlink,
     recursive_search,
-    select_pattern,
-    unselect_pattern,
 };
 
 std::string format_size(const std::uint64_t size) {
@@ -468,8 +463,10 @@ struct App::Impl {
     TransferProgress progress;
     ViewerModel viewer;
     EditorModel editor;
+    bool exit_after_editor{false};
     SyntaxHighlighter syntax_highlighter;
     bool editor_syntax{true};
+    bool editor_line_numbers{true};
     std::uint64_t syntax_change_id{
         std::numeric_limits<std::uint64_t>::max()
     };
@@ -603,6 +600,8 @@ struct App::Impl {
     void refresh() {
         left.refresh();
         right.refresh();
+        quick_viewer.close();
+        quick_view_path.clear();
     }
 
     void sort_active(const SortField field) {
@@ -623,7 +622,39 @@ struct App::Impl {
             return;
         }
         terminal->Post(std::move(task));
+    }
+
+    void request_operation_cancel() {
+        {
+            std::lock_guard lock(operation_pause_mutex);
+            operation_cancellation.request();
+            operation_paused.store(
+                false,
+                std::memory_order_release
+            );
+        }
+        operation_pause_condition.notify_all();
         terminal->PostEvent(ftxui::Event::Custom);
+    }
+
+    void finish_operation(
+        std::string message,
+        const std::optional<int> clear_selection = std::nullopt
+    ) {
+        mode = Mode::panels;
+        operation_running.store(false, std::memory_order_release);
+        try {
+            if (clear_selection) {
+                (*clear_selection == 0 ? left : right)
+                    .clear_selection();
+            }
+            refresh();
+            status = std::move(message);
+        } catch (const std::exception& error) {
+            status =
+                std::move(message) +
+                "; refresh failed: " + error.what();
+        }
     }
 
     void start_prompt(
@@ -773,7 +804,7 @@ struct App::Impl {
                                         return !operation_paused.load(
                                                    std::memory_order_acquire
                                                ) ||
-                                               operation_cancellation
+                                               Cancellation{}
                                                    .requested();
                                     }
                                 );
@@ -848,39 +879,22 @@ struct App::Impl {
                         move_operation,
                         source_index
                     ] {
-                        mode = Mode::panels;
-                        operation_running.store(
-                            false,
-                            std::memory_order_release
+                        finish_operation(
+                            move_operation
+                                ? "Move complete"
+                                : "Copy complete",
+                            source_index
                         );
-                        try {
-                            (source_index == 0 ? left : right)
-                                .clear_selection();
-                            refresh();
-                            status = move_operation
-                                         ? "Move complete"
-                                         : "Copy complete";
-                        } catch (const std::exception& error) {
-                            set_error(error);
-                        }
                     });
                 } catch (const OperationCancelled&) {
                     post_ui([this] {
-                        status = "Operation cancelled";
-                        mode = Mode::panels;
-                        operation_running.store(
-                            false,
-                            std::memory_order_release
-                        );
+                        finish_operation("Operation cancelled");
                     });
                 } catch (const std::exception& error) {
                     const auto message = std::string(error.what());
                     post_ui([this, message] {
-                        status = "Error: " + message;
-                        mode = Mode::panels;
-                        operation_running.store(
-                            false,
-                            std::memory_order_release
+                        finish_operation(
+                            "Error: " + message
                         );
                     });
                 }
@@ -950,7 +964,7 @@ struct App::Impl {
                                         return !operation_paused.load(
                                                    std::memory_order_acquire
                                                ) ||
-                                               operation_cancellation
+                                               Cancellation{}
                                                    .requested();
                                     }
                                 );
@@ -971,37 +985,20 @@ struct App::Impl {
                         }
                     );
                     post_ui([this, source_index] {
-                        mode = Mode::panels;
-                        operation_running.store(
-                            false,
-                            std::memory_order_release
+                        finish_operation(
+                            "Delete complete",
+                            source_index
                         );
-                        try {
-                            (source_index == 0 ? left : right)
-                                .clear_selection();
-                            refresh();
-                            status = "Delete complete";
-                        } catch (const std::exception& error) {
-                            set_error(error);
-                        }
                     });
                 } catch (const OperationCancelled&) {
                     post_ui([this] {
-                        status = "Delete cancelled";
-                        mode = Mode::panels;
-                        operation_running.store(
-                            false,
-                            std::memory_order_release
-                        );
+                        finish_operation("Delete cancelled");
                     });
                 } catch (const std::exception& error) {
                     const auto message = std::string(error.what());
                     post_ui([this, message] {
-                        status = "Error: " + message;
-                        mode = Mode::panels;
-                        operation_running.store(
-                            false,
-                            std::memory_order_release
+                        finish_operation(
+                            "Error: " + message
                         );
                     });
                 }
@@ -1116,11 +1113,6 @@ struct App::Impl {
                     active().refresh();
                     status = "Directory created";
                     break;
-                case PromptAction::find:
-                    status = active().find(prompt_value)
-                                 ? "Match found"
-                                 : "No match";
-                    break;
                 case PromptAction::recursive_search: {
                     const SearchEngine search;
                     search_results = search.search(
@@ -1147,14 +1139,6 @@ struct App::Impl {
                     prompt_value.clear();
                     return;
                 }
-                case PromptAction::select_pattern:
-                    active().select_pattern(prompt_value, true);
-                    status = "Selection updated";
-                    break;
-                case PromptAction::unselect_pattern:
-                    active().select_pattern(prompt_value, false);
-                    status = "Selection updated";
-                    break;
                 case PromptAction::viewer_find:
                     status = viewer.find(prompt_value, false)
                                  ? "Match found"
@@ -1235,38 +1219,6 @@ struct App::Impl {
                     );
                     active().refresh();
                     status = "Owner changed";
-                    break;
-                }
-                case PromptAction::symlink: {
-                    const auto* entry = active().current();
-                    if (entry == nullptr || prompt_value.empty()) {
-                        break;
-                    }
-                    active().provider()->create_symlink(
-                        entry->path,
-                        active().provider()->join(
-                            active().path(),
-                            prompt_value
-                        )
-                    );
-                    active().refresh();
-                    status = "Symbolic link created";
-                    break;
-                }
-                case PromptAction::hardlink: {
-                    const auto* entry = active().current();
-                    if (entry == nullptr || prompt_value.empty()) {
-                        break;
-                    }
-                    active().provider()->create_hardlink(
-                        entry->path,
-                        active().provider()->join(
-                            active().path(),
-                            prompt_value
-                        )
-                    );
-                    active().refresh();
-                    status = "Hard link created";
                     break;
                 }
                 case PromptAction::none:
@@ -1691,7 +1643,16 @@ struct App::Impl {
         if (segments.empty()) {
             segments.push_back(text(""));
         }
-        return hbox(std::move(segments));
+        auto content = hbox(std::move(segments));
+        if (!editor_line_numbers) {
+            return content;
+        }
+        return hbox({
+            text(std::to_string(index + 1U)) |
+                color(Color::Grey50) |
+                size(WIDTH, EQUAL, 6),
+            std::move(content),
+        });
     }
 
     ftxui::Element render_editor() {
@@ -1723,7 +1684,11 @@ struct App::Impl {
         const auto cursor_width =
             editor_display_width(current_line, editor.column());
         const auto content_width = static_cast<std::size_t>(
-            std::max(1, terminal_size.dimx)
+            std::max(
+                1,
+                terminal_size.dimx -
+                    (editor_line_numbers ? 6 : 0)
+            )
         );
         const auto first_column =
             cursor_width >= content_width
@@ -1843,7 +1808,10 @@ struct App::Impl {
                 "Paste from clipboard  S-Ins",
             },
             {"Find  F7", "Replace  F4", "Go to line  C-g"},
-            {"Toggle syntax highlighting  C-s"},
+            {
+                "Toggle syntax highlighting  C-s",
+                "Toggle line numbers  M-n",
+            },
             {"No commands"},
             {"No commands"},
             {"Tab inserts 4 spaces"},
@@ -1915,6 +1883,7 @@ struct App::Impl {
                    text("C-Ins/S-Del Copy/cut block"),
                    text("S-Ins      Paste clipboard"),
                    text("Ctrl-S     Syntax highlighting"),
+                   text("Alt-N      Line numbers"),
                    separator(),
                    text("Press F1 or Esc") | center,
                }) |
@@ -2684,8 +2653,23 @@ struct App::Impl {
 
     ftxui::Element render() {
         using namespace ftxui;
+        const bool editor_context =
+            mode == Mode::editor ||
+            mode == Mode::editor_menu ||
+            mode == Mode::editor_help ||
+            mode == Mode::editor_error ||
+            mode == Mode::editor_search_dialog ||
+            mode == Mode::editor_replace_dialog ||
+            mode == Mode::editor_replace_confirm ||
+            mode == Mode::editor_close_dialog ||
+            (
+                mode == Mode::prompt &&
+                mode_before_prompt == Mode::editor
+            );
         Element body;
-        if (quick_view) {
+        if (editor_context) {
+            body = emptyElement();
+        } else if (quick_view) {
             body =
                 active_index == 0
                     ? hbox({
@@ -2820,19 +2804,6 @@ struct App::Impl {
                 key("10", "Quit"),
             }),
         });
-        const bool editor_context =
-            mode == Mode::editor ||
-            mode == Mode::editor_menu ||
-            mode == Mode::editor_help ||
-            mode == Mode::editor_error ||
-            mode == Mode::editor_search_dialog ||
-            mode == Mode::editor_replace_dialog ||
-            mode == Mode::editor_replace_confirm ||
-            mode == Mode::editor_close_dialog ||
-            (
-                mode == Mode::prompt &&
-                mode_before_prompt == Mode::editor
-            );
         if (editor_context) {
             document = render_editor();
         }
@@ -3100,6 +3071,10 @@ struct App::Impl {
         editor_shift_marking = false;
         editor.close();
         mode = Mode::panels;
+        if (exit_after_editor) {
+            terminal->Exit();
+            return;
+        }
         try {
             refresh();
             status = "Editor closed";
@@ -3225,10 +3200,17 @@ struct App::Impl {
             return;
         }
         if (category == 3U) {
-            editor_syntax = !editor_syntax;
-            status = editor_syntax
-                         ? "Syntax highlighting enabled"
-                         : "Syntax highlighting disabled";
+            if (item == 0U) {
+                editor_syntax = !editor_syntax;
+                status = editor_syntax
+                             ? "Syntax highlighting enabled"
+                             : "Syntax highlighting disabled";
+            } else {
+                editor_line_numbers = !editor_line_numbers;
+                status = editor_line_numbers
+                             ? "Line numbers enabled"
+                             : "Line numbers disabled";
+            }
             return;
         }
         status = "No command in this menu";
@@ -3236,7 +3218,7 @@ struct App::Impl {
 
     bool handle_editor_menu(const ftxui::Event& event) {
         static constexpr std::array<std::size_t, 7> item_counts{
-            3, 10, 3, 1, 1, 1, 1
+            3, 10, 3, 2, 1, 1, 1
         };
         if (event == ftxui::Event::Escape ||
             event == ftxui::Event::F9) {
@@ -3854,6 +3836,13 @@ struct App::Impl {
                          : "Syntax highlighting disabled";
             return true;
         }
+        if (event == ftxui::Event::AltN) {
+            editor_line_numbers = !editor_line_numbers;
+            status = editor_line_numbers
+                         ? "Line numbers enabled"
+                         : "Line numbers disabled";
+            return true;
+        }
         if (event == ftxui::Event::CtrlF) {
             show_editor_message(
                 "Save block",
@@ -4197,17 +4186,23 @@ struct App::Impl {
             event == ftxui::Event::F10 ||
             event == ftxui::Event::CtrlC ||
             event == ftxui::Event::Character('a')) {
-            operation_cancellation.request();
-            operation_pause_condition.notify_all();
+            request_operation_cancel();
             status = "Cancelling operation";
             return true;
         }
         if (event == ftxui::Event::Character(' ') ||
             event == ftxui::Event::Character('p')) {
-            const auto paused = !operation_paused.load(
-                std::memory_order_acquire
-            );
-            operation_paused.store(paused, std::memory_order_release);
+            bool paused = false;
+            {
+                std::lock_guard lock(operation_pause_mutex);
+                paused = !operation_paused.load(
+                    std::memory_order_acquire
+                );
+                operation_paused.store(
+                    paused,
+                    std::memory_order_release
+                );
+            }
             if (!paused) {
                 operation_pause_condition.notify_all();
             }
@@ -4216,8 +4211,17 @@ struct App::Impl {
         }
         if (event == ftxui::Event::Character('s') &&
             operation_label != "Delete") {
-            operation_skip.store(true, std::memory_order_release);
-            operation_paused.store(false, std::memory_order_release);
+            {
+                std::lock_guard lock(operation_pause_mutex);
+                operation_skip.store(
+                    true,
+                    std::memory_order_release
+                );
+                operation_paused.store(
+                    false,
+                    std::memory_order_release
+                );
+            }
             operation_pause_condition.notify_all();
             status = "Skipping current entry";
             return true;
@@ -4431,7 +4435,7 @@ struct App::Impl {
                        operation_running.load(
                            std::memory_order_acquire
                        )) {
-                operation_cancellation.request();
+                request_operation_cancel();
                 status = "Cancelling operation";
             } else if (event == ftxui::Event::CtrlO) {
                 const auto result = run_process("", true);
@@ -4480,7 +4484,7 @@ struct App::Impl {
                 if (operation_running.load(
                         std::memory_order_acquire
                     )) {
-                    operation_cancellation.request();
+                    request_operation_cancel();
                     status = "Cancel operation before quitting";
                     return true;
                 }
@@ -4616,6 +4620,7 @@ void App::open_editor(const std::string& path) {
                   path
               );
     impl_->editor.open(impl_->active().provider(), resolved);
+    impl_->exit_after_editor = true;
     impl_->mode = Mode::editor;
 }
 
@@ -4628,7 +4633,7 @@ std::string App::active_path() const {
 int App::run() {
     struct TerminalCleanup {
         ~TerminalCleanup() {
-            std::cout << "\033[0m\n" << std::flush;
+            std::cout << "\033[0m" << std::flush;
         }
     } terminal_cleanup;
     auto terminal = ftxui::App::FullscreenAlternateScreen();
@@ -4648,7 +4653,7 @@ int App::run() {
             if (implementation->operation_running.load(
                     std::memory_order_acquire
                 )) {
-                implementation->operation_cancellation.request();
+                implementation->request_operation_cancel();
             }
             if (implementation->operation_thread.joinable()) {
                 implementation->operation_thread.join();
@@ -4674,8 +4679,6 @@ int App::run() {
     impl_->config.show_hidden = impl_->left.show_hidden();
     impl_->config.sort = impl_->left.sort_field();
     impl_->config.sort_descending = impl_->left.descending();
-    impl_->config.left_path = impl_->left.path();
-    impl_->config.right_path = impl_->right.path();
     try {
         impl_->config.save(default_config_path());
     } catch (...) {

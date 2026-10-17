@@ -23,10 +23,9 @@ namespace {
 std::chrono::system_clock::time_point to_system_time(
     const std::filesystem::file_time_type value
 ) {
-    return std::chrono::system_clock::now() +
-           std::chrono::duration_cast<std::chrono::system_clock::duration>(
-               value - std::filesystem::file_time_type::clock::now()
-           );
+    return std::chrono::time_point_cast<
+        std::chrono::system_clock::duration
+    >(std::chrono::file_clock::to_sys(value));
 }
 
 bool path_is_within(
@@ -291,7 +290,7 @@ LocalProvider::LocalProvider(std::filesystem::path root) {
 }
 
 std::string LocalProvider::id() const {
-    return "local";
+    return "local:" + root_.string();
 }
 
 std::string LocalProvider::display_name() const {
@@ -469,7 +468,7 @@ std::vector<Entry> LocalProvider::list(
     std::error_code error;
     for (std::filesystem::directory_iterator iterator(
              directory,
-             std::filesystem::directory_options::skip_permission_denied,
+             std::filesystem::directory_options::none,
              error
          ),
          end;
@@ -963,6 +962,11 @@ bool LocalProvider::copy_direct(
     }
     const auto source_entry = stat(source_path.string(), cancellation);
     if (source_entry.kind == EntryKind::directory) {
+        if (path_is_within(source_path, destination_path)) {
+            throw std::invalid_argument(
+                "cannot copy a directory into itself"
+            );
+        }
         const bool created = !exists(destination_path.string());
         bool copied_all = true;
         create_directory(destination_path.string());
@@ -996,6 +1000,13 @@ bool LocalProvider::copy_direct(
                 );
             }
             throw;
+        }
+        if (source_entry.permissions !=
+            std::filesystem::perms::unknown) {
+            set_permissions(
+                destination_path.string(),
+                source_entry.permissions
+            );
         }
         return copied_all;
     }
@@ -1051,7 +1062,7 @@ void LocalProvider::set_permissions(
     const std::filesystem::perms permissions
 ) {
     std::filesystem::permissions(
-        resolve(path),
+        resolve_follow(path),
         permissions,
         std::filesystem::perm_options::replace
     );

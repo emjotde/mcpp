@@ -143,6 +143,7 @@ private:
         std::optional<EditorPosition> selection_begin;
         std::optional<EditorPosition> selection_end;
         bool marking{false};
+        std::size_t byte_size{0};
     };
 
     [[nodiscard]] std::string content() const;
@@ -162,6 +163,8 @@ private:
     );
     void erase_text(EditorPosition begin, EditorPosition end);
     void record_undo();
+    [[nodiscard]] Snapshot snapshot() const;
+    void trim_undo();
     void restore(Snapshot snapshot);
 
     ProviderPtr provider_;
@@ -180,6 +183,8 @@ private:
     std::string clipboard_;
     std::vector<Snapshot> undo_;
     std::vector<Snapshot> redo_;
+    std::size_t undo_bytes_{0};
+    std::size_t redo_bytes_{0};
 };
 
 }  // namespace mcpp

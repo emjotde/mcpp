@@ -297,6 +297,39 @@ void test_local_provider() {
         followed_escape = true;
     }
     check(followed_escape, "directory symlink confinement");
+    bool chmod_escape = false;
+    try {
+        provider.set_permissions(
+            (temporary.path() / "escape-link").string(),
+            std::filesystem::perms::owner_all
+        );
+    } catch (const std::invalid_argument&) {
+        chmod_escape = true;
+    }
+    check(chmod_escape, "chmod symlink confinement");
+
+    const auto unreadable = temporary.path() / "unreadable";
+    std::filesystem::create_directory(unreadable);
+    std::filesystem::permissions(
+        unreadable,
+        std::filesystem::perms::none,
+        std::filesystem::perm_options::replace
+    );
+    bool unreadable_rejected = false;
+    try {
+        static_cast<void>(provider.list(unreadable.string(), {}, {}));
+    } catch (const std::runtime_error&) {
+        unreadable_rejected = true;
+    }
+    std::filesystem::permissions(
+        unreadable,
+        std::filesystem::perms::owner_all,
+        std::filesystem::perm_options::replace
+    );
+    check(
+        unreadable_rejected,
+        "unreadable directory listing is not silently empty"
+    );
 
     bool escaped = false;
     try {
@@ -453,6 +486,11 @@ void test_operations() {
     std::filesystem::create_directories(destination_dir);
     write_file(source_dir / "a.txt", "alpha");
     write_file(source_dir / "sub" / "b.txt", "bravo");
+    std::filesystem::permissions(
+        source_dir,
+        std::filesystem::perms::owner_all,
+        std::filesystem::perm_options::replace
+    );
 
     mcpp::LocalProvider provider(temporary.path());
     const auto source = provider.stat(source_dir.string(), {});
@@ -478,6 +516,31 @@ void test_operations() {
         read_file(destination_dir / "source" / "sub" / "b.txt"),
         std::string("bravo"),
         "recursive copy"
+    );
+    check_equal(
+        std::filesystem::status(
+            destination_dir / "source"
+        ).permissions(),
+        std::filesystem::perms::owner_all,
+        "recursive copy preserves directory permissions"
+    );
+    bool descendant_rejected = false;
+    try {
+        operations.copy(
+            provider,
+            {source},
+            provider,
+            source_dir.string(),
+            {},
+            {}
+        );
+    } catch (const std::invalid_argument&) {
+        descendant_rejected = true;
+    }
+    check(
+        descendant_rejected &&
+            !std::filesystem::exists(source_dir / "source"),
+        "copy rejects descendant destination"
     );
 
     const auto copied = provider.stat(
@@ -1279,9 +1342,10 @@ void test_config() {
     config.sort = mcpp::SortField::size;
     config.sort_descending = true;
     config.theme = "blue";
-    config.left_path = "/left";
-    config.right_path = "/right";
-    config.bookmarks = {"/one", "/two"};
+    config.bookmarks = {
+        "/one",
+        "/two\nconfirm_delete=true",
+    };
     config.save(path);
     const auto loaded = mcpp::Config::load(path);
     check(loaded.show_hidden, "config hidden");
@@ -1293,6 +1357,12 @@ void test_config() {
         loaded.bookmarks.size(),
         std::size_t{2},
         "config bookmarks"
+    );
+    check(
+        !loaded.confirm_delete &&
+            loaded.bookmarks[1] ==
+                "/two\nconfirm_delete=true",
+        "config escapes record separators"
     );
     struct stat status {};
     check(
@@ -1377,6 +1447,30 @@ void test_search_compare() {
             }
         ),
         "compare changed size"
+    );
+    check(
+        comparator.compare(
+            provider,
+            left.string(),
+            provider,
+            left.string(),
+            true,
+            {}
+        ).empty(),
+        "identical directories compare equal"
+    );
+    const auto left_alias = temporary.path() / "left-alias";
+    std::filesystem::create_directory_symlink(left, left_alias);
+    check(
+        comparator.compare(
+            provider,
+            left_alias.string(),
+            provider,
+            left.string(),
+            true,
+            {}
+        ).empty(),
+        "directory symlink roots compare by relative names"
     );
 }
 

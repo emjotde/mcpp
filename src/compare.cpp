@@ -9,8 +9,8 @@ using Inventory = std::map<std::string, Entry, std::less<>>;
 
 void inventory(
     Provider& provider,
-    const std::string& root,
     const std::string& directory,
+    const std::string& relative_directory,
     const bool recursive,
     const Cancellation& cancellation,
     Inventory& result
@@ -22,20 +22,17 @@ void inventory(
              cancellation
          )) {
         cancellation.throw_if_requested();
-        auto relative = entry.path;
-        if (relative.starts_with(root)) {
-            relative.erase(0, root.size());
-            while (!relative.empty() && relative.front() == '/') {
-                relative.erase(relative.begin());
-            }
-        }
+        const auto relative =
+            relative_directory.empty()
+                ? entry.name
+                : relative_directory + "/" + entry.name;
         result.emplace(relative, entry);
         if (recursive &&
             entry.kind == EntryKind::directory) {
             inventory(
                 provider,
-                root,
                 entry.path,
+                relative,
                 true,
                 cancellation,
                 result
@@ -61,7 +58,7 @@ std::vector<Difference> DirectoryComparator::compare(
     inventory(
         left_provider,
         normalized_left,
-        normalized_left,
+        {},
         recursive,
         cancellation,
         left
@@ -69,7 +66,7 @@ std::vector<Difference> DirectoryComparator::compare(
     inventory(
         right_provider,
         normalized_right,
-        normalized_right,
+        {},
         recursive,
         cancellation,
         right

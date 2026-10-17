@@ -16,8 +16,6 @@ struct Config {
     SortField sort{SortField::name};
     bool sort_descending{false};
     std::string theme{"grayscale"};
-    std::string left_path;
-    std::string right_path;
     std::vector<std::string> bookmarks;
 
     static Config load(const std::filesystem::path& path);

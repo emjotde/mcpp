@@ -22,6 +22,29 @@ void emit_progress(
     }
 }
 
+bool is_descendant_path(
+    Provider& provider,
+    const std::string_view parent,
+    const std::string_view candidate
+) {
+    const auto parent_path = std::filesystem::path(
+        provider.normalize(parent)
+    );
+    const auto candidate_path = std::filesystem::path(
+        provider.normalize(candidate)
+    );
+    auto parent_part = parent_path.begin();
+    auto candidate_part = candidate_path.begin();
+    while (parent_part != parent_path.end() &&
+           candidate_part != candidate_path.end() &&
+           *parent_part == *candidate_part) {
+        ++parent_part;
+        ++candidate_part;
+    }
+    return parent_part == parent_path.end() &&
+           candidate_part != candidate_path.end();
+}
+
 void accumulate_entry(
     Provider& provider,
     const Entry& entry,
@@ -243,6 +266,17 @@ bool OperationEngine::copy_entry(
             destination_provider.normalize(destination_path)) {
         return false;
     }
+    if (source.kind == EntryKind::directory &&
+        source_provider.id() == destination_provider.id() &&
+        is_descendant_path(
+            source_provider,
+            source.path,
+            destination_path
+        )) {
+        throw std::invalid_argument(
+            "cannot copy a directory into itself"
+        );
+    }
     const bool destination_exists =
         destination_provider.exists(destination_path);
     const bool overwrite =
@@ -337,6 +371,18 @@ bool OperationEngine::copy_entry(
             } catch (const SkipCurrent&) {
                 copied_all = false;
             }
+        }
+        if (options.preserve_permissions &&
+            has_capability(
+                destination_provider.capabilities(),
+                ProviderCapability::permissions
+            ) &&
+            effective_source.permissions !=
+                std::filesystem::perms::unknown) {
+            destination_provider.set_permissions(
+                destination_path,
+                effective_source.permissions
+            );
         }
         return copied_all;
     }

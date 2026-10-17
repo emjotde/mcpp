@@ -102,6 +102,8 @@ void EditorModel::open(
     clear_selection();
     undo_.clear();
     redo_.clear();
+    undo_bytes_ = 0;
+    redo_bytes_ = 0;
 }
 
 void EditorModel::close() {
@@ -118,6 +120,8 @@ void EditorModel::close() {
     clear_selection();
     undo_.clear();
     redo_.clear();
+    undo_bytes_ = 0;
+    redo_bytes_ = 0;
 }
 
 bool EditorModel::open() const noexcept {
@@ -869,19 +873,37 @@ bool EditorModel::replace_selection(
 }
 
 void EditorModel::record_undo() {
-    undo_.push_back({
+    auto current = snapshot();
+    undo_bytes_ += current.byte_size;
+    undo_.push_back(std::move(current));
+    trim_undo();
+    redo_.clear();
+    redo_bytes_ = 0;
+}
+
+EditorModel::Snapshot EditorModel::snapshot() const {
+    return {
         .lines = lines_,
         .row = row_,
         .column = column_,
         .selection_begin = selection_begin_,
         .selection_end = selection_end_,
         .marking = marking_,
-    });
+        .byte_size = byte_size(),
+    };
+}
+
+void EditorModel::trim_undo() {
     constexpr std::size_t maximum = 100U;
-    if (undo_.size() > maximum) {
+    constexpr std::size_t maximum_bytes = 64U * 1024U * 1024U;
+    while (undo_.size() > 1U &&
+           (
+               undo_.size() > maximum ||
+               undo_bytes_ > maximum_bytes
+           )) {
+        undo_bytes_ -= undo_.front().byte_size;
         undo_.erase(undo_.begin());
     }
-    redo_.clear();
 }
 
 void EditorModel::restore(Snapshot snapshot) {
@@ -899,17 +921,13 @@ bool EditorModel::undo() {
     if (undo_.empty()) {
         return false;
     }
-    redo_.push_back({
-        .lines = lines_,
-        .row = row_,
-        .column = column_,
-        .selection_begin = selection_begin_,
-        .selection_end = selection_end_,
-        .marking = marking_,
-    });
-    auto snapshot = std::move(undo_.back());
+    auto current = snapshot();
+    redo_bytes_ += current.byte_size;
+    redo_.push_back(std::move(current));
+    auto previous = std::move(undo_.back());
+    undo_bytes_ -= previous.byte_size;
     undo_.pop_back();
-    restore(std::move(snapshot));
+    restore(std::move(previous));
     return true;
 }
 
@@ -917,17 +935,14 @@ bool EditorModel::redo() {
     if (redo_.empty()) {
         return false;
     }
-    undo_.push_back({
-        .lines = lines_,
-        .row = row_,
-        .column = column_,
-        .selection_begin = selection_begin_,
-        .selection_end = selection_end_,
-        .marking = marking_,
-    });
-    auto snapshot = std::move(redo_.back());
+    auto current = snapshot();
+    undo_bytes_ += current.byte_size;
+    undo_.push_back(std::move(current));
+    trim_undo();
+    auto next = std::move(redo_.back());
+    redo_bytes_ -= next.byte_size;
     redo_.pop_back();
-    restore(std::move(snapshot));
+    restore(std::move(next));
     return true;
 }
 

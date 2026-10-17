@@ -80,14 +80,20 @@ int main(const int argc, char** argv) {
         }
         auto config = mcpp::Config::load(mcpp::default_config_path());
         const auto current = std::filesystem::current_path();
+        const auto pane_path = [&](const std::string& value) {
+            const auto path = std::filesystem::path(value);
+            return (
+                path.is_absolute() ? path : current / path
+            ).lexically_normal().string();
+        };
         const auto left =
             paths.empty()
                 ? current.string()
-                : paths[0];
+                : pane_path(paths[0]);
         const auto right =
             paths.size() < 2U
                 ? current.string()
-                : paths[1];
+                : pane_path(paths[1]);
         mcpp::App app(left, right, std::move(config));
         if (view_file) {
             app.open_viewer(*view_file);

@@ -8,6 +8,7 @@
 #include <sstream>
 #include <map>
 #include <stdexcept>
+#include <string_view>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <vector>
@@ -46,6 +47,43 @@ SortField parse_sort(const std::string& value) {
     return SortField::name;
 }
 
+std::string encode_value(const std::string_view value) {
+    std::string result;
+    result.reserve(value.size());
+    for (const auto character : value) {
+        if (character == '\\') {
+            result += "\\\\";
+        } else if (character == '\n') {
+            result += "\\n";
+        } else if (character == '\r') {
+            result += "\\r";
+        } else {
+            result += character;
+        }
+    }
+    return result;
+}
+
+std::string decode_value(const std::string_view value) {
+    std::string result;
+    result.reserve(value.size());
+    for (std::size_t index = 0; index < value.size(); ++index) {
+        if (value[index] != '\\' || index + 1U >= value.size()) {
+            result += value[index];
+            continue;
+        }
+        const auto escaped = value[++index];
+        if (escaped == 'n') {
+            result += '\n';
+        } else if (escaped == 'r') {
+            result += '\r';
+        } else {
+            result += escaped;
+        }
+    }
+    return result;
+}
+
 }  // namespace
 
 Config Config::load(const std::filesystem::path& path) {
@@ -78,13 +116,9 @@ Config Config::load(const std::filesystem::path& path) {
         } else if (key == "sort_descending") {
             result.sort_descending = parse_bool(value);
         } else if (key == "theme") {
-            result.theme = value;
-        } else if (key == "left_path") {
-            result.left_path = value;
-        } else if (key == "right_path") {
-            result.right_path = value;
+            result.theme = decode_value(value);
         } else if (key == "bookmark") {
-            result.bookmarks.push_back(value);
+            result.bookmarks.push_back(decode_value(value));
         }
     }
     return result;
@@ -108,11 +142,9 @@ void Config::save(const std::filesystem::path& path) const {
            << "sort=" << sort_name(sort) << '\n'
            << "sort_descending="
            << (sort_descending ? "true" : "false") << '\n'
-           << "theme=" << theme << '\n'
-           << "left_path=" << left_path << '\n'
-           << "right_path=" << right_path << '\n';
+           << "theme=" << encode_value(theme) << '\n';
     for (const auto& bookmark : bookmarks) {
-        output << "bookmark=" << bookmark << '\n';
+        output << "bookmark=" << encode_value(bookmark) << '\n';
     }
     if (!output) {
         throw std::runtime_error("cannot serialize configuration");
