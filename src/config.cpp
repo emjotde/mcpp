@@ -117,6 +117,10 @@ Config Config::load(const std::filesystem::path& path) {
             result.sort_descending = parse_bool(value);
         } else if (key == "theme") {
             result.theme = decode_value(value);
+        } else if (key == "editor_syntax") {
+            result.editor_syntax = parse_bool(value);
+        } else if (key == "editor_line_numbers") {
+            result.editor_line_numbers = parse_bool(value);
         } else if (key == "bookmark") {
             result.bookmarks.push_back(decode_value(value));
         }
@@ -142,7 +146,11 @@ void Config::save(const std::filesystem::path& path) const {
            << "sort=" << sort_name(sort) << '\n'
            << "sort_descending="
            << (sort_descending ? "true" : "false") << '\n'
-           << "theme=" << encode_value(theme) << '\n';
+           << "theme=" << encode_value(theme) << '\n'
+           << "editor_syntax="
+           << (editor_syntax ? "true" : "false") << '\n'
+           << "editor_line_numbers="
+           << (editor_line_numbers ? "true" : "false") << '\n';
     for (const auto& bookmark : bookmarks) {
         output << "bookmark=" << encode_value(bookmark) << '\n';
     }

@@ -326,20 +326,19 @@ movement, and viewport-sized Page Up/Down.
 #### Selection and clipboard
 
 mcpp implements one persistent linear F3/Shift-arrow selection and can copy,
-move, delete, or repeatedly copy it. Typing and ordinary character deletion do
-not consume the block. mcedit additionally supports:
+move, delete, or repeatedly copy it. Rectangular F13/Alt-arrow blocks support
+copy, move, delete, rendering, and clipboard operations. Typing and ordinary
+character deletion do not consume a linear block. mcedit additionally
+supports:
 
 - word, file-boundary, and scrolling selection variants beyond the basic
   Shift-arrow/Home/End/Page bindings;
-- rectangular column blocks (`F13` and Alt-arrow bindings);
-- mark-all, unmark, line/word marking, and block indentation;
-- a persistent on-disk clip file shared across editor processes;
-- mouse positioning and mouse block selection.
+- line/word marking and block indentation;
+- mouse drag block selection.
 
-mcpp supports reusable in-memory copy/cut/paste through `Ctrl-Insert`,
-`Shift-Delete`, and `Shift-Insert`, and keeps that clipboard across files
-opened in the same process. It does not persist the clip file across
-processes.
+mcpp supports copy/cut/paste through `Ctrl-Insert`, `Shift-Delete`, and
+`Shift-Insert`, keeps column-mode metadata in-process, and safely persists the
+clip text in a mode-0600 atomic cache file across processes.
 
 #### Search and replace
 

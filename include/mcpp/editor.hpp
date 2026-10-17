@@ -41,10 +41,11 @@ public:
     [[nodiscard]] std::size_t column() const noexcept;
     [[nodiscard]] std::size_t byte_size() const noexcept;
     [[nodiscard]] std::size_t cursor_offset() const noexcept;
-    [[nodiscard]] std::size_t selection_size() const noexcept;
+    [[nodiscard]] std::size_t selection_size() const;
     [[nodiscard]] std::uint64_t change_id() const noexcept;
     [[nodiscard]] bool marking() const noexcept;
     [[nodiscard]] bool overwrite() const noexcept;
+    [[nodiscard]] bool column_selection() const noexcept;
     [[nodiscard]] std::optional<std::pair<
         EditorPosition,
         EditorPosition
@@ -58,7 +59,9 @@ public:
     void goto_line(std::size_t line);
     void set_position(EditorPosition position);
     void toggle_mark();
+    void toggle_column_mark();
     void begin_mark();
+    void begin_column_mark();
     void finish_mark();
     void clear_selection();
     void select_all();
@@ -76,6 +79,11 @@ public:
     [[nodiscard]] bool move_selection();
     [[nodiscard]] bool delete_selection();
     [[nodiscard]] std::optional<std::string> selected_text() const;
+    [[nodiscard]] std::optional<std::pair<
+        std::size_t,
+        std::size_t
+    >> selection_on_line(std::size_t row) const;
+    void paste_column(std::string_view text);
     [[nodiscard]] bool replace_selection(
         std::string_view replacement,
         std::optional<std::pair<
@@ -151,6 +159,7 @@ private:
         std::optional<EditorPosition> selection_begin;
         std::optional<EditorPosition> selection_end;
         bool marking{false};
+        bool column_selection{false};
         std::size_t byte_size{0};
     };
 
@@ -188,6 +197,7 @@ private:
     std::optional<EditorPosition> selection_begin_;
     std::optional<EditorPosition> selection_end_;
     bool marking_{false};
+    bool column_selection_{false};
     bool overwrite_{false};
     bool new_file_{false};
     std::string clipboard_;

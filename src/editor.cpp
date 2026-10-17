@@ -108,6 +108,20 @@ std::size_t byte_column(
     return offset;
 }
 
+std::size_t prepare_column_insertion(
+    std::string& line,
+    const std::size_t target
+) {
+    auto offset = byte_column(line, target);
+    const auto actual = display_column(line, offset);
+    if (actual < target) {
+        const auto padding = target - actual;
+        line.insert(offset, padding, ' ');
+        offset += padding;
+    }
+    return offset;
+}
+
 bool word_character(
     const std::string_view line,
     const std::size_t column
@@ -261,12 +275,26 @@ std::size_t EditorModel::cursor_offset() const noexcept {
     return offset({.row = row_, .column = column_});
 }
 
-std::size_t EditorModel::selection_size() const noexcept {
+std::size_t EditorModel::selection_size() const {
     const auto selected = selection();
-    return selected
-               ? offset(selected->second) -
-                     offset(selected->first)
-               : 0U;
+    if (!selected) {
+        return 0U;
+    }
+    if (!column_selection_) {
+        return offset(selected->second) -
+               offset(selected->first);
+    }
+    std::size_t result = 0;
+    for (auto row = selected->first.row;
+         row <= selected->second.row;
+         ++row) {
+        const auto range = selection_on_line(row);
+        result += range->second - range->first;
+        if (row != selected->second.row) {
+            ++result;
+        }
+    }
+    return result;
 }
 
 std::uint64_t EditorModel::change_id() const noexcept {
@@ -281,6 +309,10 @@ bool EditorModel::overwrite() const noexcept {
     return overwrite_;
 }
 
+bool EditorModel::column_selection() const noexcept {
+    return column_selection_;
+}
+
 std::optional<std::pair<EditorPosition, EditorPosition>>
 EditorModel::selection() const noexcept {
     if (!selection_begin_ || !selection_end_ ||
@@ -288,6 +320,41 @@ EditorModel::selection() const noexcept {
         return std::nullopt;
     }
     return std::minmax(*selection_begin_, *selection_end_);
+}
+
+std::optional<std::pair<std::size_t, std::size_t>>
+EditorModel::selection_on_line(const std::size_t row) const {
+    const auto selected = selection();
+    if (!selected || row >= lines_.size() ||
+        row < selected->first.row ||
+        row > selected->second.row) {
+        return std::nullopt;
+    }
+    if (!column_selection_) {
+        const auto begin =
+            row == selected->first.row
+                ? selected->first.column
+                : 0U;
+        const auto end =
+            row == selected->second.row
+                ? selected->second.column
+                : lines_[row].size();
+        return std::pair{begin, end};
+    }
+    const auto begin_display = display_column(
+        lines_[selection_begin_->row],
+        selection_begin_->column
+    );
+    const auto end_display = display_column(
+        lines_[selection_end_->row],
+        selection_end_->column
+    );
+    const auto left = std::min(begin_display, end_display);
+    const auto right = std::max(begin_display, end_display);
+    return std::pair{
+        byte_column(lines_[row], left),
+        byte_column(lines_[row], right),
+    };
 }
 
 std::string EditorModel::content() const {
@@ -564,13 +631,45 @@ void EditorModel::toggle_mark() {
         return;
     }
     clear_selection();
+    column_selection_ = false;
     selection_begin_ = cursor;
     selection_end_ = cursor;
     marking_ = true;
 }
 
+void EditorModel::toggle_column_mark() {
+    const EditorPosition cursor{
+        .row = row_,
+        .column = column_,
+    };
+    if (marking_ && column_selection_) {
+        selection_end_ = cursor;
+        marking_ = false;
+        return;
+    }
+    clear_selection();
+    selection_begin_ = cursor;
+    selection_end_ = cursor;
+    marking_ = true;
+    column_selection_ = true;
+}
+
 void EditorModel::begin_mark() {
     if (marking_) {
+        return;
+    }
+    clear_selection();
+    column_selection_ = false;
+    selection_begin_ = EditorPosition{
+        .row = row_,
+        .column = column_,
+    };
+    selection_end_ = selection_begin_;
+    marking_ = true;
+}
+
+void EditorModel::begin_column_mark() {
+    if (marking_ && column_selection_) {
         return;
     }
     clear_selection();
@@ -580,6 +679,7 @@ void EditorModel::begin_mark() {
     };
     selection_end_ = selection_begin_;
     marking_ = true;
+    column_selection_ = true;
 }
 
 void EditorModel::finish_mark() {
@@ -596,12 +696,14 @@ void EditorModel::clear_selection() {
     selection_begin_.reset();
     selection_end_.reset();
     marking_ = false;
+    column_selection_ = false;
 }
 
 void EditorModel::select_all() {
     if (lines_.empty()) {
         return;
     }
+    column_selection_ = false;
     selection_begin_ = EditorPosition{};
     selection_end_ = EditorPosition{
         .row = lines_.size() - 1U,
@@ -678,6 +780,55 @@ void EditorModel::insert(const std::string_view text) {
 
 void EditorModel::paste(const std::string_view text) {
     insert_text(text, false);
+}
+
+void EditorModel::paste_column(const std::string_view text) {
+    if (text.empty()) {
+        return;
+    }
+    std::vector<std::string> block;
+    std::size_t begin = 0;
+    while (begin <= text.size()) {
+        const auto end = text.find('\n', begin);
+        block.emplace_back(
+            text.substr(
+                begin,
+                end == std::string_view::npos
+                    ? text.size() - begin
+                    : end - begin
+            )
+        );
+        if (end == std::string_view::npos) {
+            break;
+        }
+        begin = end + 1U;
+    }
+    if (block.empty()) {
+        return;
+    }
+    record_undo();
+    const auto target_row = row_;
+    const auto target_display =
+        display_column(lines_[row_], column_);
+    while (lines_.size() < target_row + block.size()) {
+        lines_.emplace_back();
+    }
+    for (std::size_t index = 0; index < block.size(); ++index) {
+        auto& line = lines_[target_row + index];
+        const auto width = display_column(line, line.size());
+        if (width < target_display) {
+            line.append(target_display - width, ' ');
+        }
+        const auto target =
+            prepare_column_insertion(line, target_display);
+        line.insert(target, block[index]);
+    }
+    row_ = target_row;
+    column_ = byte_column(lines_[row_], target_display);
+    preferred_display_column_ = target_display;
+    clear_selection();
+    dirty_ = true;
+    ++change_id_;
 }
 
 void EditorModel::insert_text(
@@ -961,6 +1112,47 @@ bool EditorModel::copy_selection() {
         begin_offset,
         end_offset - begin_offset
     );
+    if (column_selection_) {
+        const auto block = selected_text();
+        if (!block) {
+            return false;
+        }
+        clipboard_ = *block;
+        const auto target_row = row_;
+        const auto target_display =
+            display_column(lines_[row_], column_);
+        const auto begin_display = display_column(
+            lines_[selection_begin_->row],
+            selection_begin_->column
+        );
+        const auto end_display = display_column(
+            lines_[selection_end_->row],
+            selection_end_->column
+        );
+        const auto width =
+            std::max(begin_display, end_display) -
+            std::min(begin_display, end_display);
+        const auto height =
+            selected->second.row - selected->first.row + 1U;
+        paste_column(clipboard_);
+        selection_begin_ = EditorPosition{
+            .row = target_row,
+            .column = byte_column(
+                lines_[target_row],
+                target_display
+            ),
+        };
+        selection_end_ = EditorPosition{
+            .row = target_row + height - 1U,
+            .column = byte_column(
+                lines_[target_row + height - 1U],
+                target_display + width
+            ),
+        };
+        column_selection_ = true;
+        marking_ = false;
+        return true;
+    }
     insert_text(clipboard_, false, true);
     return true;
 }
@@ -969,6 +1161,91 @@ bool EditorModel::move_selection() {
     const auto selected = selection();
     if (!selected) {
         return false;
+    }
+    if (column_selection_) {
+        const auto block_text = selected_text();
+        if (!block_text) {
+            return false;
+        }
+        const auto begin_display = display_column(
+            lines_[selection_begin_->row],
+            selection_begin_->column
+        );
+        const auto end_display = display_column(
+            lines_[selection_end_->row],
+            selection_end_->column
+        );
+        const auto left = std::min(begin_display, end_display);
+        const auto right = std::max(begin_display, end_display);
+        auto target_display =
+            display_column(lines_[row_], column_);
+        if (row_ >= selected->first.row &&
+            row_ <= selected->second.row &&
+            target_display >= left &&
+            target_display <= right) {
+            return false;
+        }
+        if (row_ >= selected->first.row &&
+            row_ <= selected->second.row &&
+            target_display > right) {
+            target_display -= right - left;
+        }
+        std::vector<std::pair<std::size_t, std::size_t>> ranges;
+        for (auto row = selected->first.row;
+             row <= selected->second.row;
+             ++row) {
+            ranges.push_back(*selection_on_line(row));
+        }
+        std::vector<std::string> block;
+        std::size_t block_begin = 0;
+        while (block_begin <= block_text->size()) {
+            const auto block_end =
+                block_text->find('\n', block_begin);
+            block.emplace_back(block_text->substr(
+                block_begin,
+                block_end == std::string::npos
+                    ? block_text->size() - block_begin
+                    : block_end - block_begin
+            ));
+            if (block_end == std::string::npos) {
+                break;
+            }
+            block_begin = block_end + 1U;
+        }
+        record_undo();
+        for (std::size_t index = 0; index < ranges.size(); ++index) {
+            auto& line = lines_[selected->first.row + index];
+            line.erase(
+                ranges[index].first,
+                ranges[index].second - ranges[index].first
+            );
+        }
+        const auto target_row = row_;
+        while (lines_.size() < target_row + block.size()) {
+            lines_.emplace_back();
+        }
+        for (std::size_t index = 0; index < block.size(); ++index) {
+            auto& line = lines_[target_row + index];
+            const auto line_width =
+                display_column(line, line.size());
+            if (line_width < target_display) {
+                line.append(target_display - line_width, ' ');
+            }
+            line.insert(
+                prepare_column_insertion(
+                    line,
+                    target_display
+                ),
+                block[index]
+            );
+        }
+        column_ = byte_column(lines_[target_row], target_display);
+        row_ = target_row;
+        preferred_display_column_ = target_display;
+        clear_selection();
+        dirty_ = true;
+        ++change_id_;
+        return true;
     }
     auto serialized = content();
     auto begin_offset = offset(selected->first);
@@ -1007,6 +1284,41 @@ bool EditorModel::delete_selection() {
     if (!selected) {
         return false;
     }
+    if (column_selection_) {
+        std::vector<std::pair<std::size_t, std::size_t>> ranges;
+        ranges.reserve(
+            selected->second.row - selected->first.row + 1U
+        );
+        for (auto row = selected->first.row;
+             row <= selected->second.row;
+             ++row) {
+            ranges.push_back(*selection_on_line(row));
+        }
+        if (std::ranges::all_of(
+                ranges,
+                [](const auto range) {
+                    return range.first == range.second;
+                }
+            )) {
+            return true;
+        }
+        record_undo();
+        for (std::size_t index = 0; index < ranges.size(); ++index) {
+            auto& line = lines_[selected->first.row + index];
+            line.erase(
+                ranges[index].first,
+                ranges[index].second - ranges[index].first
+            );
+        }
+        row_ = selected->first.row;
+        column_ = ranges.front().first;
+        preferred_display_column_ =
+            display_column(lines_[row_], column_);
+        clear_selection();
+        dirty_ = true;
+        ++change_id_;
+        return true;
+    }
     record_undo();
     replace_range(selected->first, selected->second, "");
     dirty_ = true;
@@ -1018,6 +1330,41 @@ std::optional<std::string> EditorModel::selected_text() const {
     const auto selected = selection();
     if (!selected) {
         return std::nullopt;
+    }
+    if (column_selection_) {
+        const auto begin_display = display_column(
+            lines_[selection_begin_->row],
+            selection_begin_->column
+        );
+        const auto end_display = display_column(
+            lines_[selection_end_->row],
+            selection_end_->column
+        );
+        const auto width =
+            std::max(begin_display, end_display) -
+            std::min(begin_display, end_display);
+        if (width == 0U) {
+            return std::nullopt;
+        }
+        std::string result;
+        for (auto row = selected->first.row;
+             row <= selected->second.row;
+             ++row) {
+            const auto range = selection_on_line(row);
+            result.append(
+                lines_[row],
+                range->first,
+                range->second - range->first
+            );
+            const auto actual =
+                display_column(lines_[row], range->second) -
+                display_column(lines_[row], range->first);
+            result.append(width - std::min(width, actual), ' ');
+            if (row != selected->second.row) {
+                result += '\n';
+            }
+        }
+        return result;
     }
     const auto begin_offset = offset(selected->first);
     const auto end_offset = offset(selected->second);
@@ -1100,6 +1447,7 @@ EditorModel::Snapshot EditorModel::snapshot() const {
         .selection_begin = selection_begin_,
         .selection_end = selection_end_,
         .marking = marking_,
+        .column_selection = column_selection_,
         .byte_size = byte_size(),
     };
 }
@@ -1126,6 +1474,7 @@ void EditorModel::restore(Snapshot snapshot) {
     selection_begin_ = snapshot.selection_begin;
     selection_end_ = snapshot.selection_end;
     marking_ = snapshot.marking;
+    column_selection_ = snapshot.column_selection;
     dirty_ = true;
     ++change_id_;
 }
@@ -1292,6 +1641,7 @@ bool EditorModel::find(
     selection_begin_ = position(found->begin);
     selection_end_ = position(found->end);
     marking_ = false;
+    column_selection_ = false;
     row_ = selection_begin_->row;
     column_ = selection_begin_->column;
     preferred_display_column_ =

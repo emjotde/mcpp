@@ -1,6 +1,7 @@
 #include "mcpp/config.hpp"
 #include "mcpp/compare.hpp"
 #include "mcpp/editor.hpp"
+#include "mcpp/editor_clipboard.hpp"
 #include "mcpp/editor_search.hpp"
 #include "mcpp/local_provider.hpp"
 #include "mcpp/operations.hpp"
@@ -1271,6 +1272,100 @@ void test_viewer_editor() {
         !editor.selection().has_value(),
         "editor unmark"
     );
+    const auto column_block_path =
+        temporary.path() / "column-block.txt";
+    write_file(column_block_path, "abcdef\nab\na bcdef\n");
+    editor.open(provider, column_block_path.string());
+    editor.move(0, 1);
+    editor.toggle_column_mark();
+    editor.move(0, 2);
+    editor.move(2, 0);
+    editor.toggle_column_mark();
+    check(editor.column_selection(), "editor column block mode");
+    check_equal(
+        *editor.selected_text(),
+        std::string("bc\nb \n b"),
+        "editor rectangular block text"
+    );
+    check(editor.delete_selection(), "delete rectangular block");
+    check_equal(
+        editor.lines()[0],
+        std::string("adef"),
+        "column delete first row"
+    );
+    check_equal(
+        editor.lines()[1],
+        std::string("a"),
+        "column delete short row"
+    );
+    check_equal(
+        editor.lines()[2],
+        std::string("acdef"),
+        "column delete final row"
+    );
+    check(editor.undo(), "undo rectangular delete");
+    editor.clear_selection();
+    editor.goto_line(1);
+    editor.home();
+    editor.paste_column("X\nY\nZ");
+    check_equal(
+        editor.lines()[0],
+        std::string("Xabcdef"),
+        "column paste first row"
+    );
+    check_equal(
+        editor.lines()[2],
+        std::string("Za bcdef"),
+        "column paste final row"
+    );
+    write_file(column_block_path, "abcdef\nuvwxyz\n");
+    editor.open(provider, column_block_path.string());
+    editor.move(0, 2);
+    editor.toggle_column_mark();
+    editor.move(0, 2);
+    editor.move(1, 0);
+    editor.toggle_column_mark();
+    editor.set_position({.row = 0, .column = 0});
+    check(editor.copy_selection(), "first column copy");
+    check(editor.copy_selection(), "repeated column copy");
+    check_equal(
+        editor.lines()[0],
+        std::string("cdcdabcdef"),
+        "repeated column copy first row"
+    );
+    check_equal(
+        editor.lines()[1],
+        std::string("wxwxuvwxyz"),
+        "repeated column copy second row"
+    );
+    write_file(column_block_path, "abc\ndef\n");
+    editor.open(provider, column_block_path.string());
+    editor.move(0, 1);
+    editor.toggle_column_mark();
+    editor.move(1, 0);
+    editor.toggle_column_mark();
+    check(
+        !editor.copy_selection(),
+        "zero-width column copy is rejected"
+    );
+    check(
+        editor.delete_selection(),
+        "zero-width column delete is handled"
+    );
+    check_equal(
+        editor.lines()[0],
+        std::string("abc"),
+        "zero-width column delete keeps text"
+    );
+    write_file(column_block_path, "abcd\n\tfoo\n");
+    editor.open(provider, column_block_path.string());
+    editor.move(0, 2);
+    editor.paste_column("X\nY");
+    check_equal(
+        editor.lines()[1],
+        std::string("  Y\tfoo"),
+        "column paste pads inside tab"
+    );
     write_file(overwrite_path, "abcdef");
     editor.open(provider, overwrite_path.string());
     editor.move(0, 2);
@@ -1497,6 +1592,8 @@ void test_config() {
     config.sort = mcpp::SortField::size;
     config.sort_descending = true;
     config.theme = "blue";
+    config.editor_syntax = false;
+    config.editor_line_numbers = false;
     config.bookmarks = {
         "/one",
         "/two\nconfirm_delete=true",
@@ -1508,6 +1605,10 @@ void test_config() {
     check_equal(loaded.sort, mcpp::SortField::size, "config sort");
     check(loaded.sort_descending, "config sort direction");
     check_equal(loaded.theme, std::string("blue"), "config theme");
+    check(
+        !loaded.editor_syntax && !loaded.editor_line_numbers,
+        "config editor display settings"
+    );
     check_equal(
         loaded.bookmarks.size(),
         std::size_t{2},
@@ -1540,6 +1641,38 @@ void test_config() {
             std::filesystem::symlink_status(linked_config)
         ),
         "config save replaces symlink itself"
+    );
+}
+
+void test_editor_clipboard() {
+    TemporaryDirectory temporary;
+    const auto path = temporary.path() / "cache" / "clip";
+    mcpp::save_editor_clipboard(path, "alpha\nbeta");
+    check_equal(
+        mcpp::load_editor_clipboard(path),
+        std::string("alpha\nbeta"),
+        "persistent editor clipboard"
+    );
+    struct stat status {};
+    check(
+        ::stat(path.c_str(), &status) == 0 &&
+            (status.st_mode & 0777) == 0600,
+        "editor clipboard permissions"
+    );
+    const auto victim = temporary.path() / "victim";
+    write_file(victim, "victim");
+    std::filesystem::remove(path);
+    std::filesystem::create_symlink(victim, path);
+    mcpp::save_editor_clipboard(path, "replacement");
+    check_equal(
+        read_file(victim),
+        std::string("victim"),
+        "clipboard save does not follow symlink"
+    );
+    check_equal(
+        mcpp::load_editor_clipboard(path),
+        std::string("replacement"),
+        "clipboard save replaces symlink"
     );
 }
 
@@ -1941,6 +2074,7 @@ int main() {
         {"operations", test_operations},
         {"viewer/editor", test_viewer_editor},
         {"config", test_config},
+        {"editor clipboard", test_editor_clipboard},
         {"search/compare", test_search_compare},
         {"syntax", test_syntax},
         {"editor search", test_editor_search},

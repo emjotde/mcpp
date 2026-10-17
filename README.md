@@ -23,6 +23,7 @@ Azure Blob Storage through azcpp. SSH/SFTP work is currently paused.
 - MC-style visual state cues using a grayscale-only palette
 - Toggleable VS Code Dark+-style syntax colors within grayscale UI chrome
 - Toggleable editor line-number gutter and mcedit-style position header
+- Persistent linear/column blocks and atomic cross-session editor clipboard
 
 The implementation is behaviorally familiar but does not use Midnight
 Commander source code, resources, strings, tests, or artwork. A shallow MC

@@ -1,6 +1,7 @@
 #include "mcpp/app.hpp"
 
 #include "mcpp/compare.hpp"
+#include "mcpp/editor_clipboard.hpp"
 #include "mcpp/local_provider.hpp"
 #include "mcpp/location.hpp"
 #include "mcpp/search.hpp"
@@ -74,6 +75,11 @@ enum class PromptAction {
     editor_new,
     editor_save_as,
     editor_goto,
+    hardlink,
+    symlink,
+    relative_symlink,
+    select_pattern,
+    unselect_pattern,
     quick_cd,
     chmod,
     chown,
@@ -482,6 +488,11 @@ std::string permission_text(const Entry& entry) {
     return result;
 }
 
+struct MenuRow {
+    std::string label;
+    int action{-1};
+};
+
 }  // namespace
 
 struct App::Impl {
@@ -517,6 +528,7 @@ struct App::Impl {
     std::vector<std::size_t> editor_line_first_columns;
     std::size_t editor_first_row{0};
     std::string editor_clipboard;
+    bool editor_clipboard_column{false};
     std::string editor_search_needle;
     EditorSearchOptions editor_search_options;
     bool editor_search_in_selection{false};
@@ -542,6 +554,7 @@ struct App::Impl {
     std::size_t editor_menu_item{0};
     std::size_t editor_close_choice{0};
     bool editor_shift_marking{false};
+    bool editor_column_marking{false};
     std::string editor_message_title{"Editor error"};
     std::string editor_error_message;
     ftxui::App* terminal{nullptr};
@@ -608,6 +621,8 @@ struct App::Impl {
         right.set_directories_first(config.directories_first);
         left.set_sort(config.sort, config.sort_descending);
         right.set_sort(config.sort, config.sort_descending);
+        editor_syntax = config.editor_syntax;
+        editor_line_numbers = config.editor_line_numbers;
     }
 
     Pane& active() {
@@ -1219,6 +1234,14 @@ struct App::Impl {
                                  ? "Match found"
                                  : "No match";
                     break;
+                case PromptAction::select_pattern:
+                    active().select_pattern(prompt_value, true);
+                    status = "Selection updated";
+                    break;
+                case PromptAction::unselect_pattern:
+                    active().select_pattern(prompt_value, false);
+                    status = "Selection updated";
+                    break;
                 case PromptAction::editor_open:
                 case PromptAction::editor_new: {
                     if (editor.dirty()) {
@@ -1269,6 +1292,36 @@ struct App::Impl {
                     }
                     editor.goto_line(line);
                     status = "Line " + std::to_string(line);
+                    break;
+                }
+                case PromptAction::hardlink:
+                case PromptAction::symlink:
+                case PromptAction::relative_symlink: {
+                    const auto* entry = active().current();
+                    if (entry == nullptr || prompt_value.empty()) {
+                        break;
+                    }
+                    const auto destination =
+                        active().provider()->join(
+                            active().path(),
+                            prompt_value
+                        );
+                    if (prompt_action == PromptAction::hardlink) {
+                        active().provider()->create_hardlink(
+                            entry->path,
+                            destination
+                        );
+                    } else {
+                        active().provider()->create_symlink(
+                            prompt_action ==
+                                    PromptAction::relative_symlink
+                                ? entry->name
+                                : entry->path,
+                            destination
+                        );
+                    }
+                    active().refresh();
+                    status = "Link created";
                     break;
                 }
                 case PromptAction::quick_cd:
@@ -1565,18 +1618,9 @@ struct App::Impl {
         const auto& line = editor.lines()[index];
         auto selected_begin = line.size();
         auto selected_end = std::size_t{0};
-        if (const auto selected = editor.selection();
-            selected &&
-            index >= selected->first.row &&
-            index <= selected->second.row) {
-            selected_begin =
-                index == selected->first.row
-                    ? selected->first.column
-                    : 0U;
-            selected_end =
-                index == selected->second.row
-                    ? selected->second.column
-                    : line.size();
+        if (const auto selected = editor.selection_on_line(index)) {
+            selected_begin = selected->first;
+            selected_end = selected->second;
         }
 
         const auto visible_begin =
@@ -1732,6 +1776,47 @@ struct App::Impl {
             segments.push_back(std::move(segment));
             display_begin += display_width;
         }
+        if (editor.column_selection()) {
+            const auto selected = editor.selection();
+            if (selected &&
+                index >= selected->first.row &&
+                index <= selected->second.row) {
+                const auto first_display = editor_display_width(
+                    editor.lines()[selected->first.row],
+                    selected->first.column
+                );
+                const auto second_display = editor_display_width(
+                    editor.lines()[selected->second.row],
+                    selected->second.column
+                );
+                const auto selection_left =
+                    std::min(first_display, second_display);
+                const auto selection_right =
+                    std::max(first_display, second_display);
+                const auto line_width =
+                    editor_display_width(line, line.size());
+                if (line_width < selection_left) {
+                    segments.push_back(
+                        text(std::string(
+                            selection_left - line_width,
+                            ' '
+                        ))
+                    );
+                }
+                const auto virtual_begin =
+                    std::max(line_width, selection_left);
+                if (selection_right > virtual_begin) {
+                    segments.push_back(
+                        text(std::string(
+                            selection_right - virtual_begin,
+                            ' '
+                        )) |
+                        color(Color::Grey0) |
+                        bgcolor(Color::Grey85)
+                    );
+                }
+            }
+        }
         if (index == editor.row() &&
             editor.column() == line.size() &&
             visible_end == line.size()) {
@@ -1831,12 +1916,12 @@ struct App::Impl {
         }
 
         static const std::array<std::string, 7> menu_names{
-            "File", "Edit", "Search", "Command",
-            "Format", "Window", "Options"
+            "File     ", "Edit     ", "Search     ", "Command     ",
+            "Format     ", "Window     ", "Options"
         };
         Elements menu;
         for (std::size_t index = 0; index < menu_names.size(); ++index) {
-            auto item = text(" " + menu_names[index] + " ");
+            auto item = text(menu_names[index]);
             if (index == editor_menu_category) {
                 item = item |
                        color(Color::Grey100) |
@@ -1920,47 +2005,131 @@ struct App::Impl {
         });
     }
 
+    static const std::array<
+        std::vector<MenuRow>,
+        7
+    >& editor_menu_items() {
+        static const std::array<std::vector<MenuRow>, 7> menus{{
+            {
+                {"Open file...", 0},
+                {"New  C-n", 1},
+                {"Close", 2},
+                {"History...  M-E", -1},
+                {"", -2},
+                {"Save  F2", 3},
+                {"Save as...  F12", 4},
+                {"", -2},
+                {"Insert file...  F15", -1},
+                {"Copy to file...  C-f", -1},
+                {"", -2},
+                {"User menu...  F11", -1},
+                {"", -2},
+                {"About...", -1},
+                {"", -2},
+                {"Quit  F10", 2},
+            },
+            {
+                {"Undo  C-u", 0},
+                {"Redo  M-r", 1},
+                {"", -2},
+                {"Toggle insert/overwrite  Ins", 2},
+                {"", -2},
+                {"Mark  F3", 3},
+                {"Mark columns  F13", 4},
+                {"Mark all", 5},
+                {"Unmark", 6},
+                {"", -2},
+                {"Copy  F5", 7},
+                {"Move  F6", 8},
+                {"Delete  F8", 9},
+                {"", -2},
+                {"Copy to clipfile  C-Ins", 10},
+                {"Cut to clipfile  S-Del", 11},
+                {"Paste from clipfile  S-Ins", 12},
+                {"", -2},
+                {"Beginning  C-Home", 13},
+                {"End  C-End", 14},
+            },
+            {
+                {"Search...  F7", 0},
+                {"Search again  F17", 1},
+                {"Replace...  F4", 2},
+                {"", -2},
+                {"Toggle bookmark  M-k", -1},
+                {"Next bookmark  M-j", -1},
+                {"Previous bookmark  M-i", -1},
+                {"Flush bookmarks  M-o", -1},
+            },
+            {
+                {"Go to line...  M-l", 0},
+                {"Toggle line numbers  M-n", 2},
+                {"Go to matching bracket  M-b", 1},
+                {"Toggle syntax highlighting  C-s", 3},
+                {"", -2},
+                {"Find declaration", -1},
+                {"Back from declaration", -1},
+                {"Forward to declaration", -1},
+                {"", -2},
+                {"Encoding...", -1},
+                {"", -2},
+                {"Refresh screen", -1},
+                {"", -2},
+                {"Start/Stop record macro", -1},
+                {"Delete macro...", -1},
+                {"Record/Repeat actions", -1},
+                {"", -2},
+                {"Spell check", -1},
+                {"Check word", -1},
+                {"Change spelling language...", -1},
+                {"", -2},
+                {"Mail...", -1},
+            },
+            {
+                {"Insert literal...  C-q", -1},
+                {"Insert date/time", -1},
+                {"", -2},
+                {"Format paragraph  M-p", -1},
+                {"Sort...  M-t", -1},
+                {"Paste output of...  M-u", -1},
+                {"External formatter", -1},
+            },
+            {
+                {"Move window", -1},
+                {"Resize window", -1},
+                {"Toggle fullscreen", -1},
+                {"", -2},
+                {"Next buffer", -1},
+                {"Previous buffer", -1},
+                {"Buffer list...", -1},
+            },
+            {
+                {"General...", -1},
+                {"Save mode...", -1},
+                {"Learn keys...", -1},
+                {"Syntax highlighting...", -1},
+                {"", -2},
+                {"Syntax file", -1},
+                {"Menu file", -1},
+                {"", -2},
+                {"Save setup", 0},
+            },
+        }};
+        return menus;
+    }
+
     ftxui::Element render_editor_menu() const {
         using namespace ftxui;
-        static const std::array<std::vector<std::string>, 7> menus{{
-            {
-                "Open file...",
-                "New  C-n",
-                "Close",
-                "Save  F2",
-                "Save as...  F12",
-            },
-            {
-                "Undo  C-u",
-                "Redo  M-r",
-                "Toggle ins/overw  Ins",
-                "Mark  F3",
-                "Mark all",
-                "Unmark",
-                "Copy  F5",
-                "Move  F6",
-                "Delete  F8",
-                "Copy to clipboard  C-Ins",
-                "Cut to clipboard  S-Del",
-                "Paste from clipboard  S-Ins",
-                "Beginning  C-Home",
-                "End  C-End",
-            },
-            {"Find  F7", "Search again  F17", "Replace  F4"},
-            {
-                "Go to line  M-l",
-                "Go to matching bracket  M-b",
-                "Toggle line numbers  M-n",
-                "Toggle syntax highlighting  C-s",
-            },
-            {"No commands"},
-            {"No commands"},
-            {"Tab inserts 4 spaces"},
-        }};
         Elements rows;
-        const auto& items = menus[editor_menu_category];
+        const auto& items = editor_menu_items()[editor_menu_category];
         for (std::size_t index = 0; index < items.size(); ++index) {
-            auto row = text(" " + items[index] + " ");
+            if (items[index].action == -2) {
+                rows.push_back(separator());
+                continue;
+            }
+            auto row = text(" " + items[index].label);
+            if (items[index].action < 0) {
+                row = row | color(Color::Grey66) | dim;
+            }
             if (index == editor_menu_item) {
                 row = row | inverted | focus;
             }
@@ -2252,57 +2421,106 @@ struct App::Impl {
     }
 
     static const std::array<
-        std::vector<std::string>,
+        std::vector<MenuRow>,
         5
     >& pulldown_items() {
-        static const std::array<std::vector<std::string>, 5> items{{
+        static const std::array<std::vector<MenuRow>, 5> items{{
             {
-                "Brief listing",
-                "Full listing",
-                "Toggle hidden",
-                "Sort by name",
-                "Sort by size",
-                "Sort by time",
-                "Toggle directories first",
-                "Refresh",
-                "Directory hotlist",
+                {"File listing", 12},
+                {"Quick view         C-x q", 10},
+                {"Info               C-x i", 11},
+                {"Tree", -1},
+                {"", -2},
+                {"Listing format...", -1},
+                {"Sort order...", -1},
+                {"Filter...", -1},
+                {"Encoding...        M-e", -1},
+                {"", -2},
+                {"FTP link...", -1},
+                {"Shell link...", -1},
+                {"SFTP link...", -1},
+                {"Panelize", -1},
+                {"", -2},
+                {"Rescan             C-r", 7},
             },
             {
-                "View",
-                "Edit",
-                "Copy",
-                "Rename",
-                "Move",
-                "Make directory",
-                "Delete",
-                "Information",
-                "Change mode",
-                "Change owner",
-                "Quit",
+                {"View              F3", 0},
+                {"View file...", 0},
+                {"Filtered view     M-!", -1},
+                {"Edit              F4", 1},
+                {"Copy              F5", 2},
+                {"Chmod             C-x c", 8},
+                {"Link              C-x l", 11},
+                {"Symlink           C-x s", 12},
+                {"Relative symlink  C-x v", 13},
+                {"Edit symlink      C-x C-s", -1},
+                {"Chown             C-x o", 9},
+                {"Advanced chown", -1},
+                {"Chattr            C-x e", -1},
+                {"Rename/Move       F6", 4},
+                {"Mkdir             F7", 5},
+                {"Delete            F8", 6},
+                {"Quick cd          M-c", 14},
+                {"", -2},
+                {"Select group      +", 15},
+                {"Unselect group    -", 16},
+                {"Invert selection  *", 17},
+                {"", -2},
+                {"Exit              F10", 10},
             },
             {
-                "Find recursively",
-                "Compare directories",
-                "Quick directory",
-                "Subshell",
-                "Refresh both",
+                {"User menu                     F2", 8},
+                {"Directory tree", -1},
+                {"Find file                     M-?", 0},
+                {"Swap panels                   C-u", 5},
+                {"Switch panels on/off          C-o", 3},
+                {"Compare directories           C-x d", 1},
+                {"Compare files                 C-x C-d", -1},
+                {"External panelize             C-x !", -1},
+                {"Show directory sizes          C-Space", -1},
+                {"", -2},
+                {"Command history               M-h", -1},
+                {"Viewed/edited files history   M-E", -1},
+                {"Directory hotlist             C-\\", 7},
+                {"Active VFS list               C-x a", -1},
+                {"Background jobs               C-x j", -1},
+                {"Screen list                   M-`", -1},
+                {"", -2},
+                {"Undelete files", -1},
+                {"", -2},
+                {"Edit extension file", -1},
+                {"Edit menu file", -1},
+                {"Edit highlighting group file", -1},
             },
             {
-                "Toggle quick view",
-                "Confirm delete",
-                "Confirm overwrite",
-                "Save setup",
+                {"Configuration...", -1},
+                {"Layout...", -1},
+                {"Panel options...", -1},
+                {"Confirmation...", -1},
+                {"Appearance...", -1},
+                {"Display bits...", -1},
+                {"Learn keys...", -1},
+                {"Virtual FS...", -1},
+                {"", -2},
+                {"Save setup", 3},
             },
             {
-                "Brief listing",
-                "Full listing",
-                "Toggle hidden",
-                "Sort by name",
-                "Sort by size",
-                "Sort by time",
-                "Toggle directories first",
-                "Refresh",
-                "Directory hotlist",
+                {"File listing", 12},
+                {"Quick view         C-x q", 10},
+                {"Info               C-x i", 11},
+                {"Tree", -1},
+                {"", -2},
+                {"Listing format...", -1},
+                {"Sort order...", -1},
+                {"Filter...", -1},
+                {"Encoding...        M-e", -1},
+                {"", -2},
+                {"FTP link...", -1},
+                {"Shell link...", -1},
+                {"SFTP link...", -1},
+                {"Panelize", -1},
+                {"", -2},
+                {"Rescan             C-r", 7},
             },
         }};
         return items;
@@ -2310,15 +2528,22 @@ struct App::Impl {
 
     ftxui::Element render_pulldown() {
         using namespace ftxui;
-        static const std::array<std::string, 5> names{
-            "Left", "File", "Command", "Options", "Right"
+        static constexpr std::array<int, 5> widths{
+            27, 28, 40, 21, 27
         };
         Elements rows;
         const auto& items = pulldown_items()[pulldown_category];
         pulldown_item_boxes.clear();
         pulldown_item_boxes.resize(items.size());
         for (std::size_t index = 0; index < items.size(); ++index) {
-            auto row = text(" " + items[index] + " ");
+            if (items[index].action == -2) {
+                rows.push_back(separator());
+                continue;
+            }
+            auto row = text(" " + items[index].label + " ");
+            if (items[index].action < 0) {
+                row = row | color(Color::Grey66) | dim;
+            }
             if (index == pulldown_item) {
                 row = row | inverted | focus;
             }
@@ -2328,20 +2553,29 @@ struct App::Impl {
             );
         }
         return gray_menu(
-            window(
-                text(" " + names[pulldown_category] + " ") | bold,
-                vbox(std::move(rows)),
-                LIGHT
+            (
+                vbox(std::move(rows)) |
+                borderStyled(LIGHT)
             ) |
-            size(WIDTH, EQUAL, 32)
+            size(
+                WIDTH,
+                EQUAL,
+                widths[pulldown_category]
+            )
         );
     }
 
     void execute_pulldown() {
+        const auto action =
+            pulldown_items()[pulldown_category][pulldown_item]
+                .action;
+        if (action < 0) {
+            return;
+        }
         if (pulldown_category == 0U ||
             pulldown_category == 4U) {
             active_index = pulldown_category == 0U ? 0 : 1;
-            switch (pulldown_item) {
+            switch (action) {
                 case 0:
                     detailed_view = false;
                     break;
@@ -2372,6 +2606,20 @@ struct App::Impl {
                     bookmark_cursor = 0;
                     mode = Mode::bookmarks;
                     return;
+                case 9:
+                    sort_active(SortField::extension);
+                    break;
+                case 10:
+                    quick_view = !quick_view;
+                    quick_viewer.close();
+                    quick_view_path.clear();
+                    break;
+                case 11:
+                    mode = Mode::information;
+                    return;
+                case 12:
+                    detailed_view = !detailed_view;
+                    break;
                 default:
                     break;
             }
@@ -2380,7 +2628,7 @@ struct App::Impl {
         }
         if (pulldown_category == 1U) {
             const auto* entry = active().current();
-            switch (pulldown_item) {
+            switch (action) {
                 case 0:
                     if (entry != nullptr &&
                         can_open_file(*entry)) {
@@ -2447,6 +2695,48 @@ struct App::Impl {
                 case 10:
                     exit_terminal();
                     return;
+                case 11:
+                    start_prompt(
+                        PromptAction::hardlink,
+                        "Hard link name"
+                    );
+                    return;
+                case 12:
+                    start_prompt(
+                        PromptAction::symlink,
+                        "Symbolic link name"
+                    );
+                    return;
+                case 13:
+                    start_prompt(
+                        PromptAction::relative_symlink,
+                        "Relative symbolic link name"
+                    );
+                    return;
+                case 14:
+                    start_prompt(
+                        PromptAction::quick_cd,
+                        "Change directory",
+                        active().path()
+                    );
+                    return;
+                case 15:
+                    start_prompt(
+                        PromptAction::select_pattern,
+                        "Select group",
+                        "*"
+                    );
+                    return;
+                case 16:
+                    start_prompt(
+                        PromptAction::unselect_pattern,
+                        "Unselect group",
+                        "*"
+                    );
+                    return;
+                case 17:
+                    active().invert_selection();
+                    break;
                 default:
                     break;
             }
@@ -2454,7 +2744,7 @@ struct App::Impl {
             return;
         }
         if (pulldown_category == 2U) {
-            switch (pulldown_item) {
+            switch (action) {
                 case 0:
                     start_prompt(
                         PromptAction::recursive_search,
@@ -2491,6 +2781,20 @@ struct App::Impl {
                 case 4:
                     refresh();
                     break;
+                case 5:
+                    std::swap(left, right);
+                    active_index = 1 - active_index;
+                    break;
+                case 6:
+                    passive().change_directory(active().path());
+                    break;
+                case 7:
+                    bookmark_cursor = 0;
+                    mode = Mode::bookmarks;
+                    return;
+                case 8:
+                    mode = Mode::user_menu;
+                    return;
                 default:
                     break;
             }
@@ -2498,7 +2802,7 @@ struct App::Impl {
             return;
         }
         if (pulldown_category == 3U) {
-            switch (pulldown_item) {
+            switch (action) {
                 case 0:
                     quick_view = !quick_view;
                     quick_viewer.close();
@@ -2932,11 +3236,15 @@ struct App::Impl {
                 ? "Hint: Tab changes your current panel."
                 : status + progress_text;
         static const std::array<std::string, 5> menu_names{
-            "Left", "File", "Command", "Options", "Right"
+            " Left     ",
+            "File     ",
+            "Command     ",
+            "Options     ",
+            "Right "
         };
         Elements menu_elements;
         for (std::size_t index = 0; index < menu_names.size(); ++index) {
-            auto item = text(" " + menu_names[index] + " ");
+            auto item = text(menu_names[index]);
             if (mode == Mode::pulldown &&
                 index == pulldown_category) {
                 item = item |
@@ -3092,7 +3400,7 @@ struct App::Impl {
             });
         } else if (mode == Mode::pulldown) {
             static constexpr std::array<int, 5> offsets{
-                0, 6, 12, 21, 30
+                0, 9, 18, 30, 42
             };
             auto positioned_menu = vbox({
                 filler() | size(HEIGHT, EQUAL, 1),
@@ -3237,6 +3545,7 @@ struct App::Impl {
 
     void close_editor() {
         editor_shift_marking = false;
+        editor_column_marking = false;
         editor.close();
         mode = Mode::panels;
         if (exit_after_editor) {
@@ -3263,24 +3572,49 @@ struct App::Impl {
     void store_editor_clipboard(const bool cut) {
         if (const auto selected = editor.selected_text()) {
             editor_clipboard = *selected;
-            if (cut) {
-                static_cast<void>(editor.delete_selection());
+            editor_clipboard_column = editor.column_selection();
+            try {
+                save_editor_clipboard(
+                    editor_clipboard_path(),
+                    editor_clipboard
+                );
+                if (cut) {
+                    static_cast<void>(editor.delete_selection());
+                }
+                status = cut
+                             ? "Block cut to clipboard"
+                             : "Block copied to clipboard";
+            } catch (const std::exception& error) {
+                show_editor_error(error);
             }
-            status = cut
-                         ? "Block cut to clipboard"
-                         : "Block copied to clipboard";
         } else {
             status = "No marked block";
         }
     }
 
     void paste_editor_clipboard() {
-        if (editor_clipboard.empty()) {
-            status = "Clipboard is empty";
-            return;
+        try {
+            const auto path = editor_clipboard_path();
+            const auto persisted = load_editor_clipboard(path);
+            if (std::filesystem::exists(path)) {
+                if (persisted != editor_clipboard) {
+                    editor_clipboard_column = false;
+                }
+                editor_clipboard = persisted;
+            }
+            if (editor_clipboard.empty()) {
+                status = "Clipboard is empty";
+                return;
+            }
+            if (editor_clipboard_column) {
+                editor.paste_column(editor_clipboard);
+            } else {
+                editor.paste(editor_clipboard);
+            }
+            status = "Clipboard pasted";
+        } catch (const std::exception& error) {
+            show_editor_error(error);
         }
-        editor.paste(editor_clipboard);
-        status = "Clipboard pasted";
     }
 
     void repeat_editor_search() {
@@ -3313,7 +3647,11 @@ struct App::Impl {
 
     void execute_editor_menu_item() {
         const auto category = editor_menu_category;
-        const auto item = editor_menu_item;
+        const auto item =
+            editor_menu_items()[category][editor_menu_item].action;
+        if (item < 0) {
+            return;
+        }
         mode = Mode::editor;
         if (category == 0U) {
             if (item == 0U) {
@@ -3368,43 +3706,49 @@ struct App::Impl {
                                  : "Block marked";
                     break;
                 case 4:
+                    editor.toggle_column_mark();
+                    status = editor.marking()
+                                 ? "Marking columns"
+                                 : "Column block marked";
+                    break;
+                case 5:
                     editor.select_all();
                     status = "All text marked";
                     break;
-                case 5:
+                case 6:
                     editor.clear_selection();
                     status = "Block unmarked";
                     break;
-                case 6:
+                case 7:
                     status = editor.copy_selection()
                                  ? "Block copied"
                                  : "No marked block";
                     break;
-                case 7:
+                case 8:
                     status = editor.move_selection()
                                  ? "Block moved"
                                  : "No movable block";
                     break;
-                case 8:
+                case 9:
                     if (!editor.delete_selection()) {
                         editor.erase();
                     }
                     status = "Deleted";
                     break;
-                case 9:
+                case 10:
                     store_editor_clipboard(false);
                     break;
-                case 10:
+                case 11:
                     store_editor_clipboard(true);
                     break;
-                case 11:
+                case 12:
                     paste_editor_clipboard();
                     break;
-                case 12:
+                case 13:
                     editor.goto_line(1);
                     editor.home();
                     break;
-                case 13:
+                case 14:
                     editor.goto_line(editor.lines().size());
                     editor.end();
                     break;
@@ -3447,13 +3791,56 @@ struct App::Impl {
             }
             return;
         }
+        if (category == 6U && item == 0) {
+            try {
+                config.editor_syntax = editor_syntax;
+                config.editor_line_numbers = editor_line_numbers;
+                config.save(default_config_path());
+                status = "Setup saved";
+            } catch (const std::exception& error) {
+                show_editor_error(error);
+            }
+            return;
+        }
         status = "No command in this menu";
     }
 
+    void reset_editor_menu_item() {
+        const auto& items = editor_menu_items()[editor_menu_category];
+        const auto match = std::find_if(
+            items.begin(),
+            items.end(),
+            [](const MenuRow& item) {
+                return item.action >= 0;
+            }
+        );
+        editor_menu_item =
+            match == items.end()
+                ? 0U
+                : static_cast<std::size_t>(
+                      std::distance(items.begin(), match)
+                  );
+    }
+
+    void move_editor_menu_item(const int direction) {
+        const auto& items = editor_menu_items()[editor_menu_category];
+        if (items.empty()) {
+            editor_menu_item = 0;
+            return;
+        }
+        for (std::size_t count = 0; count < items.size(); ++count) {
+            editor_menu_item =
+                direction > 0
+                    ? (editor_menu_item + 1U) % items.size()
+                    : (editor_menu_item + items.size() - 1U) %
+                          items.size();
+            if (items[editor_menu_item].action >= 0) {
+                return;
+            }
+        }
+    }
+
     bool handle_editor_menu(const ftxui::Event& event) {
-        static constexpr std::array<std::size_t, 7> item_counts{
-            5, 14, 3, 4, 1, 1, 1
-        };
         if (event == ftxui::Event::Escape ||
             event == ftxui::Event::F9) {
             mode = Mode::editor;
@@ -3463,37 +3850,41 @@ struct App::Impl {
             editor_menu_category =
                 (
                     editor_menu_category +
-                    item_counts.size() - 1U
+                    editor_menu_items().size() - 1U
                 ) %
-                item_counts.size();
-            editor_menu_item = 0;
+                editor_menu_items().size();
+            reset_editor_menu_item();
             return true;
         }
         if (event == ftxui::Event::ArrowRight ||
             event == ftxui::Event::Tab) {
             editor_menu_category =
-                (editor_menu_category + 1U) % item_counts.size();
-            editor_menu_item = 0;
+                (editor_menu_category + 1U) %
+                editor_menu_items().size();
+            reset_editor_menu_item();
             return true;
         }
         if (event == ftxui::Event::ArrowUp) {
-            const auto count = item_counts[editor_menu_category];
-            editor_menu_item =
-                (editor_menu_item + count - 1U) % count;
+            move_editor_menu_item(-1);
             return true;
         }
         if (event == ftxui::Event::ArrowDown) {
-            const auto count = item_counts[editor_menu_category];
-            editor_menu_item = (editor_menu_item + 1U) % count;
+            move_editor_menu_item(1);
             return true;
         }
         if (event == ftxui::Event::Home) {
             editor_menu_item = 0;
+            reset_editor_menu_item();
             return true;
         }
         if (event == ftxui::Event::End) {
-            editor_menu_item =
-                item_counts[editor_menu_category] - 1U;
+            const auto& items =
+                editor_menu_items()[editor_menu_category];
+            editor_menu_item = items.empty() ? 0U : items.size() - 1U;
+            while (editor_menu_item > 0U &&
+                   items[editor_menu_item].action < 0) {
+                --editor_menu_item;
+            }
             return true;
         }
         if (event == ftxui::Event::Return) {
@@ -3905,6 +4296,49 @@ struct App::Impl {
             }
             return false;
         }
+        const auto column_move = [&](const ftxui::Event& key,
+                                     const int rows,
+                                     const int columns) {
+            if (event != key) {
+                return false;
+            }
+            if (editor_shift_marking) {
+                editor.finish_mark();
+                editor_shift_marking = false;
+            }
+            if (!editor_column_marking) {
+                editor.begin_column_mark();
+                editor_column_marking = true;
+            }
+            editor.move(rows, columns);
+            return true;
+        };
+        if (column_move(
+                ftxui::Event::Special("\x1B[1;3A"),
+                -1,
+                0
+            ) ||
+            column_move(
+                ftxui::Event::Special("\x1B[1;3B"),
+                1,
+                0
+            ) ||
+            column_move(
+                ftxui::Event::Special("\x1B[1;3D"),
+                0,
+                -1
+            ) ||
+            column_move(
+                ftxui::Event::Special("\x1B[1;3C"),
+                0,
+                1
+            )) {
+            return true;
+        }
+        if (editor_column_marking) {
+            editor.finish_mark();
+            editor_column_marking = false;
+        }
         const bool clipboard_event =
             event == ftxui::Event::Special("\x1B[2;5~") ||
             event == ftxui::Event::Special("\x1B[3;2~") ||
@@ -3985,6 +4419,14 @@ struct App::Impl {
         if (editor_shift_marking) {
             editor.finish_mark();
             editor_shift_marking = false;
+        }
+        if (event == ftxui::Event::Special("\x1B[25~") ||
+            event == ftxui::Event::Special("\x1B[1;2P")) {
+            editor.toggle_column_mark();
+            status = editor.marking()
+                         ? "Marking columns"
+                         : "Column block marked";
+            return true;
         }
         if (event == ftxui::Event::F1) {
             mode = Mode::editor_help;
@@ -4228,6 +4670,41 @@ struct App::Impl {
         return true;
     }
 
+    void reset_pulldown_item() {
+        const auto& items = pulldown_items()[pulldown_category];
+        const auto match = std::find_if(
+            items.begin(),
+            items.end(),
+            [](const MenuRow& item) {
+                return item.action >= 0;
+            }
+        );
+        pulldown_item =
+            match == items.end()
+                ? 0U
+                : static_cast<std::size_t>(
+                      std::distance(items.begin(), match)
+                  );
+    }
+
+    void move_pulldown_item(const int direction) {
+        const auto& items = pulldown_items()[pulldown_category];
+        if (items.empty()) {
+            pulldown_item = 0;
+            return;
+        }
+        for (std::size_t count = 0; count < items.size(); ++count) {
+            pulldown_item =
+                direction > 0
+                    ? (pulldown_item + 1U) % items.size()
+                    : (pulldown_item + items.size() - 1U) %
+                          items.size();
+            if (items[pulldown_item].action >= 0) {
+                return;
+            }
+        }
+    }
+
     bool handle_pulldown(const ftxui::Event& event) {
         if (event == ftxui::Event::Escape ||
             event == ftxui::Event::F9) {
@@ -4247,7 +4724,7 @@ struct App::Impl {
                             mouse.y
                         )) {
                         pulldown_category = index;
-                        pulldown_item = 0;
+                        reset_pulldown_item();
                         return true;
                     }
                 }
@@ -4273,29 +4750,20 @@ struct App::Impl {
         }
         if (event == ftxui::Event::ArrowLeft) {
             pulldown_category = (pulldown_category + 4U) % 5U;
-            pulldown_item = 0;
+            reset_pulldown_item();
             return true;
         }
         if (event == ftxui::Event::ArrowRight) {
             pulldown_category = (pulldown_category + 1U) % 5U;
-            pulldown_item = 0;
+            reset_pulldown_item();
             return true;
         }
-        const auto item_count =
-            pulldown_items()[pulldown_category].size();
         if (event == ftxui::Event::ArrowDown) {
-            pulldown_item =
-                item_count == 0U
-                    ? 0U
-                    : (pulldown_item + 1U) % item_count;
+            move_pulldown_item(1);
             return true;
         }
         if (event == ftxui::Event::ArrowUp) {
-            pulldown_item =
-                item_count == 0U
-                    ? 0U
-                    : (pulldown_item + item_count - 1U) %
-                          item_count;
+            move_pulldown_item(-1);
             return true;
         }
         if (event == ftxui::Event::Return) {
@@ -4641,6 +5109,9 @@ struct App::Impl {
             event == ftxui::Event::Special("\x1B[6;5~") ||
             event == ftxui::Event::CtrlS ||
             event == ftxui::Event::AltS ||
+            event == ftxui::Event::CtrlU ||
+            event == ftxui::Event::AltC ||
+            event == ftxui::Event::Special("\x1B.") ||
             event == ftxui::Event::F1 ||
             event == ftxui::Event::F2 ||
             event == ftxui::Event::F3 ||
@@ -4700,7 +5171,7 @@ struct App::Impl {
                                 mouse.y
                             )) {
                             pulldown_category = index;
-                            pulldown_item = 0;
+                            reset_pulldown_item();
                             mode = Mode::pulldown;
                             return true;
                         }
@@ -4802,11 +5273,9 @@ struct App::Impl {
                 );
             } else if (event == ftxui::Event::Return) {
                 static_cast<void>(active().enter());
-            } else if (event == ftxui::Event::AltY ||
-                       event == ftxui::Event::AltH) {
+            } else if (event == ftxui::Event::AltY) {
                 active().history_back();
-            } else if (event == ftxui::Event::AltU ||
-                       event == ftxui::Event::AltL) {
+            } else if (event == ftxui::Event::AltU) {
                 active().history_forward();
             } else if (event == ftxui::Event::Insert) {
                 active().toggle_selected();
@@ -4820,6 +5289,21 @@ struct App::Impl {
             } else if (event == ftxui::Event::CtrlR) {
                 refresh();
                 status = "Refreshed";
+            } else if (event == ftxui::Event::CtrlU) {
+                std::swap(left, right);
+                active_index = 1 - active_index;
+            } else if (event == ftxui::Event::AltC) {
+                start_prompt(
+                    PromptAction::quick_cd,
+                    "Change directory",
+                    active().path()
+                );
+            } else if (
+                event == ftxui::Event::Special("\x1B.")
+            ) {
+                active().set_show_hidden(
+                    !active().show_hidden()
+                );
             } else if (event == ftxui::Event::CtrlC &&
                        operation_running.load(
                            std::memory_order_acquire
@@ -4867,7 +5351,7 @@ struct App::Impl {
                 }
             } else if (event == ftxui::Event::F9) {
                 pulldown_category = 0;
-                pulldown_item = 0;
+                reset_pulldown_item();
                 mode = Mode::pulldown;
             } else if (event == ftxui::Event::F10) {
                 if (operation_running.load(
@@ -5073,6 +5557,9 @@ int App::run() {
     impl_->config.show_hidden = impl_->left.show_hidden();
     impl_->config.directories_first =
         impl_->left.directories_first();
+    impl_->config.editor_syntax = impl_->editor_syntax;
+    impl_->config.editor_line_numbers =
+        impl_->editor_line_numbers;
     impl_->config.sort = impl_->left.sort_field();
     impl_->config.sort_descending = impl_->left.descending();
     try {
