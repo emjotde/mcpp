@@ -575,14 +575,9 @@ Entry LocalProvider::stat_follow(
     const Cancellation& cancellation
 ) const {
     cancellation.throw_if_requested();
-    const auto original = resolve(path);
-    auto result = make_entry(
+    return make_entry(
         std::filesystem::directory_entry(resolve_follow(path))
     );
-    result.name = original.filename().string();
-    result.path = original.string();
-    result.hidden = result.name.starts_with('.');
-    return result;
 }
 
 bool LocalProvider::exists(const std::string_view path) const {

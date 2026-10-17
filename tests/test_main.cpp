@@ -862,6 +862,42 @@ void test_viewer_editor() {
     viewer.toggle_hex();
     check(viewer.hex(), "viewer hex");
 
+    const auto link_target = temporary.path() / "linked.txt";
+    const auto link_path = temporary.path() / "linked-alias";
+    write_file(link_target, "linked content");
+    std::filesystem::create_symlink(
+        link_target.filename(),
+        link_path
+    );
+    mcpp::ViewerModel linked_viewer;
+    linked_viewer.open(provider, link_path.string());
+    check_equal(
+        linked_viewer.lines(80, 10).front(),
+        std::string("linked content"),
+        "viewer follows file symlink"
+    );
+    const auto wide_path = temporary.path() / "wide.txt";
+    write_file(wide_path, "测试abc\n");
+    mcpp::ViewerModel wide_viewer;
+    wide_viewer.open(provider, wide_path.string());
+    check_equal(
+        wide_viewer.lines(4, 10).front(),
+        std::string("测试"),
+        "viewer clips at UTF-8 cell boundary"
+    );
+    wide_viewer.set_wrap(true);
+    const auto wrapped_wide = wide_viewer.lines(4, 10);
+    check_equal(
+        wrapped_wide.size(),
+        std::size_t{2},
+        "viewer wraps UTF-8 by cell width"
+    );
+    check_equal(
+        wrapped_wide[1],
+        std::string("abc"),
+        "viewer retains text after UTF-8 wrap"
+    );
+
     mcpp::EditorModel editor;
     editor.open(provider, path.string());
     editor.move(1, 4);
@@ -977,6 +1013,22 @@ void test_viewer_editor() {
         conflict = true;
     }
     check(conflict, "editor conflict");
+
+    editor.open(provider, link_path.string());
+    editor.end();
+    editor.insert('!');
+    editor.save(false);
+    check(
+        std::filesystem::is_symlink(
+            std::filesystem::symlink_status(link_path)
+        ),
+        "editor preserves file symlink"
+    );
+    check_equal(
+        read_file(link_target),
+        std::string("linked content!"),
+        "editor saves through file symlink"
+    );
 }
 
 void test_config() {

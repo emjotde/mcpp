@@ -15,7 +15,7 @@ struct Config {
     bool directories_first{true};
     SortField sort{SortField::name};
     bool sort_descending{false};
-    std::string theme{"mono"};
+    std::string theme{"grayscale"};
     std::string left_path;
     std::string right_path;
     std::vector<std::string> bookmarks;

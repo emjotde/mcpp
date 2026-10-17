@@ -253,28 +253,144 @@ menu, hint, prompt, and file-manager keybar, unlike MC's dedicated viewer.
 
 ### Editor
 
-The installed MC was configured to use an external editor, so `mcedit` was
-also tested directly.
+This comparison used `/usr/bin/mcedit` from MC 4.8.30, its installed manual
+and default keymap, every pull-down menu, and paired pseudo-terminal editing
+checks. The current mcpp editor now looks like mcedit at first glance, but it
+is not behaviorally equivalent.
 
-mcpp has basic insertion, deletion, lines, save, conflict detection, search,
-and undo/redo. Missing MC editor behavior includes:
+What is already close:
 
-- character cursor rendering rather than whole-line inversion;
-- text selection, clipboard, block and column modes;
-- find/replace and repeat;
-- goto line, bracket matching, bookmarks, and multi-file history;
-- save-as, new file, insert file, and external commands;
-- syntax highlighting and syntax toggle;
-- tabs/indentation, paragraph formatting, completion, and macros;
-- line-number and whitespace displays;
-- codepage handling;
-- spell checking;
-- crash recovery and safe edit session files;
-- menu system and editor-specific F-key bar;
-- configurable external editor selection.
+- a dedicated full-screen editor with an editor-specific header and keybar;
+- a character cursor, UTF-8 code-point movement, and horizontal scrolling;
+- linear F3 marking and basic F5/F6/F8 block operations;
+- F7 literal search, F4 single replacement, save-as, and goto-line;
+- undo/redo, atomic saves, external-change detection, and dirty-close
+  confirmation;
+- regular-file symlink editing that updates the target without replacing the
+  link;
+- visible save errors and readable narrow-terminal rendering.
 
-The 16 MiB editor limit is mcpp-specific and not presented as a recoverable
-choice.
+#### File and window lifecycle
+
+| Capability | mcedit | mcpp | Gap |
+|---|---|---|---|
+| Existing file | Yes | Yes | Close |
+| New/open another file | File menu and `Ctrl-N` | No editor action | Missing |
+| Multiple files/windows | Multiple movable/resizable windows | One buffer | Missing |
+| File history | Persistent history dialog | No | Missing |
+| Save/save-as | Confirmation, overwrite handling, save modes | Save and no-clobber save-as | Partial |
+| Insert/copy block to file | Yes | No | Missing |
+| Concurrent-edit lock | Lock file and user decision | Revision conflict detected only at save | Partial |
+| Backups/recovery | Configurable save modes and recovery support | Atomic replacement only | Partial |
+| Large-file handling | Warns at 64 MiB and offers to continue | Hard rejection above 16 MiB | Different |
+| Binary/non-printable editing | Supported | Bytes load, but display/edit behavior is incomplete | Incorrect |
+
+The mcpp safety baseline is good: writes are atomic, stale revisions are
+rejected, and symlink targets are resolved once when opened. It does not yet
+offer mcedit's save-mode choices, lock interaction, recovery, or multi-file
+workflow.
+
+#### Editing and navigation
+
+| Behavior | mcedit | mcpp |
+|---|---|---|
+| Insert/overwrite | `Insert` toggles mode | Insert only |
+| Word movement | `Ctrl-Left/Right` | No |
+| File top/bottom | `Ctrl-Home/End` | No |
+| Delete word/line/to-EOL | Dedicated bindings | Character/backspace only |
+| Desired column on vertical move | Preserved across short lines | Column is clamped and lost |
+| Page Up/Down | Uses the visible editor height | Uses the visible editor height | Close |
+| Tab handling | Configurable real/fake tabs and tab width | Always inserts four spaces |
+| Existing tabs | Configurable width | Displayed at fixed four-cell stops |
+| Auto-indent | Configurable | No |
+| Literal insertion | `Ctrl-Q` | No |
+| Completion | `Alt-Tab` | No |
+| Matching bracket | `Alt-B` | No |
+| Paragraph formatting/sort/filter | Yes | No |
+
+Live checks confirmed visible differences:
+
+- `Insert`, then `X` over `abc` produces `Xbc` in mcedit and `Xabc` in
+  mcpp.
+- `Shift-Right` twice, then F8 leaves `c` in mcedit and `bc` in mcpp because
+  mcpp does not implement Shift-arrow marking.
+- `Ctrl-U` undoes in mcedit; mcpp currently binds undo to `Ctrl-Z`.
+
+#### Selection and clipboard
+
+mcpp implements one linear F3 selection and can copy, move, or delete it.
+Unlike mcedit's persistent block, mcpp consumes the selection when text is
+typed or F5 is used, so a block cannot be copied repeatedly without marking it
+again. mcedit additionally supports:
+
+- Shift-arrow, word, page, file-boundary, and scrolling selection;
+- rectangular column blocks (`F13` and Alt-arrow bindings);
+- mark-all, unmark, line/word marking, and block indentation;
+- persistent clip-file copy/cut/paste through `Ctrl-Insert`,
+  `Shift-Delete`, and `Shift-Insert`;
+- mouse positioning and mouse block selection.
+
+mcpp has no reusable clipboard or paste action. Its internal scratch string is
+used only while a selected block is copied or moved. It has no standard
+terminal-editor selection bindings or persistent clip file.
+
+#### Search and replace
+
+| Capability | mcedit | mcpp |
+|---|---|---|
+| Forward literal search | Yes | Yes |
+| Case-sensitive option | Yes | No UI |
+| Backward search | Yes | No |
+| Regular expression/wildcard/hex | Yes | No |
+| Whole words/selection/all charsets | Yes | No |
+| Search again | `F17` | No |
+| Find all | Results action | No |
+| Failed-search feedback | Dialog | Dialog |
+| Interactive replace choices | Replace/skip/all/one | No |
+| Replace again | `F14` | No |
+
+mcpp's F4 flow asks for two strings and immediately replaces one
+case-insensitive match, wrapping to the start of the file. That is materially
+different from mcedit's option dialog and per-match replacement flow.
+
+#### Key compatibility
+
+Several mcpp shortcuts conflict with mcedit's default keymap:
+
+| Action/key | mcedit | mcpp |
+|---|---|---|
+| `Esc` | Quit/close | Clear selection only |
+| Undo | `Ctrl-U` | `Ctrl-Z` |
+| Redo | `Alt-R` | `Ctrl-Y` |
+| Goto line | `Alt-L` | `Ctrl-G` |
+| `Ctrl-S` | Toggle syntax highlighting | Save |
+| `Ctrl-F` | Save block to file | Search |
+| `Insert` | Toggle insert/overwrite | No action |
+
+The F1-F10 labels are now similar, but matching labels are not sufficient
+while common keyboard habits produce different actions.
+
+#### Menus, status, and options
+
+mcpp shows the same seven top-level editor menu names. Only File, Edit, and
+Search contain a small working subset; Command, Format, Window, and Options
+are placeholders. mcedit exposes open/new/history, insert/copy file, clip-file
+operations, bookmarks, syntax and encoding, macros, spell checking, literal
+insertion, formatting, external filters, multiple windows, general editor
+options, save modes, and key learning. mcpp editor menus also lack mouse item
+activation and menu hotkeys.
+
+The mcedit header reports insert/overwrite state, selection size, line and
+column details, total lines/bytes, character code, and window state. mcpp
+reports path, modified state, line/column, and bytes only. Line numbers,
+whitespace markers, syntax highlighting, bookmarks, codepages, spell
+checking, macros, and session recovery are absent.
+
+The next editor work should first align default keys, Esc behavior,
+Shift-arrow selection, overwrite mode, word/file navigation, and the
+search/replace flow. File lifecycle and multi-buffer work come next. Syntax,
+macros, spell checking, and code navigation are later parity work, not
+requirements for a dependable basic editor.
 
 ### Command line and subshell
 

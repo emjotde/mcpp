@@ -20,11 +20,12 @@ Azure Blob Storage through azcpp. SSH/SFTP work is currently paused.
 - Directory comparison and quick-view panel
 - Local command line, history, and restored-terminal subshell
 - Persisted panel paths and preferences
+- MC-style visual state cues using a grayscale-only palette
 
 The implementation is behaviorally familiar but does not use Midnight
 Commander source code, resources, strings, tests, or artwork. A shallow MC
-checkout under ignored `reference/` is used only for black-box behavioral
-comparison.
+checkout under ignored `reference/` is used only to study behavior and
+documentation; no MC implementation is copied.
 
 ## Build
 

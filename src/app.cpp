@@ -101,6 +101,27 @@ std::string format_size(const std::uint64_t size) {
     return output.str();
 }
 
+std::string format_panel_size(const std::uint64_t size) {
+    const auto decimal = std::to_string(size);
+    if (decimal.size() <= 8U) {
+        return decimal;
+    }
+    static constexpr std::array<char, 6> suffixes{
+        'B', 'K', 'M', 'G', 'T', 'P'
+    };
+    auto value = static_cast<double>(size);
+    std::size_t suffix = 0;
+    while (value >= 1024.0 && suffix + 1U < suffixes.size()) {
+        value /= 1024.0;
+        ++suffix;
+    }
+    std::ostringstream output;
+    output << std::fixed
+           << std::setprecision(value < 10.0 ? 1 : 0)
+           << value << suffixes[suffix];
+    return output.str();
+}
+
 std::string display_text(const std::string_view value) {
     std::string result;
     result.reserve(value.size());
@@ -157,13 +178,24 @@ std::size_t next_utf8(
     return offset;
 }
 
-std::size_t utf8_offset_for_width(
+std::size_t editor_offset_for_width(
     const std::string_view value,
     const std::size_t target_width
 ) {
     std::size_t offset = 0;
     std::size_t width = 0;
     while (offset < value.size()) {
+        if (value[offset] == '\t') {
+            constexpr std::size_t tab_width = 4U;
+            const auto glyph_width =
+                tab_width - width % tab_width;
+            if (width + glyph_width > target_width) {
+                break;
+            }
+            width += glyph_width;
+            ++offset;
+            continue;
+        }
         const auto next = next_utf8(value, offset);
         const auto glyph_width = static_cast<std::size_t>(
             std::max(
@@ -178,6 +210,60 @@ std::size_t utf8_offset_for_width(
         offset = next;
     }
     return offset;
+}
+
+std::size_t editor_display_width(
+    const std::string_view value,
+    const std::size_t byte_offset
+) {
+    std::size_t offset = 0;
+    std::size_t width = 0;
+    const auto end = std::min(byte_offset, value.size());
+    while (offset < end) {
+        if (value[offset] == '\t') {
+            constexpr std::size_t tab_width = 4U;
+            width += tab_width - width % tab_width;
+            ++offset;
+            continue;
+        }
+        const auto next = std::min(next_utf8(value, offset), end);
+        width += static_cast<std::size_t>(
+            std::max(
+                0,
+                ftxui::string_width(
+                    value.substr(offset, next - offset)
+                )
+            )
+        );
+        offset = next;
+    }
+    return width;
+}
+
+std::string editor_display_text(
+    const std::string_view value,
+    std::size_t display_column
+) {
+    std::string result;
+    for (std::size_t offset = 0; offset < value.size();) {
+        if (value[offset] == '\t') {
+            constexpr std::size_t tab_width = 4U;
+            const auto spaces =
+                tab_width - display_column % tab_width;
+            result.append(spaces, ' ');
+            display_column += spaces;
+            ++offset;
+            continue;
+        }
+        const auto next = next_utf8(value, offset);
+        const auto glyph = value.substr(offset, next - offset);
+        result += glyph;
+        display_column += static_cast<std::size_t>(
+            std::max(0, ftxui::string_width(glyph))
+        );
+        offset = next;
+    }
+    return result;
 }
 
 std::string format_time(
@@ -245,6 +331,72 @@ std::string type_prefix(const Entry& entry) {
             return " ";
     }
     return " ";
+}
+
+bool can_open_file(const Entry& entry) {
+    return entry.kind == EntryKind::file ||
+           (
+               entry.kind == EntryKind::symlink &&
+               !entry.target_is_directory
+           );
+}
+
+ftxui::Element gray_dialog(ftxui::Element element) {
+    using namespace ftxui;
+    return std::move(element) |
+           color(Color::Grey11) |
+           bgcolor(Color::Grey82);
+}
+
+ftxui::Element gray_menu(ftxui::Element element) {
+    using namespace ftxui;
+    return std::move(element) |
+           color(Color::Grey11) |
+           bgcolor(Color::Grey78);
+}
+
+ftxui::Element gray_selected(
+    ftxui::Element element,
+    const bool marked,
+    const bool active
+) {
+    using namespace ftxui;
+    const auto foreground =
+        active ? Color::Grey0 : Color::Grey93;
+    const auto background =
+        active ? Color::Grey85 : Color::Grey27;
+    auto result = std::move(element) |
+                  color(foreground) |
+                  bgcolor(background);
+    return marked ? result | bold : result;
+}
+
+ftxui::Element gray_entry(
+    ftxui::Element element,
+    const Entry& entry
+) {
+    using namespace ftxui;
+    if (entry.kind == EntryKind::directory) {
+        return std::move(element) | color(Color::Grey100);
+    }
+    if (entry.kind == EntryKind::symlink) {
+        return std::move(element) | color(Color::Grey66);
+    }
+    if (entry.kind == EntryKind::other) {
+        return std::move(element) | color(Color::Grey46);
+    }
+    const auto executable =
+        (
+            entry.permissions &
+            (
+                std::filesystem::perms::owner_exec |
+                std::filesystem::perms::group_exec |
+                std::filesystem::perms::others_exec
+            )
+        ) != std::filesystem::perms::none;
+    return executable
+               ? std::move(element) | color(Color::Grey100) | underlined
+               : std::move(element) | color(Color::Grey85);
 }
 
 std::string permission_text(const Entry& entry) {
@@ -318,6 +470,7 @@ struct App::Impl {
     std::size_t editor_menu_category{0};
     std::size_t editor_menu_item{0};
     std::size_t editor_close_choice{0};
+    std::string editor_message_title{"Editor error"};
     std::string editor_error_message;
     ftxui::App* terminal{nullptr};
     std::jthread operation_thread;
@@ -347,6 +500,7 @@ struct App::Impl {
     std::size_t pulldown_category{0};
     std::size_t pulldown_item{0};
     std::array<ftxui::Box, 5> top_menu_boxes{};
+    std::vector<ftxui::Box> pulldown_item_boxes;
     bool dialog_move{false};
     bool dialog_exact{false};
     std::string dialog_destination;
@@ -385,6 +539,34 @@ struct App::Impl {
 
     Pane& passive() {
         return active_index == 0 ? right : left;
+    }
+
+    static std::size_t panel_visible_rows() {
+        return static_cast<std::size_t>(
+            std::max(3, ftxui::Terminal::Size().dimy - 9)
+        );
+    }
+
+    static std::pair<std::size_t, std::size_t>
+    viewer_dimensions() {
+        const auto size = ftxui::Terminal::Size();
+        return {
+            static_cast<std::size_t>(std::max(1, size.dimx - 2)),
+            static_cast<std::size_t>(std::max(1, size.dimy - 10)),
+        };
+    }
+
+    static std::size_t editor_visible_rows() {
+        return static_cast<std::size_t>(
+            std::max(1, ftxui::Terminal::Size().dimy - 2)
+        );
+    }
+
+    static std::size_t editor_page_rows() {
+        return std::max<std::size_t>(
+            1U,
+            editor_visible_rows() - 1U
+        );
     }
 
     void refresh() {
@@ -948,9 +1130,17 @@ struct App::Impl {
                                  : "No match";
                     break;
                 case PromptAction::editor_find:
-                    status = editor.find(prompt_value, false)
-                                 ? "Match found"
-                                 : "No match";
+                    if (editor.find(prompt_value, false)) {
+                        status = "Match found";
+                    } else {
+                        prompt_action = PromptAction::none;
+                        prompt_value.clear();
+                        show_editor_message(
+                            "Search",
+                            "Search string not found"
+                        );
+                        return;
+                    }
                     break;
                 case PromptAction::editor_replace_find:
                     editor_replace_needle = prompt_value;
@@ -959,13 +1149,22 @@ struct App::Impl {
                     prompt_value.clear();
                     return;
                 case PromptAction::editor_replace_with:
-                    status = editor.replace(
-                                 editor_replace_needle,
-                                 prompt_value,
-                                 false
-                             )
-                                 ? "Replaced"
-                                 : "No match";
+                    if (editor.replace(
+                            editor_replace_needle,
+                            prompt_value,
+                            false
+                        )) {
+                        status = "Replaced";
+                    } else {
+                        editor_replace_needle.clear();
+                        prompt_action = PromptAction::none;
+                        prompt_value.clear();
+                        show_editor_message(
+                            "Replace",
+                            "Search string not found"
+                        );
+                        return;
+                    }
                     editor_replace_needle.clear();
                     break;
                 case PromptAction::editor_save_as:
@@ -1106,9 +1305,7 @@ struct App::Impl {
         const auto panel_width = std::max(30, terminal_size.dimx / 2);
         const auto inner_width = std::max(28, panel_width - 2);
         const auto name_width = std::max(10, inner_width - 24);
-        const auto visible_rows = static_cast<std::size_t>(
-            std::max(3, terminal_size.dimy - 9)
-        );
+        const auto visible_rows = panel_visible_rows();
         Elements rows;
         const auto& entries = pane.entries();
         rows.reserve(visible_rows);
@@ -1134,7 +1331,7 @@ struct App::Impl {
                           text(
                               entry.revision == "mcpp:parent"
                                   ? "UP--DIR"
-                                  : std::to_string(entry.size)
+                                  : format_panel_size(entry.size)
                           ) | size(WIDTH, EQUAL, 8),
                           separator(),
                           text(format_panel_time(entry.modified)) |
@@ -1144,10 +1341,20 @@ struct App::Impl {
                           text(pane.is_selected(entry) ? "*" : " "),
                           text(name) | flex,
                       });
-            if (index == pane.cursor() && focused) {
-                row = row | inverted | focus;
-            } else if (pane.is_selected(entry)) {
-                row = row | bold;
+            if (index == pane.cursor()) {
+                row = gray_selected(
+                    std::move(row),
+                    pane.is_selected(entry),
+                    focused
+                );
+                if (focused) {
+                    row = row | focus;
+                }
+            } else {
+                row = gray_entry(std::move(row), entry);
+                if (pane.is_selected(entry)) {
+                    row = row | bold;
+                }
             }
             rows.push_back(
                 std::move(row) | reflect(entry_boxes[index])
@@ -1170,10 +1377,14 @@ struct App::Impl {
         const auto info =
             current == nullptr
                 ? std::string{}
-                : permission_text(*current) + " " +
-                      display_text(current->name) + "  " +
-                      format_size(current->size) +
-                      "  " + current->owner + ":" + current->group;
+                : inner_width < 50
+                      ? display_text(current->name) + "  " +
+                            format_size(current->size)
+                      : permission_text(*current) + " " +
+                            display_text(current->name) + "  " +
+                            format_size(current->size) +
+                            "  " + current->owner + ":" +
+                            current->group;
         std::string available;
         try {
             const auto disk = pane.provider()->space(pane.path());
@@ -1194,7 +1405,9 @@ struct App::Impl {
             static_cast<std::size_t>(std::max(8, panel_width - 8))
         ) + " ");
         if (focused) {
-            title = title | bold;
+            title = title | color(Color::Grey100) | bold;
+        } else {
+            title = title | color(Color::Grey58);
         }
         auto header =
             detailed_view
@@ -1209,6 +1422,16 @@ struct App::Impl {
                           size(WIDTH, EQUAL, 12),
                   })
                 : text(" Name");
+        header = header | color(Color::Grey93) | bold;
+        const auto minimum_info_width = std::min(
+            static_cast<int>(info.size()),
+            std::max(12, inner_width / 2)
+        );
+        if (static_cast<int>(available.size()) +
+                minimum_info_width + 1 >
+            inner_width) {
+            available.clear();
+        }
         const auto available_width =
             static_cast<int>(available.size());
         const auto info_width =
@@ -1223,7 +1446,7 @@ struct App::Impl {
                            static_cast<std::size_t>(info_width)
                        )) | size(WIDTH, EQUAL, info_width),
                        filler(),
-                       text(available) | dim,
+                       text(available) | color(Color::Grey50),
                    }),
                });
         return window(title, content, LIGHT) |
@@ -1232,7 +1455,8 @@ struct App::Impl {
 
     ftxui::Element render_viewer() {
         using namespace ftxui;
-        const auto rows = viewer.lines(120, 40);
+        const auto [width, height] = viewer_dimensions();
+        const auto rows = viewer.lines(width, height);
         Elements elements;
         for (const auto& row : rows) {
             elements.push_back(text(row));
@@ -1275,7 +1499,7 @@ struct App::Impl {
         }
 
         const auto visible_begin =
-            utf8_offset_for_width(line, first_column);
+            editor_offset_for_width(line, first_column);
         std::vector<std::size_t> boundaries{
             visible_begin,
             line.size(),
@@ -1305,19 +1529,56 @@ struct App::Impl {
             if (begin < visible_begin || begin == end) {
                 continue;
             }
-            auto segment = text(line.substr(begin, end - begin));
+            const auto display_begin =
+                editor_display_width(line, begin);
+            auto displayed = editor_display_text(
+                std::string_view(line).substr(begin, end - begin),
+                display_begin
+            );
+            if (begin == visible_begin &&
+                line[begin] == '\t' &&
+                display_begin < first_column) {
+                displayed.erase(
+                    0,
+                    std::min(
+                        first_column - display_begin,
+                        displayed.size()
+                    )
+                );
+            }
+            const bool cursor =
+                index == editor.row() &&
+                begin == editor.column();
+            if (cursor && line[begin] == '\t') {
+                segments.push_back(
+                    focusCursorBlock(text(" ") | inverted | bold)
+                );
+                if (displayed.size() > 1U) {
+                    auto remainder = text(displayed.substr(1U));
+                    if (begin >= selected_begin &&
+                        begin < selected_end) {
+                        remainder = remainder | inverted;
+                    }
+                    segments.push_back(std::move(remainder));
+                }
+                continue;
+            }
+            auto segment = text(displayed);
             if (begin >= selected_begin && begin < selected_end) {
                 segment = segment | inverted;
             }
-            if (index == editor.row() &&
-                begin == editor.column()) {
-                segment = segment | inverted | bold;
+            if (cursor) {
+                segment = focusCursorBlock(
+                    segment | inverted | bold
+                );
             }
             segments.push_back(std::move(segment));
         }
         if (index == editor.row() &&
             editor.column() == line.size()) {
-            segments.push_back(text(" ") | inverted | bold);
+            segments.push_back(
+                focusCursorBlock(text(" ") | inverted | bold)
+            );
         }
         if (segments.empty()) {
             segments.push_back(text(""));
@@ -1328,9 +1589,7 @@ struct App::Impl {
     ftxui::Element render_editor() {
         using namespace ftxui;
         const auto terminal_size = Terminal::Size();
-        const auto visible_rows = static_cast<std::size_t>(
-            std::max(1, terminal_size.dimy - 2)
-        );
+        const auto visible_rows = editor_visible_rows();
         const auto& lines = editor.lines();
         const auto first =
             editor.row() > visible_rows / 2U
@@ -1338,17 +1597,8 @@ struct App::Impl {
                 : 0U;
         const auto end = std::min(lines.size(), first + visible_rows);
         const auto& current_line = lines[editor.row()];
-        const auto cursor_width = static_cast<std::size_t>(
-            std::max(
-                0,
-                string_width(
-                    std::string_view(current_line).substr(
-                        0,
-                        editor.column()
-                    )
-                )
-            )
-        );
+        const auto cursor_width =
+            editor_display_width(current_line, editor.column());
         const auto content_width = static_cast<std::size_t>(
             std::max(1, terminal_size.dimx)
         );
@@ -1371,13 +1621,16 @@ struct App::Impl {
         for (std::size_t index = 0; index < menu_names.size(); ++index) {
             auto item = text(" " + menu_names[index] + " ");
             if (index == editor_menu_category) {
-                item = item | bold | underlined;
+                item = item |
+                       color(Color::Grey100) |
+                       bgcolor(Color::Grey23) |
+                       bold;
             }
             menu.push_back(std::move(item));
         }
-        const auto header =
+        auto header =
             mode == Mode::editor_menu
-                ? hbox(std::move(menu)) | inverted
+                ? hbox(std::move(menu))
                 : hbox({
                       text(display_text(editor.path())) | bold | flex,
                       text(
@@ -1395,6 +1648,7 @@ struct App::Impl {
                           "b"
                       ),
                   });
+        header = gray_menu(std::move(header));
         const auto key_width =
             std::max(3, terminal_size.dimx / 10);
         const auto key = [key_width](
@@ -1409,9 +1663,15 @@ struct App::Impl {
                 )
             );
             return hbox({
-                       text(number) | inverted,
-                       text(label.substr(0, label_width)),
-                       text(" "),
+                       text(number) |
+                           color(Color::Grey0) |
+                           bgcolor(Color::Grey85),
+                       hbox({
+                           text(label.substr(0, label_width)),
+                           text(" "),
+                       }) |
+                           color(Color::Grey85) |
+                           bgcolor(Color::Grey11),
                    }) |
                    size(WIDTH, EQUAL, key_width);
         };
@@ -1460,7 +1720,9 @@ struct App::Impl {
             }
             rows.push_back(std::move(row));
         }
-        return vbox(std::move(rows)) | borderStyled(LIGHT);
+        return gray_menu(
+            vbox(std::move(rows)) | borderStyled(LIGHT)
+        );
     }
 
     ftxui::Element render_editor_close_dialog() const {
@@ -1520,14 +1782,16 @@ struct App::Impl {
     ftxui::Element render_editor_error() const {
         using namespace ftxui;
         return vbox({
-                   text("Editor error") | bold | center,
+                   text(editor_message_title) | bold | center,
                    separator(),
                    paragraph(display_text(editor_error_message)),
                    separator(),
                    text("[ OK ]") | inverted | center,
                }) |
                borderStyled(LIGHT) |
-               size(WIDTH, LESS_THAN, 72);
+               size(WIDTH, LESS_THAN, 72) |
+               color(Color::Grey100) |
+               bgcolor(Color::Grey19);
     }
 
     ftxui::Element render_help() const {
@@ -1629,26 +1893,33 @@ struct App::Impl {
         return items;
     }
 
-    ftxui::Element render_pulldown() const {
+    ftxui::Element render_pulldown() {
         using namespace ftxui;
         static const std::array<std::string, 5> names{
             "Left", "File", "Command", "Options", "Right"
         };
         Elements rows;
         const auto& items = pulldown_items()[pulldown_category];
+        pulldown_item_boxes.clear();
+        pulldown_item_boxes.resize(items.size());
         for (std::size_t index = 0; index < items.size(); ++index) {
             auto row = text(" " + items[index] + " ");
             if (index == pulldown_item) {
                 row = row | inverted | focus;
             }
-            rows.push_back(std::move(row));
+            rows.push_back(
+                std::move(row) |
+                reflect(pulldown_item_boxes[index])
+            );
         }
-        return window(
-                   text(" " + names[pulldown_category] + " ") | bold,
-                   vbox(std::move(rows)),
-                   LIGHT
-               ) |
-               size(WIDTH, EQUAL, 32);
+        return gray_menu(
+            window(
+                text(" " + names[pulldown_category] + " ") | bold,
+                vbox(std::move(rows)),
+                LIGHT
+            ) |
+            size(WIDTH, EQUAL, 32)
+        );
     }
 
     void execute_pulldown() {
@@ -1692,7 +1963,7 @@ struct App::Impl {
             switch (pulldown_item) {
                 case 0:
                     if (entry != nullptr &&
-                        entry->kind == EntryKind::file) {
+                        can_open_file(*entry)) {
                         viewer.open(active().provider(), entry->path);
                         mode = Mode::viewer;
                         return;
@@ -1700,7 +1971,7 @@ struct App::Impl {
                     break;
                 case 1:
                     if (entry != nullptr &&
-                        entry->kind == EntryKind::file) {
+                        can_open_file(*entry)) {
                         editor.open(active().provider(), entry->path);
                         mode = Mode::editor;
                         return;
@@ -2013,13 +2284,17 @@ struct App::Impl {
                        format_size(current.bytes_done) + " / " +
                        format_size(current.bytes_total)
                    ),
-                   gauge(std::clamp(byte_ratio, 0.0F, 1.0F)),
+                   gauge(std::clamp(byte_ratio, 0.0F, 1.0F)) |
+                       color(Color::Grey11) |
+                       bgcolor(Color::Grey70),
                    text(
                        "Files: " +
                        std::to_string(current.files_done) + " / " +
                        std::to_string(current.files_total)
                    ),
-                   gauge(std::clamp(file_ratio, 0.0F, 1.0F)),
+                   gauge(std::clamp(file_ratio, 0.0F, 1.0F)) |
+                       color(Color::Grey11) |
+                       bgcolor(Color::Grey70),
                    separator(),
                    text(
                        operation_paused.load(std::memory_order_acquire)
@@ -2087,7 +2362,7 @@ struct App::Impl {
     ftxui::Element render_quick_view() {
         using namespace ftxui;
         const auto* entry = active().current();
-        if (entry == nullptr || entry->kind != EntryKind::file) {
+        if (entry == nullptr || !can_open_file(*entry)) {
             quick_viewer.close();
             quick_view_path.clear();
             return vbox({
@@ -2190,9 +2465,15 @@ struct App::Impl {
                 )
             );
             return hbox({
-                       text(number) | inverted,
-                       text(label.substr(0, label_width)),
-                       text(" "),
+                       text(number) |
+                           color(Color::Grey0) |
+                           bgcolor(Color::Grey85),
+                       hbox({
+                           text(label.substr(0, label_width)),
+                           text(" "),
+                       }) |
+                           color(Color::Grey85) |
+                           bgcolor(Color::Grey11),
                    }) |
                    size(WIDTH, EQUAL, key_width);
         };
@@ -2220,16 +2501,21 @@ struct App::Impl {
             auto item = text(" " + menu_names[index] + " ");
             if (mode == Mode::pulldown &&
                 index == pulldown_category) {
-                item = item | bold | underlined;
+                item = item |
+                       color(Color::Grey100) |
+                       bgcolor(Color::Grey23) |
+                       bold;
             }
             menu_elements.push_back(
                 std::move(item) | reflect(top_menu_boxes[index])
             );
         }
         auto document = vbox({
-            hbox(std::move(menu_elements)) | inverted,
+            gray_menu(hbox(std::move(menu_elements))),
             body | flex,
-            text(hint),
+            text(hint) |
+                color(Color::Grey11) |
+                bgcolor(Color::Grey62),
             text(
                 command_mode
                     ? prompt + " " + command_line
@@ -2266,7 +2552,7 @@ struct App::Impl {
                 filler(),
                 hbox({
                     filler(),
-                    std::move(element) | clear_under,
+                    gray_dialog(std::move(element)) | clear_under,
                     filler(),
                 }),
                 filler(),
@@ -2386,7 +2672,9 @@ struct App::Impl {
                 positioned_menu,
             });
         }
-        return document;
+        return document |
+               color(Color::Grey85) |
+               bgcolor(Color::Grey3);
     }
 
     bool handle_prompt(const ftxui::Event& event) {
@@ -2411,6 +2699,7 @@ struct App::Impl {
     }
 
     bool handle_viewer(const ftxui::Event& event) {
+        const auto viewport_lines = viewer_dimensions().second;
         if (event == ftxui::Event::Escape ||
             event == ftxui::Event::F3 ||
             event == ftxui::Event::F10) {
@@ -2419,19 +2708,19 @@ struct App::Impl {
             return true;
         }
         if (event == ftxui::Event::ArrowDown) {
-            viewer.scroll_lines(1, 40);
+            viewer.scroll_lines(1, viewport_lines);
             return true;
         }
         if (event == ftxui::Event::ArrowUp) {
-            viewer.scroll_lines(-1, 40);
+            viewer.scroll_lines(-1, viewport_lines);
             return true;
         }
         if (event == ftxui::Event::PageDown) {
-            viewer.page(1, 40);
+            viewer.page(1, viewport_lines);
             return true;
         }
         if (event == ftxui::Event::PageUp) {
-            viewer.page(-1, 40);
+            viewer.page(-1, viewport_lines);
             return true;
         }
         if (event == ftxui::Event::F2) {
@@ -2449,10 +2738,18 @@ struct App::Impl {
         return false;
     }
 
-    void show_editor_error(const std::exception& error) {
-        editor_error_message = error.what();
-        status = "Error: " + editor_error_message;
+    void show_editor_message(
+        std::string title,
+        std::string message
+    ) {
+        editor_message_title = std::move(title);
+        editor_error_message = std::move(message);
         mode = Mode::editor_error;
+    }
+
+    void show_editor_error(const std::exception& error) {
+        status = "Error: " + std::string(error.what());
+        show_editor_message("Editor error", error.what());
     }
 
     void save_editor() {
@@ -2746,9 +3043,13 @@ struct App::Impl {
         } else if (event == ftxui::Event::End) {
             editor.end();
         } else if (event == ftxui::Event::PageUp) {
-            editor.page(-20);
+            editor.page(
+                -static_cast<int>(editor_page_rows())
+            );
         } else if (event == ftxui::Event::PageDown) {
-            editor.page(20);
+            editor.page(
+                static_cast<int>(editor_page_rows())
+            );
         } else if (event == ftxui::Event::Tab) {
             editor.insert("    ");
         } else if (event == ftxui::Event::Return) {
@@ -2829,6 +3130,24 @@ struct App::Impl {
                         pulldown_item = 0;
                         return true;
                     }
+                }
+                for (std::size_t index = 0;
+                     index < pulldown_item_boxes.size();
+                     ++index) {
+                    if (!pulldown_item_boxes[index].Contain(
+                            mouse.x,
+                            mouse.y
+                        )) {
+                        continue;
+                    }
+                    pulldown_item = index;
+                    try {
+                        execute_pulldown();
+                    } catch (const std::exception& error) {
+                        set_error(error);
+                        mode = Mode::panels;
+                    }
+                    return true;
                 }
             }
         }
@@ -3169,6 +3488,10 @@ struct App::Impl {
                     active().move_cursor(3);
                     return true;
                 }
+                if (mouse.button != ftxui::Mouse::Left ||
+                    mouse.motion != ftxui::Mouse::Pressed) {
+                    return false;
+                }
                 Pane* pane = nullptr;
                 std::vector<ftxui::Box>* boxes = nullptr;
                 if (left_box.Contain(mouse.x, mouse.y)) {
@@ -3180,9 +3503,7 @@ struct App::Impl {
                     pane = &right;
                     boxes = &right_entry_boxes;
                 }
-                if (pane != nullptr && boxes != nullptr &&
-                    mouse.button == ftxui::Mouse::Left &&
-                    mouse.motion == ftxui::Mouse::Pressed) {
+                if (pane != nullptr && boxes != nullptr) {
                     for (std::size_t index = 0;
                          index < boxes->size();
                          ++index) {
@@ -3203,8 +3524,7 @@ struct App::Impl {
                                 if (!pane->enter()) {
                                     const auto* entry = pane->current();
                                     if (entry != nullptr &&
-                                        entry->kind ==
-                                            EntryKind::file) {
+                                        can_open_file(*entry)) {
                                         viewer.open(
                                             pane->provider(),
                                             entry->path
@@ -3229,9 +3549,13 @@ struct App::Impl {
             } else if (event == ftxui::Event::ArrowUp) {
                 active().move_cursor(-1);
             } else if (event == ftxui::Event::PageDown) {
-                active().page_cursor(20);
+                active().page_cursor(
+                    static_cast<int>(panel_visible_rows())
+                );
             } else if (event == ftxui::Event::PageUp) {
-                active().page_cursor(-20);
+                active().page_cursor(
+                    -static_cast<int>(panel_visible_rows())
+                );
             } else if (event == ftxui::Event::Home) {
                 active().move_cursor(
                     -static_cast<int>(active().cursor())
@@ -3243,7 +3567,7 @@ struct App::Impl {
             } else if (event == ftxui::Event::Return) {
                 if (!active().enter()) {
                     const auto* entry = active().current();
-                    if (entry != nullptr && entry->kind == EntryKind::file) {
+                    if (entry != nullptr && can_open_file(*entry)) {
                         viewer.open(active().provider(), entry->path);
                         mode = Mode::viewer;
                     }
@@ -3278,13 +3602,13 @@ struct App::Impl {
                 mode = Mode::user_menu;
             } else if (event == ftxui::Event::F3) {
                 const auto* entry = active().current();
-                if (entry != nullptr && entry->kind == EntryKind::file) {
+                if (entry != nullptr && can_open_file(*entry)) {
                     viewer.open(active().provider(), entry->path);
                     mode = Mode::viewer;
                 }
             } else if (event == ftxui::Event::F4) {
                 const auto* entry = active().current();
-                if (entry != nullptr && entry->kind == EntryKind::file) {
+                if (entry != nullptr && can_open_file(*entry)) {
                     editor.open(active().provider(), entry->path);
                     mode = Mode::editor;
                 }

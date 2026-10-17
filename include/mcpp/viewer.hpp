@@ -48,6 +48,7 @@ private:
 
     ProviderPtr provider_;
     std::string path_;
+    std::string storage_path_;
     std::uint64_t size_{0};
     std::uint64_t offset_{0};
     std::uint64_t window_offset_{0};

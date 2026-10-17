@@ -4,6 +4,9 @@
 #include <cctype>
 #include <iomanip>
 #include <sstream>
+#include <stdexcept>
+
+#include <ftxui/screen/string.hpp>
 
 namespace mcpp {
 namespace {
@@ -22,6 +25,54 @@ std::string lowercase(std::string value) {
     return value;
 }
 
+void append_text_line(
+    std::vector<std::string>& output,
+    const std::string_view line,
+    const std::size_t width,
+    const std::size_t height,
+    const bool wrap
+) {
+    if (width == 0U) {
+        output.emplace_back(line);
+        return;
+    }
+    std::string current;
+    std::size_t current_width = 0;
+    for (const auto& glyph : ftxui::Utf8ToGlyphs(line)) {
+        if (glyph.empty()) {
+            continue;
+        }
+        std::string displayed = glyph;
+        auto glyph_width = static_cast<std::size_t>(
+            std::max(0, ftxui::string_width(glyph))
+        );
+        if (glyph == "\t") {
+            constexpr std::size_t tab_width = 8U;
+            glyph_width = tab_width - current_width % tab_width;
+            displayed.assign(glyph_width, ' ');
+        }
+        if (current_width + glyph_width > width &&
+            !current.empty()) {
+            output.push_back(std::move(current));
+            if (!wrap || output.size() >= height) {
+                return;
+            }
+            current.clear();
+            current_width = 0;
+            if (glyph == "\t") {
+                constexpr std::size_t tab_width = 8U;
+                glyph_width = tab_width;
+                displayed.assign(glyph_width, ' ');
+            }
+        }
+        current += displayed;
+        current_width += glyph_width;
+    }
+    if (output.size() < height) {
+        output.push_back(std::move(current));
+    }
+}
+
 }  // namespace
 
 void ViewerModel::open(
@@ -31,7 +82,11 @@ void ViewerModel::open(
 ) {
     provider_ = std::move(provider);
     path_ = std::move(path);
-    const auto entry = provider_->stat(path_, cancellation);
+    const auto entry = provider_->stat_follow(path_, cancellation);
+    if (entry.kind != EntryKind::file) {
+        throw std::runtime_error("viewer requires a regular file");
+    }
+    storage_path_ = entry.path;
     size_ = entry.size;
     offset_ = 0;
     load_window(0, window_size, cancellation);
@@ -40,6 +95,7 @@ void ViewerModel::open(
 void ViewerModel::close() {
     provider_.reset();
     path_.clear();
+    storage_path_.clear();
     window_.clear();
     size_ = 0;
     offset_ = 0;
@@ -167,7 +223,7 @@ void ViewerModel::load_window(
     }
     std::ostringstream output;
     provider_->read(
-        path_,
+        storage_path_,
         offset,
         std::min<std::uint64_t>(size, size_ - offset),
         output,
@@ -236,17 +292,7 @@ std::vector<std::string> ViewerModel::lines(
     std::istringstream input(window_.substr(local));
     std::string line;
     while (result.size() < height && std::getline(input, line)) {
-        if (!wrap_ || width == 0U || line.size() <= width) {
-            result.push_back(
-                width == 0U ? line : line.substr(0, width)
-            );
-            continue;
-        }
-        for (std::size_t begin = 0; begin < line.size() &&
-                                     result.size() < height;
-             begin += width) {
-            result.push_back(line.substr(begin, width));
-        }
+        append_text_line(result, line, width, height, wrap_);
     }
     return result;
 }
@@ -269,7 +315,7 @@ std::optional<std::uint64_t> ViewerModel::find(
         cancellation.throw_if_requested();
         std::ostringstream output;
         provider_->read(
-            path_,
+            storage_path_,
             cursor,
             std::min(chunk_size, size_ - cursor),
             output,

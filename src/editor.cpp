@@ -68,7 +68,11 @@ void EditorModel::open(
 ) {
     provider_ = std::move(provider);
     path_ = std::move(path);
-    const auto entry = provider_->stat(path_, cancellation);
+    const auto entry = provider_->stat_follow(path_, cancellation);
+    if (entry.kind != EntryKind::file) {
+        throw std::runtime_error("editor requires a regular file");
+    }
+    storage_path_ = entry.path;
     constexpr std::uint64_t maximum = 16U * 1024U * 1024U;
     if (entry.size > maximum) {
         throw std::runtime_error(
@@ -78,7 +82,7 @@ void EditorModel::open(
     revision_ = entry.revision;
     std::ostringstream output;
     provider_->read(
-        path_,
+        storage_path_,
         0,
         entry.size,
         output,
@@ -102,6 +106,7 @@ void EditorModel::open(
 void EditorModel::close() {
     provider_.reset();
     path_.clear();
+    storage_path_.clear();
     revision_.clear();
     lines_.clear();
     row_ = 0;
@@ -578,7 +583,7 @@ void EditorModel::save(
     auto serialized = content();
     std::istringstream input(serialized);
     provider_->write(
-        path_,
+        storage_path_,
         input,
         serialized.size(),
         true,
@@ -587,7 +592,8 @@ void EditorModel::save(
         cancellation,
         {}
     );
-    revision_ = provider_->stat(path_, cancellation).revision;
+    revision_ =
+        provider_->stat(storage_path_, cancellation).revision;
     dirty_ = false;
 }
 
@@ -622,7 +628,8 @@ void EditorModel::save_as(
         {}
     );
     path_ = std::move(path);
-    revision_ = provider_->stat(path_, cancellation).revision;
+    storage_path_ = path_;
+    revision_ = provider_->stat(storage_path_, cancellation).revision;
     dirty_ = false;
 }
 

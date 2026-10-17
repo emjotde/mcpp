@@ -101,6 +101,7 @@ private:
 
     ProviderPtr provider_;
     std::string path_;
+    std::string storage_path_;
     std::string revision_;
     std::vector<std::string> lines_;
     std::size_t row_{0};

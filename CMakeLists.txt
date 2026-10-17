@@ -71,7 +71,7 @@ add_library(
     src/editor.cpp
 )
 target_include_directories(mcpp_core PUBLIC include)
-target_link_libraries(mcpp_core PUBLIC Threads::Threads)
+target_link_libraries(mcpp_core PUBLIC Threads::Threads screen)
 target_compile_definitions(mcpp_core PUBLIC MCPP_VERSION="${PROJECT_VERSION}")
 mcpp_target_defaults(mcpp_core)
 
