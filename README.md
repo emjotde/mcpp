@@ -51,6 +51,9 @@ Sandboxed destructive tests run without host mounts:
 bash tests/run_container.sh
 ```
 
+The current parity gaps against GNU Midnight Commander are documented in
+[docs/mc-gap-analysis.md](docs/mc-gap-analysis.md).
+
 ## Initial key map
 
 | Key | Action |
