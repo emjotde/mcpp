@@ -542,6 +542,7 @@ struct App::Impl {
     std::string operation_label{"File operation"};
     bool pending_move{false};
     bool pending_exact{false};
+    bool exiting{false};
 
     Impl(
         std::string left_path,
@@ -637,8 +638,30 @@ struct App::Impl {
     }
 
     void exit_terminal() {
-        std::cout << "\033[H\033[2J" << std::flush;
-        terminal->Exit();
+        if (!exiting) {
+            exiting = true;
+            const auto size = ftxui::Terminal::Size();
+            std::string blank;
+            blank.reserve(
+                static_cast<std::size_t>(
+                    std::max(0, size.dimx * size.dimy)
+                ) +
+                static_cast<std::size_t>(
+                    std::max(0, size.dimy * 12)
+                )
+            );
+            const std::string row(
+                static_cast<std::size_t>(std::max(0, size.dimx)),
+                ' '
+            );
+            for (int line = 1; line <= size.dimy; ++line) {
+                blank += "\033[" + std::to_string(line) + ";1H";
+                blank += row;
+            }
+            blank += "\033[H";
+            std::cout << blank << std::flush;
+            terminal->Exit();
+        }
     }
 
     void finish_operation(
@@ -2657,6 +2680,9 @@ struct App::Impl {
 
     ftxui::Element render() {
         using namespace ftxui;
+        if (exiting) {
+            return filler();
+        }
         const bool editor_context =
             mode == Mode::editor ||
             mode == Mode::editor_menu ||
@@ -4669,7 +4695,12 @@ int App::run() {
             finish();
         }
     } operation_guard{impl_.get()};
+    bool first_frame = true;
     auto component = ftxui::Renderer([&] {
+        if (first_frame) {
+            first_frame = false;
+            std::cout << "\033[H\033[2J" << std::flush;
+        }
         return impl_->render();
     });
     component = ftxui::CatchEvent(
