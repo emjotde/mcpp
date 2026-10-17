@@ -1129,7 +1129,7 @@ struct App::Impl {
                    separator(),
                    text("Press Esc or F1"),
                }) |
-               border | size(WIDTH, GREATER_THAN, 48) | center;
+               borderStyled(LIGHT) | size(WIDTH, EQUAL, 50);
     }
 
     ftxui::Element render_menu() const {
@@ -1151,7 +1151,7 @@ struct App::Impl {
         rows.push_back(separator());
         rows.push_back(text("Esc closes menu"));
         return vbox(std::move(rows)) |
-               border | size(WIDTH, GREATER_THAN, 48) | center;
+               borderStyled(LIGHT) | size(WIDTH, EQUAL, 50);
     }
 
     static const std::array<
@@ -1228,7 +1228,7 @@ struct App::Impl {
                    vbox(std::move(rows)),
                    LIGHT
                ) |
-               size(WIDTH, GREATER_THAN, 32) | center;
+               size(WIDTH, EQUAL, 32);
     }
 
     void execute_pulldown() {
@@ -1449,7 +1449,7 @@ struct App::Impl {
                    separator(),
                    text("Enter opens; Delete removes; Esc closes"),
                }) |
-               border | size(WIDTH, GREATER_THAN, 60) | center;
+               borderStyled(LIGHT) | size(WIDTH, EQUAL, 62);
     }
 
     ftxui::Element render_information() {
@@ -1484,7 +1484,7 @@ struct App::Impl {
                    separator(),
                    text("Esc closes"),
                }) |
-               border | size(WIDTH, GREATER_THAN, 70) | center;
+               borderStyled(LIGHT) | size(WIDTH, EQUAL, 72);
     }
 
     ftxui::Element render_search_results() const {
@@ -1667,43 +1667,72 @@ struct App::Impl {
                 key("10", "Quit"),
             }),
         });
+        const auto centered_modal = [](Element element) {
+            return vbox({
+                filler(),
+                hbox({
+                    filler(),
+                    std::move(element) | clear_under,
+                    filler(),
+                }),
+                filler(),
+            });
+        };
         if (mode == Mode::prompt) {
+            auto prompt_dialog = vbox({
+                              text(prompt_title) | bold,
+                              separator(),
+                              text("> " + prompt_value),
+                              separator(),
+                              text("Enter confirms; Esc cancels") | dim,
+                          }) |
+                          borderStyled(LIGHT) |
+                          size(WIDTH, EQUAL, 56);
             document = dbox({
                 document,
-                vbox({
-                    text(prompt_title) | bold,
-                    separator(),
-                    text("> " + prompt_value),
-                    separator(),
-                    text("Enter confirms; Esc cancels") | dim,
-                }) |
-                    border | clear_under |
-                    size(WIDTH, GREATER_THAN, 54) | center,
+                centered_modal(std::move(prompt_dialog)),
             });
         } else if (mode == Mode::help) {
             document = dbox({
                 document,
-                render_help() | clear_under,
+                centered_modal(render_help()),
             });
         } else if (mode == Mode::user_menu) {
             document = dbox({
                 document,
-                render_menu() | clear_under,
+                centered_modal(render_menu()),
             });
         } else if (mode == Mode::bookmarks) {
             document = dbox({
                 document,
-                render_bookmarks() | clear_under,
+                centered_modal(render_bookmarks()),
             });
         } else if (mode == Mode::information) {
             document = dbox({
                 document,
-                render_information() | clear_under,
+                centered_modal(render_information()),
             });
         } else if (mode == Mode::pulldown) {
+            static constexpr std::array<int, 5> offsets{
+                0, 6, 12, 21, 30
+            };
+            auto positioned_menu = vbox({
+                filler() | size(HEIGHT, EQUAL, 1),
+                hbox({
+                    filler() |
+                        size(
+                            WIDTH,
+                            EQUAL,
+                            offsets[pulldown_category]
+                        ),
+                    render_pulldown() | clear_under,
+                    filler(),
+                }),
+                filler(),
+            });
             document = dbox({
                 document,
-                render_pulldown() | clear_under,
+                positioned_menu,
             });
         }
         return document;
