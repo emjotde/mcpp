@@ -470,6 +470,7 @@ struct App::Impl {
     std::size_t editor_menu_category{0};
     std::size_t editor_menu_item{0};
     std::size_t editor_close_choice{0};
+    bool editor_shift_marking{false};
     std::string editor_message_title{"Editor error"};
     std::string editor_error_message;
     ftxui::App* terminal{nullptr};
@@ -1634,7 +1635,13 @@ struct App::Impl {
                 : hbox({
                       text(display_text(editor.path())) | bold | flex,
                       text(
-                          editor.dirty() ? " [-M--] " : " [----] "
+                          editor.dirty()
+                              ? editor.overwrite()
+                                    ? " [-M-O] "
+                                    : " [-M--] "
+                              : editor.overwrite()
+                                    ? " [---O] "
+                                    : " [----] "
                       ),
                       text(
                           "L:" +
@@ -1698,8 +1705,9 @@ struct App::Impl {
         static const std::array<std::vector<std::string>, 7> menus{{
             {"Save  F2", "Save as...  F12", "Close  F10"},
             {
-                "Undo  C-z",
-                "Redo  C-y",
+                "Undo  C-u",
+                "Redo  M-r",
+                "Toggle ins/overw  Ins",
                 "Mark  F3",
                 "Copy  F5",
                 "Move  F6",
@@ -1771,8 +1779,10 @@ struct App::Impl {
                    text("F9        Pull-down menu"),
                    text("F10       Close editor"),
                    text("F12       Save as"),
-                   text("Ctrl-Z/Y  Undo/redo"),
-                   text("Ctrl-G    Go to line"),
+                   text("Ctrl-U/M-R Undo/redo"),
+                   text("Alt-L      Go to line"),
+                   text("Insert     Insert/overwrite"),
+                   text("Shift-arrow Mark text"),
                    separator(),
                    text("Press F1 or Esc") | center,
                }) |
@@ -2762,6 +2772,7 @@ struct App::Impl {
     }
 
     void close_editor() {
+        editor_shift_marking = false;
         editor.close();
         mode = Mode::panels;
         try {
@@ -2810,22 +2821,28 @@ struct App::Impl {
                         editor.redo() ? "Redo" : "Nothing to redo";
                     break;
                 case 2:
+                    editor.toggle_overwrite();
+                    status = editor.overwrite()
+                                 ? "Overwrite mode"
+                                 : "Insert mode";
+                    break;
+                case 3:
                     editor.toggle_mark();
                     status = editor.marking()
                                  ? "Marking block"
                                  : "Block marked";
                     break;
-                case 3:
+                case 4:
                     status = editor.copy_selection()
                                  ? "Block copied"
                                  : "No marked block";
                     break;
-                case 4:
+                case 5:
                     status = editor.move_selection()
                                  ? "Block moved"
                                  : "No movable block";
                     break;
-                case 5:
+                case 6:
                     if (!editor.delete_selection()) {
                         editor.erase();
                     }
@@ -2861,7 +2878,7 @@ struct App::Impl {
 
     bool handle_editor_menu(const ftxui::Event& event) {
         static constexpr std::array<std::size_t, 7> item_counts{
-            3, 6, 3, 1, 1, 1, 1
+            3, 7, 3, 1, 1, 1, 1
         };
         if (event == ftxui::Event::Escape ||
             event == ftxui::Event::F9) {
@@ -2946,12 +2963,72 @@ struct App::Impl {
     }
 
     bool handle_editor(const ftxui::Event& event) {
+        const auto shifted_move = [&](const ftxui::Event& shifted,
+                                      const int rows,
+                                      const int columns) {
+            if (event != shifted) {
+                return false;
+            }
+            if (!editor_shift_marking) {
+                editor.begin_mark();
+                editor_shift_marking = true;
+            }
+            editor.move(rows, columns);
+            return true;
+        };
+        if (shifted_move(
+                ftxui::Event::Special("\x1B[1;2A"),
+                -1,
+                0
+            ) ||
+            shifted_move(
+                ftxui::Event::Special("\x1B[1;2B"),
+                1,
+                0
+            ) ||
+            shifted_move(
+                ftxui::Event::Special("\x1B[1;2D"),
+                0,
+                -1
+            ) ||
+            shifted_move(
+                ftxui::Event::Special("\x1B[1;2C"),
+                0,
+                1
+            )) {
+            return true;
+        }
+        if (event == ftxui::Event::Special("\x1B[1;2H") ||
+            event == ftxui::Event::Special("\x1B[1;2F") ||
+            event == ftxui::Event::Special("\x1B[5;2~") ||
+            event == ftxui::Event::Special("\x1B[6;2~")) {
+            if (!editor_shift_marking) {
+                editor.begin_mark();
+                editor_shift_marking = true;
+            }
+            if (event == ftxui::Event::Special("\x1B[1;2H")) {
+                editor.home();
+            } else if (event ==
+                       ftxui::Event::Special("\x1B[1;2F")) {
+                editor.end();
+            } else {
+                editor.page(
+                    event == ftxui::Event::Special("\x1B[5;2~")
+                        ? -static_cast<int>(editor_page_rows())
+                        : static_cast<int>(editor_page_rows())
+                );
+            }
+            return true;
+        }
+        if (editor_shift_marking) {
+            editor.finish_mark();
+            editor_shift_marking = false;
+        }
         if (event == ftxui::Event::F1) {
             mode = Mode::editor_help;
             return true;
         }
-        if (event == ftxui::Event::F2 ||
-            event == ftxui::Event::CtrlS) {
+        if (event == ftxui::Event::F2) {
             save_editor();
             return true;
         }
@@ -2981,8 +3058,7 @@ struct App::Impl {
                          : "No movable block";
             return true;
         }
-        if (event == ftxui::Event::F7 ||
-            event == ftxui::Event::CtrlF) {
+        if (event == ftxui::Event::F7) {
             start_prompt(PromptAction::editor_find, "Search");
             return true;
         }
@@ -2998,7 +3074,8 @@ struct App::Impl {
             mode = Mode::editor_menu;
             return true;
         }
-        if (event == ftxui::Event::F10) {
+        if (event == ftxui::Event::F10 ||
+            event == ftxui::Event::Escape) {
             request_editor_close();
             return true;
         }
@@ -3010,7 +3087,7 @@ struct App::Impl {
             );
             return true;
         }
-        if (event == ftxui::Event::CtrlG) {
+        if (event == ftxui::Event::AltL) {
             start_prompt(
                 PromptAction::editor_goto,
                 "Go to line",
@@ -3018,16 +3095,62 @@ struct App::Impl {
             );
             return true;
         }
-        if (event == ftxui::Event::CtrlZ) {
+        if (event == ftxui::Event::CtrlU) {
             status = editor.undo() ? "Undo" : "Nothing to undo";
             return true;
         }
-        if (event == ftxui::Event::CtrlY) {
+        if (event == ftxui::Event::AltR) {
             status = editor.redo() ? "Redo" : "Nothing to redo";
             return true;
         }
-        if (event == ftxui::Event::Escape) {
-            editor.clear_selection();
+        if (event == ftxui::Event::Insert) {
+            editor.toggle_overwrite();
+            return true;
+        }
+        if (event == ftxui::Event::CtrlZ ||
+            event == ftxui::Event::ArrowLeftCtrl) {
+            editor.move_word(-1);
+            return true;
+        }
+        if (event == ftxui::Event::CtrlX ||
+            event == ftxui::Event::ArrowRightCtrl) {
+            editor.move_word(1);
+            return true;
+        }
+        if (event == ftxui::Event::CtrlY) {
+            editor.delete_line();
+            return true;
+        }
+        if (event == ftxui::Event::CtrlK) {
+            editor.delete_to_end();
+            return true;
+        }
+        if (event == ftxui::Event::CtrlD) {
+            editor.erase();
+            return true;
+        }
+        if (event == ftxui::Event::CtrlS) {
+            show_editor_message(
+                "Syntax highlighting",
+                "Syntax highlighting is not implemented"
+            );
+            return true;
+        }
+        if (event == ftxui::Event::CtrlF) {
+            show_editor_message(
+                "Save block",
+                "Saving a block to a file is not implemented"
+            );
+            return true;
+        }
+        if (event == ftxui::Event::Special("\x1B[1;5H")) {
+            editor.goto_line(1);
+            editor.home();
+            return true;
+        }
+        if (event == ftxui::Event::Special("\x1B[1;5F")) {
+            editor.goto_line(editor.lines().size());
+            editor.end();
             return true;
         }
         if (event == ftxui::Event::ArrowUp) {
@@ -3780,6 +3903,7 @@ std::string App::active_path() const {
 int App::run() {
     auto terminal = ftxui::App::FullscreenAlternateScreen();
     terminal.ForceHandleCtrlC(false);
+    terminal.ForceHandleCtrlZ(false);
     terminal.TrackMouse(true);
     impl_->terminal = &terminal;
     struct OperationJoinGuard {

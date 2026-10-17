@@ -262,7 +262,8 @@ What is already close:
 
 - a dedicated full-screen editor with an editor-specific header and keybar;
 - a character cursor, UTF-8 code-point movement, and horizontal scrolling;
-- linear F3 marking and basic F5/F6/F8 block operations;
+- persistent linear F3/Shift-arrow marking and F5/F6/F8 block operations;
+- insert/overwrite modes and mcedit-compatible core navigation keys;
 - F7 literal search, F4 single replacement, save-as, and goto-line;
 - undo/redo, atomic saves, external-change detection, and dirty-close
   confirmation;
@@ -294,10 +295,10 @@ workflow.
 
 | Behavior | mcedit | mcpp |
 |---|---|---|
-| Insert/overwrite | `Insert` toggles mode | Insert only |
-| Word movement | `Ctrl-Left/Right` | No |
-| File top/bottom | `Ctrl-Home/End` | No |
-| Delete word/line/to-EOL | Dedicated bindings | Character/backspace only |
+| Insert/overwrite | `Insert` toggles mode | `Insert` toggles mode |
+| Word movement | `Ctrl-Left/Right`, `Ctrl-Z/X` | Same core bindings |
+| File top/bottom | `Ctrl-Home/End` | Same |
+| Delete word/line/to-EOL | Dedicated bindings | Line and EOL; word deletion missing |
 | Desired column on vertical move | Preserved across short lines | Column is clamped and lost |
 | Page Up/Down | Uses the visible editor height | Uses the visible editor height | Close |
 | Tab handling | Configurable real/fake tabs and tab width | Always inserts four spaces |
@@ -308,22 +309,18 @@ workflow.
 | Matching bracket | `Alt-B` | No |
 | Paragraph formatting/sort/filter | Yes | No |
 
-Live checks confirmed visible differences:
-
-- `Insert`, then `X` over `abc` produces `Xbc` in mcedit and `Xabc` in
-  mcpp.
-- `Shift-Right` twice, then F8 leaves `c` in mcedit and `bc` in mcpp because
-  mcpp does not implement Shift-arrow marking.
-- `Ctrl-U` undoes in mcedit; mcpp currently binds undo to `Ctrl-Z`.
+Paired checks now produce the same results for overwrite insertion,
+Shift-arrow marking with F8 deletion, `Ctrl-U` undo, `Alt-R` redo, word
+movement, and viewport-sized Page Up/Down.
 
 #### Selection and clipboard
 
-mcpp implements one linear F3 selection and can copy, move, or delete it.
-Unlike mcedit's persistent block, mcpp consumes the selection when text is
-typed or F5 is used, so a block cannot be copied repeatedly without marking it
-again. mcedit additionally supports:
+mcpp implements one persistent linear F3/Shift-arrow selection and can copy,
+move, delete, or repeatedly copy it. Typing and ordinary character deletion do
+not consume the block. mcedit additionally supports:
 
-- Shift-arrow, word, page, file-boundary, and scrolling selection;
+- word, file-boundary, and scrolling selection variants beyond the basic
+  Shift-arrow/Home/End/Page bindings;
 - rectangular column blocks (`F13` and Alt-arrow bindings);
 - mark-all, unmark, line/word marking, and block indentation;
 - persistent clip-file copy/cut/paste through `Ctrl-Insert`,
@@ -355,20 +352,17 @@ different from mcedit's option dialog and per-match replacement flow.
 
 #### Key compatibility
 
-Several mcpp shortcuts conflict with mcedit's default keymap:
+The core bindings now align. Two default mcedit actions remain unavailable:
 
 | Action/key | mcedit | mcpp |
 |---|---|---|
-| `Esc` | Quit/close | Clear selection only |
-| Undo | `Ctrl-U` | `Ctrl-Z` |
-| Redo | `Alt-R` | `Ctrl-Y` |
-| Goto line | `Alt-L` | `Ctrl-G` |
-| `Ctrl-S` | Toggle syntax highlighting | Save |
-| `Ctrl-F` | Save block to file | Search |
-| `Insert` | Toggle insert/overwrite | No action |
+| `Ctrl-S` | Toggle syntax highlighting | Unavailable notice |
+| `Ctrl-F` | Save block to file | Unavailable notice |
 
-The F1-F10 labels are now similar, but matching labels are not sufficient
-while common keyboard habits produce different actions.
+Esc, undo/redo, goto-line, insert/overwrite, word navigation, and file
+top/bottom now use mcedit's default bindings. `Ctrl-S` and `Ctrl-F` remain
+reserved for unimplemented mcedit actions rather than silently performing the
+old conflicting actions.
 
 #### Menus, status, and options
 
@@ -386,11 +380,11 @@ reports path, modified state, line/column, and bytes only. Line numbers,
 whitespace markers, syntax highlighting, bookmarks, codepages, spell
 checking, macros, and session recovery are absent.
 
-The next editor work should first align default keys, Esc behavior,
-Shift-arrow selection, overwrite mode, word/file navigation, and the
-search/replace flow. File lifecycle and multi-buffer work come next. Syntax,
-macros, spell checking, and code navigation are later parity work, not
-requirements for a dependable basic editor.
+The next editor work should focus on the search/replace flow, reusable
+clipboard/paste, column blocks, configurable indentation, and file lifecycle.
+Multi-buffer windows follow those basics. Syntax, macros, spell checking, and
+code navigation are later parity work, not requirements for a dependable
+basic editor.
 
 ### Command line and subshell
 

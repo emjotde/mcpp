@@ -35,23 +35,30 @@ public:
     [[nodiscard]] std::size_t column() const noexcept;
     [[nodiscard]] std::size_t byte_size() const noexcept;
     [[nodiscard]] bool marking() const noexcept;
+    [[nodiscard]] bool overwrite() const noexcept;
     [[nodiscard]] std::optional<std::pair<
         EditorPosition,
         EditorPosition
     >> selection() const noexcept;
 
     void move(int rows, int columns);
+    void move_word(int direction);
     void page(int rows);
     void home();
     void end();
     void goto_line(std::size_t line);
     void toggle_mark();
+    void begin_mark();
+    void finish_mark();
     void clear_selection();
+    void toggle_overwrite() noexcept;
     void insert(char character);
     void insert(std::string_view text);
     void newline();
     void backspace();
     void erase();
+    void delete_line();
+    void delete_to_end();
     [[nodiscard]] bool copy_selection();
     [[nodiscard]] bool move_selection();
     [[nodiscard]] bool delete_selection();
@@ -96,6 +103,12 @@ private:
         EditorPosition end,
         std::string_view replacement
     );
+    void insert_text(
+        std::string_view text,
+        bool overwrite,
+        bool include_selection_end = false
+    );
+    void erase_text(EditorPosition begin, EditorPosition end);
     void record_undo();
     void restore(Snapshot snapshot);
 
@@ -110,6 +123,7 @@ private:
     std::optional<EditorPosition> selection_begin_;
     std::optional<EditorPosition> selection_end_;
     bool marking_{false};
+    bool overwrite_{false};
     std::string clipboard_;
     std::vector<Snapshot> undo_;
     std::vector<Snapshot> redo_;

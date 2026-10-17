@@ -929,7 +929,37 @@ void test_viewer_editor() {
         std::string("alpha beta gammaalpha"),
         "editor copied block at cursor"
     );
+    check(editor.selection().has_value(), "editor keeps copied block");
+    check(editor.copy_selection(), "editor repeats block copy");
+    check_equal(
+        editor.lines()[0],
+        std::string("alpha beta gammaalphaalpha"),
+        "editor repeated persistent block copy"
+    );
+    check(editor.undo(), "editor repeated copy undo");
     check(editor.undo(), "editor block copy undo");
+    editor.insert('!');
+    check_equal(
+        editor.lines()[0],
+        std::string("alpha beta gamma!"),
+        "typing does not replace persistent block"
+    );
+    check(
+        editor.selection().has_value(),
+        "typing preserves marked block"
+    );
+    check(editor.undo(), "editor persistent block typing undo");
+    editor.backspace();
+    check_equal(
+        editor.lines()[0],
+        std::string("alpha beta gamm"),
+        "backspace edits outside persistent block"
+    );
+    check(
+        editor.selection().has_value(),
+        "backspace preserves marked block"
+    );
+    check(editor.undo(), "editor persistent block backspace undo");
     check(
         editor.replace("beta", "BETA", true),
         "editor replace"
@@ -1001,6 +1031,108 @@ void test_viewer_editor() {
         editor.lines()[0],
         std::string("abxyz"),
         "backspace clears collapsed mark"
+    );
+
+    const auto overwrite_path = temporary.path() / "overwrite.txt";
+    write_file(overwrite_path, "abc\n");
+    editor.open(provider, overwrite_path.string());
+    editor.toggle_overwrite();
+    check(editor.overwrite(), "editor overwrite mode");
+    editor.insert('X');
+    check_equal(
+        editor.lines()[0],
+        std::string("Xbc"),
+        "editor overwrite replaces character"
+    );
+    editor.end();
+    editor.insert('!');
+    check_equal(
+        editor.lines()[0],
+        std::string("Xbc!"),
+        "editor overwrite inserts at end"
+    );
+
+    const auto selection_path = temporary.path() / "selection.txt";
+    write_file(selection_path, "abcd\n");
+    editor.open(provider, selection_path.string());
+    editor.move(0, 1);
+    editor.toggle_mark();
+    editor.move(0, 2);
+    editor.toggle_mark();
+    editor.move(0, -2);
+    editor.insert('X');
+    check(editor.delete_selection(), "delete typed-in block");
+    check_equal(
+        editor.lines()[0],
+        std::string("ad"),
+        "typing at block start extends selection"
+    );
+    editor.open(provider, selection_path.string());
+    editor.move(0, 1);
+    editor.toggle_mark();
+    editor.move(0, 2);
+    editor.toggle_mark();
+    check(editor.copy_selection(), "copy at block end");
+    check(editor.copy_selection(), "repeat copy at block end");
+    check(editor.delete_selection(), "delete copied block");
+    check_equal(
+        editor.lines()[0],
+        std::string("ad"),
+        "copy at block end extends selection"
+    );
+
+    const auto active_mark_path =
+        temporary.path() / "active-mark.txt";
+    write_file(active_mark_path, "abcde\n");
+    editor.open(provider, active_mark_path.string());
+    editor.toggle_mark();
+    editor.move(0, 2);
+    editor.insert('X');
+    check(editor.marking(), "editing keeps active mark");
+    editor.move(0, 1);
+    editor.toggle_mark();
+    check(editor.delete_selection(), "delete completed active mark");
+    check_equal(
+        editor.lines()[0],
+        std::string("de"),
+        "active mark tracks edits"
+    );
+
+    const auto line_path = temporary.path() / "lines.txt";
+    write_file(line_path, "ab\néé");
+    editor.open(provider, line_path.string());
+    editor.move(0, 1);
+    editor.delete_line();
+    editor.insert('X');
+    check_equal(
+        editor.lines()[0],
+        std::string("Xéé"),
+        "line deletion aligns UTF-8 cursor"
+    );
+    write_file(line_path, "ab\ncd");
+    editor.open(provider, line_path.string());
+    editor.goto_line(2);
+    editor.delete_line();
+    editor.save(false);
+    check_equal(
+        read_file(line_path),
+        std::string("ab\n"),
+        "last-line deletion keeps preceding newline"
+    );
+
+    const auto cross_line_path =
+        temporary.path() / "cross-line.txt";
+    write_file(cross_line_path, "abc\ndef");
+    editor.open(provider, cross_line_path.string());
+    editor.end();
+    editor.begin_mark();
+    editor.move(0, 2);
+    editor.finish_mark();
+    check(editor.delete_selection(), "delete cross-line mark");
+    check_equal(
+        editor.lines()[0],
+        std::string("abcef"),
+        "horizontal marking crosses newline"
     );
 
     editor.open(provider, path.string());

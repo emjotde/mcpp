@@ -23,8 +23,10 @@ exec 3>"$temporary/input"
 sleep 1
 printf '\033[B\033[14~' >&3
 sleep 1
-# Mark "alpha", copy it to end of line, then replace "beta".
-printf '\033[13~\033[C\033[C\033[C\033[C\033[C\033[13~\033[F\033[15~' >&3
+# Ctrl-Z is an editor word-motion key, not shell job control.
+printf '\033[F\032\033[H' >&3
+# Mark "alpha" with Shift-Right, copy it twice, then replace "beta".
+printf '\033[1;2C\033[1;2C\033[1;2C\033[1;2C\033[1;2C\033[F\033[15~\033[15~' >&3
 printf '\033[14~beta\rBETA\r\033[12~' >&3
 sleep 1
 # Exercise the modified-file close dialog and discard only the last X.
@@ -43,7 +45,7 @@ if ((status != 0)); then
     exit 1
 fi
 
-if [[ "$(cat "$temporary/left/a.txt")" != "alpha BETAalpha" ]]; then
+if [[ "$(cat "$temporary/left/a.txt")" != "alpha BETAalphaalpha" ]]; then
     printf 'mcpp editor key workflow produced unexpected content\n' >&2
     exit 1
 fi
