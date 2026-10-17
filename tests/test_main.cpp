@@ -155,6 +155,56 @@ void test_local_provider() {
         std::string("replacement"),
         "atomic write"
     );
+    const auto replaced = provider.stat(
+        (temporary.path() / "a.txt").string(),
+        {}
+    );
+    std::istringstream short_input("short");
+    bool short_rejected = false;
+    try {
+        provider.write(
+            replaced.path,
+            short_input,
+            std::uint64_t{10},
+            true,
+            replaced.revision,
+            {},
+            {}
+        );
+    } catch (const std::runtime_error&) {
+        short_rejected = true;
+    }
+    check(short_rejected, "short source rejection");
+    check_equal(
+        read_file(temporary.path() / "a.txt"),
+        std::string("replacement"),
+        "short source preserves destination"
+    );
+
+    const mcpp::Cancellation publish_cancellation;
+    std::istringstream one_byte("x");
+    bool publish_cancelled = false;
+    try {
+        provider.write(
+            replaced.path,
+            one_byte,
+            std::uint64_t{1},
+            true,
+            replaced.revision,
+            publish_cancellation,
+            [&](const mcpp::TransferProgress&) {
+                publish_cancellation.request();
+            }
+        );
+    } catch (const mcpp::OperationCancelled&) {
+        publish_cancelled = true;
+    }
+    check(publish_cancelled, "pre-publish cancellation");
+    check_equal(
+        read_file(temporary.path() / "a.txt"),
+        std::string("replacement"),
+        "cancelled publish preserves destination"
+    );
     std::istringstream blocked_input("blocked");
     bool no_clobber = false;
     try {
@@ -194,6 +244,46 @@ void test_local_provider() {
         root_removal = true;
     }
     check(root_removal, "provider root removal rejection");
+    const auto deletion_root = temporary.path() / "cancel-delete";
+    for (int index = 0; index < 32; ++index) {
+        write_file(
+            deletion_root / ("file-" + std::to_string(index)),
+            "delete"
+        );
+    }
+    const mcpp::Cancellation delete_cancellation;
+    bool delete_cancelled = false;
+    try {
+        provider.remove(
+            deletion_root.string(),
+            true,
+            delete_cancellation,
+            [&](const mcpp::TransferProgress& value) {
+                if (value.files_done >= 1U) {
+                    delete_cancellation.request();
+                }
+            }
+        );
+    } catch (const mcpp::OperationCancelled&) {
+        delete_cancelled = true;
+    }
+    check(delete_cancelled, "recursive delete cancellation");
+    check(
+        std::filesystem::exists(deletion_root),
+        "cancelled recursive delete stops early"
+    );
+    const auto swapped = temporary.path() / "swapped-directory";
+    std::filesystem::create_directory(swapped);
+    std::filesystem::remove(swapped);
+    std::filesystem::create_directory_symlink(
+        outside.path(),
+        swapped
+    );
+    provider.remove(swapped.string(), true, {}, {});
+    check(
+        std::filesystem::exists(outside.path() / "outside.txt"),
+        "recursive delete does not follow swapped symlink"
+    );
     bool followed_escape = false;
     try {
         static_cast<void>(provider.list(
@@ -443,9 +533,26 @@ void test_operations() {
         (moved_dir / "renamed.txt").string(),
         {}
     );
+    operations.move_exact(
+        provider,
+        moved,
+        provider,
+        moved.path,
+        {
+            .overwrite = true,
+            .preserve_permissions = true,
+            .preserve_symlinks = true,
+            .collision = {},
+        },
+        {}
+    );
+    check(
+        std::filesystem::exists(moved.path),
+        "self move keeps source"
+    );
     operations.remove(provider, {moved}, {});
     check(
-        !std::filesystem::exists(moved_dir / "a.txt"),
+        !std::filesystem::exists(moved.path),
         "remove file"
     );
     static_cast<void>(last);
@@ -490,6 +597,85 @@ void test_operations() {
     check(
         !std::filesystem::exists(destination_dir / "large.bin"),
         "cancelled copy leaves no destination"
+    );
+
+    write_file(source_dir / "skip.txt", "source");
+    write_file(destination_dir / "skip.txt", "destination");
+    mcpp::LocalProvider second_provider(temporary.path());
+    const auto skipped = provider.stat(
+        (source_dir / "skip.txt").string(),
+        {}
+    );
+    operations.move_exact(
+        provider,
+        skipped,
+        second_provider,
+        skipped.path,
+        {
+            .overwrite = true,
+            .preserve_permissions = true,
+            .preserve_symlinks = true,
+            .collision = {},
+        },
+        {}
+    );
+    check_equal(
+        read_file(source_dir / "skip.txt"),
+        std::string("source"),
+        "cross-instance self move keeps source"
+    );
+    operations.move(
+        provider,
+        {skipped},
+        second_provider,
+        destination_dir.string(),
+        {
+            .overwrite = false,
+            .preserve_permissions = true,
+            .preserve_symlinks = true,
+            .collision =
+                [](const mcpp::Entry&, const mcpp::Entry&) {
+                    return mcpp::CollisionDecision::skip;
+                },
+        },
+        {}
+    );
+    check_equal(
+        read_file(source_dir / "skip.txt"),
+        std::string("source"),
+        "skipped move keeps source"
+    );
+    check_equal(
+        read_file(destination_dir / "skip.txt"),
+        std::string("destination"),
+        "skipped move keeps destination"
+    );
+
+    const auto fifo = source_dir / "pipe";
+    check(::mkfifo(fifo.c_str(), 0600) == 0, "create FIFO fixture");
+    const auto fifo_entry = provider.stat(fifo.string(), {});
+    bool rejected_special = false;
+    try {
+        operations.copy(
+            provider,
+            {fifo_entry},
+            provider,
+            destination_dir.string(),
+            {
+                .overwrite = false,
+                .preserve_permissions = true,
+                .preserve_symlinks = true,
+                .collision = {},
+            },
+            {}
+        );
+    } catch (const std::runtime_error&) {
+        rejected_special = true;
+    }
+    check(rejected_special, "special-file copy rejection");
+    check(
+        !std::filesystem::exists(destination_dir / "pipe"),
+        "special-file copy leaves no destination"
     );
 }
 
@@ -562,6 +748,28 @@ void test_config() {
         loaded.bookmarks.size(),
         std::size_t{2},
         "config bookmarks"
+    );
+    struct stat status {};
+    check(
+        ::stat(path.c_str(), &status) == 0 &&
+            (status.st_mode & 0777) == 0600,
+        "config file permissions"
+    );
+    const auto victim = temporary.path() / "victim";
+    const auto linked_config = temporary.path() / "linked-config";
+    write_file(victim, "victim");
+    std::filesystem::create_symlink(victim, linked_config);
+    config.save(linked_config);
+    check_equal(
+        read_file(victim),
+        std::string("victim"),
+        "config save does not follow destination symlink"
+    );
+    check(
+        std::filesystem::is_regular_file(
+            std::filesystem::symlink_status(linked_config)
+        ),
+        "config save replaces symlink itself"
     );
 }
 
@@ -636,6 +844,12 @@ void test_user_menu() {
         "x|Example command|printf '%s' %f\n"
         "invalid\n"
     );
+    std::filesystem::permissions(
+        menu,
+        std::filesystem::perms::owner_read |
+            std::filesystem::perms::owner_write,
+        std::filesystem::perm_options::replace
+    );
     const auto entries = mcpp::load_user_menu(menu);
     check_equal(entries.size(), std::size_t{1}, "user menu count");
     check_equal(entries[0].key, 'x', "user menu key");
@@ -650,6 +864,56 @@ void test_user_menu() {
             std::string::npos,
         "user menu shell quoting"
     );
+    const auto token_path = "/tmp/literal-%d-%D";
+    const auto token_expanded = mcpp::expand_user_menu_command(
+        "printf %f",
+        token_path,
+        "/current",
+        "/other"
+    );
+    check(
+        token_expanded.find(token_path) != std::string::npos,
+        "user menu does not re-expand inserted paths"
+    );
+    bool quoted_placeholder_rejected = false;
+    try {
+        static_cast<void>(mcpp::expand_user_menu_command(
+            "printf \"%f\"",
+            "$(printf INJECTED)",
+            "/current",
+            "/other"
+        ));
+    } catch (const std::invalid_argument&) {
+        quoted_placeholder_rejected = true;
+    }
+    check(
+        quoted_placeholder_rejected,
+        "quoted user-menu placeholder rejection"
+    );
+    std::filesystem::permissions(
+        menu,
+        std::filesystem::perms::owner_read |
+            std::filesystem::perms::owner_write |
+            std::filesystem::perms::group_write,
+        std::filesystem::perm_options::replace
+    );
+    bool insecure_rejected = false;
+    try {
+        static_cast<void>(mcpp::load_user_menu(menu));
+    } catch (const std::runtime_error&) {
+        insecure_rejected = true;
+    }
+    check(insecure_rejected, "insecure user menu rejection");
+
+    const auto fifo = temporary.path() / "menu-fifo";
+    check(::mkfifo(fifo.c_str(), 0600) == 0, "create menu FIFO");
+    bool fifo_rejected = false;
+    try {
+        static_cast<void>(mcpp::load_user_menu(fifo));
+    } catch (const std::runtime_error&) {
+        fifo_rejected = true;
+    }
+    check(fifo_rejected, "menu FIFO rejection");
 }
 
 }  // namespace

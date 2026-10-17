@@ -72,7 +72,7 @@ private:
         const Cancellation& cancellation
     );
 
-    static void copy_entry(
+    static bool copy_entry(
         Provider& source_provider,
         const Entry& source,
         Provider& destination_provider,

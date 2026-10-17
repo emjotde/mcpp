@@ -1,9 +1,16 @@
 #include "mcpp/config.hpp"
 
+#include <cerrno>
+#include <cstring>
 #include <cstdlib>
 #include <fstream>
+#include <fcntl.h>
+#include <sstream>
 #include <map>
 #include <stdexcept>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <vector>
 
 namespace mcpp {
 namespace {
@@ -84,12 +91,12 @@ Config Config::load(const std::filesystem::path& path) {
 }
 
 void Config::save(const std::filesystem::path& path) const {
-    std::filesystem::create_directories(path.parent_path());
-    const auto temporary = path.string() + ".tmp";
-    std::ofstream output(temporary, std::ios::trunc);
-    if (!output) {
-        throw std::runtime_error("cannot write configuration");
+    const auto created =
+        std::filesystem::create_directories(path.parent_path());
+    if (created) {
+        static_cast<void>(chmod(path.parent_path().c_str(), 0700));
     }
+    std::ostringstream output;
     output << "show_hidden=" << (show_hidden ? "true" : "false")
            << '\n'
            << "confirm_delete=" << (confirm_delete ? "true" : "false")
@@ -107,11 +114,66 @@ void Config::save(const std::filesystem::path& path) const {
     for (const auto& bookmark : bookmarks) {
         output << "bookmark=" << bookmark << '\n';
     }
-    output.close();
     if (!output) {
-        throw std::runtime_error("cannot close configuration");
+        throw std::runtime_error("cannot serialize configuration");
     }
-    std::filesystem::rename(temporary, path);
+    const auto content = std::move(output).str();
+    auto pattern =
+        (path.parent_path() / ".mcpp-config-XXXXXX").string();
+    std::vector<char> buffer(pattern.begin(), pattern.end());
+    buffer.push_back('\0');
+    int descriptor = mkostemp(buffer.data(), O_CLOEXEC);
+    if (descriptor < 0) {
+        throw std::runtime_error(
+            "cannot create configuration temporary file: " +
+            std::string(std::strerror(errno))
+        );
+    }
+    const std::filesystem::path temporary(buffer.data());
+    try {
+        if (fchmod(descriptor, 0600) != 0) {
+            throw std::runtime_error(
+                "cannot protect configuration temporary file"
+            );
+        }
+        std::size_t offset = 0;
+        while (offset < content.size()) {
+            const auto count = ::write(
+                descriptor,
+                content.data() + offset,
+                content.size() - offset
+            );
+            if (count < 0 && errno == EINTR) {
+                continue;
+            }
+            if (count <= 0) {
+                throw std::runtime_error(
+                    "cannot write configuration"
+                );
+            }
+            offset += static_cast<std::size_t>(count);
+        }
+        if (fsync(descriptor) != 0) {
+            throw std::runtime_error(
+                "cannot commit configuration"
+            );
+        }
+        if (close(descriptor) != 0) {
+            descriptor = -1;
+            throw std::runtime_error(
+                "cannot close configuration"
+            );
+        }
+        descriptor = -1;
+        std::filesystem::rename(temporary, path);
+    } catch (...) {
+        if (descriptor >= 0) {
+            static_cast<void>(close(descriptor));
+        }
+        std::error_code ignored;
+        std::filesystem::remove(temporary, ignored);
+        throw;
+    }
 }
 
 std::filesystem::path default_config_path() {

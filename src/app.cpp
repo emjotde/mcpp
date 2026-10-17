@@ -362,7 +362,7 @@ struct App::Impl {
             .preserve_permissions = true,
             .preserve_symlinks = true,
             .collision =
-                [&](const Entry&, const Entry&) {
+                [overwrite](const Entry&, const Entry&) {
                     return overwrite
                                ? CollisionDecision::overwrite
                                : CollisionDecision::skip;
@@ -370,7 +370,8 @@ struct App::Impl {
         };
         operation_running.store(true, std::memory_order_release);
         status = move_operation ? "Starting move" : "Starting copy";
-        operation_thread = std::jthread(
+        try {
+            operation_thread = std::jthread(
             [
                 this,
                 move_operation,
@@ -483,8 +484,14 @@ struct App::Impl {
                         );
                     });
                 }
-            }
-        );
+            });
+        } catch (...) {
+            operation_running.store(
+                false,
+                std::memory_order_release
+            );
+            throw;
+        }
     }
 
     bool has_collision(const std::string& destination) {
@@ -520,7 +527,8 @@ struct App::Impl {
         progress = {};
         operation_running.store(true, std::memory_order_release);
         status = "Starting delete";
-        operation_thread = std::jthread(
+        try {
+            operation_thread = std::jthread(
             [this, provider, entries, source_index] {
                 try {
                     operations.remove(
@@ -574,14 +582,25 @@ struct App::Impl {
                         );
                     });
                 }
-            }
-        );
+            });
+        } catch (...) {
+            operation_running.store(
+                false,
+                std::memory_order_release
+            );
+            throw;
+        }
     }
 
     int run_process(
         const std::string& command,
         const bool interactive
     ) {
+        if (operation_running.load(std::memory_order_acquire)) {
+            throw std::runtime_error(
+                "cannot launch a command while a file operation is running"
+            );
+        }
         int child_status = 0;
         terminal->WithRestoredIO([&] {
             const auto child = fork();
@@ -2042,14 +2061,14 @@ struct App::Impl {
             return false;
         }
         const auto* selected = active().current();
-        const auto command = expand_user_menu_command(
-            match->command,
-            selected == nullptr ? "" : selected->path,
-            active().path(),
-            passive().path()
-        );
         mode = Mode::panels;
         try {
+            const auto command = expand_user_menu_command(
+                match->command,
+                selected == nullptr ? "" : selected->path,
+                active().path(),
+                passive().path()
+            );
             const auto result = run_process(command, false);
             status =
                 match->label + " exited " +
@@ -2531,6 +2550,30 @@ int App::run() {
     terminal.ForceHandleCtrlC(false);
     terminal.TrackMouse(true);
     impl_->terminal = &terminal;
+    struct OperationJoinGuard {
+        Impl* implementation;
+        bool finished{false};
+
+        void finish() noexcept {
+            if (finished) {
+                return;
+            }
+            finished = true;
+            if (implementation->operation_running.load(
+                    std::memory_order_acquire
+                )) {
+                implementation->operation_cancellation.request();
+            }
+            if (implementation->operation_thread.joinable()) {
+                implementation->operation_thread.join();
+            }
+            implementation->terminal = nullptr;
+        }
+
+        ~OperationJoinGuard() {
+            finish();
+        }
+    } operation_guard{impl_.get()};
     auto component = ftxui::Renderer([&] {
         return impl_->render();
     });
@@ -2541,6 +2584,7 @@ int App::run() {
         }
     );
     terminal.Loop(std::move(component));
+    operation_guard.finish();
     impl_->config.show_hidden = impl_->left.show_hidden();
     impl_->config.sort = impl_->left.sort_field();
     impl_->config.sort_descending = impl_->left.descending();

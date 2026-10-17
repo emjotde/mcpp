@@ -5,6 +5,7 @@
 #include <cctype>
 #include <cerrno>
 #include <cstring>
+#include <dirent.h>
 #include <fstream>
 #include <fcntl.h>
 #include <grp.h>
@@ -64,14 +65,38 @@ std::string identity_name(
     const gid_t gid,
     const bool owner
 ) {
+    const auto requested_size =
+        sysconf(owner ? _SC_GETPW_R_SIZE_MAX : _SC_GETGR_R_SIZE_MAX);
+    const auto buffer_size = static_cast<std::size_t>(
+        requested_size > 0 ? requested_size : 16384
+    );
+    std::vector<char> buffer(buffer_size);
     if (owner) {
-        if (const auto* entry = getpwuid(uid); entry != nullptr) {
-            return entry->pw_name;
+        passwd entry{};
+        passwd* result = nullptr;
+        if (getpwuid_r(
+                uid,
+                &entry,
+                buffer.data(),
+                buffer.size(),
+                &result
+            ) == 0 &&
+            result != nullptr) {
+            return entry.pw_name;
         }
         return std::to_string(uid);
     }
-    if (const auto* entry = getgrgid(gid); entry != nullptr) {
-        return entry->gr_name;
+    group entry{};
+    group* result = nullptr;
+    if (getgrgid_r(
+            gid,
+            &entry,
+            buffer.data(),
+            buffer.size(),
+            &result
+        ) == 0 &&
+        result != nullptr) {
+        return entry.gr_name;
     }
     return std::to_string(gid);
 }
@@ -99,6 +124,155 @@ bool rename_no_replace(
         destination,
         std::error_code(errno, std::generic_category())
     );
+}
+
+int open_regular_file(const std::filesystem::path& path) {
+    const int descriptor = open(
+        path.c_str(),
+        O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC
+    );
+    if (descriptor < 0) {
+        throw std::runtime_error(
+            "cannot open regular file: " + path.string() + ": " +
+            std::string(std::strerror(errno))
+        );
+    }
+    struct stat status {};
+    if (fstat(descriptor, &status) != 0 ||
+        !S_ISREG(status.st_mode)) {
+        const auto failure = errno;
+        close(descriptor);
+        throw std::runtime_error(
+            "not a regular file: " + path.string() +
+            (failure == 0
+                 ? ""
+                 : ": " + std::string(std::strerror(failure)))
+        );
+    }
+    return descriptor;
+}
+
+class DescriptorInputBuffer final : public std::streambuf {
+public:
+    explicit DescriptorInputBuffer(const int descriptor)
+        : descriptor_(descriptor) {
+        setg(buffer_.data(), buffer_.data(), buffer_.data());
+    }
+
+protected:
+    int_type underflow() override {
+        const auto count = read(
+            descriptor_,
+            buffer_.data(),
+            buffer_.size()
+        );
+        if (count <= 0) {
+            return traits_type::eof();
+        }
+        setg(buffer_.data(), buffer_.data(), buffer_.data() + count);
+        return traits_type::to_int_type(*gptr());
+    }
+
+private:
+    int descriptor_;
+    std::array<char, 64U * 1024U> buffer_{};
+};
+
+void remove_tree_at(
+    const int parent_descriptor,
+    const std::string& name,
+    const std::filesystem::path& display_path,
+    const Cancellation& cancellation,
+    std::uint64_t& removed,
+    const ProgressCallback& progress
+) {
+    cancellation.throw_if_requested();
+    struct stat status {};
+    if (fstatat(
+            parent_descriptor,
+            name.c_str(),
+            &status,
+            AT_SYMLINK_NOFOLLOW
+        ) != 0) {
+        throw std::runtime_error(
+            "cannot inspect before removal: " +
+            display_path.string() + ": " +
+            std::string(std::strerror(errno))
+        );
+    }
+    if (S_ISDIR(status.st_mode)) {
+        const int child_descriptor = openat(
+            parent_descriptor,
+            name.c_str(),
+            O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
+        );
+        if (child_descriptor < 0) {
+            throw std::runtime_error(
+                "cannot open directory for removal: " +
+                display_path.string() + ": " +
+                std::string(std::strerror(errno))
+            );
+        }
+        DIR* directory = fdopendir(child_descriptor);
+        if (directory == nullptr) {
+            const auto failure = errno;
+            close(child_descriptor);
+            throw std::runtime_error(
+                "cannot enumerate directory for removal: " +
+                display_path.string() + ": " +
+                std::string(std::strerror(failure))
+            );
+        }
+        try {
+            while (true) {
+                errno = 0;
+                const auto* item = readdir(directory);
+                if (item == nullptr) {
+                    if (errno != 0) {
+                        throw std::runtime_error(
+                            "cannot enumerate directory for removal: " +
+                            display_path.string()
+                        );
+                    }
+                    break;
+                }
+                const std::string child_name(item->d_name);
+                if (child_name == "." || child_name == "..") {
+                    continue;
+                }
+                remove_tree_at(
+                    dirfd(directory),
+                    child_name,
+                    display_path / child_name,
+                    cancellation,
+                    removed,
+                    progress
+                );
+            }
+        } catch (...) {
+            closedir(directory);
+            throw;
+        }
+        closedir(directory);
+    }
+    cancellation.throw_if_requested();
+    if (unlinkat(
+            parent_descriptor,
+            name.c_str(),
+            S_ISDIR(status.st_mode) ? AT_REMOVEDIR : 0
+        ) != 0) {
+        throw std::runtime_error(
+            "cannot remove " + display_path.string() + ": " +
+            std::string(std::strerror(errno))
+        );
+    }
+    ++removed;
+    if (progress) {
+        progress({
+            .files_done = removed,
+            .current_path = display_path.string(),
+        });
+    }
 }
 
 }  // namespace
@@ -424,29 +598,46 @@ void LocalProvider::read(
     std::ostream& output,
     const Cancellation& cancellation
 ) const {
-    std::ifstream input(resolve_follow(path), std::ios::binary);
-    if (!input) {
-        throw std::runtime_error("cannot open file for reading");
-    }
-    input.seekg(static_cast<std::streamoff>(offset));
+    const auto source = resolve_follow(path);
+    const int descriptor = open_regular_file(source);
     std::array<char, 64U * 1024U> buffer{};
     auto remaining = length;
-    while (remaining > 0U && input) {
-        cancellation.throw_if_requested();
-        const auto requested = static_cast<std::streamsize>(
-            std::min<std::uint64_t>(remaining, buffer.size())
-        );
-        input.read(buffer.data(), requested);
-        const auto count = input.gcount();
-        if (count <= 0) {
-            break;
+    std::uint64_t position = offset;
+    try {
+        while (remaining > 0U) {
+            cancellation.throw_if_requested();
+            const auto requested = static_cast<std::size_t>(
+                std::min<std::uint64_t>(remaining, buffer.size())
+            );
+            const auto count = pread(
+                descriptor,
+                buffer.data(),
+                requested,
+                static_cast<off_t>(position)
+            );
+            if (count < 0 && errno == EINTR) {
+                continue;
+            }
+            if (count < 0) {
+                throw std::runtime_error(
+                    "failed while reading " + source.string()
+                );
+            }
+            if (count == 0) {
+                break;
+            }
+            output.write(buffer.data(), count);
+            if (!output.good()) {
+                throw std::runtime_error("failed while writing file data");
+            }
+            remaining -= static_cast<std::uint64_t>(count);
+            position += static_cast<std::uint64_t>(count);
         }
-        output.write(buffer.data(), count);
-        if (!output.good()) {
-            throw std::runtime_error("failed while writing file data");
-        }
-        remaining -= static_cast<std::uint64_t>(count);
+    } catch (...) {
+        close(descriptor);
+        throw;
     }
+    close(descriptor);
 }
 
 void LocalProvider::write(
@@ -478,7 +669,7 @@ void LocalProvider::write(
         (destination.parent_path() / ".mcpp-write-XXXXXX").string();
     std::vector<char> temporary_buffer(pattern.begin(), pattern.end());
     temporary_buffer.push_back('\0');
-    int descriptor = mkstemp(temporary_buffer.data());
+    int descriptor = mkostemp(temporary_buffer.data(), O_CLOEXEC);
     if (descriptor < 0) {
         throw std::runtime_error(
             "cannot create temporary output: " +
@@ -519,6 +710,11 @@ void LocalProvider::write(
             );
             const auto count = input.gcount();
             if (count <= 0) {
+                if (input.bad() || (!input.eof() && input.fail())) {
+                    throw std::runtime_error(
+                        "failed while reading source data"
+                    );
+                }
                 break;
             }
             std::streamsize offset = 0;
@@ -549,12 +745,20 @@ void LocalProvider::write(
                     .current_path = destination.string(),
                 });
             }
+            cancellation.throw_if_requested();
         }
+        if (length && written != *length) {
+            throw std::runtime_error(
+                "source ended before expected length"
+            );
+        }
+        cancellation.throw_if_requested();
         if (fsync(descriptor) != 0) {
             throw std::runtime_error(
                 "failed to commit " + temporary.string()
             );
         }
+        cancellation.throw_if_requested();
         if (close(descriptor) != 0) {
             descriptor = -1;
             throw std::runtime_error(
@@ -562,6 +766,7 @@ void LocalProvider::write(
             );
         }
         descriptor = -1;
+        cancellation.throw_if_requested();
         if (overwrite) {
             if (expected_revision) {
                 const auto current = stat(
@@ -626,7 +831,30 @@ void LocalProvider::remove(
     }
     std::uint64_t count = 0;
     if (recursive) {
-        count = std::filesystem::remove_all(target);
+        const auto parent = target.parent_path();
+        const int parent_descriptor = open(
+            parent.c_str(),
+            O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
+        );
+        if (parent_descriptor < 0) {
+            throw std::runtime_error(
+                "cannot open removal parent: " + parent.string()
+            );
+        }
+        try {
+            remove_tree_at(
+                parent_descriptor,
+                target.filename().string(),
+                target,
+                cancellation,
+                count,
+                progress
+            );
+        } catch (...) {
+            close(parent_descriptor);
+            throw;
+        }
+        close(parent_descriptor);
     } else {
         count = std::filesystem::remove(target) ? 1U : 0U;
     }
@@ -635,7 +863,7 @@ void LocalProvider::remove(
             "nothing removed: " + target.string()
         );
     }
-    if (progress) {
+    if (progress && !recursive) {
         progress({
             .files_done = count,
             .files_total = count,
@@ -656,10 +884,16 @@ void LocalProvider::rename(
             "refusing to rename provider root"
         );
     }
-    if (!overwrite && exists(destination_path.string())) {
-        throw std::runtime_error(
-            "destination exists: " + destination_path.string()
-        );
+    if (source_path == destination_path) {
+        return;
+    }
+    if (!overwrite) {
+        if (!rename_no_replace(source_path, destination_path)) {
+            throw std::runtime_error(
+                "destination exists: " + destination_path.string()
+            );
+        }
+        return;
     }
     if (overwrite) {
         std::optional<std::filesystem::path> backup;
@@ -700,7 +934,6 @@ void LocalProvider::rename(
         }
         return;
     }
-    std::filesystem::rename(source_path, destination_path);
 }
 
 void LocalProvider::copy_direct(
@@ -764,21 +997,29 @@ void LocalProvider::copy_direct(
         }
         return;
     }
-    std::ifstream input(source_path, std::ios::binary);
-    if (!input) {
+    if (source_entry.kind != EntryKind::file) {
         throw std::runtime_error(
-            "cannot open copy source: " + source_path.string()
+            "unsupported special file type: " + source_path.string()
         );
     }
-    write(
-        destination_path.string(),
-        input,
-        source_entry.size,
-        overwrite,
-        std::nullopt,
-        cancellation,
-        progress
-    );
+    const int source_descriptor = open_regular_file(source_path);
+    try {
+        DescriptorInputBuffer source_buffer(source_descriptor);
+        std::istream input(&source_buffer);
+        write(
+            destination_path.string(),
+            input,
+            source_entry.size,
+            overwrite,
+            std::nullopt,
+            cancellation,
+            progress
+        );
+    } catch (...) {
+        close(source_descriptor);
+        throw;
+    }
+    close(source_descriptor);
     if (source_entry.permissions != std::filesystem::perms::unknown) {
         set_permissions(
             destination_path.string(),

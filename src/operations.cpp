@@ -4,6 +4,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <fcntl.h>
 #include <sstream>
 #include <stdexcept>
 #include <streambuf>
@@ -131,7 +132,7 @@ public:
             pattern.end()
         );
         buffer.push_back('\0');
-        descriptor_ = mkstemp(buffer.data());
+        descriptor_ = mkostemp(buffer.data(), O_CLOEXEC);
         if (descriptor_ < 0) {
             throw std::runtime_error(
                 "cannot create transfer temporary file: " +
@@ -198,7 +199,7 @@ TransferProgress OperationEngine::measure(
     return result;
 }
 
-void OperationEngine::copy_entry(
+bool OperationEngine::copy_entry(
     Provider& source_provider,
     const Entry& source,
     Provider& destination_provider,
@@ -210,6 +211,11 @@ void OperationEngine::copy_entry(
 ) {
     cancellation.throw_if_requested();
     const auto destination_path = std::string(destination);
+    if (source_provider.id() == destination_provider.id() &&
+        source_provider.normalize(source.path) ==
+            destination_provider.normalize(destination_path)) {
+        return false;
+    }
     const bool destination_exists =
         destination_provider.exists(destination_path);
     const bool overwrite =
@@ -224,7 +230,7 @@ void OperationEngine::copy_entry(
               )
             : false;
     if (destination_exists && !overwrite) {
-        return;
+        return false;
     }
 
     state.current_path = source.path;
@@ -261,20 +267,22 @@ void OperationEngine::copy_entry(
         state.bytes_done += completed.bytes_total;
         state.files_done += completed.files_total;
         emit_progress(progress, state);
-        return;
+        return true;
     }
 
     if (source.kind == EntryKind::directory) {
         if (!destination_exists) {
             destination_provider.create_directory(destination_path);
         }
+        bool copied_all = true;
         for (const auto& child :
              source_provider.list(
                  source.path,
                  {.show_hidden = true},
                  cancellation
              )) {
-            copy_entry(
+            copied_all =
+                copy_entry(
                 source_provider,
                 child,
                 destination_provider,
@@ -286,9 +294,9 @@ void OperationEngine::copy_entry(
                 cancellation,
                 state,
                 progress
-            );
+            ) && copied_all;
         }
-        return;
+        return copied_all;
     }
 
     if (source.kind == EntryKind::symlink &&
@@ -345,6 +353,7 @@ void OperationEngine::copy_entry(
     state.bytes_done += source.size;
     ++state.files_done;
     emit_progress(progress, state);
+    return true;
 }
 
 void OperationEngine::copy(
@@ -359,7 +368,7 @@ void OperationEngine::copy(
     auto state = measure(source_provider, sources, cancellation);
     emit_progress(progress, state);
     for (const auto& source : sources) {
-        copy_entry(
+        static_cast<void>(copy_entry(
             source_provider,
             source,
             destination_provider,
@@ -371,7 +380,7 @@ void OperationEngine::copy(
             cancellation,
             state,
             progress
-        );
+        ));
     }
 }
 
@@ -438,7 +447,7 @@ void OperationEngine::move(
                 state.current_path = source.path;
                 emit_progress(progress, state);
             } catch (const std::filesystem::filesystem_error&) {
-                copy_entry(
+                const auto copied = copy_entry(
                     source_provider,
                     source,
                     destination_provider,
@@ -455,31 +464,42 @@ void OperationEngine::move(
                     state,
                     progress
                 );
-                source_provider.remove(
-                    source.path,
-                    source.kind == EntryKind::directory,
-                    cancellation,
-                    {}
-                );
+                if (copied) {
+                    source_provider.remove(
+                        source.path,
+                        source.kind == EntryKind::directory,
+                        cancellation,
+                        {}
+                    );
+                }
             }
         }
         return;
     }
-    copy(
-        source_provider,
-        sources,
-        destination_provider,
-        destination_directory,
-        options,
-        cancellation,
-        progress
-    );
-    remove(
-        source_provider,
-        sources,
-        cancellation,
-        progress
-    );
+    auto state = measure(source_provider, sources, cancellation);
+    for (const auto& source : sources) {
+        const auto copied = copy_entry(
+            source_provider,
+            source,
+            destination_provider,
+            destination_provider.join(
+                destination_directory,
+                source.name
+            ),
+            options,
+            cancellation,
+            state,
+            progress
+        );
+        if (copied) {
+            source_provider.remove(
+                source.path,
+                source.kind == EntryKind::directory,
+                cancellation,
+                {}
+            );
+        }
+    }
 }
 
 void OperationEngine::remove(
@@ -514,6 +534,11 @@ void OperationEngine::move_exact(
     const ProgressCallback& progress
 ) const {
     cancellation.throw_if_requested();
+    if (source_provider.id() == destination_provider.id() &&
+        source_provider.normalize(source.path) ==
+            destination_provider.normalize(destination)) {
+        return;
+    }
     bool overwrite = options.overwrite;
     if (destination_provider.exists(destination) && !overwrite) {
         if (!options.collision) {
@@ -559,7 +584,7 @@ void OperationEngine::move_exact(
         }
     }
     auto state = measure(source_provider, {source}, cancellation);
-    copy_entry(
+    const auto copied = copy_entry(
         source_provider,
         source,
         destination_provider,
@@ -574,12 +599,14 @@ void OperationEngine::move_exact(
         state,
         progress
     );
-    source_provider.remove(
-        source.path,
-        source.kind == EntryKind::directory,
-        cancellation,
-        {}
-    );
+    if (copied) {
+        source_provider.remove(
+            source.path,
+            source.kind == EntryKind::directory,
+            cancellation,
+            {}
+        );
+    }
 }
 
 }  // namespace mcpp
