@@ -109,6 +109,7 @@ void EditorModel::open(
     row_ = 0;
     column_ = 0;
     dirty_ = false;
+    ++change_id_;
     overwrite_ = false;
     clear_selection();
     undo_.clear();
@@ -124,6 +125,7 @@ void EditorModel::close() {
     row_ = 0;
     column_ = 0;
     dirty_ = false;
+    ++change_id_;
     overwrite_ = false;
     clear_selection();
     undo_.clear();
@@ -160,6 +162,10 @@ std::size_t EditorModel::byte_size() const noexcept {
         result += line.size();
     }
     return result;
+}
+
+std::uint64_t EditorModel::change_id() const noexcept {
+    return change_id_;
 }
 
 bool EditorModel::marking() const noexcept {
@@ -454,6 +460,10 @@ void EditorModel::insert(const std::string_view text) {
     insert_text(text, overwrite_);
 }
 
+void EditorModel::paste(const std::string_view text) {
+    insert_text(text, false);
+}
+
 void EditorModel::insert_text(
     const std::string_view text,
     const bool overwrite,
@@ -574,6 +584,7 @@ void EditorModel::insert_text(
         clear_selection();
     }
     dirty_ = true;
+    ++change_id_;
 }
 
 void EditorModel::newline() {
@@ -643,6 +654,7 @@ void EditorModel::erase_text(
         clear_selection();
     }
     dirty_ = true;
+    ++change_id_;
 }
 
 void EditorModel::backspace() {
@@ -715,6 +727,7 @@ void EditorModel::delete_to_end() {
     record_undo();
     lines_[row_].erase(column_);
     dirty_ = true;
+    ++change_id_;
 }
 
 bool EditorModel::copy_selection() {
@@ -763,6 +776,7 @@ bool EditorModel::move_selection() {
     column_ = cursor.column;
     clear_selection();
     dirty_ = true;
+    ++change_id_;
     return true;
 }
 
@@ -774,6 +788,38 @@ bool EditorModel::delete_selection() {
     record_undo();
     replace_range(selected->first, selected->second, "");
     dirty_ = true;
+    ++change_id_;
+    return true;
+}
+
+std::optional<std::string> EditorModel::selected_text() const {
+    const auto selected = selection();
+    if (!selected) {
+        return std::nullopt;
+    }
+    const auto begin_offset = offset(selected->first);
+    const auto end_offset = offset(selected->second);
+    return content().substr(
+        begin_offset,
+        end_offset - begin_offset
+    );
+}
+
+bool EditorModel::replace_selection(
+    const std::string_view replacement
+) {
+    const auto selected = selection();
+    if (!selected) {
+        return false;
+    }
+    record_undo();
+    replace_range(
+        selected->first,
+        selected->second,
+        replacement
+    );
+    dirty_ = true;
+    ++change_id_;
     return true;
 }
 
@@ -801,6 +847,7 @@ void EditorModel::restore(Snapshot snapshot) {
     selection_end_ = snapshot.selection_end;
     marking_ = snapshot.marking;
     dirty_ = true;
+    ++change_id_;
 }
 
 bool EditorModel::undo() {
@@ -901,7 +948,9 @@ void EditorModel::save_as(
 
 bool EditorModel::find(
     const std::string_view needle,
-    const bool case_sensitive
+    const bool case_sensitive,
+    const bool wrap,
+    const bool overlap
 ) {
     if (needle.empty()) {
         return false;
@@ -918,10 +967,13 @@ bool EditorModel::find(
     });
     if (const auto selected = selection();
         selected && EditorPosition{row_, column_} == selected->first) {
-        begin = offset(selected->second);
+        begin =
+            overlap
+                ? next_character(serialized, begin)
+                : offset(selected->second);
     }
     auto found = haystack.find(sought, begin);
-    if (found == std::string::npos && begin != 0U) {
+    if (found == std::string::npos && wrap && begin != 0U) {
         found = haystack.find(sought);
     }
     if (found == std::string::npos) {
@@ -933,6 +985,54 @@ bool EditorModel::find(
     row_ = selection_begin_->row;
     column_ = selection_begin_->column;
     return true;
+}
+
+std::size_t EditorModel::replace_all(
+    const std::string_view needle,
+    const std::string_view replacement,
+    const bool case_sensitive
+) {
+    const auto selected = selection();
+    if (!selected || needle.empty()) {
+        return 0U;
+    }
+    const auto original = content();
+    const auto haystack =
+        case_sensitive ? original : lowercase(original);
+    const auto sought =
+        case_sensitive ? std::string(needle)
+                       : lowercase(std::string(needle));
+    const auto start = offset(selected->first);
+    std::string replaced;
+    replaced.reserve(original.size());
+    replaced.append(original, 0, start);
+    auto cursor = start;
+    auto final_cursor = start;
+    std::size_t count = 0;
+    while (true) {
+        const auto found = haystack.find(sought, cursor);
+        if (found == std::string::npos) {
+            break;
+        }
+        replaced.append(original, cursor, found - cursor);
+        replaced += replacement;
+        final_cursor = replaced.size();
+        cursor = found + needle.size();
+        ++count;
+    }
+    if (count == 0U) {
+        return 0U;
+    }
+    replaced.append(original, cursor, std::string::npos);
+    record_undo();
+    set_content(replaced);
+    const auto destination = position(final_cursor);
+    row_ = destination.row;
+    column_ = destination.column;
+    clear_selection();
+    dirty_ = true;
+    ++change_id_;
+    return count;
 }
 
 bool EditorModel::replace(
@@ -950,6 +1050,7 @@ bool EditorModel::replace(
     record_undo();
     replace_range(selected->first, selected->second, replacement);
     dirty_ = true;
+    ++change_id_;
     return true;
 }
 

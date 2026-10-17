@@ -4,6 +4,7 @@
 #include "mcpp/local_provider.hpp"
 #include "mcpp/location.hpp"
 #include "mcpp/search.hpp"
+#include "mcpp/syntax.hpp"
 #include "mcpp/user_menu.hpp"
 
 #include <algorithm>
@@ -46,6 +47,7 @@ enum class Mode {
     editor_menu,
     editor_help,
     editor_error,
+    editor_replace_confirm,
     editor_close_dialog,
     prompt,
     help,
@@ -466,7 +468,19 @@ struct App::Impl {
     TransferProgress progress;
     ViewerModel viewer;
     EditorModel editor;
+    SyntaxHighlighter syntax_highlighter;
+    bool editor_syntax{true};
+    std::uint64_t syntax_change_id{
+        std::numeric_limits<std::uint64_t>::max()
+    };
+    std::string syntax_path;
+    std::vector<std::vector<SyntaxSpan>> syntax_spans;
+    std::string editor_clipboard;
+    std::string editor_search_needle;
     std::string editor_replace_needle;
+    std::string editor_replace_text;
+    std::size_t editor_replace_choice{0};
+    std::size_t editor_replacements{0};
     std::size_t editor_menu_category{0};
     std::size_t editor_menu_item{0};
     std::size_t editor_close_choice{0};
@@ -1131,6 +1145,7 @@ struct App::Impl {
                                  : "No match";
                     break;
                 case PromptAction::editor_find:
+                    editor_search_needle = prompt_value;
                     if (editor.find(prompt_value, false)) {
                         status = "Match found";
                     } else {
@@ -1150,14 +1165,13 @@ struct App::Impl {
                     prompt_value.clear();
                     return;
                 case PromptAction::editor_replace_with:
-                    if (editor.replace(
+                    editor_replace_text = prompt_value;
+                    if (!editor.find(
                             editor_replace_needle,
-                            prompt_value,
                             false
                         )) {
-                        status = "Replaced";
-                    } else {
                         editor_replace_needle.clear();
+                        editor_replace_text.clear();
                         prompt_action = PromptAction::none;
                         prompt_value.clear();
                         show_editor_message(
@@ -1166,8 +1180,12 @@ struct App::Impl {
                         );
                         return;
                     }
-                    editor_replace_needle.clear();
-                    break;
+                    editor_replace_choice = 0;
+                    editor_replacements = 0;
+                    prompt_action = PromptAction::none;
+                    prompt_value.clear();
+                    mode = Mode::editor_replace_confirm;
+                    return;
                 case PromptAction::editor_save_as:
                     if (!prompt_value.empty()) {
                         editor.save_as(prompt_value, false);
@@ -1283,6 +1301,7 @@ struct App::Impl {
         } catch (const std::exception& error) {
             if (mode_before_prompt == Mode::editor) {
                 editor_replace_needle.clear();
+                editor_replace_text.clear();
                 prompt_action = PromptAction::none;
                 prompt_value.clear();
                 show_editor_error(error);
@@ -1477,9 +1496,40 @@ struct App::Impl {
                border;
     }
 
+    static ftxui::Element style_syntax(
+        ftxui::Element element,
+        const SyntaxStyle style
+    ) {
+        using namespace ftxui;
+        switch (style) {
+            case SyntaxStyle::keyword:
+                return std::move(element) |
+                       color(Color::RGB(86, 156, 214)) | bold;
+            case SyntaxStyle::type:
+                return std::move(element) |
+                       color(Color::RGB(78, 201, 176));
+            case SyntaxStyle::string_literal:
+                return std::move(element) |
+                       color(Color::RGB(206, 145, 120));
+            case SyntaxStyle::comment:
+                return std::move(element) |
+                       color(Color::RGB(106, 153, 85)) | italic;
+            case SyntaxStyle::number:
+                return std::move(element) |
+                       color(Color::RGB(181, 206, 168));
+            case SyntaxStyle::preprocessor:
+                return std::move(element) |
+                       color(Color::RGB(197, 134, 192)) | bold;
+            case SyntaxStyle::normal:
+                return element;
+        }
+        return element;
+    }
+
     ftxui::Element render_editor_line(
         const std::size_t index,
-        const std::size_t first_column
+        const std::size_t first_column,
+        const std::size_t viewport_width
     ) const {
         using namespace ftxui;
         const auto& line = editor.lines()[index];
@@ -1501,19 +1551,56 @@ struct App::Impl {
 
         const auto visible_begin =
             editor_offset_for_width(line, first_column);
+        auto visible_end = editor_offset_for_width(
+            line,
+            first_column + viewport_width
+        );
+        if (visible_end == visible_begin &&
+            visible_end < line.size()) {
+            visible_end = next_utf8(line, visible_end);
+        }
         std::vector<std::size_t> boundaries{
             visible_begin,
-            line.size(),
-            std::min(selected_begin, line.size()),
-            std::min(selected_end, line.size()),
+            visible_end,
+            std::clamp(
+                selected_begin,
+                visible_begin,
+                visible_end
+            ),
+            std::clamp(
+                selected_end,
+                visible_begin,
+                visible_end
+            ),
         };
-        if (index == editor.row()) {
+        if (index == editor.row() &&
+            editor.column() >= visible_begin &&
+            editor.column() <= visible_end) {
             boundaries.push_back(
-                std::min(editor.column(), line.size())
+                std::min(editor.column(), visible_end)
             );
             boundaries.push_back(
-                next_utf8(line, editor.column())
+                std::min(
+                    next_utf8(line, editor.column()),
+                    visible_end
+                )
             );
+        }
+        if (editor_syntax && index < syntax_spans.size()) {
+            for (const auto& span : syntax_spans[index]) {
+                if (span.end <= visible_begin) {
+                    continue;
+                }
+                if (span.begin >= visible_end) {
+                    break;
+                }
+                boundaries.push_back(
+                    std::max(span.begin, visible_begin)
+                );
+                boundaries.push_back(
+                    std::min(span.end, visible_end)
+                );
+            }
         }
         std::sort(boundaries.begin(), boundaries.end());
         boundaries.erase(
@@ -1522,6 +1609,16 @@ struct App::Impl {
         );
 
         Elements segments;
+        auto display_begin =
+            editor_display_width(line, visible_begin);
+        std::size_t syntax_index = 0;
+        if (editor_syntax && index < syntax_spans.size()) {
+            while (syntax_index < syntax_spans[index].size() &&
+                   syntax_spans[index][syntax_index].end <=
+                       visible_begin) {
+                ++syntax_index;
+            }
+        }
         for (std::size_t boundary = 0;
              boundary + 1U < boundaries.size();
              ++boundary) {
@@ -1530,11 +1627,12 @@ struct App::Impl {
             if (begin < visible_begin || begin == end) {
                 continue;
             }
-            const auto display_begin =
-                editor_display_width(line, begin);
             auto displayed = editor_display_text(
                 std::string_view(line).substr(begin, end - begin),
                 display_begin
+            );
+            const auto display_width = static_cast<std::size_t>(
+                std::max(0, string_width(displayed))
             );
             if (begin == visible_begin &&
                 line[begin] == '\t' &&
@@ -1550,35 +1648,70 @@ struct App::Impl {
             const bool cursor =
                 index == editor.row() &&
                 begin == editor.column();
+            const bool selected =
+                begin >= selected_begin && begin < selected_end;
             if (cursor && line[begin] == '\t') {
                 segments.push_back(
-                    focusCursorBlock(text(" ") | inverted | bold)
+                    focusCursorBlock(
+                        text(" ") |
+                        color(Color::Grey0) |
+                        bgcolor(Color::Grey85) |
+                        bold
+                    )
                 );
                 if (displayed.size() > 1U) {
                     auto remainder = text(displayed.substr(1U));
-                    if (begin >= selected_begin &&
-                        begin < selected_end) {
-                        remainder = remainder | inverted;
+                    if (selected) {
+                        remainder = remainder |
+                                    color(Color::Grey0) |
+                                    bgcolor(Color::Grey85);
                     }
                     segments.push_back(std::move(remainder));
                 }
+                display_begin += display_width;
                 continue;
             }
             auto segment = text(displayed);
-            if (begin >= selected_begin && begin < selected_end) {
-                segment = segment | inverted;
-            }
             if (cursor) {
                 segment = focusCursorBlock(
-                    segment | inverted | bold
+                    segment |
+                    color(Color::Grey0) |
+                    bgcolor(Color::Grey85) |
+                    bold
                 );
+            } else if (selected) {
+                segment = segment |
+                          color(Color::Grey0) |
+                          bgcolor(Color::Grey85);
+            } else if (editor_syntax && index < syntax_spans.size()) {
+                while (syntax_index < syntax_spans[index].size() &&
+                       syntax_spans[index][syntax_index].end <= begin) {
+                    ++syntax_index;
+                }
+                if (syntax_index < syntax_spans[index].size() &&
+                    begin >=
+                        syntax_spans[index][syntax_index].begin &&
+                    begin <
+                        syntax_spans[index][syntax_index].end) {
+                    segment = style_syntax(
+                        std::move(segment),
+                        syntax_spans[index][syntax_index].style
+                    );
+                }
             }
             segments.push_back(std::move(segment));
+            display_begin += display_width;
         }
         if (index == editor.row() &&
-            editor.column() == line.size()) {
+            editor.column() == line.size() &&
+            visible_end == line.size()) {
             segments.push_back(
-                focusCursorBlock(text(" ") | inverted | bold)
+                focusCursorBlock(
+                    text(" ") |
+                    color(Color::Grey0) |
+                    bgcolor(Color::Grey85) |
+                    bold
+                )
             );
         }
         if (segments.empty()) {
@@ -1592,6 +1725,21 @@ struct App::Impl {
         const auto terminal_size = Terminal::Size();
         const auto visible_rows = editor_visible_rows();
         const auto& lines = editor.lines();
+        if (editor_syntax &&
+            (
+                syntax_change_id != editor.change_id() ||
+                syntax_path != editor.path() ||
+                syntax_spans.size() != lines.size()
+            )) {
+            syntax_spans = syntax_highlighter.highlight(
+                editor.path(),
+                lines
+            );
+            syntax_change_id = editor.change_id();
+            syntax_path = editor.path();
+        } else if (!editor_syntax && !syntax_spans.empty()) {
+            syntax_spans.clear();
+        }
         const auto first =
             editor.row() > visible_rows / 2U
                 ? editor.row() - visible_rows / 2U
@@ -1610,7 +1758,11 @@ struct App::Impl {
         Elements elements;
         for (std::size_t index = first; index < end; ++index) {
             elements.push_back(
-                render_editor_line(index, first_column)
+                render_editor_line(
+                    index,
+                    first_column,
+                    content_width
+                )
             );
         }
 
@@ -1712,9 +1864,12 @@ struct App::Impl {
                 "Copy  F5",
                 "Move  F6",
                 "Delete  F8",
+                "Copy to clipboard  C-Ins",
+                "Cut to clipboard  S-Del",
+                "Paste from clipboard  S-Ins",
             },
             {"Find  F7", "Replace  F4", "Go to line  C-g"},
-            {"No commands"},
+            {"Toggle syntax highlighting  C-s"},
             {"No commands"},
             {"No commands"},
             {"Tab inserts 4 spaces"},
@@ -1783,6 +1938,9 @@ struct App::Impl {
                    text("Alt-L      Go to line"),
                    text("Insert     Insert/overwrite"),
                    text("Shift-arrow Mark text"),
+                   text("C-Ins/S-Del Copy/cut block"),
+                   text("S-Ins      Paste clipboard"),
+                   text("Ctrl-S     Syntax highlighting"),
                    separator(),
                    text("Press F1 or Esc") | center,
                }) |
@@ -1802,6 +1960,40 @@ struct App::Impl {
                size(WIDTH, LESS_THAN, 72) |
                color(Color::Grey100) |
                bgcolor(Color::Grey19);
+    }
+
+    ftxui::Element render_editor_replace_confirm() const {
+        using namespace ftxui;
+        const auto button = [&](const std::string& label,
+                                const std::size_t index) {
+            auto element = text("[ " + label + " ]");
+            return index == editor_replace_choice
+                       ? element | inverted | focus
+                       : element;
+        };
+        return vbox({
+                   text("Replace") | bold | center,
+                   separator(),
+                   text(
+                       "\"" + display_text(editor_replace_needle) +
+                       "\" with \"" +
+                       display_text(editor_replace_text) + "\"?"
+                   ),
+                   separator(),
+                   hbox({
+                       button("Replace", 0),
+                       text(" "),
+                       button("Skip", 1),
+                       text(" "),
+                       button("All", 2),
+                       text(" "),
+                       button("One", 3),
+                       text(" "),
+                       button("Cancel", 4),
+                   }) | center,
+               }) |
+               borderStyled(LIGHT) |
+               size(WIDTH, LESS_THAN, 78);
     }
 
     ftxui::Element render_help() const {
@@ -2549,6 +2741,7 @@ struct App::Impl {
             mode == Mode::editor_menu ||
             mode == Mode::editor_help ||
             mode == Mode::editor_error ||
+            mode == Mode::editor_replace_confirm ||
             mode == Mode::editor_close_dialog ||
             (
                 mode == Mode::prompt &&
@@ -2591,6 +2784,11 @@ struct App::Impl {
             document = dbox({
                 document,
                 centered_modal(render_editor_error()),
+            });
+        } else if (mode == Mode::editor_replace_confirm) {
+            document = dbox({
+                document,
+                centered_modal(render_editor_replace_confirm()),
             });
         } else if (mode == Mode::editor_close_dialog) {
             document = dbox({
@@ -2792,6 +2990,29 @@ struct App::Impl {
         }
     }
 
+    void store_editor_clipboard(const bool cut) {
+        if (const auto selected = editor.selected_text()) {
+            editor_clipboard = *selected;
+            if (cut) {
+                static_cast<void>(editor.delete_selection());
+            }
+            status = cut
+                         ? "Block cut to clipboard"
+                         : "Block copied to clipboard";
+        } else {
+            status = "No marked block";
+        }
+    }
+
+    void paste_editor_clipboard() {
+        if (editor_clipboard.empty()) {
+            status = "Clipboard is empty";
+            return;
+        }
+        editor.paste(editor_clipboard);
+        status = "Clipboard pasted";
+    }
+
     void execute_editor_menu_item() {
         const auto category = editor_menu_category;
         const auto item = editor_menu_item;
@@ -2848,6 +3069,15 @@ struct App::Impl {
                     }
                     status = "Deleted";
                     break;
+                case 7:
+                    store_editor_clipboard(false);
+                    break;
+                case 8:
+                    store_editor_clipboard(true);
+                    break;
+                case 9:
+                    paste_editor_clipboard();
+                    break;
                 default:
                     break;
             }
@@ -2873,12 +3103,19 @@ struct App::Impl {
             }
             return;
         }
+        if (category == 3U) {
+            editor_syntax = !editor_syntax;
+            status = editor_syntax
+                         ? "Syntax highlighting enabled"
+                         : "Syntax highlighting disabled";
+            return;
+        }
         status = "No command in this menu";
     }
 
     bool handle_editor_menu(const ftxui::Event& event) {
         static constexpr std::array<std::size_t, 7> item_counts{
-            3, 7, 3, 1, 1, 1, 1
+            3, 10, 3, 1, 1, 1, 1
         };
         if (event == ftxui::Event::Escape ||
             event == ftxui::Event::F9) {
@@ -2962,7 +3199,114 @@ struct App::Impl {
         return true;
     }
 
+    void finish_editor_replace(const std::string& message) {
+        status = message;
+        editor_replace_needle.clear();
+        editor_replace_text.clear();
+        editor_replace_choice = 0;
+        mode = Mode::editor;
+    }
+
+    bool handle_editor_replace_confirm(const ftxui::Event& event) {
+        if (event == ftxui::Event::Escape) {
+            finish_editor_replace("Replace cancelled");
+            return true;
+        }
+        if (event == ftxui::Event::ArrowLeft ||
+            event == ftxui::Event::TabReverse) {
+            editor_replace_choice =
+                (editor_replace_choice + 4U) % 5U;
+            return true;
+        }
+        if (event == ftxui::Event::ArrowRight ||
+            event == ftxui::Event::Tab) {
+            editor_replace_choice =
+                (editor_replace_choice + 1U) % 5U;
+            return true;
+        }
+        if (event == ftxui::Event::Character('r')) {
+            editor_replace_choice = 0;
+        } else if (event == ftxui::Event::Character('s')) {
+            editor_replace_choice = 1;
+        } else if (event == ftxui::Event::Character('a')) {
+            editor_replace_choice = 2;
+        } else if (event == ftxui::Event::Character('o')) {
+            editor_replace_choice = 3;
+        } else if (event == ftxui::Event::Character('c')) {
+            editor_replace_choice = 4;
+        } else if (event != ftxui::Event::Return) {
+            return false;
+        }
+
+        if (editor_replace_choice == 4U) {
+            finish_editor_replace("Replace cancelled");
+            return true;
+        }
+        if (editor_replace_choice == 1U) {
+            if (!editor.find(
+                    editor_replace_needle,
+                    false,
+                    false,
+                    true
+                )) {
+                finish_editor_replace(
+                    std::to_string(editor_replacements) +
+                    " replacement(s)"
+                );
+            }
+            return true;
+        }
+        if (editor_replace_choice == 2U) {
+            editor_replacements += editor.replace_all(
+                editor_replace_needle,
+                editor_replace_text,
+                false
+            );
+            finish_editor_replace(
+                std::to_string(editor_replacements) +
+                " replacement(s)"
+            );
+            return true;
+        }
+
+        if (editor.replace_selection(editor_replace_text)) {
+            ++editor_replacements;
+        }
+        if (editor_replace_choice == 3U ||
+            !editor.find(
+                editor_replace_needle,
+                false,
+                false
+            )) {
+            finish_editor_replace(
+                std::to_string(editor_replacements) +
+                " replacement(s)"
+            );
+        }
+        return true;
+    }
+
     bool handle_editor(const ftxui::Event& event) {
+        const bool clipboard_event =
+            event == ftxui::Event::Special("\x1B[2;5~") ||
+            event == ftxui::Event::Special("\x1B[3;2~") ||
+            event == ftxui::Event::Special("\x1B[2;2~");
+        if (clipboard_event && editor_shift_marking) {
+            editor.finish_mark();
+            editor_shift_marking = false;
+        }
+        if (event == ftxui::Event::Special("\x1B[2;5~")) {
+            store_editor_clipboard(false);
+            return true;
+        }
+        if (event == ftxui::Event::Special("\x1B[3;2~")) {
+            store_editor_clipboard(true);
+            return true;
+        }
+        if (event == ftxui::Event::Special("\x1B[2;2~")) {
+            paste_editor_clipboard();
+            return true;
+        }
         const auto shifted_move = [&](const ftxui::Event& shifted,
                                       const int rows,
                                       const int columns) {
@@ -3062,6 +3406,22 @@ struct App::Impl {
             start_prompt(PromptAction::editor_find, "Search");
             return true;
         }
+        if (event == ftxui::Event::Special("\x1B[31~") ||
+            event == ftxui::Event::Special("\x1B[18;2~")) {
+            if (editor_search_needle.empty()) {
+                start_prompt(PromptAction::editor_find, "Search");
+            } else if (!editor.find(
+                           editor_search_needle,
+                           false,
+                           false
+                       )) {
+                show_editor_message(
+                    "Search",
+                    "Search string not found"
+                );
+            }
+            return true;
+        }
         if (event == ftxui::Event::F8) {
             if (!editor.delete_selection()) {
                 editor.erase();
@@ -3130,10 +3490,10 @@ struct App::Impl {
             return true;
         }
         if (event == ftxui::Event::CtrlS) {
-            show_editor_message(
-                "Syntax highlighting",
-                "Syntax highlighting is not implemented"
-            );
+            editor_syntax = !editor_syntax;
+            status = editor_syntax
+                         ? "Syntax highlighting enabled"
+                         : "Syntax highlighting disabled";
             return true;
         }
         if (event == ftxui::Event::CtrlF) {
@@ -3809,6 +4169,9 @@ struct App::Impl {
                 return true;
             }
             return false;
+        }
+        if (mode == Mode::editor_replace_confirm) {
+            return handle_editor_replace_confirm(event);
         }
         if (mode == Mode::editor_close_dialog) {
             return handle_editor_close_dialog(event);

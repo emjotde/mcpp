@@ -323,13 +323,13 @@ not consume the block. mcedit additionally supports:
   Shift-arrow/Home/End/Page bindings;
 - rectangular column blocks (`F13` and Alt-arrow bindings);
 - mark-all, unmark, line/word marking, and block indentation;
-- persistent clip-file copy/cut/paste through `Ctrl-Insert`,
-  `Shift-Delete`, and `Shift-Insert`;
+- a persistent on-disk clip file shared across editor processes;
 - mouse positioning and mouse block selection.
 
-mcpp has no reusable clipboard or paste action. Its internal scratch string is
-used only while a selected block is copied or moved. It has no standard
-terminal-editor selection bindings or persistent clip file.
+mcpp supports reusable in-memory copy/cut/paste through `Ctrl-Insert`,
+`Shift-Delete`, and `Shift-Insert`, and keeps that clipboard across files
+opened in the same process. It does not persist the clip file across
+processes.
 
 #### Search and replace
 
@@ -340,15 +340,16 @@ terminal-editor selection bindings or persistent clip file.
 | Backward search | Yes | No |
 | Regular expression/wildcard/hex | Yes | No |
 | Whole words/selection/all charsets | Yes | No |
-| Search again | `F17` | No |
+| Search again | `F17` | Yes |
 | Find all | Results action | No |
 | Failed-search feedback | Dialog | Dialog |
-| Interactive replace choices | Replace/skip/all/one | No |
+| Interactive replace choices | Replace/skip/all/one | Yes, literal search |
 | Replace again | `F14` | No |
 
-mcpp's F4 flow asks for two strings and immediately replaces one
-case-insensitive match, wrapping to the start of the file. That is materially
-different from mcedit's option dialog and per-match replacement flow.
+mcpp's F4 flow asks for two strings and then offers Replace, Skip, All, One,
+and Cancel for each literal match. It remains materially simpler than
+mcedit's option dialog because case, direction, regular expression, wildcard,
+hex, whole-word, selection, and charset choices are absent.
 
 #### Key compatibility
 
@@ -356,35 +357,36 @@ The core bindings now align. Two default mcedit actions remain unavailable:
 
 | Action/key | mcedit | mcpp |
 |---|---|---|
-| `Ctrl-S` | Toggle syntax highlighting | Unavailable notice |
 | `Ctrl-F` | Save block to file | Unavailable notice |
 
 Esc, undo/redo, goto-line, insert/overwrite, word navigation, and file
-top/bottom now use mcedit's default bindings. `Ctrl-S` and `Ctrl-F` remain
-reserved for unimplemented mcedit actions rather than silently performing the
-old conflicting actions.
+top/bottom now use mcedit's default bindings. `Ctrl-S` toggles built-in syntax
+highlighting. `Ctrl-F` remains reserved for an unimplemented mcedit action
+rather than silently performing the old conflicting search action.
 
 #### Menus, status, and options
 
-mcpp shows the same seven top-level editor menu names. Only File, Edit, and
-Search contain a small working subset; Command, Format, Window, and Options
-are placeholders. mcedit exposes open/new/history, insert/copy file, clip-file
-operations, bookmarks, syntax and encoding, macros, spell checking, literal
+mcpp shows the same seven top-level editor menu names. File, Edit, and Search
+contain a working subset, and Command can toggle syntax highlighting; Format,
+Window, and Options remain placeholders. mcedit additionally exposes
+open/new/history, insert/copy file, persistent clip-file operations,
+bookmarks, syntax selection and encoding, macros, spell checking, literal
 insertion, formatting, external filters, multiple windows, general editor
 options, save modes, and key learning. mcpp editor menus also lack mouse item
 activation and menu hotkeys.
 
 The mcedit header reports insert/overwrite state, selection size, line and
 column details, total lines/bytes, character code, and window state. mcpp
-reports path, modified state, line/column, and bytes only. Line numbers,
-whitespace markers, syntax highlighting, bookmarks, codepages, spell
-checking, macros, and session recovery are absent.
+reports path, modified/overwrite state, line/column, and bytes. It provides
+built-in VS Code Dark+-style highlighting for common C-family, Rust, Go,
+JavaScript, Python, shell, JSON, Markdown, and configuration files, but no
+external rule database or syntax chooser. Line numbers, whitespace markers,
+bookmarks, codepages, spell checking, macros, and session recovery are absent.
 
-The next editor work should focus on the search/replace flow, reusable
-clipboard/paste, column blocks, configurable indentation, and file lifecycle.
-Multi-buffer windows follow those basics. Syntax, macros, spell checking, and
-code navigation are later parity work, not requirements for a dependable
-basic editor.
+The next editor work should focus on search options, column blocks,
+configurable indentation, and file lifecycle. Multi-buffer windows follow
+those basics. Syntax, macros, spell checking, and code navigation are later
+parity work, not requirements for a dependable basic editor.
 
 ### Command line and subshell
 

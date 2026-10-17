@@ -21,6 +21,7 @@ Azure Blob Storage through azcpp. SSH/SFTP work is currently paused.
 - Local command line, history, and restored-terminal subshell
 - Persisted panel paths and preferences
 - MC-style visual state cues using a grayscale-only palette
+- Toggleable VS Code Dark+-style syntax colors within grayscale UI chrome
 
 The implementation is behaviorally familiar but does not use Midnight
 Commander source code, resources, strings, tests, or artwork. A shallow MC

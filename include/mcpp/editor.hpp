@@ -4,6 +4,7 @@
 
 #include <cstddef>
 #include <compare>
+#include <cstdint>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -34,6 +35,7 @@ public:
     [[nodiscard]] std::size_t row() const noexcept;
     [[nodiscard]] std::size_t column() const noexcept;
     [[nodiscard]] std::size_t byte_size() const noexcept;
+    [[nodiscard]] std::uint64_t change_id() const noexcept;
     [[nodiscard]] bool marking() const noexcept;
     [[nodiscard]] bool overwrite() const noexcept;
     [[nodiscard]] std::optional<std::pair<
@@ -54,6 +56,7 @@ public:
     void toggle_overwrite() noexcept;
     void insert(char character);
     void insert(std::string_view text);
+    void paste(std::string_view text);
     void newline();
     void backspace();
     void erase();
@@ -62,6 +65,10 @@ public:
     [[nodiscard]] bool copy_selection();
     [[nodiscard]] bool move_selection();
     [[nodiscard]] bool delete_selection();
+    [[nodiscard]] std::optional<std::string> selected_text() const;
+    [[nodiscard]] bool replace_selection(
+        std::string_view replacement
+    );
     bool undo();
     bool redo();
     void save(
@@ -75,6 +82,13 @@ public:
     );
     [[nodiscard]] bool find(
         std::string_view needle,
+        bool case_sensitive,
+        bool wrap = true,
+        bool overlap = false
+    );
+    [[nodiscard]] std::size_t replace_all(
+        std::string_view needle,
+        std::string_view replacement,
         bool case_sensitive
     );
     [[nodiscard]] bool replace(
@@ -120,6 +134,7 @@ private:
     std::size_t row_{0};
     std::size_t column_{0};
     bool dirty_{false};
+    std::uint64_t change_id_{0};
     std::optional<EditorPosition> selection_begin_;
     std::optional<EditorPosition> selection_end_;
     bool marking_{false};

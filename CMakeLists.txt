@@ -66,6 +66,7 @@ add_library(
     src/operations.cpp
     src/pane.cpp
     src/search.cpp
+    src/syntax.cpp
     src/user_menu.cpp
     src/viewer.cpp
     src/editor.cpp

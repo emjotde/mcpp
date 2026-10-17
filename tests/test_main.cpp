@@ -5,6 +5,7 @@
 #include "mcpp/operations.hpp"
 #include "mcpp/pane.hpp"
 #include "mcpp/search.hpp"
+#include "mcpp/syntax.hpp"
 #include "mcpp/user_menu.hpp"
 #include "mcpp/viewer.hpp"
 
@@ -1051,6 +1052,16 @@ void test_viewer_editor() {
         std::string("Xbc!"),
         "editor overwrite inserts at end"
     );
+    write_file(overwrite_path, "abcdef");
+    editor.open(provider, overwrite_path.string());
+    editor.move(0, 2);
+    editor.toggle_overwrite();
+    editor.paste("ab");
+    check_equal(
+        editor.lines()[0],
+        std::string("ababcdef"),
+        "clipboard paste ignores overwrite mode"
+    );
 
     const auto selection_path = temporary.path() / "selection.txt";
     write_file(selection_path, "abcd\n");
@@ -1133,6 +1144,42 @@ void test_viewer_editor() {
         editor.lines()[0],
         std::string("abcef"),
         "horizontal marking crosses newline"
+    );
+
+    const auto overlap_path = temporary.path() / "overlap.txt";
+    write_file(overlap_path, "ababa");
+    editor.open(provider, overlap_path.string());
+    check(editor.find("aba", true), "find first overlap");
+    check(
+        editor.find("aba", true, false, true),
+        "find overlapping match"
+    );
+    check_equal(
+        editor.column(),
+        std::size_t{2},
+        "overlapping search starts after match start"
+    );
+
+    const auto replace_all_path =
+        temporary.path() / "replace-all.txt";
+    std::string many_matches;
+    for (int index = 0; index < 120; ++index) {
+        many_matches += "a ";
+    }
+    write_file(replace_all_path, many_matches);
+    editor.open(provider, replace_all_path.string());
+    check(editor.find("a", true), "find replace-all start");
+    check_equal(
+        editor.replace_all("a", "b", true),
+        std::size_t{120},
+        "replace all count"
+    );
+    check(editor.undo(), "replace all single undo");
+    editor.save(false);
+    check_equal(
+        read_file(replace_all_path),
+        many_matches,
+        "replace all undo restores every match"
     );
 
     editor.open(provider, path.string());
@@ -1273,6 +1320,69 @@ void test_search_compare() {
     );
 }
 
+void test_syntax() {
+    const mcpp::SyntaxHighlighter highlighter;
+    const auto cpp = highlighter.highlight(
+        "sample.cpp",
+        {
+            "const int value = 42; // note",
+            "/* block",
+            "comment */ return \"done\";",
+        }
+    );
+    const auto has_style = [](const std::vector<mcpp::SyntaxSpan>& spans,
+                              const mcpp::SyntaxStyle style) {
+        return std::ranges::any_of(
+            spans,
+            [&](const mcpp::SyntaxSpan& span) {
+                return span.style == style;
+            }
+        );
+    };
+    check(
+        has_style(cpp[0], mcpp::SyntaxStyle::keyword) &&
+            has_style(cpp[0], mcpp::SyntaxStyle::type) &&
+            has_style(cpp[0], mcpp::SyntaxStyle::number) &&
+            has_style(cpp[0], mcpp::SyntaxStyle::comment),
+        "C++ syntax classes"
+    );
+    check(
+        has_style(cpp[1], mcpp::SyntaxStyle::comment) &&
+            has_style(cpp[2], mcpp::SyntaxStyle::comment) &&
+            has_style(cpp[2], mcpp::SyntaxStyle::string_literal),
+        "multiline syntax state"
+    );
+    const auto directive_comment = highlighter.highlight(
+        "directive.cpp",
+        {"/* banner", "# text */", "int value = 42;"}
+    );
+    check(
+        has_style(
+            directive_comment[1],
+            mcpp::SyntaxStyle::comment
+        ) &&
+            !has_style(
+                directive_comment[2],
+                mcpp::SyntaxStyle::comment
+            ) &&
+            has_style(
+                directive_comment[2],
+                mcpp::SyntaxStyle::type
+            ),
+        "preprocessor line closes block comment"
+    );
+    const auto python = highlighter.highlight(
+        "sample.py",
+        {"def greet(name): # comment", "    return \"hi\""}
+    );
+    check(
+        has_style(python[0], mcpp::SyntaxStyle::keyword) &&
+            has_style(python[0], mcpp::SyntaxStyle::comment) &&
+            has_style(python[1], mcpp::SyntaxStyle::string_literal),
+        "Python syntax classes"
+    );
+}
+
 void test_user_menu() {
     TemporaryDirectory temporary;
     const auto menu = temporary.path() / "menu";
@@ -1368,6 +1478,7 @@ int main() {
         {"viewer/editor", test_viewer_editor},
         {"config", test_config},
         {"search/compare", test_search_compare},
+        {"syntax", test_syntax},
         {"user menu", test_user_menu},
     };
     int failures = 0;
