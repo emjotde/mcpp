@@ -634,7 +634,6 @@ struct App::Impl {
             );
         }
         operation_pause_condition.notify_all();
-        terminal->PostEvent(ftxui::Event::Custom);
     }
 
     void finish_operation(
@@ -4633,7 +4632,7 @@ std::string App::active_path() const {
 int App::run() {
     struct TerminalCleanup {
         ~TerminalCleanup() {
-            std::cout << "\033[0m" << std::flush;
+            std::cout << "\033[0m\n" << std::flush;
         }
     } terminal_cleanup;
     auto terminal = ftxui::App::FullscreenAlternateScreen();
