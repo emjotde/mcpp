@@ -33,7 +33,7 @@ printf '\033[15~\r' >&3
 sleep 1
 printf 'touch cmd-created.txt\r' >&3
 sleep 1
-printf '\033[21~' >&3
+printf ' \t\033[21~' >&3
 set +e
 wait "$runner"
 status=$?

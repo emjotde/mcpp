@@ -38,6 +38,7 @@ enum class SortField {
 
 struct ListRequest {
     bool show_hidden{false};
+    bool directories_first{true};
     SortField sort{SortField::name};
     bool descending{false};
     std::size_t offset{0};

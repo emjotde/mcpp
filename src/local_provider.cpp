@@ -20,14 +20,6 @@
 namespace mcpp {
 namespace {
 
-std::chrono::system_clock::time_point to_system_time(
-    const std::filesystem::file_time_type value
-) {
-    return std::chrono::time_point_cast<
-        std::chrono::system_clock::duration
-    >(std::chrono::file_clock::to_sys(value));
-}
-
 bool path_is_within(
     const std::filesystem::path& root,
     const std::filesystem::path& candidate
@@ -428,11 +420,6 @@ Entry LocalProvider::make_entry(
         result.kind = EntryKind::other;
     }
 
-    const auto modified = directory_entry.last_write_time(error);
-    if (!error) {
-        result.modified = to_system_time(modified);
-    }
-
     struct stat native_status {};
     if (lstat(directory_entry.path().c_str(), &native_status) == 0) {
         result.size = static_cast<std::uint64_t>(
@@ -448,6 +435,11 @@ Entry LocalProvider::make_entry(
             native_status.st_gid,
             false
         );
+        result.modified =
+            std::chrono::system_clock::time_point{
+                std::chrono::seconds(native_status.st_mtim.tv_sec) +
+                std::chrono::nanoseconds(native_status.st_mtim.tv_nsec)
+            };
         result.revision =
             std::to_string(native_status.st_dev) + ":" +
             std::to_string(native_status.st_ino) + ":" +
@@ -500,7 +492,8 @@ std::vector<Entry> LocalProvider::list(
         const auto right_directory =
             right.kind == EntryKind::directory ||
             right.target_is_directory;
-        if (left_directory != right_directory) {
+        if (request.directories_first &&
+            left_directory != right_directory) {
             return left_directory;
         }
         int comparison = 0;

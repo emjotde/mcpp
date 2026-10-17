@@ -63,8 +63,10 @@ The current parity gaps against GNU Midnight Commander are documented in
 |---|---|
 | `Tab` | Switch pane |
 | `Enter` | Enter directory |
-| `Backspace` | Parent directory |
-| `Insert` / `Space` | Toggle selection |
+| `Left` / `Ctrl-PageUp` | Parent directory |
+| `Right` / `Ctrl-PageDown` | Enter selected directory |
+| `Insert` | Toggle selection |
+| `Ctrl-S` / `Alt-S` | Incremental panel search |
 | `F3` | View |
 | `F4` | Edit |
 | `F5` | Copy |

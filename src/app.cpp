@@ -70,6 +70,8 @@ enum class PromptAction {
     rename,
     mkdir,
     viewer_find,
+    editor_open,
+    editor_new,
     editor_save_as,
     editor_goto,
     quick_cd,
@@ -173,6 +175,45 @@ std::size_t next_utf8(
         ++offset;
     }
     return offset;
+}
+
+std::uint32_t utf8_codepoint(
+    const std::string_view value,
+    const std::size_t offset
+) {
+    if (offset >= value.size()) {
+        return 0U;
+    }
+    const auto first = static_cast<unsigned char>(value[offset]);
+    if (first < 0x80U) {
+        return first;
+    }
+    std::uint32_t result = 0;
+    std::size_t length = 0;
+    if ((first & 0xE0U) == 0xC0U) {
+        result = first & 0x1FU;
+        length = 2;
+    } else if ((first & 0xF0U) == 0xE0U) {
+        result = first & 0x0FU;
+        length = 3;
+    } else if ((first & 0xF8U) == 0xF0U) {
+        result = first & 0x07U;
+        length = 4;
+    } else {
+        return first;
+    }
+    if (offset + length > value.size()) {
+        return first;
+    }
+    for (std::size_t index = 1; index < length; ++index) {
+        const auto next =
+            static_cast<unsigned char>(value[offset + index]);
+        if ((next & 0xC0U) != 0x80U) {
+            return first;
+        }
+        result = (result << 6U) | (next & 0x3FU);
+    }
+    return result;
 }
 
 std::size_t editor_offset_for_width(
@@ -472,6 +513,9 @@ struct App::Impl {
     };
     std::string syntax_path;
     std::vector<std::vector<SyntaxSpan>> syntax_spans;
+    std::vector<ftxui::Box> editor_line_boxes;
+    std::vector<std::size_t> editor_line_first_columns;
+    std::size_t editor_first_row{0};
     std::string editor_clipboard;
     std::string editor_search_needle;
     EditorSearchOptions editor_search_options;
@@ -506,6 +550,8 @@ struct App::Impl {
     std::mutex operation_mutex;
     std::string command_line;
     bool command_mode{false};
+    bool panel_search_mode{false};
+    std::string panel_search;
     std::vector<std::string> command_history;
     std::size_t command_history_index{0};
     std::vector<UserMenuEntry> user_menu;
@@ -558,6 +604,8 @@ struct App::Impl {
         user_menu = load_user_menu(default_user_menu_path());
         left.set_show_hidden(config.show_hidden);
         right.set_show_hidden(config.show_hidden);
+        left.set_directories_first(config.directories_first);
+        right.set_directories_first(config.directories_first);
         left.set_sort(config.sort, config.sort_descending);
         right.set_sort(config.sort, config.sort_descending);
     }
@@ -1171,6 +1219,37 @@ struct App::Impl {
                                  ? "Match found"
                                  : "No match";
                     break;
+                case PromptAction::editor_open:
+                case PromptAction::editor_new: {
+                    if (editor.dirty()) {
+                        throw std::runtime_error(
+                            "save or discard current changes first"
+                        );
+                    }
+                    auto path = std::filesystem::path(prompt_value);
+                    if (path.is_relative()) {
+                        path =
+                            std::filesystem::path(editor.path())
+                                .parent_path() /
+                            path;
+                    }
+                    if (prompt_action == PromptAction::editor_open) {
+                        editor.open(
+                            active().provider(),
+                            path.string()
+                        );
+                    } else {
+                        editor.create(
+                            active().provider(),
+                            path.string()
+                        );
+                    }
+                    status =
+                        prompt_action == PromptAction::editor_open
+                            ? "File opened"
+                            : "New file";
+                    break;
+                }
                 case PromptAction::editor_save_as:
                     if (!prompt_value.empty()) {
                         editor.save_as(prompt_value, false);
@@ -1320,9 +1399,7 @@ struct App::Impl {
                     pane.is_selected(entry),
                     focused
                 );
-                if (focused) {
-                    row = row | focus;
-                }
+                row = row | focus;
             } else {
                 row = gray_entry(std::move(row), entry);
                 if (pane.is_selected(entry)) {
@@ -1483,7 +1560,7 @@ struct App::Impl {
         const std::size_t index,
         const std::size_t first_column,
         const std::size_t viewport_width
-    ) const {
+    ) {
         using namespace ftxui;
         const auto& line = editor.lines()[index];
         auto selected_begin = line.size();
@@ -1721,14 +1798,35 @@ struct App::Impl {
             cursor_width >= content_width
                 ? cursor_width - content_width + 1U
                 : 0U;
+        editor_first_row = first;
+        editor_line_boxes.clear();
+        editor_line_boxes.resize(end - first);
+        editor_line_first_columns.clear();
+        editor_line_first_columns.reserve(end - first);
         Elements elements;
         for (std::size_t index = first; index < end; ++index) {
+            const auto visible_begin = editor_offset_for_width(
+                lines[index],
+                first_column
+            );
+            const auto aligned_column = editor_display_width(
+                lines[index],
+                visible_begin
+            );
+            editor_line_first_columns.push_back(
+                visible_begin < lines[index].size() &&
+                        lines[index][visible_begin] == '\t' &&
+                        aligned_column < first_column
+                    ? first_column
+                    : aligned_column
+            );
             elements.push_back(
                 render_editor_line(
                     index,
                     first_column,
                     content_width
-                )
+                ) |
+                reflect(editor_line_boxes[index - first])
             );
         }
 
@@ -1747,6 +1845,20 @@ struct App::Impl {
             }
             menu.push_back(std::move(item));
         }
+        const auto character =
+            utf8_codepoint(current_line, editor.column());
+        std::ostringstream editor_status;
+        editor_status
+            << " L:[" << editor.row() + 1U
+            << " C:" << cursor_width + 1U
+            << "/" << editor.lines().size() << "]"
+            << " *(" << editor.selection_size()
+            << "/" << editor.cursor_offset()
+            << "/" << editor.byte_size() << "b)"
+            << " " << std::setfill('0') << std::setw(4)
+            << character
+            << " U+" << std::uppercase << std::hex
+            << std::setw(4) << character << std::dec;
         auto header =
             mode == Mode::editor_menu
                 ? hbox(std::move(menu))
@@ -1761,17 +1873,7 @@ struct App::Impl {
                                     ? " [---O] "
                                     : " [----] "
                       ),
-                      text(
-                          "L:" +
-                          std::to_string(editor.row() + 1U) +
-                          "/" +
-                          std::to_string(editor.lines().size()) +
-                          " C:" +
-                          std::to_string(cursor_width + 1U) +
-                          " " +
-                          std::to_string(editor.byte_size()) +
-                          "b"
-                      ),
+                      text(editor_status.str()),
                   });
         header = gray_menu(std::move(header));
         const auto key_width =
@@ -1821,23 +1923,35 @@ struct App::Impl {
     ftxui::Element render_editor_menu() const {
         using namespace ftxui;
         static const std::array<std::vector<std::string>, 7> menus{{
-            {"Save  F2", "Save as...  F12", "Close  F10"},
+            {
+                "Open file...",
+                "New  C-n",
+                "Close",
+                "Save  F2",
+                "Save as...  F12",
+            },
             {
                 "Undo  C-u",
                 "Redo  M-r",
                 "Toggle ins/overw  Ins",
                 "Mark  F3",
+                "Mark all",
+                "Unmark",
                 "Copy  F5",
                 "Move  F6",
                 "Delete  F8",
                 "Copy to clipboard  C-Ins",
                 "Cut to clipboard  S-Del",
                 "Paste from clipboard  S-Ins",
+                "Beginning  C-Home",
+                "End  C-End",
             },
-            {"Find  F7", "Replace  F4", "Go to line  C-g"},
+            {"Find  F7", "Search again  F17", "Replace  F4"},
             {
-                "Toggle syntax highlighting  C-s",
+                "Go to line  M-l",
+                "Go to matching bracket  M-b",
                 "Toggle line numbers  M-n",
+                "Toggle syntax highlighting  C-s",
             },
             {"No commands"},
             {"No commands"},
@@ -1848,12 +1962,21 @@ struct App::Impl {
         for (std::size_t index = 0; index < items.size(); ++index) {
             auto row = text(" " + items[index] + " ");
             if (index == editor_menu_item) {
-                row = row | inverted;
+                row = row | inverted | focus;
             }
             rows.push_back(std::move(row));
         }
         return gray_menu(
-            vbox(std::move(rows)) | borderStyled(LIGHT)
+            (
+                vbox(std::move(rows)) |
+                yframe |
+                size(
+                    HEIGHT,
+                    LESS_THAN,
+                    std::max(1, Terminal::Size().dimy - 3)
+                )
+            ) |
+            borderStyled(LIGHT)
         );
     }
 
@@ -2037,7 +2160,15 @@ struct App::Impl {
                 }) | center
             );
         }
-        return vbox(std::move(rows)) |
+        return (
+                   vbox(std::move(rows)) |
+                   yframe |
+                   size(
+                       HEIGHT,
+                       LESS_THAN,
+                       std::max(1, Terminal::Size().dimy - 3)
+                   )
+               ) |
                borderStyled(LIGHT) |
                size(WIDTH, EQUAL, 72);
     }
@@ -2132,6 +2263,7 @@ struct App::Impl {
                 "Sort by name",
                 "Sort by size",
                 "Sort by time",
+                "Toggle directories first",
                 "Refresh",
                 "Directory hotlist",
             },
@@ -2168,6 +2300,7 @@ struct App::Impl {
                 "Sort by name",
                 "Sort by size",
                 "Sort by time",
+                "Toggle directories first",
                 "Refresh",
                 "Directory hotlist",
             },
@@ -2228,9 +2361,14 @@ struct App::Impl {
                     sort_active(SortField::modified);
                     break;
                 case 6:
-                    active().refresh();
+                    active().set_directories_first(
+                        !active().directories_first()
+                    );
                     break;
                 case 7:
+                    active().refresh();
+                    break;
+                case 8:
                     bookmark_cursor = 0;
                     mode = Mode::bookmarks;
                     return;
@@ -3145,21 +3283,65 @@ struct App::Impl {
         status = "Clipboard pasted";
     }
 
+    void repeat_editor_search() {
+        if (editor_search_needle.empty()) {
+            start_editor_search_dialog(false);
+            return;
+        }
+        if (editor_search_change_id != editor.change_id()) {
+            editor_search_scope.reset();
+            editor_search_in_selection = false;
+            editor_search_change_id = editor.change_id();
+        }
+        try {
+            if (!editor.find(
+                    editor_search_needle,
+                    editor_search_options,
+                    false,
+                    false,
+                    editor_search_scope
+                )) {
+                show_editor_message(
+                    "Search",
+                    "Search string not found"
+                );
+            }
+        } catch (const std::exception& error) {
+            show_editor_error(error);
+        }
+    }
+
     void execute_editor_menu_item() {
         const auto category = editor_menu_category;
         const auto item = editor_menu_item;
         mode = Mode::editor;
         if (category == 0U) {
             if (item == 0U) {
-                save_editor();
+                start_prompt(
+                    PromptAction::editor_open,
+                    "Open file",
+                    editor.path()
+                );
             } else if (item == 1U) {
+                start_prompt(
+                    PromptAction::editor_new,
+                    "New file",
+                    (
+                        std::filesystem::path(editor.path())
+                            .parent_path() /
+                        "new-file"
+                    ).string()
+                );
+            } else if (item == 2U) {
+                request_editor_close();
+            } else if (item == 3U) {
+                save_editor();
+            } else {
                 start_prompt(
                     PromptAction::editor_save_as,
                     "Save as",
                     editor.path()
                 );
-            } else {
-                request_editor_close();
             }
             return;
         }
@@ -3186,29 +3368,45 @@ struct App::Impl {
                                  : "Block marked";
                     break;
                 case 4:
+                    editor.select_all();
+                    status = "All text marked";
+                    break;
+                case 5:
+                    editor.clear_selection();
+                    status = "Block unmarked";
+                    break;
+                case 6:
                     status = editor.copy_selection()
                                  ? "Block copied"
                                  : "No marked block";
                     break;
-                case 5:
+                case 7:
                     status = editor.move_selection()
                                  ? "Block moved"
                                  : "No movable block";
                     break;
-                case 6:
+                case 8:
                     if (!editor.delete_selection()) {
                         editor.erase();
                     }
                     status = "Deleted";
                     break;
-                case 7:
+                case 9:
                     store_editor_clipboard(false);
                     break;
-                case 8:
+                case 10:
                     store_editor_clipboard(true);
                     break;
-                case 9:
+                case 11:
                     paste_editor_clipboard();
+                    break;
+                case 12:
+                    editor.goto_line(1);
+                    editor.home();
+                    break;
+                case 13:
+                    editor.goto_line(editor.lines().size());
+                    editor.end();
                     break;
                 default:
                     break;
@@ -3219,27 +3417,33 @@ struct App::Impl {
             if (item == 0U) {
                 start_editor_search_dialog(false);
             } else if (item == 1U) {
-                start_editor_search_dialog(true);
+                repeat_editor_search();
             } else {
-                start_prompt(
-                    PromptAction::editor_goto,
-                    "Go to line",
-                    std::to_string(editor.row() + 1U)
-                );
+                start_editor_search_dialog(true);
             }
             return;
         }
         if (category == 3U) {
             if (item == 0U) {
-                editor_syntax = !editor_syntax;
-                status = editor_syntax
-                             ? "Syntax highlighting enabled"
-                             : "Syntax highlighting disabled";
-            } else {
+                start_prompt(
+                    PromptAction::editor_goto,
+                    "Go to line",
+                    std::to_string(editor.row() + 1U)
+                );
+            } else if (item == 1U) {
+                status = editor.match_bracket()
+                             ? "Matching bracket"
+                             : "No matching bracket";
+            } else if (item == 2U) {
                 editor_line_numbers = !editor_line_numbers;
                 status = editor_line_numbers
                              ? "Line numbers enabled"
                              : "Line numbers disabled";
+            } else {
+                editor_syntax = !editor_syntax;
+                status = editor_syntax
+                             ? "Syntax highlighting enabled"
+                             : "Syntax highlighting disabled";
             }
             return;
         }
@@ -3248,7 +3452,7 @@ struct App::Impl {
 
     bool handle_editor_menu(const ftxui::Event& event) {
         static constexpr std::array<std::size_t, 7> item_counts{
-            3, 10, 3, 2, 1, 1, 1
+            5, 14, 3, 4, 1, 1, 1
         };
         if (event == ftxui::Event::Escape ||
             event == ftxui::Event::F9) {
@@ -3281,6 +3485,15 @@ struct App::Impl {
         if (event == ftxui::Event::ArrowDown) {
             const auto count = item_counts[editor_menu_category];
             editor_menu_item = (editor_menu_item + 1U) % count;
+            return true;
+        }
+        if (event == ftxui::Event::Home) {
+            editor_menu_item = 0;
+            return true;
+        }
+        if (event == ftxui::Event::End) {
+            editor_menu_item =
+                item_counts[editor_menu_category] - 1U;
             return true;
         }
         if (event == ftxui::Event::Return) {
@@ -3646,6 +3859,52 @@ struct App::Impl {
     }
 
     bool handle_editor(const ftxui::Event& event) {
+        if (event.is_mouse()) {
+            auto mouse_event = event;
+            const auto& mouse = mouse_event.mouse();
+            if (mouse.button == ftxui::Mouse::WheelUp) {
+                editor.move(-3, 0);
+                return true;
+            }
+            if (mouse.button == ftxui::Mouse::WheelDown) {
+                editor.move(3, 0);
+                return true;
+            }
+            if (mouse.button == ftxui::Mouse::Left &&
+                mouse.motion == ftxui::Mouse::Pressed) {
+                for (std::size_t index = 0;
+                     index < editor_line_boxes.size();
+                     ++index) {
+                    const auto& box = editor_line_boxes[index];
+                    if (!box.Contain(mouse.x, mouse.y)) {
+                        continue;
+                    }
+                    const auto row = editor_first_row + index;
+                    const auto gutter =
+                        editor_line_numbers ? 6 : 0;
+                    const auto cell = static_cast<std::size_t>(
+                        std::max(
+                            0,
+                            mouse.x - box.x_min - gutter
+                        )
+                    );
+                    const auto column = editor_offset_for_width(
+                        editor.lines()[row],
+                        editor_line_first_columns[index] + cell
+                    );
+                    if (mouse.shift) {
+                        editor.begin_mark();
+                        editor.set_position({row, column});
+                        editor.finish_mark();
+                    } else {
+                        editor.clear_selection();
+                        editor.set_position({row, column});
+                    }
+                    return true;
+                }
+            }
+            return false;
+        }
         const bool clipboard_event =
             event == ftxui::Event::Special("\x1B[2;5~") ||
             event == ftxui::Event::Special("\x1B[3;2~") ||
@@ -3764,32 +4023,7 @@ struct App::Impl {
         }
         if (event == ftxui::Event::Special("\x1B[31~") ||
             event == ftxui::Event::Special("\x1B[18;2~")) {
-            if (editor_search_needle.empty()) {
-                start_editor_search_dialog(false);
-            } else {
-                if (editor_search_change_id !=
-                    editor.change_id()) {
-                    editor_search_scope.reset();
-                    editor_search_in_selection = false;
-                    editor_search_change_id = editor.change_id();
-                }
-                try {
-                    if (!editor.find(
-                            editor_search_needle,
-                            editor_search_options,
-                            false,
-                            false,
-                            editor_search_scope
-                        )) {
-                        show_editor_message(
-                            "Search",
-                            "Search string not found"
-                        );
-                    }
-                } catch (const std::exception& error) {
-                    show_editor_error(error);
-                }
-            }
+            repeat_editor_search();
             return true;
         }
         if (event == ftxui::Event::F8) {
@@ -3822,6 +4056,18 @@ struct App::Impl {
                 PromptAction::editor_goto,
                 "Go to line",
                 std::to_string(editor.row() + 1U)
+            );
+            return true;
+        }
+        if (event == ftxui::Event::CtrlN) {
+            start_prompt(
+                PromptAction::editor_new,
+                "New file",
+                (
+                    std::filesystem::path(editor.path())
+                        .parent_path() /
+                    "new-file"
+                ).string()
             );
             return true;
         }
@@ -3873,6 +4119,12 @@ struct App::Impl {
                          : "Line numbers disabled";
             return true;
         }
+        if (event == ftxui::Event::AltB) {
+            status = editor.match_bracket()
+                         ? "Matching bracket"
+                         : "No matching bracket";
+            return true;
+        }
         if (event == ftxui::Event::CtrlF) {
             show_editor_message(
                 "Save block",
@@ -3911,7 +4163,15 @@ struct App::Impl {
                 static_cast<int>(editor_page_rows())
             );
         } else if (event == ftxui::Event::Tab) {
-            editor.insert("    ");
+            constexpr std::size_t tab_width = 4U;
+            const auto display_column = editor_display_width(
+                editor.lines()[editor.row()],
+                editor.column()
+            );
+            editor.insert(std::string(
+                tab_width - display_column % tab_width,
+                ' '
+            ));
         } else if (event == ftxui::Event::Return) {
             editor.newline();
         } else if (event == ftxui::Event::Backspace) {
@@ -4301,7 +4561,98 @@ struct App::Impl {
     }
 
     bool handle_panels(ftxui::Event event) {
-        if (command_mode) {
+        if (event.is_mouse() &&
+            (
+                event.mouse().motion == ftxui::Mouse::Moved ||
+                event.mouse().motion == ftxui::Mouse::Released
+            )) {
+            return false;
+        }
+        bool panel_search_confirmed = false;
+        if (panel_search_mode) {
+            if (event == ftxui::Event::Escape) {
+                panel_search_mode = false;
+                status = "Ready";
+                return true;
+            } else if (event == ftxui::Event::Return) {
+                panel_search_mode = false;
+                panel_search_confirmed = true;
+                status = "Ready";
+            } else if (event == ftxui::Event::Backspace) {
+                erase_last_utf8(panel_search);
+                if (!panel_search.empty()) {
+                    static_cast<void>(
+                        active().find(
+                            panel_search,
+                            false,
+                            true,
+                            true
+                        )
+                    );
+                }
+                status = "Quick search: " + panel_search;
+                return true;
+            } else if (event == ftxui::Event::CtrlS ||
+                       event == ftxui::Event::AltS) {
+                if (!panel_search.empty()) {
+                    static_cast<void>(
+                        active().find(
+                            panel_search,
+                            false,
+                            false,
+                            true
+                        )
+                    );
+                }
+                return true;
+            } else if (event.is_character()) {
+                panel_search += event.character();
+                const auto found =
+                    active().find(
+                        panel_search,
+                        false,
+                        true,
+                        true
+                    );
+                status = found
+                             ? "Quick search: " + panel_search
+                             : "Quick search: " + panel_search +
+                                   " (not found)";
+                return true;
+            } else {
+                panel_search_mode = false;
+            }
+        }
+        const bool panel_shortcut =
+            event.is_mouse() ||
+            event == ftxui::Event::Tab ||
+            event == ftxui::Event::ArrowUp ||
+            event == ftxui::Event::ArrowDown ||
+            event == ftxui::Event::ArrowLeft ||
+            event == ftxui::Event::ArrowRight ||
+            event == ftxui::Event::PageUp ||
+            event == ftxui::Event::PageDown ||
+            event == ftxui::Event::Home ||
+            event == ftxui::Event::End ||
+            event == ftxui::Event::Insert ||
+            event == ftxui::Event::Special("\x1B[1;2A") ||
+            event == ftxui::Event::Special("\x1B[1;2B") ||
+            event == ftxui::Event::Special("\x1B[5;5~") ||
+            event == ftxui::Event::Special("\x1B[6;5~") ||
+            event == ftxui::Event::CtrlS ||
+            event == ftxui::Event::AltS ||
+            event == ftxui::Event::F1 ||
+            event == ftxui::Event::F2 ||
+            event == ftxui::Event::F3 ||
+            event == ftxui::Event::F4 ||
+            event == ftxui::Event::F5 ||
+            event == ftxui::Event::F6 ||
+            event == ftxui::Event::F7 ||
+            event == ftxui::Event::F8 ||
+            event == ftxui::Event::F9 ||
+            event == ftxui::Event::F10;
+        if (command_mode && !panel_shortcut &&
+            !panel_search_confirmed) {
             if (event == ftxui::Event::Escape) {
                 command_mode = false;
                 command_line.clear();
@@ -4311,14 +4662,14 @@ struct App::Impl {
                 if (!command_line.empty()) {
                     command_line.pop_back();
                 }
-            } else if (event == ftxui::Event::ArrowUp) {
+            } else if (event == ftxui::Event::AltP) {
                 if (!command_history.empty() &&
                     command_history_index > 0U) {
                     --command_history_index;
                     command_line =
                         command_history[command_history_index];
                 }
-            } else if (event == ftxui::Event::ArrowDown) {
+            } else if (event == ftxui::Event::AltN) {
                 if (command_history_index + 1U <
                     command_history.size()) {
                     ++command_history_index;
@@ -4355,30 +4706,36 @@ struct App::Impl {
                         }
                     }
                 }
-                if (mouse.button == ftxui::Mouse::WheelUp) {
-                    active().move_cursor(-3);
+                Pane* pane = nullptr;
+                int pane_index = active_index;
+                std::vector<ftxui::Box>* boxes = nullptr;
+                if (left_box.Contain(mouse.x, mouse.y)) {
+                    pane_index = 0;
+                    pane = &left;
+                    boxes = &left_entry_boxes;
+                } else if (right_box.Contain(mouse.x, mouse.y)) {
+                    pane_index = 1;
+                    pane = &right;
+                    boxes = &right_entry_boxes;
+                }
+                if (pane != nullptr &&
+                    mouse.button == ftxui::Mouse::WheelUp) {
+                    active_index = pane_index;
+                    pane->move_cursor(-3);
                     return true;
                 }
-                if (mouse.button == ftxui::Mouse::WheelDown) {
-                    active().move_cursor(3);
+                if (pane != nullptr &&
+                    mouse.button == ftxui::Mouse::WheelDown) {
+                    active_index = pane_index;
+                    pane->move_cursor(3);
                     return true;
                 }
                 if (mouse.button != ftxui::Mouse::Left ||
                     mouse.motion != ftxui::Mouse::Pressed) {
                     return false;
                 }
-                Pane* pane = nullptr;
-                std::vector<ftxui::Box>* boxes = nullptr;
-                if (left_box.Contain(mouse.x, mouse.y)) {
-                    active_index = 0;
-                    pane = &left;
-                    boxes = &left_entry_boxes;
-                } else if (right_box.Contain(mouse.x, mouse.y)) {
-                    active_index = 1;
-                    pane = &right;
-                    boxes = &right_entry_boxes;
-                }
                 if (pane != nullptr && boxes != nullptr) {
+                    active_index = pane_index;
                     for (std::size_t index = 0;
                          index < boxes->size();
                          ++index) {
@@ -4396,17 +4753,7 @@ struct App::Impl {
                                 last_click_index == index &&
                                 now - last_click <
                                     std::chrono::milliseconds(400)) {
-                                if (!pane->enter()) {
-                                    const auto* entry = pane->current();
-                                    if (entry != nullptr &&
-                                        can_open_file(*entry)) {
-                                        viewer.open(
-                                            pane->provider(),
-                                            entry->path
-                                        );
-                                        mode = Mode::viewer;
-                                    }
-                                }
+                                static_cast<void>(pane->enter());
                             }
                             last_click = now;
                             last_click_pane = active_index;
@@ -4419,10 +4766,24 @@ struct App::Impl {
             }
             if (event == ftxui::Event::Tab) {
                 active_index = 1 - active_index;
+            } else if (
+                event == ftxui::Event::Special("\x1B[1;2A")
+            ) {
+                active().toggle_selected(-1);
+            } else if (
+                event == ftxui::Event::Special("\x1B[1;2B")
+            ) {
+                active().toggle_selected(1);
             } else if (event == ftxui::Event::ArrowDown) {
                 active().move_cursor(1);
             } else if (event == ftxui::Event::ArrowUp) {
                 active().move_cursor(-1);
+            } else if (event == ftxui::Event::ArrowLeft ||
+                       event == ftxui::Event::Special("\x1B[5;5~")) {
+                static_cast<void>(active().up());
+            } else if (event == ftxui::Event::ArrowRight ||
+                       event == ftxui::Event::Special("\x1B[6;5~")) {
+                static_cast<void>(active().enter());
             } else if (event == ftxui::Event::PageDown) {
                 active().page_cursor(
                     static_cast<int>(panel_visible_rows())
@@ -4440,22 +4801,20 @@ struct App::Impl {
                     static_cast<int>(active().entries().size())
                 );
             } else if (event == ftxui::Event::Return) {
-                if (!active().enter()) {
-                    const auto* entry = active().current();
-                    if (entry != nullptr && can_open_file(*entry)) {
-                        viewer.open(active().provider(), entry->path);
-                        mode = Mode::viewer;
-                    }
-                }
-            } else if (event == ftxui::Event::Backspace) {
-                active().up();
-            } else if (event == ftxui::Event::AltH) {
+                static_cast<void>(active().enter());
+            } else if (event == ftxui::Event::AltY ||
+                       event == ftxui::Event::AltH) {
                 active().history_back();
-            } else if (event == ftxui::Event::AltL) {
+            } else if (event == ftxui::Event::AltU ||
+                       event == ftxui::Event::AltL) {
                 active().history_forward();
-            } else if (event == ftxui::Event::Insert ||
-                       event == ftxui::Event::Character(' ')) {
+            } else if (event == ftxui::Event::Insert) {
                 active().toggle_selected();
+            } else if (event == ftxui::Event::CtrlS ||
+                       event == ftxui::Event::AltS) {
+                panel_search_mode = true;
+                panel_search.clear();
+                status = "Quick search: ";
             } else if (event == ftxui::Event::CtrlA) {
                 active().select_all();
             } else if (event == ftxui::Event::CtrlR) {
@@ -4712,6 +5071,8 @@ int App::run() {
     terminal.Loop(std::move(component));
     operation_guard.finish();
     impl_->config.show_hidden = impl_->left.show_hidden();
+    impl_->config.directories_first =
+        impl_->left.directories_first();
     impl_->config.sort = impl_->left.sort_field();
     impl_->config.sort_descending = impl_->left.descending();
     try {

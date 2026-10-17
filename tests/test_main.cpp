@@ -390,6 +390,21 @@ void test_pane() {
         std::string("two.txt"),
         "pane find target"
     );
+    check(
+        pane.find("two", false, true) &&
+            pane.current()->name == "two.txt",
+        "incremental pane search keeps matching cursor"
+    );
+    check(
+        !pane.find("link", false, true, true),
+        "quick search does not match internal substring"
+    );
+    check(
+        pane.find("sub", false, true, true) &&
+            pane.current()->name.starts_with("sub"),
+        "quick search matches filename prefix"
+    );
+    check(pane.find("two"), "restore pane find target");
     pane.move_cursor(-2);
     check(pane.enter(), "pane enter");
     check_equal(
@@ -397,7 +412,19 @@ void test_pane() {
         std::size_t{2},
         "pane child listing"
     );
-    check(pane.up(), "pane up");
+    pane.toggle_selected();
+    check(
+        pane.cursor() == 1U &&
+            !pane.is_selected(*pane.current()),
+        "mark-and-move skips parent entry"
+    );
+    pane.move_cursor(-1);
+    check(pane.enter(), "pane parent entry");
+    check_equal(
+        pane.current()->name,
+        std::string("sub-link"),
+        "parent entry restores child cursor"
+    );
     check(pane.history_back(), "pane history back");
     check_equal(
         pane.entries().size(),
@@ -411,6 +438,35 @@ void test_pane() {
         pane.entries().size(),
         std::size_t{2},
         "symlink directory listing"
+    );
+    const auto locked = temporary.path() / "locked";
+    std::filesystem::create_directory(locked);
+    std::filesystem::permissions(
+        locked,
+        std::filesystem::perms::none,
+        std::filesystem::perm_options::replace
+    );
+    pane.up();
+    check(pane.find("locked"), "find locked directory");
+    const auto stable_path = pane.path();
+    const auto stable_entries = pane.entries().size();
+    bool locked_rejected = false;
+    try {
+        static_cast<void>(pane.enter());
+    } catch (const std::runtime_error&) {
+        locked_rejected = true;
+    }
+    std::filesystem::permissions(
+        locked,
+        std::filesystem::perms::owner_all,
+        std::filesystem::perm_options::replace
+    );
+    check(
+        locked_rejected &&
+            pane.path() == stable_path &&
+            pane.entries().size() == stable_entries &&
+            pane.current()->name == "locked",
+        "failed navigation preserves pane state"
     );
 }
 
@@ -1065,6 +1121,53 @@ void test_viewer_editor() {
         std::string(" BETA gamma\nsecond linealpha!\n"),
         "relative save as uses edited file directory"
     );
+    const auto created_path = temporary.path() / "created.txt";
+    editor.create(provider, created_path.string());
+    editor.insert("created\n");
+    editor.save(false);
+    check_equal(
+        read_file(created_path),
+        std::string("created\n"),
+        "editor creates new file"
+    );
+    const auto new_target = temporary.path() / "new-target.txt";
+    const auto saved_target = temporary.path() / "saved-target.txt";
+    editor.create(provider, new_target.string());
+    editor.insert("first");
+    editor.save_as(saved_target.string(), false);
+    editor.insert(" second");
+    editor.save(false);
+    check_equal(
+        read_file(saved_target),
+        std::string("first second"),
+        "save as establishes normal save target"
+    );
+    const auto stable_path = temporary.path() / "stable.txt";
+    write_file(stable_path, "stable");
+    editor.open(provider, stable_path.string());
+    bool missing_rejected = false;
+    try {
+        editor.open(
+            provider,
+            (temporary.path() / "missing.txt").string()
+        );
+    } catch (const std::runtime_error&) {
+        missing_rejected = true;
+    }
+    check(
+        missing_rejected &&
+            editor.path() == stable_path.string() &&
+            editor.lines()[0] == "stable",
+        "failed open preserves current buffer identity"
+    );
+    editor.end();
+    editor.insert('!');
+    editor.save(false);
+    check_equal(
+        read_file(stable_path),
+        std::string("stable!"),
+        "failed open preserves save target"
+    );
 
     const auto utf_path = temporary.path() / "utf.txt";
     write_file(utf_path, "abc\néxyz\n");
@@ -1115,6 +1218,58 @@ void test_viewer_editor() {
         editor.lines()[0],
         std::string("Xbc!"),
         "editor overwrite inserts at end"
+    );
+    const auto column_path = temporary.path() / "columns.txt";
+    write_file(column_path, "123456\nx\n123456\n");
+    editor.open(provider, column_path.string());
+    editor.move(0, 5);
+    editor.move(1, 0);
+    check_equal(
+        editor.column(),
+        std::size_t{1},
+        "vertical move clamps on short line"
+    );
+    editor.move(1, 0);
+    check_equal(
+        editor.column(),
+        std::size_t{5},
+        "vertical move restores preferred column"
+    );
+    write_file(column_path, "abcde\nééééé\nabcde\n");
+    editor.open(provider, column_path.string());
+    editor.end();
+    editor.move(1, 0);
+    check_equal(
+        editor.column(),
+        std::size_t{10},
+        "vertical move preserves UTF-8 display column"
+    );
+    editor.move(1, 0);
+    check_equal(
+        editor.column(),
+        std::size_t{5},
+        "vertical move restores ASCII display column"
+    );
+    const auto bracket_path = temporary.path() / "brackets.txt";
+    write_file(bracket_path, "call(one[two]);\n");
+    editor.open(provider, bracket_path.string());
+    editor.move(0, 4);
+    check(editor.match_bracket(), "editor matching bracket");
+    check_equal(
+        editor.column(),
+        std::size_t{13},
+        "editor matching bracket target"
+    );
+    editor.select_all();
+    check_equal(
+        editor.selection_size(),
+        editor.byte_size(),
+        "editor mark all"
+    );
+    editor.clear_selection();
+    check(
+        !editor.selection().has_value(),
+        "editor unmark"
     );
     write_file(overwrite_path, "abcdef");
     editor.open(provider, overwrite_path.string());

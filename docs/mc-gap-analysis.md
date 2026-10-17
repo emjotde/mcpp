@@ -172,7 +172,7 @@ These are useful foundations, not parity.
 | Sort modes | 8 plus unsorted/natural options | Name, extension, size, mtime | Partial |
 | Reverse sorting | Yes | Yes | Working |
 | Panel filters | Glob/regex, files-only, case options | No | Missing |
-| Quick search | Incremental panel search | Find-next prompt/menu only | Partial |
+| Quick search | Incremental panel search | Incremental Ctrl-S/Alt-S search | Working |
 | Directory sizes | On demand | Shows directory inode size | Missing |
 | Tree panel | Dynamic/static tree | No | Missing |
 | Info panel | Full panel mode | Small modal | Partial |
@@ -180,12 +180,22 @@ These are useful foundations, not parity.
 | Panelize | Find/external command results become panel | Separate results screen | Missing |
 | Horizontal split and resizing | Yes | No | Missing |
 | Swap/synchronize panes | Yes | No | Missing |
-| File highlighting | Rules, types, permissions | Focus/mark only | Missing |
+| File highlighting | Rules, types, permissions | Built-in grayscale type/mode cues | Partial |
 | Codepage selection | Yes | No | Missing |
-| Tiny terminal adaptation | Truncates fields/keybar intentionally | Keybar and fields become unreadable | Incorrect |
+| Tiny terminal adaptation | Truncates fields/keybar intentionally | Compact fields and keybar | Working |
 
-At 60x15, MC keeps usable panels and truncates the keybar. mcpp concatenates
-key labels and clips paths/status without a minimum-size mode.
+At 60x15, both programs keep panel navigation and current-item information
+usable. mcpp keeps all ten compact key labels visible, while MC drops later
+labels when necessary.
+
+The follow-up source and side-by-side review aligned Left/Right and
+Ctrl-PageUp/Down directory traversal, parent-row cursor restoration,
+Alt-Y/Alt-U history movement, Shift-Up/Down marking, pointed-pane mouse
+wheel behavior, Space command-line input, and incremental quick search.
+Remaining navigation differences are MC's directory-history popup, other-pane
+sync/change-directory commands, multi-column horizontal movement, panel
+filters, directory-size calculation, extension/executable Enter actions, and
+tree/panelize modes.
 
 ### Menus and input widgets
 
@@ -193,9 +203,9 @@ key labels and clips paths/status without a minimum-size mode.
 |---|---|---|---|
 | F2 user menu | Local/user/system lookup, conditions, multiline commands | One global `key|label|command` file | Partial |
 | F9 pull-down | Full Left/File/Command/Options/Right menus | Small subset | Partial |
-| Dialog widgets | Buttons, checkboxes, radio, tab order, hotkeys | One text field and Enter/Esc | Missing |
+| Dialog widgets | Buttons, checkboxes, radio, tab order, hotkeys | Buttons, checks, radio-like modes, tab order | Partial |
 | Input editing | Cursor, words, kill/yank, selection, history, completion | Append/backspace only | Missing |
-| Mouse in menus/dialogs | Yes | Top menu and panel rows only | Partial |
+| Mouse in menus/dialogs | Yes | Panel rows and commander pull-downs; editor/dialog mouse incomplete | Partial |
 | Hypertext help | Contextual, indexed, links/history | Static key summary | Missing |
 | Learn/redefine keys | Yes | No | Missing |
 
@@ -276,7 +286,7 @@ What is already close:
 | Capability | mcedit | mcpp | Gap |
 |---|---|---|---|
 | Existing file | Yes | Yes | Close |
-| New/open another file | File menu and `Ctrl-N` | No editor action | Missing |
+| New/open another file | File menu and `Ctrl-N` | Single-buffer File menu and `Ctrl-N` | Partial |
 | Multiple files/windows | Multiple movable/resizable windows | One buffer | Missing |
 | File history | Persistent history dialog | No | Missing |
 | Save/save-as | Confirmation, overwrite handling, save modes | Save and no-clobber save-as | Partial |
@@ -299,9 +309,9 @@ workflow.
 | Word movement | `Ctrl-Left/Right`, `Ctrl-Z/X` | Same core bindings |
 | File top/bottom | `Ctrl-Home/End` | Same |
 | Delete word/line/to-EOL | Dedicated bindings | Line and EOL; word deletion missing |
-| Desired column on vertical move | Preserved across short lines | Column is clamped and lost |
+| Desired column on vertical move | Preserved across short lines | Preserved across short lines |
 | Page Up/Down | Uses the visible editor height | Uses the visible editor height | Close |
-| Tab handling | Configurable real/fake tabs and tab width | Always inserts four spaces |
+| Tab handling | Configurable real/fake tabs and tab width | Advances to fixed four-column fake-tab stops |
 | Existing tabs | Configurable width | Displayed at fixed four-cell stops |
 | Auto-indent | Configurable | No |
 | Literal insertion | `Ctrl-Q` | No |
@@ -378,7 +388,8 @@ activation and menu hotkeys.
 
 The mcedit header reports insert/overwrite state, selection size, line and
 column details, total lines/bytes, character code, and window state. mcpp
-reports path, modified/overwrite state, line/column, and bytes. It provides
+reports path, modified/overwrite state, line/column, selection/cursor/total
+bytes, and Unicode character value. It provides
 built-in VS Code Dark+-style highlighting for common C-family, Rust, Go,
 JavaScript, Python, shell, JSON, Markdown, and configuration files, but no
 external rule database or syntax chooser. Line numbers are toggleable with

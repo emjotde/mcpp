@@ -68,6 +68,7 @@ void Pane::refresh(const Cancellation& cancellation) {
         path_,
         {
             .show_hidden = show_hidden_,
+            .directories_first = directories_first_,
             .sort = sort_,
             .descending = descending_,
         },
@@ -142,6 +143,9 @@ bool Pane::enter(const Cancellation& cancellation) {
          !entry->target_is_directory)) {
         return false;
     }
+    if (is_parent_entry(*entry)) {
+         return up(cancellation);
+    }
     navigate(entry->path, true, cancellation);
     return true;
 }
@@ -188,10 +192,22 @@ void Pane::navigate(
             "not a directory: " + normalized
         );
     }
+    const auto previous_path = path_;
+    const auto previous_entries = entries_;
+    const auto previous_selected = selected_;
+    const auto previous_cursor = cursor_;
     path_ = std::move(normalized);
     selected_.clear();
     cursor_ = 0;
-    refresh(cancellation);
+    try {
+        refresh(cancellation);
+    } catch (...) {
+        path_ = previous_path;
+        entries_ = previous_entries;
+        selected_ = previous_selected;
+        cursor_ = previous_cursor;
+        throw;
+    }
     if (record) {
         if (history_index_ + 1U < history_.size()) {
             history_.erase(
@@ -235,12 +251,13 @@ bool Pane::history_forward(const Cancellation& cancellation) {
     return true;
 }
 
-void Pane::toggle_selected() {
+void Pane::toggle_selected(const int movement) {
     const auto* entry = current();
     if (entry == nullptr) {
         return;
     }
     if (is_parent_entry(*entry)) {
+        move_cursor(movement);
         return;
     }
     if (selected_.contains(entry->path)) {
@@ -248,7 +265,7 @@ void Pane::toggle_selected() {
     } else {
         selected_.insert(entry->path);
     }
-    move_cursor(1);
+    move_cursor(movement);
 }
 
 void Pane::select_all() {
@@ -303,7 +320,9 @@ void Pane::invert_selection() {
 
 bool Pane::find(
     const std::string_view needle,
-    const bool case_sensitive
+    const bool case_sensitive,
+    const bool include_current,
+    const bool prefix
 ) {
     if (needle.empty() || entries_.empty()) {
         return false;
@@ -322,10 +341,16 @@ bool Pane::find(
         return value;
     };
     const auto sought = normalize(std::string(needle));
-    for (std::size_t offset = 1U; offset <= entries_.size(); ++offset) {
+    const auto first = include_current ? 0U : 1U;
+    for (std::size_t offset = first;
+         offset < entries_.size() + first;
+         ++offset) {
         const auto index = (cursor_ + offset) % entries_.size();
-        if (normalize(entries_[index].name).find(sought) !=
-            std::string::npos) {
+        const auto name = normalize(entries_[index].name);
+        if (
+            (prefix && name.starts_with(sought)) ||
+            (!prefix && name.find(sought) != std::string::npos)
+        ) {
             cursor_ = index;
             return true;
         }
@@ -379,6 +404,15 @@ void Pane::set_show_hidden(const bool value) {
 
 bool Pane::show_hidden() const noexcept {
     return show_hidden_;
+}
+
+void Pane::set_directories_first(const bool value) {
+    directories_first_ = value;
+    refresh();
+}
+
+bool Pane::directories_first() const noexcept {
+    return directories_first_;
 }
 
 void Pane::set_sort(

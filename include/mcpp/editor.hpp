@@ -28,6 +28,10 @@ public:
         std::string path,
         const Cancellation& cancellation = {}
     );
+    void create(
+        ProviderPtr provider,
+        std::string path
+    );
     void close();
     [[nodiscard]] bool open() const noexcept;
     [[nodiscard]] bool dirty() const noexcept;
@@ -36,6 +40,8 @@ public:
     [[nodiscard]] std::size_t row() const noexcept;
     [[nodiscard]] std::size_t column() const noexcept;
     [[nodiscard]] std::size_t byte_size() const noexcept;
+    [[nodiscard]] std::size_t cursor_offset() const noexcept;
+    [[nodiscard]] std::size_t selection_size() const noexcept;
     [[nodiscard]] std::uint64_t change_id() const noexcept;
     [[nodiscard]] bool marking() const noexcept;
     [[nodiscard]] bool overwrite() const noexcept;
@@ -55,6 +61,8 @@ public:
     void begin_mark();
     void finish_mark();
     void clear_selection();
+    void select_all();
+    [[nodiscard]] bool match_bracket();
     void toggle_overwrite() noexcept;
     void insert(char character);
     void insert(std::string_view text);
@@ -174,12 +182,14 @@ private:
     std::vector<std::string> lines_;
     std::size_t row_{0};
     std::size_t column_{0};
+    std::optional<std::size_t> preferred_display_column_;
     bool dirty_{false};
     std::uint64_t change_id_{0};
     std::optional<EditorPosition> selection_begin_;
     std::optional<EditorPosition> selection_end_;
     bool marking_{false};
     bool overwrite_{false};
+    bool new_file_{false};
     std::string clipboard_;
     std::vector<Snapshot> undo_;
     std::vector<Snapshot> redo_;

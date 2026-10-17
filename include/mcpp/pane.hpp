@@ -23,13 +23,18 @@ public:
         std::string path,
         const Cancellation& cancellation = {}
     );
-    void toggle_selected();
+    void toggle_selected(int movement = 1);
     void select_all();
     void clear_selection();
     void select_paths(const std::vector<std::string>& paths);
     void select_pattern(std::string_view pattern, bool selected);
     void invert_selection();
-    bool find(std::string_view needle, bool case_sensitive = false);
+    bool find(
+        std::string_view needle,
+        bool case_sensitive = false,
+        bool include_current = false,
+        bool prefix = false
+    );
 
     [[nodiscard]] const ProviderPtr& provider() const noexcept;
     [[nodiscard]] const std::string& path() const noexcept;
@@ -41,6 +46,8 @@ public:
 
     void set_show_hidden(bool value);
     [[nodiscard]] bool show_hidden() const noexcept;
+    void set_directories_first(bool value);
+    [[nodiscard]] bool directories_first() const noexcept;
     void set_sort(SortField field, bool descending);
     [[nodiscard]] SortField sort_field() const noexcept;
     [[nodiscard]] bool descending() const noexcept;
@@ -58,6 +65,7 @@ private:
     std::set<std::string, std::less<>> selected_;
     std::size_t cursor_{0};
     bool show_hidden_{false};
+    bool directories_first_{true};
     SortField sort_{SortField::name};
     bool descending_{false};
     std::vector<std::string> history_;
