@@ -336,20 +336,21 @@ processes.
 | Capability | mcedit | mcpp |
 |---|---|---|
 | Forward literal search | Yes | Yes |
-| Case-sensitive option | Yes | No UI |
-| Backward search | Yes | No |
-| Regular expression/wildcard/hex | Yes | No |
-| Whole words/selection/all charsets | Yes | No |
+| Case-sensitive option | Yes | Yes |
+| Backward search | Yes | Yes |
+| Regular expression/wildcard/hex | Yes | Yes |
+| Whole words/in selection | Yes | Yes |
+| All-charsets search | Yes | No |
 | Search again | `F17` | Yes |
-| Find all | Results action | No |
+| Find all | Results action | Match count |
 | Failed-search feedback | Dialog | Dialog |
 | Interactive replace choices | Replace/skip/all/one | Yes, literal search |
 | Replace again | `F14` | No |
 
-mcpp's F4 flow asks for two strings and then offers Replace, Skip, All, One,
-and Cancel for each literal match. It remains materially simpler than
-mcedit's option dialog because case, direction, regular expression, wildcard,
-hex, whole-word, selection, and charset choices are absent.
+mcpp's F4 flow provides Normal, Regular expression, Wildcard, and Hexadecimal
+modes plus case, direction, whole-word, and selection-scope options, followed
+by Replace, Skip, All, One, and Cancel decisions. Remaining differences are
+all-charsets search, a navigable Find All results list, and F14 replace-again.
 
 #### Key compatibility
 
@@ -383,10 +384,10 @@ JavaScript, Python, shell, JSON, Markdown, and configuration files, but no
 external rule database or syntax chooser. Line numbers, whitespace markers,
 bookmarks, codepages, spell checking, macros, and session recovery are absent.
 
-The next editor work should focus on search options, column blocks,
-configurable indentation, and file lifecycle. Multi-buffer windows follow
-those basics. Syntax, macros, spell checking, and code navigation are later
-parity work, not requirements for a dependable basic editor.
+The next editor work should focus on column blocks, configurable indentation,
+and file lifecycle. Multi-buffer windows follow those basics. Macros, spell
+checking, and code navigation are later parity work, not requirements for a
+dependable basic editor.
 
 ### Command line and subshell
 

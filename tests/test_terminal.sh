@@ -47,6 +47,13 @@ if ((status != 0)); then
     exit 1
 fi
 
+tr -d '\000' <"$temporary/output" >"$temporary/output-clean"
+if ! grep -aFq $'\033[?1049l\r\033[0m\r' \
+    "$temporary/output-clean"; then
+    printf 'mcpp did not restore a clean terminal line on exit\n' >&2
+    exit 1
+fi
+
 if [[ ! -d "$temporary/left/created" ]]; then
     printf 'mcpp F7 did not create the requested directory\n' >&2
     exit 1

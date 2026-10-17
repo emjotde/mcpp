@@ -70,6 +70,7 @@ add_library(
     src/user_menu.cpp
     src/viewer.cpp
     src/editor.cpp
+    src/editor_search.cpp
 )
 target_include_directories(mcpp_core PUBLIC include)
 target_link_libraries(mcpp_core PUBLIC Threads::Threads screen)

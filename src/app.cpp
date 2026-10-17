@@ -19,6 +19,7 @@
 #include <ctime>
 #include <functional>
 #include <iomanip>
+#include <iostream>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -47,6 +48,8 @@ enum class Mode {
     editor_menu,
     editor_help,
     editor_error,
+    editor_search_dialog,
+    editor_replace_dialog,
     editor_replace_confirm,
     editor_close_dialog,
     prompt,
@@ -68,9 +71,6 @@ enum class PromptAction {
     mkdir,
     find,
     viewer_find,
-    editor_find,
-    editor_replace_find,
-    editor_replace_with,
     editor_save_as,
     editor_goto,
     quick_cd,
@@ -477,6 +477,22 @@ struct App::Impl {
     std::vector<std::vector<SyntaxSpan>> syntax_spans;
     std::string editor_clipboard;
     std::string editor_search_needle;
+    EditorSearchOptions editor_search_options;
+    bool editor_search_in_selection{false};
+    EditorSearchOptions editor_dialog_options;
+    bool editor_dialog_in_selection{false};
+    std::optional<std::pair<
+        EditorPosition,
+        EditorPosition
+    >> editor_search_scope;
+    std::uint64_t editor_search_change_id{0};
+    std::optional<std::pair<
+        EditorPosition,
+        EditorPosition
+    >> editor_dialog_scope;
+    std::string editor_dialog_query;
+    std::string editor_dialog_replacement;
+    std::size_t editor_dialog_focus{0};
     std::string editor_replace_needle;
     std::string editor_replace_text;
     std::size_t editor_replace_choice{0};
@@ -1144,48 +1160,6 @@ struct App::Impl {
                                  ? "Match found"
                                  : "No match";
                     break;
-                case PromptAction::editor_find:
-                    editor_search_needle = prompt_value;
-                    if (editor.find(prompt_value, false)) {
-                        status = "Match found";
-                    } else {
-                        prompt_action = PromptAction::none;
-                        prompt_value.clear();
-                        show_editor_message(
-                            "Search",
-                            "Search string not found"
-                        );
-                        return;
-                    }
-                    break;
-                case PromptAction::editor_replace_find:
-                    editor_replace_needle = prompt_value;
-                    prompt_action = PromptAction::editor_replace_with;
-                    prompt_title = "Replace with";
-                    prompt_value.clear();
-                    return;
-                case PromptAction::editor_replace_with:
-                    editor_replace_text = prompt_value;
-                    if (!editor.find(
-                            editor_replace_needle,
-                            false
-                        )) {
-                        editor_replace_needle.clear();
-                        editor_replace_text.clear();
-                        prompt_action = PromptAction::none;
-                        prompt_value.clear();
-                        show_editor_message(
-                            "Replace",
-                            "Search string not found"
-                        );
-                        return;
-                    }
-                    editor_replace_choice = 0;
-                    editor_replacements = 0;
-                    prompt_action = PromptAction::none;
-                    prompt_value.clear();
-                    mode = Mode::editor_replace_confirm;
-                    return;
                 case PromptAction::editor_save_as:
                     if (!prompt_value.empty()) {
                         editor.save_as(prompt_value, false);
@@ -1960,6 +1934,116 @@ struct App::Impl {
                size(WIDTH, LESS_THAN, 72) |
                color(Color::Grey100) |
                bgcolor(Color::Grey19);
+    }
+
+    ftxui::Element render_editor_search_dialog() const {
+        using namespace ftxui;
+        const bool replace = mode == Mode::editor_replace_dialog;
+        const auto focused = [&](Element element,
+                                 const std::size_t index) {
+            return editor_dialog_focus == index
+                       ? element | inverted | focus
+                       : element;
+        };
+        const auto checked = [](const bool value) {
+            return std::string(value ? "[x] " : "[ ] ");
+        };
+        static const std::array<std::string, 4> mode_names{
+            "Normal", "Regular expression", "Wildcard", "Hexadecimal"
+        };
+        Elements rows{
+            text(replace ? "Replace" : "Search") | bold | center,
+            separator(),
+            text("Search for:"),
+            focused(
+                text("> " + display_text(editor_dialog_query)),
+                0
+            ),
+        };
+        if (replace) {
+            rows.push_back(text("Replace with:"));
+            rows.push_back(
+                focused(
+                    text(
+                        "> " +
+                        display_text(editor_dialog_replacement)
+                    ),
+                    1
+                )
+            );
+        }
+        rows.push_back(separator());
+        rows.push_back(
+            focused(
+                text(
+                    "Mode: " +
+                    mode_names[static_cast<std::size_t>(
+                        editor_dialog_options.mode
+                    )] +
+                    "  (Left/Right changes)"
+                ),
+                2
+            )
+        );
+        rows.push_back(
+            focused(
+                text(
+                    checked(editor_dialog_options.case_sensitive) +
+                    "Case sensitive"
+                ),
+                3
+            )
+        );
+        rows.push_back(
+            focused(
+                text(
+                    checked(editor_dialog_options.backwards) +
+                    "Backwards"
+                ),
+                4
+            )
+        );
+        rows.push_back(
+            focused(
+                text(
+                    checked(editor_dialog_in_selection) +
+                    "In selection"
+                ),
+                5
+            )
+        );
+        rows.push_back(
+            focused(
+                text(
+                    checked(editor_dialog_options.whole_words) +
+                    "Whole words"
+                ),
+                6
+            )
+        );
+        rows.push_back(separator());
+        if (replace) {
+            rows.push_back(
+                hbox({
+                    focused(text(" [ OK ] "), 7),
+                    text("  "),
+                    focused(text(" [ Cancel ] "), 8),
+                }) | center
+            );
+        } else {
+            rows.push_back(
+                hbox({
+                    focused(text(" [ OK ] "), 7),
+                    text("  "),
+                    focused(text(" [ Find all ] "), 8),
+                    text("  "),
+                    focused(text(" [ Cancel ] "), 9),
+                }) | center
+            );
+        }
+        return vbox(std::move(rows)) |
+               borderStyled(LIGHT) |
+               size(WIDTH, EQUAL, 72);
     }
 
     ftxui::Element render_editor_replace_confirm() const {
@@ -2741,6 +2825,8 @@ struct App::Impl {
             mode == Mode::editor_menu ||
             mode == Mode::editor_help ||
             mode == Mode::editor_error ||
+            mode == Mode::editor_search_dialog ||
+            mode == Mode::editor_replace_dialog ||
             mode == Mode::editor_replace_confirm ||
             mode == Mode::editor_close_dialog ||
             (
@@ -2784,6 +2870,14 @@ struct App::Impl {
             document = dbox({
                 document,
                 centered_modal(render_editor_error()),
+            });
+        } else if (
+            mode == Mode::editor_search_dialog ||
+            mode == Mode::editor_replace_dialog
+        ) {
+            document = dbox({
+                document,
+                centered_modal(render_editor_search_dialog()),
             });
         } else if (mode == Mode::editor_replace_confirm) {
             document = dbox({
@@ -2960,6 +3054,39 @@ struct App::Impl {
         show_editor_message("Editor error", error.what());
     }
 
+    void start_editor_search_dialog(const bool replace) {
+        editor_dialog_query = editor_search_needle;
+        editor_dialog_replacement =
+            replace ? editor_replace_text : std::string{};
+        editor_dialog_scope = editor.selection();
+        editor_dialog_options = editor_search_options;
+        editor_dialog_in_selection =
+            editor_search_in_selection && editor_dialog_scope.has_value();
+        if (!editor_dialog_scope) {
+            editor_dialog_in_selection = false;
+        }
+        editor_dialog_focus = 0;
+        mode = replace
+                   ? Mode::editor_replace_dialog
+                   : Mode::editor_search_dialog;
+    }
+
+    void commit_editor_search(
+        const std::string& query,
+        const EditorSearchOptions& options,
+        const bool in_selection,
+        const std::optional<std::pair<
+            EditorPosition,
+            EditorPosition
+        >> scope
+    ) {
+        editor_search_needle = query;
+        editor_search_options = options;
+        editor_search_in_selection = in_selection;
+        editor_search_scope = scope;
+        editor_search_change_id = editor.change_id();
+    }
+
     void save_editor() {
         try {
             editor.save(false);
@@ -3085,15 +3212,9 @@ struct App::Impl {
         }
         if (category == 2U) {
             if (item == 0U) {
-                start_prompt(
-                    PromptAction::editor_find,
-                    "Search"
-                );
+                start_editor_search_dialog(false);
             } else if (item == 1U) {
-                start_prompt(
-                    PromptAction::editor_replace_find,
-                    "Search for"
-                );
+                start_editor_search_dialog(true);
             } else {
                 start_prompt(
                     PromptAction::editor_goto,
@@ -3207,6 +3328,203 @@ struct App::Impl {
         mode = Mode::editor;
     }
 
+    bool handle_editor_search_dialog(const ftxui::Event& event) {
+        const bool replace = mode == Mode::editor_replace_dialog;
+        static const std::array<std::size_t, 9> search_focus{
+            0, 2, 3, 4, 5, 6, 7, 8, 9
+        };
+        static const std::array<std::size_t, 9> replace_focus{
+            0, 1, 2, 3, 4, 5, 6, 7, 8
+        };
+        const auto& order = replace ? replace_focus : search_focus;
+        const auto move_focus = [&](const int amount) {
+            const auto current = std::find(
+                order.begin(),
+                order.end(),
+                editor_dialog_focus
+            );
+            const auto index =
+                current == order.end()
+                    ? std::size_t{0}
+                    : static_cast<std::size_t>(
+                          std::distance(order.begin(), current)
+                      );
+            editor_dialog_focus = order[
+                (
+                    index + order.size() +
+                    (amount < 0 ? order.size() - 1U : 1U)
+                ) %
+                order.size()
+            ];
+        };
+        if (event == ftxui::Event::Escape) {
+            mode = Mode::editor;
+            return true;
+        }
+        if (event == ftxui::Event::Tab ||
+            event == ftxui::Event::ArrowDown) {
+            move_focus(1);
+            return true;
+        }
+        if (event == ftxui::Event::TabReverse ||
+            event == ftxui::Event::ArrowUp) {
+            move_focus(-1);
+            return true;
+        }
+        if (event == ftxui::Event::Backspace &&
+            (editor_dialog_focus == 0U ||
+             editor_dialog_focus == 1U)) {
+            auto& value =
+                editor_dialog_focus == 0U
+                    ? editor_dialog_query
+                    : editor_dialog_replacement;
+            erase_last_utf8(value);
+            return true;
+        }
+        if (editor_dialog_focus == 2U &&
+            (
+                event == ftxui::Event::ArrowLeft ||
+                event == ftxui::Event::ArrowRight ||
+                event == ftxui::Event::Character(' ')
+            )) {
+            constexpr auto count = 4U;
+            auto value = static_cast<unsigned int>(
+                editor_dialog_options.mode
+            );
+            value =
+                event == ftxui::Event::ArrowLeft
+                    ? (value + count - 1U) % count
+                    : (value + 1U) % count;
+            editor_dialog_options.mode =
+                static_cast<EditorSearchMode>(value);
+            return true;
+        }
+        if (editor_dialog_focus >= 3U &&
+            editor_dialog_focus <= 6U &&
+            (
+                event == ftxui::Event::Character(' ') ||
+                event == ftxui::Event::Return
+            )) {
+            switch (editor_dialog_focus) {
+                case 3:
+                    editor_dialog_options.case_sensitive =
+                        !editor_dialog_options.case_sensitive;
+                    break;
+                case 4:
+                    editor_dialog_options.backwards =
+                        !editor_dialog_options.backwards;
+                    break;
+                case 5:
+                    editor_dialog_in_selection =
+                        !editor_dialog_in_selection;
+                    break;
+                case 6:
+                    editor_dialog_options.whole_words =
+                        !editor_dialog_options.whole_words;
+                    break;
+                default:
+                    break;
+            }
+            return true;
+        }
+        if (event.is_character() &&
+            (editor_dialog_focus == 0U ||
+             editor_dialog_focus == 1U)) {
+            auto& value =
+                editor_dialog_focus == 0U
+                    ? editor_dialog_query
+                    : editor_dialog_replacement;
+            value += event.character();
+            return true;
+        }
+        if (replace && event == ftxui::Event::Return &&
+            editor_dialog_focus == 0U) {
+            editor_dialog_focus = 1U;
+            return true;
+        }
+        if (event != ftxui::Event::Return) {
+            return false;
+        }
+        if ((editor_dialog_focus == 8U && replace) ||
+            editor_dialog_focus == 9U) {
+            mode = Mode::editor;
+            return true;
+        }
+        if (editor_dialog_query.empty()) {
+            show_editor_message("Search", "Search string is empty");
+            return true;
+        }
+        if (editor_dialog_in_selection && !editor_dialog_scope) {
+            show_editor_message(
+                "Search",
+                "No marked block to search"
+            );
+            return true;
+        }
+        const auto scope =
+            editor_dialog_in_selection
+                ? editor_dialog_scope
+                : std::nullopt;
+        try {
+            if (!replace && editor_dialog_focus == 8U) {
+                const auto count = editor.count_matches(
+                    editor_dialog_query,
+                    editor_dialog_options,
+                    scope
+                );
+                commit_editor_search(
+                    editor_dialog_query,
+                    editor_dialog_options,
+                    editor_dialog_in_selection,
+                    scope
+                );
+                show_editor_message(
+                    "Search",
+                    std::to_string(count) + " match(es)"
+                );
+                return true;
+            }
+            if (!editor.find(
+                    editor_dialog_query,
+                    editor_dialog_options,
+                    true,
+                    false,
+                    scope
+                )) {
+                commit_editor_search(
+                    editor_dialog_query,
+                    editor_dialog_options,
+                    editor_dialog_in_selection,
+                    scope
+                );
+                show_editor_message(
+                    replace ? "Replace" : "Search",
+                    "Search string not found"
+                );
+                return true;
+            }
+            commit_editor_search(
+                editor_dialog_query,
+                editor_dialog_options,
+                editor_dialog_in_selection,
+                scope
+            );
+            if (replace) {
+                editor_replace_needle = editor_search_needle;
+                editor_replace_text = editor_dialog_replacement;
+                editor_replace_choice = 0;
+                editor_replacements = 0;
+                mode = Mode::editor_replace_confirm;
+            } else {
+                status = "Match found";
+                mode = Mode::editor;
+            }
+        } catch (const std::exception& error) {
+            show_editor_error(error);
+        }
+        return true;
+    }
+
     bool handle_editor_replace_confirm(const ftxui::Event& event) {
         if (event == ftxui::Event::Escape) {
             finish_editor_replace("Replace cancelled");
@@ -3245,9 +3563,10 @@ struct App::Impl {
         if (editor_replace_choice == 1U) {
             if (!editor.find(
                     editor_replace_needle,
+                    editor_search_options,
                     false,
-                    false,
-                    true
+                    true,
+                    editor_search_scope
                 )) {
                 finish_editor_replace(
                     std::to_string(editor_replacements) +
@@ -3257,11 +3576,18 @@ struct App::Impl {
             return true;
         }
         if (editor_replace_choice == 2U) {
-            editor_replacements += editor.replace_all(
-                editor_replace_needle,
-                editor_replace_text,
-                false
-            );
+            try {
+                editor_replacements += editor.replace_all(
+                    editor_replace_needle,
+                    editor_replace_text,
+                    editor_search_options,
+                    editor_search_scope
+                );
+                editor_search_change_id = editor.change_id();
+            } catch (const std::exception& error) {
+                show_editor_error(error);
+                return true;
+            }
             finish_editor_replace(
                 std::to_string(editor_replacements) +
                 " replacement(s)"
@@ -3269,14 +3595,35 @@ struct App::Impl {
             return true;
         }
 
-        if (editor.replace_selection(editor_replace_text)) {
+        std::string replacement;
+        try {
+            replacement = editor.replacement_for_selection(
+                editor_replace_needle,
+                editor_replace_text,
+                editor_search_options
+            );
+        } catch (const std::exception& error) {
+            show_editor_error(error);
+            return true;
+        }
+        const auto match = editor.selection();
+        if (editor.replace_selection(
+                replacement,
+                &editor_search_scope
+            )) {
             ++editor_replacements;
+            editor_search_change_id = editor.change_id();
+        }
+        if (editor_search_options.backwards && match) {
+            editor.set_position(match->first);
         }
         if (editor_replace_choice == 3U ||
             !editor.find(
                 editor_replace_needle,
+                editor_search_options,
                 false,
-                false
+                false,
+                editor_search_scope
             )) {
             finish_editor_replace(
                 std::to_string(editor_replacements) +
@@ -3384,10 +3731,7 @@ struct App::Impl {
             return true;
         }
         if (event == ftxui::Event::F4) {
-            start_prompt(
-                PromptAction::editor_replace_find,
-                "Search for"
-            );
+            start_editor_search_dialog(true);
             return true;
         }
         if (event == ftxui::Event::F5) {
@@ -3403,22 +3747,36 @@ struct App::Impl {
             return true;
         }
         if (event == ftxui::Event::F7) {
-            start_prompt(PromptAction::editor_find, "Search");
+            start_editor_search_dialog(false);
             return true;
         }
         if (event == ftxui::Event::Special("\x1B[31~") ||
             event == ftxui::Event::Special("\x1B[18;2~")) {
             if (editor_search_needle.empty()) {
-                start_prompt(PromptAction::editor_find, "Search");
-            } else if (!editor.find(
-                           editor_search_needle,
-                           false,
-                           false
-                       )) {
-                show_editor_message(
-                    "Search",
-                    "Search string not found"
-                );
+                start_editor_search_dialog(false);
+            } else {
+                if (editor_search_change_id !=
+                    editor.change_id()) {
+                    editor_search_scope.reset();
+                    editor_search_in_selection = false;
+                    editor_search_change_id = editor.change_id();
+                }
+                try {
+                    if (!editor.find(
+                            editor_search_needle,
+                            editor_search_options,
+                            false,
+                            false,
+                            editor_search_scope
+                        )) {
+                        show_editor_message(
+                            "Search",
+                            "Search string not found"
+                        );
+                    }
+                } catch (const std::exception& error) {
+                    show_editor_error(error);
+                }
             }
             return true;
         }
@@ -4173,6 +4531,10 @@ struct App::Impl {
         if (mode == Mode::editor_replace_confirm) {
             return handle_editor_replace_confirm(event);
         }
+        if (mode == Mode::editor_search_dialog ||
+            mode == Mode::editor_replace_dialog) {
+            return handle_editor_search_dialog(event);
+        }
         if (mode == Mode::editor_close_dialog) {
             return handle_editor_close_dialog(event);
         }
@@ -4264,6 +4626,11 @@ std::string App::active_path() const {
 }
 
 int App::run() {
+    struct TerminalCleanup {
+        ~TerminalCleanup() {
+            std::cout << "\033[0m\n" << std::flush;
+        }
+    } terminal_cleanup;
     auto terminal = ftxui::App::FullscreenAlternateScreen();
     terminal.ForceHandleCtrlC(false);
     terminal.ForceHandleCtrlZ(false);

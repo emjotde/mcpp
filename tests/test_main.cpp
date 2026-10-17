@@ -1,6 +1,7 @@
 #include "mcpp/config.hpp"
 #include "mcpp/compare.hpp"
 #include "mcpp/editor.hpp"
+#include "mcpp/editor_search.hpp"
 #include "mcpp/local_provider.hpp"
 #include "mcpp/operations.hpp"
 #include "mcpp/pane.hpp"
@@ -1182,6 +1183,65 @@ void test_viewer_editor() {
         "replace all undo restores every match"
     );
 
+    const auto scoped_path = temporary.path() / "scoped.txt";
+    write_file(scoped_path, "a a a");
+    editor.open(provider, scoped_path.string());
+    std::optional<std::pair<
+        mcpp::EditorPosition,
+        mcpp::EditorPosition
+    >> scope{
+        std::pair{
+            mcpp::EditorPosition{.row = 0, .column = 0},
+            mcpp::EditorPosition{.row = 0, .column = 3},
+        }
+    };
+    const mcpp::EditorSearchOptions scoped_options{
+        .case_sensitive = true,
+    };
+    check(
+        editor.find(
+            "a",
+            scoped_options,
+            false,
+            false,
+            scope
+        ),
+        "find first scoped match"
+    );
+    check(
+        editor.replace_selection("", &scope),
+        "replace first scoped match"
+    );
+    check(
+        editor.find(
+            "a",
+            scoped_options,
+            false,
+            false,
+            scope
+        ),
+        "find rebased scoped match"
+    );
+    check(
+        editor.replace_selection("", &scope),
+        "replace second scoped match"
+    );
+    check(
+        !editor.find(
+            "a",
+            scoped_options,
+            false,
+            false,
+            scope
+        ),
+        "scoped replacement stays inside original block"
+    );
+    check_equal(
+        editor.lines()[0],
+        std::string("  a"),
+        "scoped replacement keeps outside match"
+    );
+
     editor.open(provider, path.string());
     editor.insert('?');
     write_file(path, "external");
@@ -1383,6 +1443,161 @@ void test_syntax() {
     );
 }
 
+void test_editor_search() {
+    const std::string text = "Alpha alpha\nfoobar foo\n";
+    const auto normal = mcpp::EditorSearch::find(
+        text,
+        "alpha",
+        0,
+        0,
+        text.size(),
+        {},
+        false,
+        false
+    );
+    check(
+        normal.has_value() && normal->begin == 0U,
+        "case-insensitive editor search"
+    );
+    const mcpp::EditorSearchOptions case_sensitive{
+        .case_sensitive = true,
+    };
+    const auto exact = mcpp::EditorSearch::find(
+        text,
+        "alpha",
+        0,
+        0,
+        text.size(),
+        case_sensitive,
+        false,
+        false
+    );
+    check(
+        exact.has_value() && exact->begin == 6U,
+        "case-sensitive editor search"
+    );
+    const mcpp::EditorSearchOptions backwards{
+        .backwards = true,
+    };
+    const auto reverse = mcpp::EditorSearch::find(
+        text,
+        "alpha",
+        text.size(),
+        0,
+        text.size(),
+        backwards,
+        false,
+        false
+    );
+    check(
+        reverse.has_value() && reverse->begin == 6U,
+        "backwards editor search"
+    );
+    const mcpp::EditorSearchOptions whole{
+        .case_sensitive = true,
+        .whole_words = true,
+    };
+    const auto word = mcpp::EditorSearch::find(
+        text,
+        "foo",
+        0,
+        0,
+        text.size(),
+        whole,
+        false,
+        false
+    );
+    check(
+        word.has_value() && word->begin == 19U,
+        "whole-word editor search"
+    );
+    const mcpp::EditorSearchOptions regex{
+        .mode = mcpp::EditorSearchMode::regular_expression,
+        .case_sensitive = true,
+    };
+    const auto expression = mcpp::EditorSearch::find(
+        text,
+        "f(o+)bar",
+        0,
+        0,
+        text.size(),
+        regex,
+        false,
+        false
+    );
+    check(expression.has_value(), "regular-expression search");
+    check_equal(
+        mcpp::EditorSearch::find_all(
+            "foofoo",
+            "^foo",
+            0,
+            6,
+            regex
+        ).size(),
+        std::size_t{1},
+        "regular-expression anchors"
+    );
+    check_equal(
+        mcpp::EditorSearch::replacement(
+            "foobar",
+            {.begin = 0, .end = 6},
+            "f(o+)bar",
+            "b$1m",
+            regex
+        ),
+        std::string("boom"),
+        "regular-expression replacement"
+    );
+    const mcpp::EditorSearchOptions wildcard{
+        .mode = mcpp::EditorSearchMode::wildcard,
+        .case_sensitive = true,
+    };
+    check(
+        mcpp::EditorSearch::find(
+            text,
+            "f*bar",
+            0,
+            0,
+            text.size(),
+            wildcard,
+            false,
+            false
+        ).has_value(),
+        "wildcard editor search"
+    );
+    const std::string long_line(100000U, 'a');
+    check(
+        mcpp::EditorSearch::find(
+            long_line,
+            "*",
+            0,
+            0,
+            long_line.size(),
+            wildcard,
+            false,
+            false
+        ).has_value(),
+        "stack-safe wildcard search"
+    );
+    const mcpp::EditorSearchOptions hexadecimal{
+        .mode = mcpp::EditorSearchMode::hexadecimal,
+    };
+    const auto bytes = mcpp::EditorSearch::find(
+        text,
+        "41 6c",
+        0,
+        0,
+        text.size(),
+        hexadecimal,
+        false,
+        false
+    );
+    check(
+        bytes.has_value() && bytes->begin == 0U,
+        "hexadecimal editor search"
+    );
+}
+
 void test_user_menu() {
     TemporaryDirectory temporary;
     const auto menu = temporary.path() / "menu";
@@ -1479,6 +1694,7 @@ int main() {
         {"config", test_config},
         {"search/compare", test_search_compare},
         {"syntax", test_syntax},
+        {"editor search", test_editor_search},
         {"user menu", test_user_menu},
     };
     int failures = 0;

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "mcpp/provider.hpp"
+#include "mcpp/editor_search.hpp"
 
 #include <cstddef>
 #include <compare>
@@ -49,6 +50,7 @@ public:
     void home();
     void end();
     void goto_line(std::size_t line);
+    void set_position(EditorPosition position);
     void toggle_mark();
     void begin_mark();
     void finish_mark();
@@ -67,7 +69,11 @@ public:
     [[nodiscard]] bool delete_selection();
     [[nodiscard]] std::optional<std::string> selected_text() const;
     [[nodiscard]] bool replace_selection(
-        std::string_view replacement
+        std::string_view replacement,
+        std::optional<std::pair<
+            EditorPosition,
+            EditorPosition
+        >>* scope = nullptr
     );
     bool undo();
     bool redo();
@@ -86,11 +92,43 @@ public:
         bool wrap = true,
         bool overlap = false
     );
+    [[nodiscard]] bool find(
+        std::string_view needle,
+        const EditorSearchOptions& options,
+        bool wrap,
+        bool overlap,
+        std::optional<std::pair<
+            EditorPosition,
+            EditorPosition
+        >> scope = std::nullopt
+    );
     [[nodiscard]] std::size_t replace_all(
         std::string_view needle,
         std::string_view replacement,
         bool case_sensitive
     );
+    [[nodiscard]] std::size_t replace_all(
+        std::string_view needle,
+        std::string_view replacement,
+        const EditorSearchOptions& options,
+        std::optional<std::pair<
+            EditorPosition,
+            EditorPosition
+        >> scope = std::nullopt
+    );
+    [[nodiscard]] std::string replacement_for_selection(
+        std::string_view needle,
+        std::string_view replacement,
+        const EditorSearchOptions& options
+    ) const;
+    [[nodiscard]] std::size_t count_matches(
+        std::string_view needle,
+        const EditorSearchOptions& options,
+        std::optional<std::pair<
+            EditorPosition,
+            EditorPosition
+        >> scope = std::nullopt
+    ) const;
     [[nodiscard]] bool replace(
         std::string_view needle,
         std::string_view replacement,

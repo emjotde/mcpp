@@ -9,18 +9,6 @@
 namespace mcpp {
 namespace {
 
-std::string lowercase(std::string value) {
-    std::transform(
-        value.begin(),
-        value.end(),
-        value.begin(),
-        [](const unsigned char character) {
-            return static_cast<char>(std::tolower(character));
-        }
-    );
-    return value;
-}
-
 bool continuation(const unsigned char value) {
     return (value & 0xC0U) == 0x80U;
 }
@@ -393,6 +381,25 @@ void EditorModel::goto_line(const std::size_t line) {
         lines_.size() - 1U
     );
     column_ = std::min(column_, lines_[row_].size());
+    while (column_ > 0U &&
+           column_ < lines_[row_].size() &&
+           continuation(
+               static_cast<unsigned char>(lines_[row_][column_])
+           )) {
+        --column_;
+    }
+    update_mark();
+}
+
+void EditorModel::set_position(EditorPosition destination) {
+    if (lines_.empty()) {
+        return;
+    }
+    row_ = std::min(destination.row, lines_.size() - 1U);
+    column_ = std::min(
+        destination.column,
+        lines_[row_].size()
+    );
     while (column_ > 0U &&
            column_ < lines_[row_].size() &&
            continuation(
@@ -806,11 +813,27 @@ std::optional<std::string> EditorModel::selected_text() const {
 }
 
 bool EditorModel::replace_selection(
-    const std::string_view replacement
+    const std::string_view replacement,
+    std::optional<std::pair<
+        EditorPosition,
+        EditorPosition
+    >>* scope
 ) {
     const auto selected = selection();
     if (!selected) {
         return false;
+    }
+    const auto edit_begin = offset(selected->first);
+    const auto edit_end = offset(selected->second);
+    std::optional<std::pair<std::size_t, std::size_t>>
+        scope_offsets;
+    if (scope != nullptr && *scope) {
+        auto begin = offset((*scope)->first);
+        auto end = offset((*scope)->second);
+        if (begin > end) {
+            std::swap(begin, end);
+        }
+        scope_offsets = {{begin, end}};
     }
     record_undo();
     replace_range(
@@ -818,6 +841,28 @@ bool EditorModel::replace_selection(
         selected->second,
         replacement
     );
+    if (scope_offsets) {
+        auto [begin, end] = *scope_offsets;
+        const auto delta =
+            static_cast<std::ptrdiff_t>(replacement.size()) -
+            static_cast<std::ptrdiff_t>(edit_end - edit_begin);
+        if (edit_end <= begin) {
+            begin = static_cast<std::size_t>(
+                static_cast<std::ptrdiff_t>(begin) + delta
+            );
+            end = static_cast<std::size_t>(
+                static_cast<std::ptrdiff_t>(end) + delta
+            );
+        } else if (edit_begin < end) {
+            end = static_cast<std::size_t>(
+                static_cast<std::ptrdiff_t>(end) + delta
+            );
+        }
+        **scope = std::pair{
+            position(begin),
+            position(end),
+        };
+    }
     dirty_ = true;
     ++change_id_;
     return true;
@@ -952,35 +997,70 @@ bool EditorModel::find(
     const bool wrap,
     const bool overlap
 ) {
+    return find(
+        needle,
+        {
+            .mode = EditorSearchMode::normal,
+            .case_sensitive = case_sensitive,
+        },
+        wrap,
+        overlap
+    );
+}
+
+bool EditorModel::find(
+    const std::string_view needle,
+    const EditorSearchOptions& options,
+    const bool wrap,
+    const bool overlap,
+    const std::optional<std::pair<
+        EditorPosition,
+        EditorPosition
+    >> scope
+) {
     if (needle.empty()) {
         return false;
     }
     const auto serialized = content();
-    const auto haystack =
-        case_sensitive ? serialized : lowercase(serialized);
-    const auto sought =
-        case_sensitive ? std::string(needle)
-                       : lowercase(std::string(needle));
-    auto begin = offset({
+    auto start = offset({
         .row = row_,
         .column = column_,
     });
     if (const auto selected = selection();
         selected && EditorPosition{row_, column_} == selected->first) {
-        begin =
-            overlap
-                ? next_character(serialized, begin)
-                : offset(selected->second);
+        if (options.backwards) {
+            start = offset(selected->first);
+        } else {
+            start =
+                overlap
+                    ? next_character(serialized, start)
+                    : offset(selected->second);
+        }
     }
-    auto found = haystack.find(sought, begin);
-    if (found == std::string::npos && wrap && begin != 0U) {
-        found = haystack.find(sought);
+    auto range_begin = std::size_t{0};
+    auto range_end = serialized.size();
+    if (scope) {
+        range_begin = offset(scope->first);
+        range_end = offset(scope->second);
+        if (range_begin > range_end) {
+            std::swap(range_begin, range_end);
+        }
     }
-    if (found == std::string::npos) {
+    const auto found = EditorSearch::find(
+        serialized,
+        needle,
+        std::clamp(start, range_begin, range_end),
+        range_begin,
+        range_end,
+        options,
+        wrap,
+        overlap
+    );
+    if (!found) {
         return false;
     }
-    selection_begin_ = position(found);
-    selection_end_ = position(found + needle.size());
+    selection_begin_ = position(found->begin);
+    selection_end_ = position(found->end);
     marking_ = false;
     row_ = selection_begin_->row;
     column_ = selection_begin_->column;
@@ -992,38 +1072,84 @@ std::size_t EditorModel::replace_all(
     const std::string_view replacement,
     const bool case_sensitive
 ) {
+    return replace_all(
+        needle,
+        replacement,
+        {
+            .mode = EditorSearchMode::normal,
+            .case_sensitive = case_sensitive,
+        }
+    );
+}
+
+std::size_t EditorModel::replace_all(
+    const std::string_view needle,
+    const std::string_view replacement_value,
+    const EditorSearchOptions& options,
+    const std::optional<std::pair<
+        EditorPosition,
+        EditorPosition
+    >> scope
+) {
     const auto selected = selection();
     if (!selected || needle.empty()) {
         return 0U;
     }
     const auto original = content();
-    const auto haystack =
-        case_sensitive ? original : lowercase(original);
-    const auto sought =
-        case_sensitive ? std::string(needle)
-                       : lowercase(std::string(needle));
-    const auto start = offset(selected->first);
-    std::string replaced;
-    replaced.reserve(original.size());
-    replaced.append(original, 0, start);
-    auto cursor = start;
-    auto final_cursor = start;
-    std::size_t count = 0;
-    while (true) {
-        const auto found = haystack.find(sought, cursor);
-        if (found == std::string::npos) {
-            break;
-        }
-        replaced.append(original, cursor, found - cursor);
-        replaced += replacement;
-        final_cursor = replaced.size();
-        cursor = found + needle.size();
-        ++count;
+    auto range_begin =
+        options.backwards ? 0U : offset(selected->first);
+    auto range_end =
+        options.backwards ? offset(selected->second)
+                          : original.size();
+    if (scope) {
+        const auto scope_begin = offset(scope->first);
+        const auto scope_end = offset(scope->second);
+        range_begin = std::max(
+            range_begin,
+            std::min(scope_begin, scope_end)
+        );
+        range_end = std::min(
+            range_end,
+            std::max(scope_begin, scope_end)
+        );
     }
-    if (count == 0U) {
+    const auto matches = EditorSearch::find_all(
+        original,
+        needle,
+        range_begin,
+        range_end,
+        options
+    );
+    if (matches.empty()) {
         return 0U;
     }
-    replaced.append(original, cursor, std::string::npos);
+    std::string replaced;
+    replaced.reserve(original.size());
+    replaced.append(original, 0, range_begin);
+    auto cursor = range_begin;
+    auto final_cursor = range_begin;
+    for (const auto match : matches) {
+        replaced.append(
+            original,
+            cursor,
+            match.begin - cursor
+        );
+        replaced += EditorSearch::replacement(
+            original,
+            match,
+            needle,
+            replacement_value,
+            options
+        );
+        final_cursor = replaced.size();
+        cursor = match.end;
+    }
+    replaced.append(
+        original,
+        cursor,
+        range_end - cursor
+    );
+    replaced.append(original, range_end, std::string::npos);
     record_undo();
     set_content(replaced);
     const auto destination = position(final_cursor);
@@ -1032,7 +1158,57 @@ std::size_t EditorModel::replace_all(
     clear_selection();
     dirty_ = true;
     ++change_id_;
-    return count;
+    return matches.size();
+}
+
+std::string EditorModel::replacement_for_selection(
+    const std::string_view needle,
+    const std::string_view replacement_value,
+    const EditorSearchOptions& options
+) const {
+    const auto selected = selected_text();
+    if (!selected) {
+        return std::string(replacement_value);
+    }
+    const auto range = selection();
+    const auto serialized = content();
+    return EditorSearch::replacement(
+        serialized,
+        {
+            .begin = offset(range->first),
+            .end = offset(range->second),
+        },
+        needle,
+        replacement_value,
+        options
+    );
+}
+
+std::size_t EditorModel::count_matches(
+    const std::string_view needle,
+    const EditorSearchOptions& options,
+    const std::optional<std::pair<
+        EditorPosition,
+        EditorPosition
+    >> scope
+) const {
+    const auto serialized = content();
+    auto range_begin = std::size_t{0};
+    auto range_end = serialized.size();
+    if (scope) {
+        range_begin = offset(scope->first);
+        range_end = offset(scope->second);
+        if (range_begin > range_end) {
+            std::swap(range_begin, range_end);
+        }
+    }
+    return EditorSearch::find_all(
+        serialized,
+        needle,
+        range_begin,
+        range_end,
+        options
+    ).size();
 }
 
 bool EditorModel::replace(
