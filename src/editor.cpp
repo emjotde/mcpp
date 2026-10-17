@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <filesystem>
 #include <sstream>
 #include <stdexcept>
 
@@ -83,28 +84,17 @@ void EditorModel::open(
         output,
         cancellation
     );
-    const auto content = std::move(output).str();
-    lines_.clear();
-    std::size_t begin = 0;
-    while (begin < content.size()) {
-        const auto end = content.find('\n', begin);
-        if (end == std::string::npos) {
-            lines_.push_back(content.substr(begin));
-            begin = content.size();
-        } else {
-            lines_.push_back(content.substr(begin, end - begin));
-            begin = end + 1U;
-            if (begin == content.size()) {
-                lines_.emplace_back();
-            }
-        }
+    const auto loaded = std::move(output).str();
+    if (loaded.size() != entry.size) {
+        throw std::runtime_error(
+            "file changed while it was being opened"
+        );
     }
-    if (lines_.empty()) {
-        lines_.emplace_back();
-    }
+    set_content(loaded);
     row_ = 0;
     column_ = 0;
     dirty_ = false;
+    clear_selection();
     undo_.clear();
     redo_.clear();
 }
@@ -117,6 +107,7 @@ void EditorModel::close() {
     row_ = 0;
     column_ = 0;
     dirty_ = false;
+    clear_selection();
     undo_.clear();
     redo_.clear();
 }
@@ -145,6 +136,127 @@ std::size_t EditorModel::column() const noexcept {
     return column_;
 }
 
+std::size_t EditorModel::byte_size() const noexcept {
+    std::size_t result = lines_.empty() ? 0U : lines_.size() - 1U;
+    for (const auto& line : lines_) {
+        result += line.size();
+    }
+    return result;
+}
+
+bool EditorModel::marking() const noexcept {
+    return marking_;
+}
+
+std::optional<std::pair<EditorPosition, EditorPosition>>
+EditorModel::selection() const noexcept {
+    if (!selection_begin_ || !selection_end_ ||
+        *selection_begin_ == *selection_end_) {
+        return std::nullopt;
+    }
+    return std::minmax(*selection_begin_, *selection_end_);
+}
+
+std::string EditorModel::content() const {
+    std::ostringstream serialized;
+    for (std::size_t index = 0; index < lines_.size(); ++index) {
+        if (index != 0U) {
+            serialized << '\n';
+        }
+        serialized << lines_[index];
+    }
+    return std::move(serialized).str();
+}
+
+void EditorModel::set_content(const std::string_view content_value) {
+    lines_.clear();
+    std::size_t begin = 0;
+    while (begin < content_value.size()) {
+        const auto end = content_value.find('\n', begin);
+        if (end == std::string_view::npos) {
+            lines_.emplace_back(content_value.substr(begin));
+            begin = content_value.size();
+        } else {
+            lines_.emplace_back(
+                content_value.substr(begin, end - begin)
+            );
+            begin = end + 1U;
+            if (begin == content_value.size()) {
+                lines_.emplace_back();
+            }
+        }
+    }
+    if (lines_.empty()) {
+        lines_.emplace_back();
+    }
+}
+
+std::size_t EditorModel::offset(EditorPosition position_value) const {
+    if (lines_.empty()) {
+        return 0U;
+    }
+    position_value.row =
+        std::min(position_value.row, lines_.size() - 1U);
+    position_value.column = std::min(
+        position_value.column,
+        lines_[position_value.row].size()
+    );
+    std::size_t result = 0;
+    for (std::size_t row = 0; row < position_value.row; ++row) {
+        result += lines_[row].size() + 1U;
+    }
+    return result + position_value.column;
+}
+
+EditorPosition EditorModel::position(std::size_t offset_value) const {
+    offset_value = std::min(offset_value, byte_size());
+    for (std::size_t row = 0; row < lines_.size(); ++row) {
+        if (offset_value <= lines_[row].size()) {
+            return {
+                .row = row,
+                .column = offset_value,
+            };
+        }
+        offset_value -= lines_[row].size();
+        if (row + 1U < lines_.size()) {
+            --offset_value;
+        }
+    }
+    return {
+        .row = lines_.size() - 1U,
+        .column = lines_.back().size(),
+    };
+}
+
+void EditorModel::update_mark() {
+    if (marking_) {
+        selection_end_ = EditorPosition{
+            .row = row_,
+            .column = column_,
+        };
+    }
+}
+
+void EditorModel::replace_range(
+    const EditorPosition begin,
+    const EditorPosition end,
+    const std::string_view replacement
+) {
+    auto serialized = content();
+    const auto begin_offset = offset(begin);
+    const auto end_offset = offset(end);
+    serialized.replace(
+        begin_offset,
+        end_offset - begin_offset,
+        replacement
+    );
+    set_content(serialized);
+    const auto cursor = position(begin_offset + replacement.size());
+    row_ = cursor.row;
+    column_ = cursor.column;
+    clear_selection();
+}
+
 void EditorModel::move(const int rows, const int columns) {
     if (lines_.empty()) {
         return;
@@ -171,24 +283,66 @@ void EditorModel::move(const int rows, const int columns) {
             column_ = next_character(lines_[row_], column_);
         }
     }
+    update_mark();
+}
+
+void EditorModel::page(const int rows) {
+    move(rows, 0);
 }
 
 void EditorModel::home() {
     column_ = 0;
+    update_mark();
 }
 
 void EditorModel::end() {
     column_ = lines_[row_].size();
+    update_mark();
+}
+
+void EditorModel::goto_line(const std::size_t line) {
+    if (lines_.empty()) {
+        return;
+    }
+    row_ = std::min(
+        line == 0U ? 0U : line - 1U,
+        lines_.size() - 1U
+    );
+    column_ = std::min(column_, lines_[row_].size());
+    while (column_ > 0U &&
+           column_ < lines_[row_].size() &&
+           continuation(
+               static_cast<unsigned char>(lines_[row_][column_])
+           )) {
+        --column_;
+    }
+    update_mark();
+}
+
+void EditorModel::toggle_mark() {
+    const EditorPosition cursor{
+        .row = row_,
+        .column = column_,
+    };
+    if (marking_) {
+        selection_end_ = cursor;
+        marking_ = false;
+        return;
+    }
+    clear_selection();
+    selection_begin_ = cursor;
+    selection_end_ = cursor;
+    marking_ = true;
+}
+
+void EditorModel::clear_selection() {
+    selection_begin_.reset();
+    selection_end_.reset();
+    marking_ = false;
 }
 
 void EditorModel::insert(const char character) {
-    record_undo();
-    lines_[row_].insert(
-        lines_[row_].begin() + static_cast<std::ptrdiff_t>(column_),
-        character
-    );
-    ++column_;
-    dirty_ = true;
+    insert(std::string_view(&character, 1U));
 }
 
 void EditorModel::insert(const std::string_view text) {
@@ -196,6 +350,11 @@ void EditorModel::insert(const std::string_view text) {
         return;
     }
     record_undo();
+    if (const auto selected = selection()) {
+        replace_range(selected->first, selected->second, text);
+        dirty_ = true;
+        return;
+    }
     std::size_t begin = 0;
     while (begin < text.size()) {
         const auto end = text.find('\n', begin);
@@ -220,26 +379,23 @@ void EditorModel::insert(const std::string_view text) {
         column_ = 0;
         begin = end + 1U;
     }
+    clear_selection();
     dirty_ = true;
 }
 
 void EditorModel::newline() {
-    record_undo();
-    auto tail = lines_[row_].substr(column_);
-    lines_[row_].erase(column_);
-    lines_.insert(
-        lines_.begin() + static_cast<std::ptrdiff_t>(row_ + 1U),
-        std::move(tail)
-    );
-    ++row_;
-    column_ = 0;
-    dirty_ = true;
+    insert("\n");
 }
 
 void EditorModel::backspace() {
+    if (selection()) {
+        static_cast<void>(delete_selection());
+        return;
+    }
     if (column_ == 0U && row_ == 0U) {
         return;
     }
+    clear_selection();
     record_undo();
     if (column_ > 0U) {
         const auto previous =
@@ -260,18 +416,20 @@ void EditorModel::backspace() {
 }
 
 void EditorModel::erase() {
+    if (selection()) {
+        static_cast<void>(delete_selection());
+        return;
+    }
     if (column_ >= lines_[row_].size() &&
         row_ + 1U >= lines_.size()) {
         return;
     }
+    clear_selection();
     record_undo();
     if (column_ < lines_[row_].size()) {
         const auto next = next_character(lines_[row_], column_);
         lines_[row_].erase(column_, next - column_);
         dirty_ = true;
-        return;
-    }
-    if (row_ + 1U >= lines_.size()) {
         return;
     }
     lines_[row_] += lines_[row_ + 1U];
@@ -281,11 +439,81 @@ void EditorModel::erase() {
     dirty_ = true;
 }
 
+bool EditorModel::copy_selection() {
+    const auto selected = selection();
+    if (!selected) {
+        return false;
+    }
+    const auto begin_offset = offset(selected->first);
+    const auto end_offset = offset(selected->second);
+    clipboard_ = content().substr(
+        begin_offset,
+        end_offset - begin_offset
+    );
+    record_undo();
+    const EditorPosition destination{
+        .row = row_,
+        .column = column_,
+    };
+    clear_selection();
+    replace_range(destination, destination, clipboard_);
+    dirty_ = true;
+    return true;
+}
+
+bool EditorModel::move_selection() {
+    const auto selected = selection();
+    if (!selected) {
+        return false;
+    }
+    auto serialized = content();
+    auto begin_offset = offset(selected->first);
+    auto end_offset = offset(selected->second);
+    auto destination = offset({
+        .row = row_,
+        .column = column_,
+    });
+    if (destination >= begin_offset && destination <= end_offset) {
+        return false;
+    }
+    clipboard_ = serialized.substr(
+        begin_offset,
+        end_offset - begin_offset
+    );
+    record_undo();
+    serialized.erase(begin_offset, end_offset - begin_offset);
+    if (destination > end_offset) {
+        destination -= end_offset - begin_offset;
+    }
+    serialized.insert(destination, clipboard_);
+    set_content(serialized);
+    const auto cursor = position(destination + clipboard_.size());
+    row_ = cursor.row;
+    column_ = cursor.column;
+    clear_selection();
+    dirty_ = true;
+    return true;
+}
+
+bool EditorModel::delete_selection() {
+    const auto selected = selection();
+    if (!selected) {
+        return false;
+    }
+    record_undo();
+    replace_range(selected->first, selected->second, "");
+    dirty_ = true;
+    return true;
+}
+
 void EditorModel::record_undo() {
     undo_.push_back({
         .lines = lines_,
         .row = row_,
         .column = column_,
+        .selection_begin = selection_begin_,
+        .selection_end = selection_end_,
+        .marking = marking_,
     });
     constexpr std::size_t maximum = 100U;
     if (undo_.size() > maximum) {
@@ -298,6 +526,9 @@ void EditorModel::restore(Snapshot snapshot) {
     lines_ = std::move(snapshot.lines);
     row_ = snapshot.row;
     column_ = snapshot.column;
+    selection_begin_ = snapshot.selection_begin;
+    selection_end_ = snapshot.selection_end;
+    marking_ = snapshot.marking;
     dirty_ = true;
 }
 
@@ -309,6 +540,9 @@ bool EditorModel::undo() {
         .lines = lines_,
         .row = row_,
         .column = column_,
+        .selection_begin = selection_begin_,
+        .selection_end = selection_end_,
+        .marking = marking_,
     });
     auto snapshot = std::move(undo_.back());
     undo_.pop_back();
@@ -324,6 +558,9 @@ bool EditorModel::redo() {
         .lines = lines_,
         .row = row_,
         .column = column_,
+        .selection_begin = selection_begin_,
+        .selection_end = selection_end_,
+        .marking = marking_,
     });
     auto snapshot = std::move(redo_.back());
     redo_.pop_back();
@@ -338,25 +575,53 @@ void EditorModel::save(
     if (!provider_) {
         throw std::runtime_error("editor is not open");
     }
-    std::ostringstream serialized;
-    for (std::size_t index = 0; index < lines_.size(); ++index) {
-        if (index != 0U) {
-            serialized << '\n';
-        }
-        serialized << lines_[index];
-    }
-    auto content = std::move(serialized).str();
-    std::istringstream input(content);
+    auto serialized = content();
+    std::istringstream input(serialized);
     provider_->write(
         path_,
         input,
-        content.size(),
+        serialized.size(),
         true,
         force ? std::nullopt
               : std::optional<std::string>(revision_),
         cancellation,
         {}
     );
+    revision_ = provider_->stat(path_, cancellation).revision;
+    dirty_ = false;
+}
+
+void EditorModel::save_as(
+    std::string path,
+    const bool force,
+    const Cancellation& cancellation
+) {
+    if (!provider_) {
+        throw std::runtime_error("editor is not open");
+    }
+    if (std::filesystem::path(path).is_relative()) {
+        path = provider_->join(provider_->parent(path_), path);
+    }
+    path = provider_->normalize(path);
+    if (path == provider_->normalize(path_)) {
+        save(force, cancellation);
+        return;
+    }
+    if (!force && provider_->exists(path)) {
+        throw std::runtime_error("destination exists: " + path);
+    }
+    auto serialized = content();
+    std::istringstream input(serialized);
+    provider_->write(
+        path,
+        input,
+        serialized.size(),
+        force,
+        std::nullopt,
+        cancellation,
+        {}
+    );
+    path_ = std::move(path);
     revision_ = provider_->stat(path_, cancellation).revision;
     dirty_ = false;
 }
@@ -368,24 +633,51 @@ bool EditorModel::find(
     if (needle.empty()) {
         return false;
     }
+    const auto serialized = content();
+    const auto haystack =
+        case_sensitive ? serialized : lowercase(serialized);
     const auto sought =
         case_sensitive ? std::string(needle)
                        : lowercase(std::string(needle));
-    for (std::size_t line_index = row_;
-         line_index < lines_.size();
-         ++line_index) {
-        auto line =
-            case_sensitive ? lines_[line_index]
-                           : lowercase(lines_[line_index]);
-        const auto begin = line_index == row_ ? column_ : 0U;
-        const auto found = line.find(sought, begin);
-        if (found != std::string::npos) {
-            row_ = line_index;
-            column_ = found;
-            return true;
-        }
+    auto begin = offset({
+        .row = row_,
+        .column = column_,
+    });
+    if (const auto selected = selection();
+        selected && EditorPosition{row_, column_} == selected->first) {
+        begin = offset(selected->second);
     }
-    return false;
+    auto found = haystack.find(sought, begin);
+    if (found == std::string::npos && begin != 0U) {
+        found = haystack.find(sought);
+    }
+    if (found == std::string::npos) {
+        return false;
+    }
+    selection_begin_ = position(found);
+    selection_end_ = position(found + needle.size());
+    marking_ = false;
+    row_ = selection_begin_->row;
+    column_ = selection_begin_->column;
+    return true;
+}
+
+bool EditorModel::replace(
+    const std::string_view needle,
+    const std::string_view replacement,
+    const bool case_sensitive
+) {
+    if (!find(needle, case_sensitive)) {
+        return false;
+    }
+    const auto selected = selection();
+    if (!selected) {
+        return false;
+    }
+    record_undo();
+    replace_range(selected->first, selected->second, replacement);
+    dirty_ = true;
+    return true;
 }
 
 }  // namespace mcpp

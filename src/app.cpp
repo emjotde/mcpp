@@ -33,6 +33,7 @@
 #include <ftxui/component/event.hpp>
 #include <ftxui/dom/elements.hpp>
 #include <ftxui/screen/box.hpp>
+#include <ftxui/screen/string.hpp>
 #include <ftxui/screen/terminal.hpp>
 
 namespace mcpp {
@@ -42,6 +43,10 @@ enum class Mode {
     panels,
     viewer,
     editor,
+    editor_menu,
+    editor_help,
+    editor_error,
+    editor_close_dialog,
     prompt,
     help,
     user_menu,
@@ -62,6 +67,10 @@ enum class PromptAction {
     find,
     viewer_find,
     editor_find,
+    editor_replace_find,
+    editor_replace_with,
+    editor_save_as,
+    editor_goto,
     quick_cd,
     chmod,
     chown,
@@ -128,6 +137,47 @@ void erase_last_utf8(std::string& value) {
         --begin;
     }
     value.erase(begin);
+}
+
+std::size_t next_utf8(
+    const std::string_view value,
+    std::size_t offset
+) {
+    if (offset >= value.size()) {
+        return value.size();
+    }
+    ++offset;
+    while (offset < value.size() &&
+           (
+               static_cast<unsigned char>(value[offset]) &
+               0xC0U
+           ) == 0x80U) {
+        ++offset;
+    }
+    return offset;
+}
+
+std::size_t utf8_offset_for_width(
+    const std::string_view value,
+    const std::size_t target_width
+) {
+    std::size_t offset = 0;
+    std::size_t width = 0;
+    while (offset < value.size()) {
+        const auto next = next_utf8(value, offset);
+        const auto glyph_width = static_cast<std::size_t>(
+            std::max(
+                0,
+                ftxui::string_width(value.substr(offset, next - offset))
+            )
+        );
+        if (width + glyph_width > target_width) {
+            break;
+        }
+        width += glyph_width;
+        offset = next;
+    }
+    return offset;
 }
 
 std::string format_time(
@@ -264,6 +314,11 @@ struct App::Impl {
     TransferProgress progress;
     ViewerModel viewer;
     EditorModel editor;
+    std::string editor_replace_needle;
+    std::size_t editor_menu_category{0};
+    std::size_t editor_menu_item{0};
+    std::size_t editor_close_choice{0};
+    std::string editor_error_message;
     ftxui::App* terminal{nullptr};
     std::jthread operation_thread;
     std::atomic_bool operation_running{false};
@@ -897,6 +952,43 @@ struct App::Impl {
                                  ? "Match found"
                                  : "No match";
                     break;
+                case PromptAction::editor_replace_find:
+                    editor_replace_needle = prompt_value;
+                    prompt_action = PromptAction::editor_replace_with;
+                    prompt_title = "Replace with";
+                    prompt_value.clear();
+                    return;
+                case PromptAction::editor_replace_with:
+                    status = editor.replace(
+                                 editor_replace_needle,
+                                 prompt_value,
+                                 false
+                             )
+                                 ? "Replaced"
+                                 : "No match";
+                    editor_replace_needle.clear();
+                    break;
+                case PromptAction::editor_save_as:
+                    if (!prompt_value.empty()) {
+                        editor.save_as(prompt_value, false);
+                        status = "Saved as " + editor.path();
+                    }
+                    break;
+                case PromptAction::editor_goto: {
+                    std::size_t parsed = 0;
+                    const auto line = std::stoull(
+                        prompt_value,
+                        &parsed
+                    );
+                    if (parsed != prompt_value.size() || line == 0U) {
+                        throw std::runtime_error(
+                            "line number must be positive"
+                        );
+                    }
+                    editor.goto_line(line);
+                    status = "Line " + std::to_string(line);
+                    break;
+                }
                 case PromptAction::quick_cd:
                     active().change_directory(prompt_value);
                     status = "Directory changed";
@@ -989,6 +1081,13 @@ struct App::Impl {
                     break;
             }
         } catch (const std::exception& error) {
+            if (mode_before_prompt == Mode::editor) {
+                editor_replace_needle.clear();
+                prompt_action = PromptAction::none;
+                prompt_value.clear();
+                show_editor_error(error);
+                return;
+            }
             set_error(error);
         }
         mode = mode_before_prompt;
@@ -1153,35 +1252,282 @@ struct App::Impl {
                border;
     }
 
+    ftxui::Element render_editor_line(
+        const std::size_t index,
+        const std::size_t first_column
+    ) const {
+        using namespace ftxui;
+        const auto& line = editor.lines()[index];
+        auto selected_begin = line.size();
+        auto selected_end = std::size_t{0};
+        if (const auto selected = editor.selection();
+            selected &&
+            index >= selected->first.row &&
+            index <= selected->second.row) {
+            selected_begin =
+                index == selected->first.row
+                    ? selected->first.column
+                    : 0U;
+            selected_end =
+                index == selected->second.row
+                    ? selected->second.column
+                    : line.size();
+        }
+
+        const auto visible_begin =
+            utf8_offset_for_width(line, first_column);
+        std::vector<std::size_t> boundaries{
+            visible_begin,
+            line.size(),
+            std::min(selected_begin, line.size()),
+            std::min(selected_end, line.size()),
+        };
+        if (index == editor.row()) {
+            boundaries.push_back(
+                std::min(editor.column(), line.size())
+            );
+            boundaries.push_back(
+                next_utf8(line, editor.column())
+            );
+        }
+        std::sort(boundaries.begin(), boundaries.end());
+        boundaries.erase(
+            std::unique(boundaries.begin(), boundaries.end()),
+            boundaries.end()
+        );
+
+        Elements segments;
+        for (std::size_t boundary = 0;
+             boundary + 1U < boundaries.size();
+             ++boundary) {
+            const auto begin = boundaries[boundary];
+            const auto end = boundaries[boundary + 1U];
+            if (begin < visible_begin || begin == end) {
+                continue;
+            }
+            auto segment = text(line.substr(begin, end - begin));
+            if (begin >= selected_begin && begin < selected_end) {
+                segment = segment | inverted;
+            }
+            if (index == editor.row() &&
+                begin == editor.column()) {
+                segment = segment | inverted | bold;
+            }
+            segments.push_back(std::move(segment));
+        }
+        if (index == editor.row() &&
+            editor.column() == line.size()) {
+            segments.push_back(text(" ") | inverted | bold);
+        }
+        if (segments.empty()) {
+            segments.push_back(text(""));
+        }
+        return hbox(std::move(segments));
+    }
+
     ftxui::Element render_editor() {
         using namespace ftxui;
-        Elements elements;
+        const auto terminal_size = Terminal::Size();
+        const auto visible_rows = static_cast<std::size_t>(
+            std::max(1, terminal_size.dimy - 2)
+        );
         const auto& lines = editor.lines();
-        const auto first = editor.row() > 15U ? editor.row() - 15U : 0U;
-        const auto end = std::min(lines.size(), first + 40U);
+        const auto first =
+            editor.row() > visible_rows / 2U
+                ? editor.row() - visible_rows / 2U
+                : 0U;
+        const auto end = std::min(lines.size(), first + visible_rows);
+        const auto& current_line = lines[editor.row()];
+        const auto cursor_width = static_cast<std::size_t>(
+            std::max(
+                0,
+                string_width(
+                    std::string_view(current_line).substr(
+                        0,
+                        editor.column()
+                    )
+                )
+            )
+        );
+        const auto content_width = static_cast<std::size_t>(
+            std::max(1, terminal_size.dimx)
+        );
+        const auto first_column =
+            cursor_width >= content_width
+                ? cursor_width - content_width + 1U
+                : 0U;
+        Elements elements;
         for (std::size_t index = first; index < end; ++index) {
-            auto row = hbox({
-                text(std::to_string(index + 1U)) |
-                    size(WIDTH, EQUAL, 6) | dim,
-                text(lines[index]),
-            });
-            if (index == editor.row()) {
+            elements.push_back(
+                render_editor_line(index, first_column)
+            );
+        }
+
+        static const std::array<std::string, 7> menu_names{
+            "File", "Edit", "Search", "Command",
+            "Format", "Window", "Options"
+        };
+        Elements menu;
+        for (std::size_t index = 0; index < menu_names.size(); ++index) {
+            auto item = text(" " + menu_names[index] + " ");
+            if (index == editor_menu_category) {
+                item = item | bold | underlined;
+            }
+            menu.push_back(std::move(item));
+        }
+        const auto header =
+            mode == Mode::editor_menu
+                ? hbox(std::move(menu)) | inverted
+                : hbox({
+                      text(display_text(editor.path())) | bold | flex,
+                      text(
+                          editor.dirty() ? " [-M--] " : " [----] "
+                      ),
+                      text(
+                          "L:" +
+                          std::to_string(editor.row() + 1U) +
+                          "/" +
+                          std::to_string(editor.lines().size()) +
+                          " C:" +
+                          std::to_string(cursor_width + 1U) +
+                          " " +
+                          std::to_string(editor.byte_size()) +
+                          "b"
+                      ),
+                  });
+        const auto key_width =
+            std::max(3, terminal_size.dimx / 10);
+        const auto key = [key_width](
+                             const std::string& number,
+                             const std::string& label
+                         ) {
+            const auto label_width = static_cast<std::size_t>(
+                std::max(
+                    0,
+                    key_width -
+                        static_cast<int>(number.size()) - 1
+                )
+            );
+            return hbox({
+                       text(number) | inverted,
+                       text(label.substr(0, label_width)),
+                       text(" "),
+                   }) |
+                   size(WIDTH, EQUAL, key_width);
+        };
+        return vbox({
+            header,
+            vbox(std::move(elements)) | flex,
+            hbox({
+                key("1", "Help"),
+                key("2", "Save"),
+                key("3", "Mark"),
+                key("4", "Replac"),
+                key("5", "Copy"),
+                key("6", "Move"),
+                key("7", "Search"),
+                key("8", "Delete"),
+                key("9", "PullDn"),
+                key("10", "Quit"),
+            }),
+        });
+    }
+
+    ftxui::Element render_editor_menu() const {
+        using namespace ftxui;
+        static const std::array<std::vector<std::string>, 7> menus{{
+            {"Save  F2", "Save as...  F12", "Close  F10"},
+            {
+                "Undo  C-z",
+                "Redo  C-y",
+                "Mark  F3",
+                "Copy  F5",
+                "Move  F6",
+                "Delete  F8",
+            },
+            {"Find  F7", "Replace  F4", "Go to line  C-g"},
+            {"No commands"},
+            {"No commands"},
+            {"No commands"},
+            {"Tab inserts 4 spaces"},
+        }};
+        Elements rows;
+        const auto& items = menus[editor_menu_category];
+        for (std::size_t index = 0; index < items.size(); ++index) {
+            auto row = text(" " + items[index] + " ");
+            if (index == editor_menu_item) {
                 row = row | inverted;
             }
-            elements.push_back(std::move(row));
+            rows.push_back(std::move(row));
         }
+        return vbox(std::move(rows)) | borderStyled(LIGHT);
+    }
+
+    ftxui::Element render_editor_close_dialog() const {
+        using namespace ftxui;
+        const auto button = [&](const std::string& label,
+                                const std::size_t index) {
+            auto element = text("[ " + label + " ]");
+            return index == editor_close_choice
+                       ? element | inverted
+                       : element;
+        };
         return vbox({
+                   text("Close file") | bold | center,
+                   separator(),
                    text(
-                       "Edit: " + editor.path() +
-                       (editor.dirty() ? " *" : "")
-                   ) |
-                       bold,
+                       "File " + display_text(editor.path()) +
+                       " was modified."
+                   ),
+                   text("Save before close?") | center,
                    separator(),
-                   vbox(std::move(elements)) | yframe | flex,
-                   separator(),
-                   text("F2/Ctrl-S Save  F4/Esc Close"),
+                   hbox({
+                       filler(),
+                       button("Yes", 0),
+                       text("  "),
+                       button("No", 1),
+                       text("  "),
+                       button("Cancel", 2),
+                       filler(),
+                   }),
                }) |
-               border;
+               borderStyled(LIGHT) |
+               size(WIDTH, LESS_THAN, 72);
+    }
+
+    ftxui::Element render_editor_help() const {
+        using namespace ftxui;
+        return vbox({
+                   text("mcpp editor") | bold | center,
+                   separator(),
+                   text("F2        Save"),
+                   text("F3        Start or finish marking"),
+                   text("F4        Replace next match"),
+                   text("F5/F6     Copy/move marked block"),
+                   text("F7        Search"),
+                   text("F8        Delete block or character"),
+                   text("F9        Pull-down menu"),
+                   text("F10       Close editor"),
+                   text("F12       Save as"),
+                   text("Ctrl-Z/Y  Undo/redo"),
+                   text("Ctrl-G    Go to line"),
+                   separator(),
+                   text("Press F1 or Esc") | center,
+               }) |
+               borderStyled(LIGHT);
+    }
+
+    ftxui::Element render_editor_error() const {
+        using namespace ftxui;
+        return vbox({
+                   text("Editor error") | bold | center,
+                   separator(),
+                   paragraph(display_text(editor_error_message)),
+                   separator(),
+                   text("[ OK ]") | inverted | center,
+               }) |
+               borderStyled(LIGHT) |
+               size(WIDTH, LESS_THAN, 72);
     }
 
     ftxui::Element render_help() const {
@@ -1817,8 +2163,6 @@ struct App::Impl {
         }
         if (mode == Mode::viewer) {
             body = render_viewer();
-        } else if (mode == Mode::editor) {
-            body = render_editor();
         } else if (mode == Mode::search_results) {
             body = render_search_results();
         }
@@ -1832,13 +2176,25 @@ struct App::Impl {
                           "/" +
                           std::to_string(progress.files_total) + "]";
         }
-        const auto key = [](const std::string& number,
-                            const std::string& label) {
+        const auto key_width =
+            std::max(3, Terminal::Size().dimx / 10);
+        const auto key = [key_width](
+                             const std::string& number,
+                             const std::string& label
+                         ) {
+            const auto label_width = static_cast<std::size_t>(
+                std::max(
+                    0,
+                    key_width -
+                        static_cast<int>(number.size()) - 1
+                )
+            );
             return hbox({
                        text(number) | inverted,
-                       text(label),
+                       text(label.substr(0, label_width)),
+                       text(" "),
                    }) |
-                   flex;
+                   size(WIDTH, EQUAL, key_width);
         };
         std::array<char, 256> hostname{};
         if (gethostname(hostname.data(), hostname.size()) != 0) {
@@ -1892,6 +2248,19 @@ struct App::Impl {
                 key("10", "Quit"),
             }),
         });
+        const bool editor_context =
+            mode == Mode::editor ||
+            mode == Mode::editor_menu ||
+            mode == Mode::editor_help ||
+            mode == Mode::editor_error ||
+            mode == Mode::editor_close_dialog ||
+            (
+                mode == Mode::prompt &&
+                mode_before_prompt == Mode::editor
+            );
+        if (editor_context) {
+            document = render_editor();
+        }
         const auto centered_modal = [](Element element) {
             return vbox({
                 filler(),
@@ -1916,6 +2285,43 @@ struct App::Impl {
             document = dbox({
                 document,
                 centered_modal(std::move(prompt_dialog)),
+            });
+        } else if (mode == Mode::editor_help) {
+            document = dbox({
+                document,
+                centered_modal(render_editor_help()),
+            });
+        } else if (mode == Mode::editor_error) {
+            document = dbox({
+                document,
+                centered_modal(render_editor_error()),
+            });
+        } else if (mode == Mode::editor_close_dialog) {
+            document = dbox({
+                document,
+                centered_modal(render_editor_close_dialog()),
+            });
+        } else if (mode == Mode::editor_menu) {
+            static constexpr std::array<int, 7> offsets{
+                0, 9, 18, 29, 41, 52, 63
+            };
+            auto positioned_menu = vbox({
+                filler() | size(HEIGHT, EQUAL, 1),
+                hbox({
+                    filler() |
+                        size(
+                            WIDTH,
+                            EQUAL,
+                            offsets[editor_menu_category]
+                        ),
+                    render_editor_menu() | clear_under,
+                    filler(),
+                }),
+                filler(),
+            });
+            document = dbox({
+                document,
+                positioned_menu,
             });
         } else if (mode == Mode::help) {
             document = dbox({
@@ -2043,19 +2449,276 @@ struct App::Impl {
         return false;
     }
 
-    bool handle_editor(const ftxui::Event& event) {
-        if (event == ftxui::Event::F2 ||
-            event == ftxui::Event::CtrlS) {
+    void show_editor_error(const std::exception& error) {
+        editor_error_message = error.what();
+        status = "Error: " + editor_error_message;
+        mode = Mode::editor_error;
+    }
+
+    void save_editor() {
+        try {
+            editor.save(false);
+            status = "Saved";
+        } catch (const std::exception& error) {
+            show_editor_error(error);
+        }
+    }
+
+    void close_editor() {
+        editor.close();
+        mode = Mode::panels;
+        try {
+            refresh();
+            status = "Editor closed";
+        } catch (const std::exception& error) {
+            set_error(error);
+        }
+    }
+
+    void request_editor_close() {
+        if (editor.dirty()) {
+            editor_close_choice = 0;
+            mode = Mode::editor_close_dialog;
+        } else {
+            close_editor();
+        }
+    }
+
+    void execute_editor_menu_item() {
+        const auto category = editor_menu_category;
+        const auto item = editor_menu_item;
+        mode = Mode::editor;
+        if (category == 0U) {
+            if (item == 0U) {
+                save_editor();
+            } else if (item == 1U) {
+                start_prompt(
+                    PromptAction::editor_save_as,
+                    "Save as",
+                    editor.path()
+                );
+            } else {
+                request_editor_close();
+            }
+            return;
+        }
+        if (category == 1U) {
+            switch (item) {
+                case 0:
+                    status =
+                        editor.undo() ? "Undo" : "Nothing to undo";
+                    break;
+                case 1:
+                    status =
+                        editor.redo() ? "Redo" : "Nothing to redo";
+                    break;
+                case 2:
+                    editor.toggle_mark();
+                    status = editor.marking()
+                                 ? "Marking block"
+                                 : "Block marked";
+                    break;
+                case 3:
+                    status = editor.copy_selection()
+                                 ? "Block copied"
+                                 : "No marked block";
+                    break;
+                case 4:
+                    status = editor.move_selection()
+                                 ? "Block moved"
+                                 : "No movable block";
+                    break;
+                case 5:
+                    if (!editor.delete_selection()) {
+                        editor.erase();
+                    }
+                    status = "Deleted";
+                    break;
+                default:
+                    break;
+            }
+            return;
+        }
+        if (category == 2U) {
+            if (item == 0U) {
+                start_prompt(
+                    PromptAction::editor_find,
+                    "Search"
+                );
+            } else if (item == 1U) {
+                start_prompt(
+                    PromptAction::editor_replace_find,
+                    "Search for"
+                );
+            } else {
+                start_prompt(
+                    PromptAction::editor_goto,
+                    "Go to line",
+                    std::to_string(editor.row() + 1U)
+                );
+            }
+            return;
+        }
+        status = "No command in this menu";
+    }
+
+    bool handle_editor_menu(const ftxui::Event& event) {
+        static constexpr std::array<std::size_t, 7> item_counts{
+            3, 6, 3, 1, 1, 1, 1
+        };
+        if (event == ftxui::Event::Escape ||
+            event == ftxui::Event::F9) {
+            mode = Mode::editor;
+            return true;
+        }
+        if (event == ftxui::Event::ArrowLeft) {
+            editor_menu_category =
+                (
+                    editor_menu_category +
+                    item_counts.size() - 1U
+                ) %
+                item_counts.size();
+            editor_menu_item = 0;
+            return true;
+        }
+        if (event == ftxui::Event::ArrowRight ||
+            event == ftxui::Event::Tab) {
+            editor_menu_category =
+                (editor_menu_category + 1U) % item_counts.size();
+            editor_menu_item = 0;
+            return true;
+        }
+        if (event == ftxui::Event::ArrowUp) {
+            const auto count = item_counts[editor_menu_category];
+            editor_menu_item =
+                (editor_menu_item + count - 1U) % count;
+            return true;
+        }
+        if (event == ftxui::Event::ArrowDown) {
+            const auto count = item_counts[editor_menu_category];
+            editor_menu_item = (editor_menu_item + 1U) % count;
+            return true;
+        }
+        if (event == ftxui::Event::Return) {
+            execute_editor_menu_item();
+            return true;
+        }
+        return false;
+    }
+
+    bool handle_editor_close_dialog(const ftxui::Event& event) {
+        if (event == ftxui::Event::Escape) {
+            mode = Mode::editor;
+            return true;
+        }
+        if (event == ftxui::Event::ArrowLeft ||
+            event == ftxui::Event::TabReverse) {
+            editor_close_choice =
+                (editor_close_choice + 2U) % 3U;
+            return true;
+        }
+        if (event == ftxui::Event::ArrowRight ||
+            event == ftxui::Event::Tab) {
+            editor_close_choice =
+                (editor_close_choice + 1U) % 3U;
+            return true;
+        }
+        if (event == ftxui::Event::Character('y')) {
+            editor_close_choice = 0;
+        } else if (event == ftxui::Event::Character('n')) {
+            editor_close_choice = 1;
+        } else if (event == ftxui::Event::Character('c')) {
+            editor_close_choice = 2;
+        } else if (event != ftxui::Event::Return) {
+            return false;
+        }
+        if (editor_close_choice == 2U) {
+            mode = Mode::editor;
+            return true;
+        }
+        if (editor_close_choice == 0U) {
             try {
                 editor.save(false);
-                status = "Saved";
             } catch (const std::exception& error) {
-                set_error(error);
+                show_editor_error(error);
+                return true;
+            }
+        }
+        close_editor();
+        return true;
+    }
+
+    bool handle_editor(const ftxui::Event& event) {
+        if (event == ftxui::Event::F1) {
+            mode = Mode::editor_help;
+            return true;
+        }
+        if (event == ftxui::Event::F2 ||
+            event == ftxui::Event::CtrlS) {
+            save_editor();
+            return true;
+        }
+        if (event == ftxui::Event::F3) {
+            editor.toggle_mark();
+            status = editor.marking()
+                         ? "Marking block"
+                         : "Block marked";
+            return true;
+        }
+        if (event == ftxui::Event::F4) {
+            start_prompt(
+                PromptAction::editor_replace_find,
+                "Search for"
+            );
+            return true;
+        }
+        if (event == ftxui::Event::F5) {
+            status = editor.copy_selection()
+                         ? "Block copied"
+                         : "No marked block";
+            return true;
+        }
+        if (event == ftxui::Event::F6) {
+            status = editor.move_selection()
+                         ? "Block moved"
+                         : "No movable block";
+            return true;
+        }
+        if (event == ftxui::Event::F7 ||
+            event == ftxui::Event::CtrlF) {
+            start_prompt(PromptAction::editor_find, "Search");
+            return true;
+        }
+        if (event == ftxui::Event::F8) {
+            if (!editor.delete_selection()) {
+                editor.erase();
             }
             return true;
         }
-        if (event == ftxui::Event::CtrlF) {
-            start_prompt(PromptAction::editor_find, "Find in file");
+        if (event == ftxui::Event::F9) {
+            editor_menu_category = 0;
+            editor_menu_item = 0;
+            mode = Mode::editor_menu;
+            return true;
+        }
+        if (event == ftxui::Event::F10) {
+            request_editor_close();
+            return true;
+        }
+        if (event == ftxui::Event::F12) {
+            start_prompt(
+                PromptAction::editor_save_as,
+                "Save as",
+                editor.path()
+            );
+            return true;
+        }
+        if (event == ftxui::Event::CtrlG) {
+            start_prompt(
+                PromptAction::editor_goto,
+                "Go to line",
+                std::to_string(editor.row() + 1U)
+            );
             return true;
         }
         if (event == ftxui::Event::CtrlZ) {
@@ -2066,14 +2729,8 @@ struct App::Impl {
             status = editor.redo() ? "Redo" : "Nothing to redo";
             return true;
         }
-        if (event == ftxui::Event::Escape ||
-            event == ftxui::Event::F4) {
-            if (editor.dirty()) {
-                status = "Unsaved changes; press F2 to save";
-            } else {
-                editor.close();
-                mode = Mode::panels;
-            }
+        if (event == ftxui::Event::Escape) {
+            editor.clear_selection();
             return true;
         }
         if (event == ftxui::Event::ArrowUp) {
@@ -2088,6 +2745,12 @@ struct App::Impl {
             editor.home();
         } else if (event == ftxui::Event::End) {
             editor.end();
+        } else if (event == ftxui::Event::PageUp) {
+            editor.page(-20);
+        } else if (event == ftxui::Event::PageDown) {
+            editor.page(20);
+        } else if (event == ftxui::Event::Tab) {
+            editor.insert("    ");
         } else if (event == ftxui::Event::Return) {
             editor.newline();
         } else if (event == ftxui::Event::Backspace) {
@@ -2678,6 +3341,30 @@ struct App::Impl {
         }
         if (mode == Mode::editor) {
             return handle_editor(event);
+        }
+        if (mode == Mode::editor_menu) {
+            return handle_editor_menu(event);
+        }
+        if (mode == Mode::editor_help) {
+            if (event == ftxui::Event::Escape ||
+                event == ftxui::Event::F1 ||
+                event == ftxui::Event::F10) {
+                mode = Mode::editor;
+                return true;
+            }
+            return false;
+        }
+        if (mode == Mode::editor_error) {
+            if (event == ftxui::Event::Escape ||
+                event == ftxui::Event::Return ||
+                event == ftxui::Event::F10) {
+                mode = Mode::editor;
+                return true;
+            }
+            return false;
+        }
+        if (mode == Mode::editor_close_dialog) {
+            return handle_editor_close_dialog(event);
         }
         if (mode == Mode::help) {
             if (event == ftxui::Event::Escape ||

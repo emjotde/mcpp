@@ -880,6 +880,94 @@ void test_viewer_editor() {
         "editor save"
     );
 
+    const auto rich_path = temporary.path() / "rich.txt";
+    write_file(rich_path, "alpha beta gamma\nsecond line\n");
+    editor.open(provider, rich_path.string());
+    editor.toggle_mark();
+    editor.move(0, 5);
+    editor.toggle_mark();
+    editor.end();
+    check(editor.copy_selection(), "editor block copy");
+    check_equal(
+        editor.lines()[0],
+        std::string("alpha beta gammaalpha"),
+        "editor copied block at cursor"
+    );
+    check(editor.undo(), "editor block copy undo");
+    check(
+        editor.replace("beta", "BETA", true),
+        "editor replace"
+    );
+    check_equal(
+        editor.lines()[0],
+        std::string("alpha BETA gamma"),
+        "editor replaced text"
+    );
+    editor.home();
+    editor.toggle_mark();
+    editor.move(0, 5);
+    editor.toggle_mark();
+    editor.goto_line(2);
+    editor.end();
+    check(editor.move_selection(), "editor block move");
+    check_equal(
+        editor.lines()[0],
+        std::string(" BETA gamma"),
+        "editor move removed source block"
+    );
+    check_equal(
+        editor.lines()[1],
+        std::string("second linealpha"),
+        "editor move inserted block"
+    );
+    const auto saved_as = temporary.path() / "saved-as.txt";
+    editor.save_as(saved_as.string(), false);
+    check_equal(
+        read_file(saved_as),
+        std::string(" BETA gamma\nsecond linealpha\n"),
+        "editor save as"
+    );
+    editor.insert('!');
+    editor.save_as("relative.txt", false);
+    check_equal(
+        read_file(temporary.path() / "relative.txt"),
+        std::string(" BETA gamma\nsecond linealpha!\n"),
+        "relative save as uses edited file directory"
+    );
+
+    const auto utf_path = temporary.path() / "utf.txt";
+    write_file(utf_path, "abc\néxyz\n");
+    editor.open(provider, utf_path.string());
+    editor.move(0, 1);
+    editor.goto_line(2);
+    check_equal(
+        editor.column(),
+        std::size_t{0},
+        "goto aligns UTF-8 cursor"
+    );
+    editor.erase();
+    check_equal(
+        editor.lines()[1],
+        std::string("xyz"),
+        "UTF-8 erase after goto"
+    );
+
+    const auto mark_path = temporary.path() / "mark.txt";
+    write_file(mark_path, "abc\nxyz\n");
+    editor.open(provider, mark_path.string());
+    editor.goto_line(2);
+    editor.home();
+    editor.toggle_mark();
+    editor.backspace();
+    editor.move(0, -1);
+    editor.erase();
+    check_equal(
+        editor.lines()[0],
+        std::string("abxyz"),
+        "backspace clears collapsed mark"
+    );
+
+    editor.open(provider, path.string());
     editor.insert('?');
     write_file(path, "external");
     bool conflict = false;

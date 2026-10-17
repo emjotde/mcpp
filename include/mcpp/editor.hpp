@@ -3,11 +3,21 @@
 #include "mcpp/provider.hpp"
 
 #include <cstddef>
+#include <compare>
+#include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace mcpp {
+
+struct EditorPosition {
+    std::size_t row{0};
+    std::size_t column{0};
+
+    auto operator<=>(const EditorPosition&) const = default;
+};
 
 class EditorModel {
 public:
@@ -23,23 +33,46 @@ public:
     [[nodiscard]] const std::vector<std::string>& lines() const noexcept;
     [[nodiscard]] std::size_t row() const noexcept;
     [[nodiscard]] std::size_t column() const noexcept;
+    [[nodiscard]] std::size_t byte_size() const noexcept;
+    [[nodiscard]] bool marking() const noexcept;
+    [[nodiscard]] std::optional<std::pair<
+        EditorPosition,
+        EditorPosition
+    >> selection() const noexcept;
 
     void move(int rows, int columns);
+    void page(int rows);
     void home();
     void end();
+    void goto_line(std::size_t line);
+    void toggle_mark();
+    void clear_selection();
     void insert(char character);
     void insert(std::string_view text);
     void newline();
     void backspace();
     void erase();
+    [[nodiscard]] bool copy_selection();
+    [[nodiscard]] bool move_selection();
+    [[nodiscard]] bool delete_selection();
     bool undo();
     bool redo();
     void save(
         bool force,
         const Cancellation& cancellation = {}
     );
+    void save_as(
+        std::string path,
+        bool force,
+        const Cancellation& cancellation = {}
+    );
     [[nodiscard]] bool find(
         std::string_view needle,
+        bool case_sensitive
+    );
+    [[nodiscard]] bool replace(
+        std::string_view needle,
+        std::string_view replacement,
         bool case_sensitive
     );
 
@@ -48,8 +81,21 @@ private:
         std::vector<std::string> lines;
         std::size_t row{0};
         std::size_t column{0};
+        std::optional<EditorPosition> selection_begin;
+        std::optional<EditorPosition> selection_end;
+        bool marking{false};
     };
 
+    [[nodiscard]] std::string content() const;
+    void set_content(std::string_view content);
+    [[nodiscard]] std::size_t offset(EditorPosition position) const;
+    [[nodiscard]] EditorPosition position(std::size_t offset) const;
+    void update_mark();
+    void replace_range(
+        EditorPosition begin,
+        EditorPosition end,
+        std::string_view replacement
+    );
     void record_undo();
     void restore(Snapshot snapshot);
 
@@ -60,6 +106,10 @@ private:
     std::size_t row_{0};
     std::size_t column_{0};
     bool dirty_{false};
+    std::optional<EditorPosition> selection_begin_;
+    std::optional<EditorPosition> selection_end_;
+    bool marking_{false};
+    std::string clipboard_;
     std::vector<Snapshot> undo_;
     std::vector<Snapshot> redo_;
 };
