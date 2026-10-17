@@ -636,6 +636,11 @@ struct App::Impl {
         operation_pause_condition.notify_all();
     }
 
+    void exit_terminal() {
+        std::cout << "\033[H\033[2J" << std::flush;
+        terminal->Exit();
+    }
+
     void finish_operation(
         std::string message,
         const std::optional<int> clear_selection = std::nullopt
@@ -2279,7 +2284,7 @@ struct App::Impl {
                     );
                     return;
                 case 10:
-                    terminal->Exit();
+                    exit_terminal();
                     return;
                 default:
                     break;
@@ -3071,7 +3076,7 @@ struct App::Impl {
         editor.close();
         mode = Mode::panels;
         if (exit_after_editor) {
-            terminal->Exit();
+            exit_terminal();
             return;
         }
         try {
@@ -4487,7 +4492,7 @@ struct App::Impl {
                     status = "Cancel operation before quitting";
                     return true;
                 }
-                terminal->Exit();
+                exit_terminal();
             } else if (event.is_character()) {
                 command_mode = true;
                 command_line = event.character();
