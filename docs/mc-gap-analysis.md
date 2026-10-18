@@ -364,9 +364,12 @@ Tree opens at the chosen pane's cwd. Enter opens the selected directory in
 the opposite listing and expands it. Right expands/moves to a child; Left
 selects the parent. Space toggles, `+` expands, and `-` collapses. A single
 click focuses the Tree pane and selects the node; a double-click opens it.
-The wheel moves the selection. Explicit collapse controls, Enter expansion,
-and Tree pointer improvements are deliberate mcpp behavior, not an assertion
-that all MC Tree modes use the same controls.
+The wheel moves the selection. Visiting a partially loaded ancestor lists its
+immediate folders asynchronously, preserving the selected path and expanded
+descendants without recursively scanning unvisited siblings.
+Explicit collapse controls, Enter expansion, and Tree pointer improvements are
+deliberate mcpp behavior, not an assertion that all MC Tree modes use the same
+controls.
 
 Unavailable listing formats, multi-column layouts, split/resizing controls,
 directory-size calculation, codepage selection, full help, key learning, and

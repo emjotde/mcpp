@@ -21,6 +21,109 @@ def wait_loaded(terminal):
     terminal.wait_for("…", present=False, timeout=45)
 
 
+def check_upward_loading(binary, tmux, root):
+    forest, other = root / "forest", root / "other"
+    current = forest / "branch" / "current"
+    for path in ("branch/current/keep/deep", "branch/peer-a/offshoot",
+                 "branch/peer-z", "outer-a/unvisited", "outer-z"):
+        (forest / path).mkdir(parents=True, exist_ok=True)
+    other.mkdir()
+    with TerminalSession(
+        binary, tmux, root / "ui", [current, other], width=120, height=36
+    ) as terminal:
+        terminal.wait_for("Name")
+        terminal.press("F9", "Enter", "Down", "Down", "Down", "Enter")
+        terminal.wait_for("Directory tree")
+        terminal.press("Tab")
+        terminal.wait(
+            lambda: terminal.selected_tree_row().endswith("current"),
+            "Tree starts at the nested cwd",
+        )
+        assert "peer-a" not in terminal.text()
+        assert "outer-a" not in terminal.text()
+        terminal.type("+")
+        terminal.wait_for("keep")
+        wait_loaded(terminal)
+        find_node(terminal, "keep")
+        terminal.type("+")
+        terminal.wait_for("deep")
+        wait_loaded(terminal)
+        find_node(terminal, "current")
+        terminal.save("before-upward-navigation")
+
+        terminal.press("Left")
+        terminal.wait(
+            lambda: terminal.selected_tree_row().endswith("branch"),
+            "Left selects the parent",
+        )
+        terminal.wait_for("peer-a")
+        terminal.wait_for("peer-z")
+        wait_loaded(terminal)
+        assert terminal.selected_tree_row().endswith("branch")
+        assert "deep" in terminal.text(), "Loading siblings retains expanded descendants"
+        assert "outer-a" not in terminal.text(), "Higher ancestors remain lazy"
+        assert "offshoot" not in terminal.text(), "Unvisited siblings are not scanned"
+        terminal.save("parent-surroundings")
+
+        terminal.press("Up")
+        terminal.wait(
+            lambda: terminal.selected_tree_row().endswith("forest"),
+            "Up selects the next ancestor",
+        )
+        terminal.wait_for("outer-a")
+        terminal.wait_for("outer-z")
+        wait_loaded(terminal)
+        assert terminal.selected_tree_row().endswith("forest")
+        assert "deep" in terminal.text()
+        assert "unvisited" not in terminal.text()
+        assert "/other$" in terminal.text().splitlines()[-2], (
+            "Static Tree navigation must not change the opposite pane cwd"
+        )
+        terminal.save("ancestor-surroundings")
+
+    with TerminalSession(
+        binary, tmux, root / "rapid-ui", [current, other], width=120, height=36
+    ) as terminal:
+        terminal.wait_for("Name")
+        terminal.press("F9", "Enter", "Down", "Down", "Down", "Enter")
+        terminal.wait_for("Directory tree")
+        terminal.press("Tab")
+        terminal.wait(
+            lambda: terminal.selected_tree_row().endswith("current"),
+            "Fresh Tree starts at the nested cwd",
+        )
+        terminal.press("Left", "Left")
+        terminal.wait_for("outer-a")
+        terminal.wait_for("peer-a")
+        wait_loaded(terminal)
+        assert terminal.selected_tree_row().endswith("forest"), (
+            "Moving up during loading retains the latest selected ancestor"
+        )
+        terminal.save("rapid-upward-navigation")
+
+
+def check_upward_loading_during_rescan(binary, tmux, root, current, other):
+    with TerminalSession(binary, tmux, root, [current, other]) as terminal:
+        terminal.wait_for("Name")
+        terminal.press("F9", "Enter", "Down", "Down", "Down", "Enter")
+        terminal.wait_for("Directory tree")
+        terminal.press("Tab")
+        terminal.wait(
+            lambda: terminal.selected_tree_row().endswith(current.name),
+            "Tree starts at the wide directory",
+        )
+        terminal.press("+", "F2", "Left")
+        terminal.wait(
+            lambda: terminal.selected_tree_row().endswith(current.parent.name),
+            "Moving up during a rescan retains the parent selection",
+        )
+        terminal.wait_for("Tree refreshed", timeout=45)
+        wait_loaded(terminal)
+        find_node(terminal, "beta")
+        find_node(terminal, "wide-00000")
+        terminal.save("rescan-and-upward-loading")
+
+
 def run(binary, tmux):
     root = Path(tempfile.mkdtemp(prefix="mcpp-tree-workflows-"))
     passed = False
@@ -32,10 +135,14 @@ def run(binary, tmux):
         for path in ("alpha/one", "locked/grand"):
             (left / path / "copy-marker.txt").write_text("Tree refresh outcome\n")
         right.mkdir()
+        check_upward_loading(binary, tmux, root / "upward")
         unicode_name = "é" * 13 + "-suffix"
         (left / unicode_name).mkdir()
         for index in range(4096):
             (left / "alpha" / f"wide-{index:05}").mkdir()
+        check_upward_loading_during_rescan(
+            binary, tmux, root / "queued-upward-ui", left / "alpha", right
+        )
         with TerminalSession(binary, tmux, root / "ui", [left, right]) as terminal:
             terminal.wait_for("Name")
             terminal.type("touch pending-marker")
@@ -236,7 +343,7 @@ def run(binary, tmux):
                 lambda: len(list(task_directory.iterdir())) <= initial_threads,
                 "Background Tree refresh finishes after the copy",
             )
-            terminal.press("Tab", "Tab")
+            terminal.wait_idle()
             assert "Copy complete" in terminal.text(), (
                 "Automatic Tree refresh must not overwrite the operation result"
             )

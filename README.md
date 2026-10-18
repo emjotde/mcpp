@@ -130,6 +130,10 @@ The current parity gaps against GNU Midnight Commander are documented in
 | `F9` | Menu |
 | `F10` | Quit |
 
+Moving up through Tree ancestors loads their immediate folders in the background.
+Expanded branches and the selected path are retained; unvisited subtrees are not
+scanned recursively.
+
 Simple prompts use `Tab` / `Shift-Tab` to move between the input, OK and
 Cancel. Input Enter accepts; focused buttons accept Enter or Space, and can
 also be clicked. Escape cancels. File / View file... prompts for a filename;

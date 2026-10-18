@@ -1153,6 +1153,7 @@ struct App::Impl {
     std::uint64_t tree_generation{0};
     std::optional<std::string> tree_refresh_pending;
     bool tree_refresh_notify_pending{false};
+    bool tree_surroundings_pending{false};
     std::string operation_label{"File operation"};
     int rendered_width{0};
     int rendered_height{0};
@@ -1511,6 +1512,7 @@ struct App::Impl {
 
     void invalidate_tree_loading() {
         ++tree_generation;
+        tree_surroundings_pending = false;
         if (tree_expansion_running.load(std::memory_order_acquire)) {
             tree_expansion_cancellation.request();
         }
@@ -1598,6 +1600,22 @@ struct App::Impl {
         );
     }
 
+    void load_tree_surroundings() {
+        tree_surroundings_pending = false;
+        if (!tree_panel || tree_cursor >= tree_nodes.size()) {
+            return;
+        }
+        const auto& node = tree_nodes[tree_cursor];
+        if (!node.expanded || node.loaded || node.loading) {
+            return;
+        }
+        if (tree_expansion_running.load(std::memory_order_acquire)) {
+            tree_surroundings_pending = true;
+            return;
+        }
+        expand_tree_node(tree_cursor, true, false);
+    }
+
     void finish_tree_loading() {
         tree_expansion_running.store(false, std::memory_order_release);
         if (tree_refresh_pending) {
@@ -1606,6 +1624,8 @@ struct App::Impl {
             tree_refresh_pending.reset();
             tree_refresh_notify_pending = false;
             refresh_tree(notify, std::move(path));
+        } else if (tree_surroundings_pending) {
+            load_tree_surroundings();
         }
     }
 
@@ -1656,11 +1676,11 @@ struct App::Impl {
             path = parent;
         }
         std::reverse(ancestry.begin(), ancestry.end());
+        // Visible ancestor branches have not had their other children listed.
         std::vector<TreeNode> nodes{{
             .path = root,
             .depth = 0,
             .expanded = !ancestry.empty(),
-            .loaded = !ancestry.empty(),
             .has_children = !ancestry.empty(),
         }};
         std::size_t depth = 1U;
@@ -1670,7 +1690,6 @@ struct App::Impl {
                 .path = path,
                 .depth = depth++,
                 .expanded = !current,
-                .loaded = !current,
                 .has_children = !current,
             });
         }
@@ -2027,6 +2046,11 @@ struct App::Impl {
         } catch (const std::exception& error) {
             set_error(error);
         }
+    }
+
+    void update_tree_selection() {
+        sync_dynamic_tree();
+        load_tree_surroundings();
     }
 
     void swap_panels() {
@@ -10120,7 +10144,7 @@ struct App::Impl {
                 );
                 if (name.starts_with(sought)) {
                     tree_cursor = index;
-                    sync_dynamic_tree();
+                    update_tree_selection();
                     return true;
                 }
             }
@@ -10415,7 +10439,7 @@ struct App::Impl {
                             )
                         ));
                         last_click_pane = -1;
-                        sync_dynamic_tree();
+                        update_tree_selection();
                         return true;
                     }
                     if (mouse.button != ftxui::Mouse::Left ||
@@ -10461,7 +10485,7 @@ struct App::Impl {
                         last_click_pane = 10 + *tree_panel;
                         last_click_path = path;
                         tree_cursor = selected_index;
-                        sync_dynamic_tree();
+                        update_tree_selection();
                         if (double_click) {
                             active().change_directory(
                                 tree_nodes[tree_cursor].path
@@ -10786,19 +10810,19 @@ struct App::Impl {
                     if (tree_cursor > 0U) {
                         --tree_cursor;
                     }
-                    sync_dynamic_tree();
+                    update_tree_selection();
                     return true;
                 }
                 if (event == ftxui::Event::ArrowDown) {
                     if (tree_cursor + 1U < tree_nodes.size()) {
                         ++tree_cursor;
                     }
-                    sync_dynamic_tree();
+                    update_tree_selection();
                     return true;
                 }
                 if (event == ftxui::Event::Home) {
                     tree_cursor = 0;
-                    sync_dynamic_tree();
+                    update_tree_selection();
                     return true;
                 }
                 if (event == ftxui::Event::End) {
@@ -10806,7 +10830,7 @@ struct App::Impl {
                         tree_nodes.empty()
                             ? 0U
                             : tree_nodes.size() - 1U;
-                    sync_dynamic_tree();
+                    update_tree_selection();
                     return true;
                 }
                 if (event == ftxui::Event::ArrowRight) {
@@ -10819,7 +10843,7 @@ struct App::Impl {
                             tree_nodes[tree_cursor].depth
                     ) {
                         ++tree_cursor;
-                        sync_dynamic_tree();
+                        update_tree_selection();
                     }
                     return true;
                 }
@@ -10835,7 +10859,7 @@ struct App::Impl {
                                 break;
                             }
                         }
-                        sync_dynamic_tree();
+                        update_tree_selection();
                     }
                     return true;
                 }
@@ -10844,7 +10868,7 @@ struct App::Impl {
                         tree_cursor > panel_visible_rows()
                             ? tree_cursor - panel_visible_rows()
                             : 0U;
-                    sync_dynamic_tree();
+                    update_tree_selection();
                     return true;
                 }
                 if (event == ftxui::Event::PageDown) {
@@ -10854,7 +10878,7 @@ struct App::Impl {
                             : tree_nodes.size() - 1U,
                         tree_cursor + panel_visible_rows()
                     );
-                    sync_dynamic_tree();
+                    update_tree_selection();
                     return true;
                 }
                 if (event == ftxui::Event::Return &&
