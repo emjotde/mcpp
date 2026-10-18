@@ -1,6 +1,6 @@
 # mcpp versus GNU Midnight Commander
 
-Review date: 2026-10-17
+Review dates: 2026-10-17 and 2026-10-18
 
 This is a functional review of the supported Linux local-filesystem workflows,
 not a claim that mcpp is a complete MC clone. Archive, SSH/SFTP, Azure, and
@@ -8,11 +8,12 @@ spelling support remain deferred.
 
 ## Audit fix delivery
 
-All 41 recorded A/B/C/H/U findings below are fixed, including the earlier
-file-safety findings as well as the last UI report. The eight broader capability
-groups remain a separate feature backlog; the explicitly paused providers and
-spelling remain paused.
-The source excerpts and line numbers in the audit sections describe the old
+The original 41 findings (A01-A16, B01-B11, C01-C10, H01-H03 and U01) were fixed
+in `13c9c34`. The follow-up walk below records additional open findings against
+`7a4370e`; the original regression results do not imply complete MC parity.
+The eight broader capability groups remain a separate feature backlog; the
+explicitly paused providers and spelling remain paused.
+The source excerpts and line numbers in the historical audit sections describe the old
 `14b7a82` baseline, not the corrected code.
 
 Core fixes now have bounded normal regressions for directory merge policy,
@@ -37,6 +38,54 @@ The complete normal container suite passed all 19 CTest entries. The Release
 binary also passed the core audit regressions and all 19 new terminal audit
 cases. The older audit descriptions remain below as historical evidence, not
 current functionality claims.
+
+## Follow-up UI walk: 2026-10-18
+
+This pass used the normal Release binary from product code `7a4370e`, after the
+Tree upward-loading fix, and the actual installed GNU MC 4.8.30. Its mcpp SHA-256
+was `d5de05345711bbf591d68de892288558c2ff937e1ab45885f41e3d5b559c5048`.
+Each terminal used private HOME/XDG directories and owned fixtures. MC runtime
+results below are not assertions about the newer reference build.
+
+The walk found four UI defects, one partial viewer feature, and one shared
+usability limitation. These remain open; this pass changes the report, not
+the product. P2 denotes a normal workflow/usability problem; P3 denotes
+misleading display information without an observed file change.
+
+| ID | Kind / priority | Finding and consequence | Direct comparison and source evidence |
+|---|---|---|---|
+| D01 | Defect / P2 | At 40x12, Copy hides its permission/link/background options and both action buttons. Wheel scrolling and eight Tabs do not bring them into view. | MC keeps OK, Background and Cancel visible at the same size. mcpp's six-Tabs/Enter sequence can still cancel: the finding is absent visible/pointer access, not permanently unreachable keyboard actions. `render_operation_dialog()` is a fixed, unframed vertical form (`src/app.cpp:5790-5865`); Move uses the same renderer but was not separately exercised. |
+| D02 | Defect / P2 | Main dropdown menus clip their selected bottom action on short terminals. At 80x12, Options > Save setup is invisible even after Up selects it. | MC shows the selected Save setup at that size. Enter executes the hidden mcpp action and creates its private config, proving this is a visibility problem rather than a disabled feature. `render_pulldown()` has no height-bounded `yframe` (`src/app.cpp:5321-5357`); the editor's separate File menu does scroll correctly. |
+| D03 | Defect / P2 | In hex mode the wheel moves the byte cursor but leaves the viewport stationary while that cursor is still visible. The first wheel event therefore does not scroll the displayed bytes. | On a 4096-byte file, mcpp advances the cursor to decimal 48 but keeps `00000000` as the first row. MC scrolls its first row to `00000020`. The problem is stationary content, not the different wheel-step sizes. The hex wheel route calls cursor movement rather than viewport scrolling (`src/app.cpp:7402-7453`). Text-mode wheel scrolling works. |
+| D04 | Defect / P3 | Hex percentage describes the end of the visible range while the adjacent offset describes the active byte, giving conflicting position information. | On a 261-byte file, mcpp shows `@0/261 100%` at the first byte and still 100% after Down to byte 16. MC shows 0% then 6%. `render_viewer()` computes percentage from `view_end()` in both modes but displays `hex_cursor()` in hex mode (`src/app.cpp:3963-3986`). |
+| D05 | Partial feature / P2 | Viewer Go to only accepts byte offsets; normal text-line and percentage navigation are missing. | In fresh MC, Go to offers Line number, Percents, Decimal offset and Hexadecimal offset; entering 20 in its default line mode shows `ROW_019`. mcpp explicitly labels its byte-only prompt and enters the middle of `ROW_000`. This is a missing choice, not incorrect byte-offset parsing (`src/app.cpp:7478-7482`). |
+| U02 | Shared limitation / P2 | Clicking a hex byte does not place the edit cursor at that byte. Users must position it with keys before typing. | Clicking the byte at offset 0x10 and typing `a` changes the staged high nibble at the old offset 0 in both tested programs. This is not a new mcpp-only MC regression and no save was issued. mcpp only handles header clicks and wheel events in the viewer body route (`src/app.cpp:7431-7454`); the reference MC mouse callback scrolls rather than mapping a click to a byte (`reference/mc/src/viewer/mcviewer.c:83-180`). Click-to-place editing would be an explicit usability improvement. |
+
+### Walk coverage and controls
+
+- Panels, Tree, Copy/Delete/Mkdir prompts, menus, full-screen viewer and editor
+  were opened directly in both programs, including 40x12 and 80x12 layouts.
+  The comparison also exercised scrolling, EOF positioning, text/hex display,
+  dirty staged hex edits, and viewer Go to.
+- Normal viewer EOF and editor document-end screens agreed for the owned long
+  text fixture. The editor's Search/Replace actions stay visible at 40x12,
+  and its File menu scrolls to Quit. These were not reported as remaining
+  failures merely because other forms and menus clip.
+- Clicking after the wide character in command text `a界b` and typing `X`
+  produced `a界Xb` in both programs. No UTF-8 caret failure was observed there.
+- mcpp's Tree loaded the parent/grandparent's immediate folders while retaining
+  its existing child branch. The cold MC Tree did not provide an equivalently
+  populated ancestry in this profile, so this pass does not claim equivalent
+  upward-navigation coverage from that MC control.
+- Copy was cancelled, not accepted; delete confirmations were not accepted.
+  Hex edits remained staged, and the original byte fixtures and empty copy
+  destination were checked unchanged. No destructive/error-injection operations,
+  sanitizer checks or optional profiling were run.
+
+Drivers, exact text/ANSI captures, result JSON and the inspected paired PNGs
+(`copy-dialog.png`, `main-menu.png`, `hex-wheel.png`, `hex-percentage.png`) are
+retained in this session's `ui-walk-20261018` artifacts. The walk is bounded
+coverage, not a complete pass of the MC keymap or all enabled actions.
 
 ## Historical source audit (`14b7a82`)
 
@@ -431,6 +480,7 @@ remain unavailable.
 
 Repeat search asks before wrapping. Standalone `--view` Quit exits rather
 than returning to panels. Hex view uses aligned 16-byte rows.
+Go to is byte-only; line/percentage entry is still missing (D05).
 In the tested far-right unwrapped search, neither program automatically
 revealed the match. That is not counted as a mcpp-only defect.
 
