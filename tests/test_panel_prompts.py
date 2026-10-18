@@ -159,12 +159,48 @@ class PanelPrompts(unittest.TestCase):
             focus(terminal, "OK")
             click_label(terminal, "> mouse-ok")
             focus(terminal, "> mouse-ok")
+            terminal.press("End")
             terminal.type("-edited")
             terminal.wait_for("> mouse-ok-edited")
             click_label(terminal, "OK")
             terminal.wait_for("Directory created")
             self.assertTrue((left / "mouse-ok-edited").is_dir())
             self.assertFalse((left / "mouse-ok").exists())
+
+    def test_cursor_selection_word_editing_and_history(self):
+        with session_case(BINARY, TMUX) as (terminal, left, _):
+            mkdir_prompt(terminal, "abécd")
+            terminal.press("Left", "Left")
+            terminal.type("X")
+            terminal.wait_for("> abéXcd")
+            terminal.press("DC")
+            terminal.wait_for("> abéXd")
+            terminal.raw(b"\x1b[1;2H")
+            terminal.type("z")
+            terminal.wait_for("> zd")
+            terminal.press("End", "BSpace", "Enter")
+            terminal.wait(lambda: (left / "z").is_dir(), "Edited directory z is created")
+
+            mkdir_prompt(terminal, "one two")
+            terminal.press("Home", "C-Right", "C-k")
+            terminal.wait_for("> one two", present=False)
+            terminal.wait_for("> one")
+            terminal.press("C-y")
+            terminal.wait_for("> one two")
+            terminal.press("C-u", "C-y", "Enter")
+            terminal.wait(
+                lambda: (left / "one two").is_dir(),
+                "Kill/yank preserves the submitted directory name",
+            )
+
+            terminal.press("F7", "M-p")
+            terminal.wait_for("> one two")
+            terminal.press("M-p")
+            terminal.wait_for("> z")
+            terminal.press("M-n")
+            terminal.wait_for("> one two")
+            terminal.press("Escape")
+            terminal.wait_for("Directory name:", present=False)
 
     def test_view_file_paths_errors_and_selection(self):
         with session_case(BINARY, TMUX) as (terminal, _, right):
@@ -212,6 +248,68 @@ class PanelPrompts(unittest.TestCase):
             terminal.wait_for("> alpha.txt")
             terminal.press("Escape")
             terminal.wait_for("Filename:", present=False)
+
+    def test_path_completion_and_command_line_editing(self):
+        with session_case(BINARY, TMUX) as (terminal, left, _):
+            find_alpha(terminal)
+            view_prompt(terminal)
+            terminal.press("C-u")
+            terminal.type("nest")
+            terminal.raw(b"\x1b\t")
+            terminal.wait_for("> nested/")
+            terminal.type("tar")
+            terminal.raw(b"\x1b\t")
+            terminal.wait_for("> nested/target.txt")
+            terminal.press("Enter")
+            terminal.wait_for("NESTED CONTENT")
+            terminal.press("F3")
+            terminal.wait_for("Name")
+
+            (left / "apple.txt").write_text("APPLE\n")
+            (left / "apricot.txt").write_text("APRICOT\n")
+            view_prompt(terminal)
+            terminal.press("C-u")
+            terminal.type("ap")
+            terminal.raw(b"\x1b\t")
+            terminal.wait_for("2 paths;")
+            terminal.raw(b"\x1b\t")
+            terminal.wait_for("> apple.txt")
+            terminal.raw(b"\x1b\t")
+            terminal.wait_for("> apricot.txt")
+            terminal.press("Escape")
+            terminal.wait_for("Filename:", present=False)
+
+            terminal.type("touch cmd-tes.txt")
+            terminal.press("Left", "Left", "Left", "Left")
+            terminal.type("t")
+            terminal.wait_for("touch cmd-test.txt")
+            terminal.press("Enter")
+            terminal.wait(
+                lambda: (left / "cmd-test.txt").is_file(),
+                "Edited command creates the intended file",
+            )
+            terminal.press("M-p")
+            terminal.wait_for("touch cmd-test.txt")
+            terminal.press("Home", "C-k")
+            terminal.wait_for("touch cmd-test.txt", present=False)
+            terminal.press("C-y")
+            terminal.wait_for("touch cmd-test.txt")
+            terminal.press("Escape")
+            terminal.wait_for("touch cmd-test.txt", present=False)
+
+    def test_copy_destination_cursor_editing(self):
+        with session_case(BINARY, TMUX) as (terminal, left, right):
+            find_alpha(terminal)
+            terminal.press("F5")
+            terminal.wait_for("Source mask:")
+            terminal.press("C-u")
+            terminal.type(str(right / "copy-nam.txt"))
+            terminal.press("Left", "Left", "Left", "Left")
+            terminal.type("e")
+            terminal.wait_for("copy-name.txt")
+            terminal.press("Enter")
+            terminal.wait_file(right / "copy-name.txt", b"ALPHA CONTENT\n")
+            self.assertTrue((left / "alpha.txt").is_file())
 
     def test_info_home_end_preserves_listing_cursor_and_marks(self):
         with session_case(BINARY, TMUX) as (terminal, _left, _right):

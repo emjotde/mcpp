@@ -122,9 +122,12 @@ Unavailable listing formats, multi-column layouts, split/resizing controls,
 directory-size calculation, codepage selection, full help, key learning, and
 custom keymaps remain gaps. Grayscale chrome is intentional.
 
-Generic inputs now have usable controls but remain simpler than MC's input
-widgets: full cursor/word editing, selection, completion, and input history
-are not implemented. Editor menus now support mouse category/action selection.
+Dialog text inputs support cursor/word editing, Shift selection, mouse positioning
+and dragging, kill/yank, and session history. Filename/directory and operation
+destination inputs provide path completion with ambiguous-match cycling.
+Editor search/replacement and numeric options use the same editing controls.
+Persistent input histories and shell-variable/command-name completion remain
+gaps. Editor menus support mouse category/action selection.
 
 ### File operations and search
 

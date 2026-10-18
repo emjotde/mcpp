@@ -25,6 +25,7 @@
 #include <iostream>
 #include <iterator>
 #include <limits>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <sstream>
@@ -186,11 +187,12 @@ std::string lowercase_text(std::string value) {
     return value;
 }
 
-void erase_last_utf8(std::string& value) {
-    if (value.empty()) {
-        return;
+std::size_t previous_utf8(const std::string_view value, std::size_t offset) {
+    offset = std::min(offset, value.size());
+    if (offset == 0U) {
+        return 0U;
     }
-    auto begin = value.size() - 1U;
+    auto begin = offset - 1U;
     while (begin > 0U &&
            (
                static_cast<unsigned char>(value[begin]) &
@@ -198,7 +200,11 @@ void erase_last_utf8(std::string& value) {
            ) == 0x80U) {
         --begin;
     }
-    value.erase(begin);
+    return begin;
+}
+
+void erase_last_utf8(std::string& value) {
+    value.erase(previous_utf8(value, value.size()));
 }
 
 std::size_t next_utf8(
@@ -652,6 +658,34 @@ struct TreeNode {
     bool loading{false};
 };
 
+struct TextInputState {
+    std::size_t cursor{0};
+    std::optional<std::size_t> anchor;
+    std::size_t rendered_cursor{0};
+    ftxui::Box cursor_box;
+    ftxui::Box box;
+    bool dragging{false};
+    std::vector<std::string> history;
+    std::size_t history_index{0};
+    std::string draft;
+    std::vector<std::string> completions;
+    std::size_t completion_index{0};
+    std::string completion_prefix;
+    std::string completion_suffix;
+    std::string completed_value;
+    std::string message;
+
+    void reset(const std::string_view value) {
+        cursor = value.size();
+        anchor.reset();
+        dragging = false;
+        history_index = history.size();
+        draft.clear();
+        completions.clear();
+        message.clear();
+    }
+};
+
 }  // namespace
 
 struct App::Impl {
@@ -671,6 +705,12 @@ struct App::Impl {
     std::string prompt_error;
     std::size_t prompt_focus{0};
     std::array<ftxui::Box, 3> prompt_boxes{};
+    std::map<PromptAction, TextInputState> prompt_inputs;
+    TextInputState destination_input;
+    TextInputState mask_input;
+    TextInputState command_input;
+    std::string input_clipboard;
+    std::array<ftxui::Box, 7> operation_dialog_boxes{};
     std::string pending_destination;
     std::string status{"Ready"};
     std::optional<std::string> pending_operation_notice;
@@ -713,6 +753,9 @@ struct App::Impl {
     >> editor_dialog_scope;
     std::string editor_dialog_query;
     std::string editor_dialog_replacement;
+    TextInputState editor_query_input;
+    TextInputState editor_replacement_input;
+    std::array<ftxui::Box, 10> editor_search_boxes{};
     std::size_t editor_dialog_focus{0};
     std::string editor_replace_needle;
     std::string editor_replace_text;
@@ -727,9 +770,11 @@ struct App::Impl {
     bool editor_quit_requested{false};
     std::size_t editor_quit_index{0};
     std::size_t editor_options_focus{0};
-    std::array<bool, 2> editor_options_touched{};
     std::string editor_options_tab_width;
     std::string editor_options_indent_width;
+    TextInputState editor_tab_input;
+    TextInputState editor_indent_input;
+    std::array<ftxui::Box, 6> editor_options_boxes{};
     bool editor_options_auto_indent{true};
     bool editor_options_show_whitespace{false};
     std::string editor_options_error;
@@ -748,7 +793,6 @@ struct App::Impl {
     bool panel_search_mode{false};
     std::string panel_search;
     std::vector<std::string> command_history;
-    std::size_t command_history_index{0};
     std::vector<UserMenuEntry> user_menu;
     ftxui::Box left_box;
     ftxui::Box right_box;
@@ -1504,6 +1548,8 @@ struct App::Impl {
         dialog_exact = move_operation;
         dialog_destination = active().path();
         dialog_source_mask = "*";
+        destination_input.reset(dialog_destination);
+        mask_input.reset(dialog_source_mask);
         dialog_preserve_attributes = true;
         dialog_preserve_symlinks = true;
         dialog_background = false;
@@ -1816,9 +1862,363 @@ struct App::Impl {
         prompt_action = action;
         prompt_title = std::move(title);
         prompt_value = std::move(value);
+        prompt_inputs[action].reset(prompt_value);
         prompt_error.clear();
         prompt_focus = 0;
         prompt_boxes = {};
+    }
+
+    void remember_input(TextInputState& input, const std::string& value) {
+        if (!value.empty() &&
+            (input.history.empty() || input.history.back() != value)) {
+            input.history.push_back(value);
+            if (input.history.size() > 100U) {
+                input.history.erase(input.history.begin());
+            }
+        }
+        input.history_index = input.history.size();
+    }
+
+    bool edit_input(
+        std::string& value,
+        TextInputState& input,
+        const ftxui::Event& event
+    ) {
+        using ftxui::Event;
+        input.completions.clear();
+        input.message.clear();
+        input.cursor = std::min(input.cursor, value.size());
+        if (input.anchor) {
+            *input.anchor = std::min(*input.anchor, value.size());
+        }
+        const auto selected = [&]() -> std::pair<std::size_t, std::size_t> {
+            const auto anchor = input.anchor.value_or(input.cursor);
+            return std::minmax(anchor, input.cursor);
+        };
+        const auto erase_selection = [&] {
+            const auto [begin, end] = selected();
+            if (begin == end) {
+                return false;
+            }
+            value.erase(begin, end - begin);
+            input.cursor = begin;
+            input.anchor.reset();
+            return true;
+        };
+        const auto move = [&](const std::size_t position, const bool extend) {
+            if (extend) {
+                if (!input.anchor) {
+                    input.anchor = input.cursor;
+                }
+            } else {
+                input.anchor.reset();
+            }
+            input.cursor = position;
+        };
+        const auto word = [&](const std::size_t position) {
+            const auto character = static_cast<unsigned char>(value[position]);
+            return character >= 0x80U || std::isalnum(character) != 0 ||
+                   character == '_';
+        };
+        const auto word_left = [&] {
+            auto position = input.cursor;
+            while (position > 0U && !word(previous_utf8(value, position))) {
+                position = previous_utf8(value, position);
+            }
+            while (position > 0U && word(previous_utf8(value, position))) {
+                position = previous_utf8(value, position);
+            }
+            return position;
+        };
+        const auto word_right = [&] {
+            auto position = input.cursor;
+            while (position < value.size() && !word(position)) {
+                position = next_utf8(value, position);
+            }
+            while (position < value.size() && word(position)) {
+                position = next_utf8(value, position);
+            }
+            return position;
+        };
+        const bool select_left =
+            event == Event::Special("\x1B[1;2D");
+        const bool select_right =
+            event == Event::Special("\x1B[1;2C");
+        const bool select_word_left =
+            event == Event::Special("\x1B[1;6D");
+        const bool select_word_right =
+            event == Event::Special("\x1B[1;6C");
+        if (event == Event::Home || event == Event::CtrlA ||
+            event == Event::Special("\x1B[1;2H")) {
+            move(0U, event == Event::Special("\x1B[1;2H"));
+        } else if (event == Event::End || event == Event::CtrlE ||
+                   event == Event::Special("\x1B[1;2F")) {
+            move(value.size(), event == Event::Special("\x1B[1;2F"));
+        } else if (event == Event::ArrowLeftCtrl || select_word_left) {
+            move(word_left(), select_word_left);
+        } else if (event == Event::ArrowRightCtrl || select_word_right) {
+            move(word_right(), select_word_right);
+        } else if (event == Event::ArrowLeft || event == Event::CtrlB ||
+                   select_left) {
+            const auto range = selected();
+            move(!select_left && range.first != range.second
+                     ? range.first
+                     : previous_utf8(value, input.cursor),
+                 select_left);
+        } else if (event == Event::ArrowRight || event == Event::CtrlF ||
+                   select_right) {
+            const auto range = selected();
+            move(!select_right && range.first != range.second
+                     ? range.second
+                     : next_utf8(value, input.cursor),
+                 select_right);
+        } else if (event == Event::CtrlU) {
+            input_clipboard = value;
+            value.clear();
+            move(0U, false);
+        } else if (event == Event::CtrlK || event == Event::CtrlW ||
+                   event == Event::Special("\x1B[3;5~")) {
+            auto [begin, end] = selected();
+            if (begin == end) {
+                begin = event == Event::CtrlW ? word_left() : input.cursor;
+                end = event == Event::CtrlK
+                          ? value.size()
+                          : event == Event::CtrlW ? input.cursor : word_right();
+            }
+            input_clipboard = value.substr(begin, end - begin);
+            value.erase(begin, end - begin);
+            move(begin, false);
+        } else if (event == Event::Backspace || event == Event::Delete) {
+            if (!erase_selection()) {
+                const auto begin = event == Event::Backspace
+                                       ? previous_utf8(value, input.cursor)
+                                       : input.cursor;
+                const auto end = event == Event::Backspace
+                                     ? input.cursor
+                                     : next_utf8(value, input.cursor);
+                value.erase(begin, end - begin);
+                move(begin, false);
+            }
+        } else if (event == Event::CtrlY ||
+                   event == Event::Special("\x1B[2;2~")) {
+            erase_selection();
+            value.insert(input.cursor, input_clipboard);
+            move(input.cursor + input_clipboard.size(), false);
+        } else if (event == Event::Special("\x1B[2;5~") ||
+                   event == Event::Special("\x1B[3;2~")) {
+            const auto [begin, end] = selected();
+            input_clipboard = value.substr(begin, end - begin);
+            if (event == Event::Special("\x1B[3;2~")) {
+                erase_selection();
+            }
+        } else if (event == Event::AltP || event == Event::ArrowUp ||
+                   event == Event::AltN || event == Event::ArrowDown) {
+            const bool backward = event == Event::AltP || event == Event::ArrowUp;
+            if (input.history_index == input.history.size()) {
+                input.draft = value;
+            }
+            if (backward && input.history_index > 0U) {
+                --input.history_index;
+            } else if (!backward && input.history_index < input.history.size()) {
+                ++input.history_index;
+            }
+            value = input.history_index < input.history.size()
+                        ? input.history[input.history_index]
+                        : input.draft;
+            move(value.size(), false);
+        } else if (event.is_character()) {
+            erase_selection();
+            value.insert(input.cursor, event.character());
+            move(input.cursor + event.character().size(), false);
+        } else {
+            return false;
+        }
+        return true;
+    }
+
+    ftxui::Element render_input(
+        const std::string& value,
+        TextInputState& input,
+        const bool active,
+        const std::string_view prefix = "> "
+    ) {
+        using namespace ftxui;
+        input.cursor = std::min(input.cursor, value.size());
+        input.rendered_cursor = input.cursor;
+        const auto anchor = std::min(input.anchor.value_or(input.cursor), value.size());
+        const auto selected = std::minmax(anchor, input.cursor);
+        Elements cells;
+        for (std::size_t offset = 0; offset <= value.size();) {
+            const auto next = next_utf8(value, offset);
+            auto cell = text(
+                offset == value.size()
+                    ? " "
+                    : display_text(std::string_view(value).substr(offset, next - offset))
+            );
+            if (offset >= selected.first && offset < selected.second) {
+                cell = cell | bold | underlined;
+            }
+            if (offset == input.cursor) {
+                cell = std::move(cell) | reflect(input.cursor_box);
+                if (active) {
+                    cell = std::move(cell) | focusCursorBarBlinking;
+                }
+            }
+            cells.push_back(std::move(cell));
+            if (offset == value.size()) {
+                break;
+            }
+            offset = next;
+        }
+        auto field = hbox({
+            text(std::string(prefix)),
+            hbox(std::move(cells)) | xflex | xframe,
+        }) | reflect(input.box);
+        return active ? field | inverted : field;
+    }
+
+    bool input_mouse(
+        const std::string& value,
+        TextInputState& input,
+        const ftxui::Mouse& mouse
+    ) {
+        if (mouse.motion == ftxui::Mouse::Released) {
+            input.dragging = false;
+            if (input.anchor == input.cursor) {
+                input.anchor.reset();
+            }
+            return true;
+        }
+        if (mouse.button != ftxui::Mouse::Left ||
+            (!input.dragging && !input.box.Contain(mouse.x, mouse.y))) {
+            return false;
+        }
+        const auto target = std::max(
+            0,
+            ftxui::string_width(display_text(
+                std::string_view(value).substr(0, input.rendered_cursor)
+            )) + mouse.x - input.cursor_box.x_min
+        );
+        std::size_t position = 0;
+        int width = 0;
+        while (position < value.size()) {
+            const auto next = next_utf8(value, position);
+            const auto columns = ftxui::string_width(display_text(
+                std::string_view(value).substr(position, next - position)
+            ));
+            if (width + columns > target) {
+                break;
+            }
+            width += columns;
+            position = next;
+        }
+        if (mouse.motion == ftxui::Mouse::Pressed) {
+            input.anchor = mouse.shift ? input.cursor : position;
+            input.dragging = true;
+        }
+        if (input.dragging) {
+            input.cursor = position;
+            input.completions.clear();
+            input.message.clear();
+            return true;
+        }
+        return false;
+    }
+
+    void complete_path(
+        std::string& value,
+        TextInputState& input,
+        const std::string& base
+    ) {
+        const auto apply = [&](const std::string& completion) {
+            const auto suffix =
+                completion.ends_with('/') && input.completion_suffix.starts_with('/')
+                    ? input.completion_suffix.substr(1U)
+                    : input.completion_suffix;
+            value = input.completion_prefix + completion + suffix;
+            input.cursor = input.completion_prefix.size() + completion.size();
+            input.anchor.reset();
+            input.completed_value = value;
+        };
+        if (!input.completions.empty() && value == input.completed_value) {
+            input.completion_index =
+                (input.completion_index + 1U) % input.completions.size();
+            apply(input.completions[input.completion_index]);
+            return;
+        }
+        input.cursor = std::min(input.cursor, value.size());
+        const auto before = std::string_view(value).substr(0, input.cursor);
+        const auto slash = before.rfind('/');
+        auto directory_text =
+            slash == std::string_view::npos
+                ? std::string{}
+                : std::string(before.substr(0, slash + 1U));
+        const auto prefix = std::string(
+            before.substr(slash == std::string_view::npos ? 0U : slash + 1U)
+        );
+        const auto end = value.find('/', input.cursor);
+        auto suffix = end == std::string::npos ? std::string{} : value.substr(end);
+        const bool directories_only = !suffix.empty();
+        if (directory_text.starts_with("~/")) {
+            const auto* home = std::getenv("HOME");
+            if (home == nullptr) {
+                throw std::runtime_error("HOME is not set");
+            }
+            directory_text = std::string(home) + directory_text.substr(1U);
+        }
+        auto directory = std::filesystem::path(directory_text);
+        if (directory.empty() || directory.is_relative()) {
+            directory = std::filesystem::path(base) / directory;
+        }
+        std::vector<std::string> matches;
+        for (const auto& entry : std::filesystem::directory_iterator(directory)) {
+            const auto name = entry.path().filename().string();
+            if (!name.starts_with(prefix) ||
+                (name.starts_with('.') && !prefix.starts_with('.'))) {
+                continue;
+            }
+            std::error_code error;
+            const bool is_directory = entry.is_directory(error);
+            if (error && error != std::errc::no_such_file_or_directory) {
+                throw std::filesystem::filesystem_error(
+                    "cannot inspect completion", entry.path(), error
+                );
+            }
+            if (!directories_only || is_directory) {
+                matches.push_back(name + (is_directory ? "/" : ""));
+            }
+        }
+        std::sort(matches.begin(), matches.end());
+        input.completions = matches;
+        input.completion_prefix = directory_text;
+        input.completion_suffix = std::move(suffix);
+        if (matches.empty()) {
+            input.message = "No matching paths";
+            return;
+        }
+        if (matches.size() == 1U) {
+            apply(matches.front());
+            input.completions.clear();
+            input.message.clear();
+            return;
+        }
+        auto common = matches.front();
+        for (const auto& match : matches) {
+            std::size_t count = 0;
+            while (count < common.size() && count < match.size() &&
+                   common[count] == match[count]) {
+                ++count;
+            }
+            while (count > 0U && count < common.size() &&
+                   (static_cast<unsigned char>(common[count]) & 0xC0U) == 0x80U) {
+                --count;
+            }
+            common.resize(count);
+        }
+        apply(common);
+        input.completion_index = matches.size() - 1U;
+        input.message =
+            std::to_string(matches.size()) + " paths; Alt-Tab cycles matches";
     }
 
     void cancel_prompt() {
@@ -1844,6 +2244,8 @@ struct App::Impl {
         dialog_preserve_symlinks = true;
         dialog_background = false;
         dialog_source_mask = "*";
+        destination_input.reset(dialog_destination);
+        mask_input.reset(dialog_source_mask);
         dialog_focus = 0;
         mode = Mode::operation_dialog;
     }
@@ -2394,8 +2796,9 @@ struct App::Impl {
         }
         const auto command = command_line;
         command_history.push_back(command);
-        command_history_index = command_history.size();
+        command_input.history = command_history;
         command_line.clear();
+        command_input.reset(command_line);
         command_mode = false;
         try {
             const auto result = run_process(command, false);
@@ -3686,14 +4089,15 @@ struct App::Impl {
                bgcolor(Color::Grey19);
     }
 
-    ftxui::Element render_editor_search_dialog() const {
+    ftxui::Element render_editor_search_dialog() {
         using namespace ftxui;
         const bool replace = mode == Mode::editor_replace_dialog;
         const auto focused = [&](Element element,
                                  const std::size_t index) {
-            return editor_dialog_focus == index
-                       ? element | inverted | focus
-                       : element;
+            if (editor_dialog_focus == index) {
+                element = element | inverted | focus;
+            }
+            return element | reflect(editor_search_boxes[index]);
         };
         const auto checked = [](const bool value) {
             return std::string(value ? "[x] " : "[ ] ");
@@ -3705,21 +4109,18 @@ struct App::Impl {
             text(replace ? "Replace" : "Search") | bold | center,
             separator(),
             text("Search for:"),
-            focused(
-                text("> " + display_text(editor_dialog_query)),
-                0
-            ),
+            render_input(
+                editor_dialog_query, editor_query_input, editor_dialog_focus == 0U
+            ) | reflect(editor_search_boxes[0]),
         };
         if (replace) {
             rows.push_back(text("Replace with:"));
             rows.push_back(
-                focused(
-                    text(
-                        "> " +
-                        display_text(editor_dialog_replacement)
-                    ),
-                    1
-                )
+                render_input(
+                    editor_dialog_replacement,
+                    editor_replacement_input,
+                    editor_dialog_focus == 1U
+                ) | reflect(editor_search_boxes[1])
             );
         }
         rows.push_back(separator());
@@ -3804,13 +4205,14 @@ struct App::Impl {
                size(WIDTH, EQUAL, 72);
     }
 
-    ftxui::Element render_editor_options_dialog() const {
+    ftxui::Element render_editor_options_dialog() {
         using namespace ftxui;
         const auto focused = [&](Element element,
                                  const std::size_t index) {
-            return editor_options_focus == index
-                       ? element | inverted | focus
-                       : element;
+            if (editor_options_focus == index) {
+                element = element | inverted | focus;
+            }
+            return element | reflect(editor_options_boxes[index]);
         };
         const auto checked = [](const bool value) {
             return std::string(value ? "[x] " : "[ ] ");
@@ -3819,20 +4221,14 @@ struct App::Impl {
             text("Editor options") | bold | center,
             separator(),
             text("Tabulation") | bold,
-            focused(
-                text(
-                    "Tab spacing:        " +
-                    editor_options_tab_width
-                ),
-                0
-            ),
-            focused(
-                text(
-                    "Indent spacing:     " +
-                    editor_options_indent_width
-                ),
-                1
-            ),
+            render_input(
+                editor_options_tab_width, editor_tab_input,
+                editor_options_focus == 0U, "Tab spacing:        "
+            ) | reflect(editor_options_boxes[0]),
+            render_input(
+                editor_options_indent_width, editor_indent_input,
+                editor_options_focus == 1U, "Indent spacing:     "
+            ) | reflect(editor_options_boxes[1]),
             separator(),
             text("Other options") | bold,
             focused(
@@ -4602,13 +4998,14 @@ struct App::Impl {
                borderStyled(LIGHT) | size(WIDTH, EQUAL, 72);
     }
 
-    ftxui::Element render_operation_dialog() const {
+    ftxui::Element render_operation_dialog() {
         using namespace ftxui;
         const auto sources = current_operation_sources();
         const auto focused = [&](Element element, const std::size_t index) {
-            return dialog_focus == index
-                       ? element | inverted | focus
-                       : element;
+            if (dialog_focus == index) {
+                element = element | inverted | focus;
+            }
+            return element | reflect(operation_dialog_boxes[index]);
         };
         return vbox({
                    text(
@@ -4627,15 +5024,13 @@ struct App::Impl {
                    ),
                    separator(),
                    text("To:"),
-                   focused(
-                       text("> " + display_text(dialog_destination)),
-                       0
-                   ),
+                   render_input(
+                       dialog_destination, destination_input, dialog_focus == 0U
+                   ) | reflect(operation_dialog_boxes[0]),
                    text("Source mask:"),
-                   focused(
-                       text("> " + display_text(dialog_source_mask)),
-                       1
-                   ),
+                   render_input(
+                       dialog_source_mask, mask_input, dialog_focus == 1U
+                   ) | reflect(operation_dialog_boxes[1]),
                    separator(),
                    focused(
                        text(
@@ -5470,14 +5865,26 @@ struct App::Impl {
             text(hint) |
                 color(Color::Grey11) |
                 bgcolor(Color::Grey62),
-            text(command_text(
-                command_mode
-                    ? prompt + " " + command_line
-                    : prompt,
-                static_cast<std::size_t>(
-                    std::max(1, Terminal::Size().dimx)
-                )
-            )),
+            command_mode
+                ? render_input(
+                      command_line,
+                      command_input,
+                      !(tree_panel && tree_panel_focused) &&
+                          !(quick_view_panel && quick_view_focused) &&
+                          !(information_panel && information_panel_focused),
+                      command_text(
+                          prompt,
+                          static_cast<std::size_t>(
+                              std::max(1, Terminal::Size().dimx / 2)
+                          )
+                      ) + " "
+                  )
+                : text(command_text(
+                      prompt,
+                      static_cast<std::size_t>(
+                          std::max(1, Terminal::Size().dimx)
+                      )
+                  )),
             std::move(keybar),
         });
         if (viewer_context) {
@@ -5566,11 +5973,13 @@ struct App::Impl {
                 )
             );
             prompt_rows.push_back(
-                focused(
-                    text("> " + display_text(prompt_value)),
-                    0
-                )
+                render_input(
+                    prompt_value, prompt_inputs[prompt_action], prompt_focus == 0U
+                ) | reflect(prompt_boxes[0])
             );
+            if (!prompt_inputs[prompt_action].message.empty()) {
+                prompt_rows.push_back(text(prompt_inputs[prompt_action].message));
+            }
             if (!prompt_error.empty()) {
                 prompt_rows.push_back(
                     text("Error: " + display_text(prompt_error)) |
@@ -5764,6 +6173,11 @@ struct App::Impl {
         if (event.is_mouse()) {
             auto mouse_event = event;
             const auto& mouse = mouse_event.mouse();
+            auto& input = prompt_inputs[prompt_action];
+            if (input.dragging ||
+                (prompt_focus == 0U && mouse.motion != ftxui::Mouse::Pressed)) {
+                return input_mouse(prompt_value, input, mouse);
+            }
             if (mouse.button == ftxui::Mouse::Left &&
                 mouse.motion == ftxui::Mouse::Pressed) {
                 for (std::size_t index = 0;
@@ -5776,7 +6190,10 @@ struct App::Impl {
                         continue;
                     }
                     prompt_focus = index;
-                    if (index == 1U) {
+                    if (index == 0U) {
+                        input_mouse(prompt_value, input, mouse);
+                    } else if (index == 1U) {
+                        remember_input(input, prompt_value);
                         execute_prompt();
                     } else if (index == 2U) {
                         cancel_prompt();
@@ -5792,6 +6209,7 @@ struct App::Impl {
             if (prompt_focus == 2U) {
                 cancel_prompt();
             } else {
+                remember_input(prompt_inputs[prompt_action], prompt_value);
                 execute_prompt();
             }
             return true;
@@ -5799,22 +6217,43 @@ struct App::Impl {
         if (prompt_focus != 0U) {
             return false;
         }
-        if (event == ftxui::Event::CtrlU) {
-            prompt_value.clear();
-            prompt_error.clear();
+        if (event == ftxui::Event::Special("\x1B\t")) {
+            const bool path =
+                prompt_action == PromptAction::view_file ||
+                prompt_action == PromptAction::rename ||
+                prompt_action == PromptAction::mkdir ||
+                prompt_action == PromptAction::quick_cd ||
+                prompt_action == PromptAction::editor_open ||
+                prompt_action == PromptAction::editor_new ||
+                prompt_action == PromptAction::editor_save_as ||
+                prompt_action == PromptAction::hardlink ||
+                prompt_action == PromptAction::symlink ||
+                prompt_action == PromptAction::relative_symlink;
+            if (path) {
+                try {
+                    complete_path(
+                        prompt_value,
+                        prompt_inputs[prompt_action],
+                        active().path()
+                    );
+                    prompt_error.clear();
+                } catch (const std::exception& error) {
+                    prompt_error = error.what();
+                }
+            } else {
+                prompt_inputs[prompt_action].message =
+                    "Path completion is not available for this field";
+            }
             return true;
         }
-        if (event == ftxui::Event::Backspace) {
-            erase_last_utf8(prompt_value);
+        const auto previous = prompt_value;
+        const auto handled = edit_input(
+            prompt_value, prompt_inputs[prompt_action], event
+        );
+        if (prompt_value != previous) {
             prompt_error.clear();
-            return true;
         }
-        if (event.is_character()) {
-            prompt_value += event.character();
-            prompt_error.clear();
-            return true;
-        }
-        return false;
+        return handled;
     }
 
     bool handle_viewer(const ftxui::Event& event) {
@@ -5919,7 +6358,10 @@ struct App::Impl {
         editor_options_show_whitespace = editor_show_whitespace;
         editor_options_error.clear();
         editor_options_focus = 0;
-        editor_options_touched = {};
+        editor_tab_input.reset(editor_options_tab_width);
+        editor_tab_input.anchor = 0U;
+        editor_indent_input.reset(editor_options_indent_width);
+        editor_indent_input.anchor = 0U;
         mode = Mode::editor_options_dialog;
     }
 
@@ -5927,6 +6369,8 @@ struct App::Impl {
         editor_dialog_query = editor.search.needle;
         editor_dialog_replacement =
             replace ? editor_replace_text : std::string{};
+        editor_query_input.reset(editor_dialog_query);
+        editor_replacement_input.reset(editor_dialog_replacement);
         editor_dialog_scope = editor.selection();
         editor_dialog_options = editor.search.options;
         editor_dialog_in_selection =
@@ -6509,6 +6953,38 @@ struct App::Impl {
     }
 
     bool handle_editor_options_dialog(const ftxui::Event& event) {
+        if (event.is_mouse()) {
+            auto mouse_event = event;
+            const auto& mouse = mouse_event.mouse();
+            if (editor_tab_input.dragging) {
+                return input_mouse(editor_options_tab_width, editor_tab_input, mouse);
+            }
+            if (editor_indent_input.dragging) {
+                return input_mouse(
+                    editor_options_indent_width, editor_indent_input, mouse
+                );
+            }
+            if (mouse.button == ftxui::Mouse::Left &&
+                mouse.motion == ftxui::Mouse::Pressed) {
+                for (std::size_t index = 0; index < editor_options_boxes.size(); ++index) {
+                    if (!editor_options_boxes[index].Contain(mouse.x, mouse.y)) {
+                        continue;
+                    }
+                    editor_options_focus = index;
+                    if (index == 0U) {
+                        input_mouse(editor_options_tab_width, editor_tab_input, mouse);
+                    } else if (index == 1U) {
+                        input_mouse(
+                            editor_options_indent_width, editor_indent_input, mouse
+                        );
+                    } else {
+                        return handle_editor_options_dialog(ftxui::Event::Return);
+                    }
+                    break;
+                }
+            }
+            return true;
+        }
         const auto move_focus = [&](const int direction) {
             editor_options_focus =
                 direction > 0
@@ -6541,36 +7017,20 @@ struct App::Impl {
                 editor_options_focus == 0U
                     ? editor_options_tab_width
                     : editor_options_indent_width;
-            if (event == ftxui::Event::Backspace) {
-                editor_options_touched[editor_options_focus] = true;
-                if (!value.empty()) {
-                    value.pop_back();
-                }
-                editor_options_error.clear();
-                return true;
-            }
-            if (event.is_character() &&
-                event.character().size() == 1U &&
-                std::isdigit(
-                    static_cast<unsigned char>(
-                        event.character().front()
-                    )
-                ) != 0) {
-                if (!editor_options_touched[editor_options_focus]) {
-                    value.clear();
-                    editor_options_touched[editor_options_focus] =
-                        true;
-                }
-                if (value.size() < 2U) {
-                    value += event.character();
-                }
-                editor_options_error.clear();
-                return true;
-            }
             if (event == ftxui::Event::Return) {
                 move_focus(1);
                 return true;
             }
+            const auto previous = value;
+            const auto handled = edit_input(
+                value,
+                editor_options_focus == 0U ? editor_tab_input : editor_indent_input,
+                event
+            );
+            if (value != previous) {
+                editor_options_error.clear();
+            }
+            return handled;
         }
         if (editor_options_focus == 2U &&
             (
@@ -6630,6 +7090,8 @@ struct App::Impl {
             editor_options_focus = 1;
             return true;
         }
+        remember_input(editor_tab_input, editor_options_tab_width);
+        remember_input(editor_indent_input, editor_options_indent_width);
         editor.set_tab_width(*tab_width);
         editor_indent_width = *indent_width;
         editor_auto_indent = editor_options_auto_indent;
@@ -6789,6 +7251,44 @@ struct App::Impl {
 
     bool handle_editor_search_dialog(const ftxui::Event& event) {
         const bool replace = mode == Mode::editor_replace_dialog;
+        if (event.is_mouse()) {
+            auto mouse_event = event;
+            const auto& mouse = mouse_event.mouse();
+            if (editor_query_input.dragging) {
+                return input_mouse(editor_dialog_query, editor_query_input, mouse);
+            }
+            if (editor_replacement_input.dragging) {
+                return input_mouse(
+                    editor_dialog_replacement, editor_replacement_input, mouse
+                );
+            }
+            if (mouse.button == ftxui::Mouse::Left &&
+                mouse.motion == ftxui::Mouse::Pressed) {
+                for (std::size_t index = 0; index < editor_search_boxes.size(); ++index) {
+                    if ((!replace && index == 1U) || (replace && index == 9U) ||
+                        !editor_search_boxes[index].Contain(mouse.x, mouse.y)) {
+                        continue;
+                    }
+                    editor_dialog_focus = index;
+                    if (index == 0U) {
+                        input_mouse(editor_dialog_query, editor_query_input, mouse);
+                    } else if (index == 1U) {
+                        input_mouse(
+                            editor_dialog_replacement, editor_replacement_input, mouse
+                        );
+                    } else if (index < 7U) {
+                        return handle_editor_search_dialog(
+                            index == 2U ? ftxui::Event::ArrowRight
+                                        : ftxui::Event::Character(' ')
+                        );
+                    } else {
+                        return handle_editor_search_dialog(ftxui::Event::Return);
+                    }
+                    break;
+                }
+            }
+            return true;
+        }
         static const std::array<std::size_t, 9> search_focus{
             0, 2, 3, 4, 5, 6, 7, 8, 9
         };
@@ -6828,16 +7328,6 @@ struct App::Impl {
         if (event == ftxui::Event::TabReverse ||
             event == ftxui::Event::ArrowUp) {
             move_focus(-1);
-            return true;
-        }
-        if (event == ftxui::Event::Backspace &&
-            (editor_dialog_focus == 0U ||
-             editor_dialog_focus == 1U)) {
-            auto& value =
-                editor_dialog_focus == 0U
-                    ? editor_dialog_query
-                    : editor_dialog_replacement;
-            erase_last_utf8(value);
             return true;
         }
         if (editor_dialog_focus == 2U &&
@@ -6886,15 +7376,16 @@ struct App::Impl {
             }
             return true;
         }
-        if (event.is_character() &&
+        if (event != ftxui::Event::Return &&
             (editor_dialog_focus == 0U ||
              editor_dialog_focus == 1U)) {
-            auto& value =
-                editor_dialog_focus == 0U
-                    ? editor_dialog_query
-                    : editor_dialog_replacement;
-            value += event.character();
-            return true;
+            return edit_input(
+                editor_dialog_focus == 0U ? editor_dialog_query
+                                           : editor_dialog_replacement,
+                editor_dialog_focus == 0U ? editor_query_input
+                                           : editor_replacement_input,
+                event
+            );
         }
         if (replace && event == ftxui::Event::Return &&
             editor_dialog_focus == 0U) {
@@ -6924,6 +7415,10 @@ struct App::Impl {
             editor_dialog_in_selection
                 ? editor_dialog_scope
                 : std::nullopt;
+        remember_input(editor_query_input, editor_dialog_query);
+        if (replace) {
+            remember_input(editor_replacement_input, editor_dialog_replacement);
+        }
         try {
             if (!replace && editor_dialog_focus == 8U) {
                 const auto count = editor.count_matches(
@@ -7812,6 +8307,36 @@ struct App::Impl {
     }
 
     bool handle_operation_dialog(const ftxui::Event& event) {
+        if (event.is_mouse()) {
+            auto mouse_event = event;
+            const auto& mouse = mouse_event.mouse();
+            if (destination_input.dragging) {
+                return input_mouse(dialog_destination, destination_input, mouse);
+            }
+            if (mask_input.dragging) {
+                return input_mouse(dialog_source_mask, mask_input, mouse);
+            }
+            if (mouse.button == ftxui::Mouse::Left &&
+                mouse.motion == ftxui::Mouse::Pressed) {
+                for (std::size_t index = 0; index < operation_dialog_boxes.size(); ++index) {
+                    if (!operation_dialog_boxes[index].Contain(mouse.x, mouse.y)) {
+                        continue;
+                    }
+                    dialog_focus = index;
+                    if (index == 0U) {
+                        input_mouse(dialog_destination, destination_input, mouse);
+                    } else if (index == 1U) {
+                        input_mouse(dialog_source_mask, mask_input, mouse);
+                    } else if (index < 5U) {
+                        return handle_operation_dialog(ftxui::Event::Character(' '));
+                    } else {
+                        return handle_operation_dialog(ftxui::Event::Return);
+                    }
+                    break;
+                }
+            }
+            return true;
+        }
         if (event == ftxui::Event::Escape ||
             (event == ftxui::Event::Return && dialog_focus == 6U)) {
             mode = Mode::panels;
@@ -7856,26 +8381,10 @@ struct App::Impl {
             }
             return true;
         }
-        if (event == ftxui::Event::Backspace &&
-            (dialog_focus == 0U || dialog_focus == 1U)) {
-            erase_last_utf8(
-                dialog_focus == 0U
-                    ? dialog_destination
-                    : dialog_source_mask
-            );
-            return true;
-        }
-        if (event.is_character() &&
-            (dialog_focus == 0U || dialog_focus == 1U)) {
-            auto& value =
-                dialog_focus == 0U
-                    ? dialog_destination
-                    : dialog_source_mask;
-            value += event.character();
-            return true;
-        }
         if (event == ftxui::Event::Return) {
             try {
+                remember_input(destination_input, dialog_destination);
+                remember_input(mask_input, dialog_source_mask);
                 confirm_operation_dialog();
             } catch (const std::exception& error) {
                 set_error(error);
@@ -7883,6 +8392,28 @@ struct App::Impl {
                 clear_tree_operation_context();
             }
             return true;
+        }
+        if (dialog_focus == 0U || dialog_focus == 1U) {
+            if (event == ftxui::Event::Special("\x1B\t")) {
+                try {
+                    if (dialog_focus == 0U) {
+                        complete_path(dialog_destination, destination_input, active().path());
+                        status = destination_input.message.empty()
+                                     ? "Path completed"
+                                     : destination_input.message;
+                    } else {
+                        status = "Path completion is only available for the destination";
+                    }
+                } catch (const std::exception& error) {
+                    status = "Completion: " + std::string(error.what());
+                }
+                return true;
+            }
+            return edit_input(
+                dialog_focus == 0U ? dialog_destination : dialog_source_mask,
+                dialog_focus == 0U ? destination_input : mask_input,
+                event
+            );
         }
         return false;
     }
@@ -8255,39 +8786,29 @@ struct App::Impl {
             !(tree_panel && tree_panel_focused) &&
             !(quick_view_panel && quick_view_focused) &&
             !(information_panel && information_panel_focused);
-        if (command_mode && listing_focused && !panel_shortcut &&
+        const bool command_navigation =
+            event == ftxui::Event::ArrowLeft ||
+            event == ftxui::Event::ArrowRight ||
+            event == ftxui::Event::Home ||
+            event == ftxui::Event::End ||
+            event == ftxui::Event::CtrlA;
+        if (!command_mode && listing_focused &&
+            (event == ftxui::Event::AltP || event == ftxui::Event::AltN) &&
+            !command_input.history.empty()) {
+            command_mode = true;
+            command_input.reset(command_line);
+        }
+        if (command_mode && listing_focused &&
+            (!panel_shortcut || command_navigation) &&
             !panel_search_confirmed) {
             if (event == ftxui::Event::Escape) {
                 command_mode = false;
                 command_line.clear();
+                command_input.reset(command_line);
             } else if (event == ftxui::Event::Return) {
                 execute_command();
-            } else if (event == ftxui::Event::Backspace) {
-                if (!command_line.empty()) {
-                    command_line.pop_back();
-                }
-            } else if (event == ftxui::Event::AltP) {
-                if (!command_history.empty() &&
-                    command_history_index > 0U) {
-                    --command_history_index;
-                    command_line =
-                        command_history[command_history_index];
-                }
-            } else if (event == ftxui::Event::AltN) {
-                if (command_history_index + 1U <
-                    command_history.size()) {
-                    ++command_history_index;
-                    command_line =
-                        command_history[command_history_index];
-                } else {
-                    command_history_index =
-                        command_history.size();
-                    command_line.clear();
-                }
-            } else if (event.is_character()) {
-                command_line += event.character();
             } else {
-                return false;
+                return edit_input(command_line, command_input, event);
             }
             return true;
         }
@@ -9011,6 +9532,7 @@ struct App::Impl {
             } else if (event.is_character()) {
                 command_mode = true;
                 command_line = event.character();
+                command_input.reset(command_line);
             } else {
                 return false;
             }

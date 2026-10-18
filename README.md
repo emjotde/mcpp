@@ -12,6 +12,8 @@ Azure Blob Storage through azcpp. SSH/SFTP work is currently paused.
 - Independent dual panes with keyboard and mouse focus
 - Directory history, quick change, hidden-file toggle, filtering, sorting,
   tree view, hotlist, and panelized search results
+- Cursor/word editing, selection, kill/yank and session history in text inputs
+- Alt-Tab path completion in filename, directory and copy/move destination inputs
 - Selection, masks, inversion, and recursive search results
 - F2 user menu, F3 range/hex viewer, and F4 conflict-aware editor
 - F5 copy, F6 move, F7 mkdir, F8 delete, F9 menu, and F10 quit
@@ -121,6 +123,16 @@ Simple prompts use `Tab` / `Shift-Tab` to move between the input, OK and
 Cancel. Input Enter accepts; focused buttons accept Enter or Space, and can
 also be clicked. Escape cancels. File / View file... prompts for a filename;
 relative filenames are resolved against the active pane.
+
+Text inputs support `Left`/`Right`, `Home`/`End`, `Ctrl-Left`/`Ctrl-Right`,
+Shift movement for selection, and Delete/Backspace at the cursor. `Ctrl-K`
+kills to the end, `Ctrl-W` kills the previous word, and `Ctrl-Y` yanks it back.
+`Alt-P`/`Alt-N` recall session history. In dialogs, `Ctrl-U` clears the field;
+the commander's `Ctrl-U` pane-swap shortcut is unchanged.
+
+Use `Alt-Tab` (or Escape followed by Tab) to complete a dialog path.
+Repeated `Alt-Tab` cycles ambiguous matches. This completes filesystem paths,
+not shell variables or command names.
 
 Left / Right / Panelize by name... performs local recursive filename matching.
 External-command panelization is not implemented: its Command menu entry is
