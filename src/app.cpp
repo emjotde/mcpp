@@ -72,6 +72,7 @@ enum class Mode {
     editor_search_dialog,
     editor_replace_dialog,
     editor_replace_confirm,
+    editor_save_dialog,
     editor_close_dialog,
     editor_options_dialog,
     editor_history,
@@ -793,6 +794,8 @@ struct App::Impl {
     bool editor_menu_dropped{false};
     std::array<ftxui::Box, 7> editor_menu_category_boxes{};
     std::vector<ftxui::Box> editor_menu_item_boxes;
+    std::size_t editor_save_choice{0};
+    std::array<ftxui::Box, 2> editor_save_boxes{};
     std::size_t editor_close_choice{0};
     bool editor_quit_requested{false};
     std::size_t editor_quit_index{0};
@@ -4177,6 +4180,32 @@ struct App::Impl {
         );
     }
 
+    ftxui::Element render_editor_save_dialog() {
+        using namespace ftxui;
+        const auto button = [&](const std::string& label, const std::size_t index) {
+            auto element = text("[ " + label + " ]");
+            if (index == editor_save_choice) {
+                element = element | inverted | focus;
+            }
+            return element | reflect(editor_save_boxes[index]);
+        };
+        return vbox({
+                   text("Save file") | bold | center,
+                   separator(),
+                   paragraph("\"" + display_text(editor.path()) + "\""),
+                   separator(),
+                   hbox({
+                       filler(),
+                       button("Save", 0),
+                       text("  "),
+                       button("Cancel", 1),
+                       filler(),
+                   }),
+               }) |
+               borderStyled(LIGHT) |
+               size(WIDTH, LESS_THAN, 72);
+    }
+
     ftxui::Element render_editor_close_dialog() const {
         using namespace ftxui;
         const auto button = [&](const std::string& label,
@@ -5861,6 +5890,7 @@ struct App::Impl {
             display_mode == Mode::editor_search_dialog ||
             display_mode == Mode::editor_replace_dialog ||
             display_mode == Mode::editor_replace_confirm ||
+            display_mode == Mode::editor_save_dialog ||
             display_mode == Mode::editor_close_dialog ||
             display_mode == Mode::editor_options_dialog ||
             display_mode == Mode::editor_history ||
@@ -6299,6 +6329,11 @@ struct App::Impl {
             document = dbox({
                 document,
                 centered_modal(render_editor_replace_confirm()),
+            });
+        } else if (mode == Mode::editor_save_dialog) {
+            document = dbox({
+                document,
+                centered_modal(render_editor_save_dialog()),
             });
         } else if (mode == Mode::editor_close_dialog) {
             document = dbox({
@@ -6752,6 +6787,12 @@ struct App::Impl {
     }
 
     void save_editor() {
+        editor_save_choice = 0;
+        mode = Mode::editor_save_dialog;
+    }
+
+    void confirm_editor_save() {
+        mode = Mode::editor;
         try {
             editor.save(false);
             remember_editor_path(editor.path());
@@ -7467,6 +7508,53 @@ struct App::Impl {
         reset_editor_view_state();
         mode = Mode::editor;
         status = "Buffer: " + editor.path();
+        return true;
+    }
+
+    bool handle_editor_save_dialog(const ftxui::Event& event) {
+        if (event == ftxui::Event::Escape || event == ftxui::Event::F10) {
+            mode = Mode::editor;
+            return true;
+        }
+        if (event == ftxui::Event::ArrowLeft ||
+            event == ftxui::Event::ArrowRight ||
+            event == ftxui::Event::Tab ||
+            event == ftxui::Event::TabReverse) {
+            editor_save_choice = 1U - editor_save_choice;
+            return true;
+        }
+        if (event.is_mouse()) {
+            auto mouse_event = event;
+            const auto& mouse = mouse_event.mouse();
+            if (mouse.button != ftxui::Mouse::Left ||
+                mouse.motion != ftxui::Mouse::Pressed) {
+                return false;
+            }
+            const auto found = std::find_if(
+                editor_save_boxes.begin(), editor_save_boxes.end(),
+                [&](const ftxui::Box& box) { return box.Contain(mouse.x, mouse.y); }
+            );
+            if (found == editor_save_boxes.end()) {
+                return false;
+            }
+            editor_save_choice = static_cast<std::size_t>(
+                found - editor_save_boxes.begin()
+            );
+        } else if (event == ftxui::Event::Character('s') ||
+                   event == ftxui::Event::Character('S')) {
+            editor_save_choice = 0;
+        } else if (event == ftxui::Event::Character('c') ||
+                   event == ftxui::Event::Character('C')) {
+            editor_save_choice = 1;
+        } else if (event != ftxui::Event::Return &&
+                   event != ftxui::Event::Character(' ')) {
+            return false;
+        }
+        if (editor_save_choice == 0U) {
+            confirm_editor_save();
+        } else {
+            mode = Mode::editor;
+        }
         return true;
     }
 
@@ -9957,6 +10045,9 @@ struct App::Impl {
         }
         if (mode == Mode::editor_close_dialog) {
             return handle_editor_close_dialog(event);
+        }
+        if (mode == Mode::editor_save_dialog) {
+            return handle_editor_save_dialog(event);
         }
         if (mode == Mode::editor_options_dialog) {
             return handle_editor_options_dialog(event);

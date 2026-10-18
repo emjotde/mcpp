@@ -155,6 +155,10 @@ column; `Ctrl-PageUp`/`Ctrl-PageDown` go to the top/bottom visible line.
 `F8` deletes the marked block, or the whole current line if no block is marked.
 Delete still removes one character, and `Ctrl-U` undoes either deletion.
 
+`F2` and File > Save ask for confirmation with Save/Cancel, including for a
+clean buffer. Cancel preserves the draft, cursor and selection. Choosing Yes
+in the modified-file close/quit dialog saves without asking a second time.
+
 Click the editor header or press `F9` to open its menus, then click a category
 or action. Drag with the left mouse button to mark text; hold `Alt` while
 starting a drag to mark columns. Shift-click extends from the current cursor.

@@ -27,7 +27,7 @@ sleep 1
 printf '\033[F\032\033[H' >&3
 # Mark "alpha", use the clipboard once, copy it twice, then replace "beta".
 printf '\033[1;2C\033[1;2C\033[1;2C\033[1;2C\033[1;2C\033[2;5~\033[F\033[2;2~\033[15~\033[15~' >&3
-printf '\033[14~beta\rBETA\ro\033[12~' >&3
+printf '\033[14~beta\rBETA\ro\033[12~\r' >&3
 sleep 1
 # Exercise the modified-file close dialog and discard only the last X.
 printf 'X\033[21~' >&3
@@ -99,7 +99,7 @@ printf '8\t2\t\t \t\r' >&5
 sleep 0.5
 printf '\033[20~\033[C\033[C\033[C\033[C\033[C\033[C\033[F\r' >&5
 sleep 0.5
-printf '\033[B\tX\033[A\033[F\tY\033[12~' >&5
+printf '\033[B\tX\033[A\033[F\tY\033[12~\r' >&5
 sleep 0.5
 printf '\033[21~' >&5
 set +e
@@ -152,7 +152,7 @@ printf -v buffer_command 'XDG_CONFIG_HOME=%q %q -e %q' \
 buffer_runner=$!
 exec 6>"$temporary/buffer-input"
 sleep 1
-printf '\016\rbuffer-two\033[12~' >&6
+printf '\016\rbuffer-two\033[12~\r' >&6
 sleep 0.5
 printf '\033[20~\033[C\033[C\033[C\033[C\033[C\r\r' >&6
 sleep 0.5

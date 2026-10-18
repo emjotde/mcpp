@@ -183,6 +183,16 @@ class TerminalSession:
         self.wait(matches, f"Expected editor state {expected}")
         return self.editor_state()
 
+    def confirm_editor_save(self):
+        self.wait_for("Save file")
+        self.press("Enter")
+        self.wait_for("Save file", present=False)
+        self.wait_editor(dirty=False)
+
+    def save_editor(self):
+        self.press("F2")
+        self.confirm_editor_save()
+
     def wait_file(self, path, expected):
         path = Path(path)
         self.wait(

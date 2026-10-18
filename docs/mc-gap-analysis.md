@@ -198,7 +198,10 @@ retain the preferred column, including through short lines. F8 deletes the whole
 unmarked line; an empty mark is cleared without deleting text. The character
 readout distinguishes a newline from EOF.
 
-F2 still saves directly rather than showing MC's save-confirmation dialog.
+F2 and File > Save show Save/Cancel confirmation for clean and dirty buffers.
+Keyboard and mouse cancellation retain the draft, cursor and mark. Save failures
+keep the editor open and dirty. Yes in the modified-file close/quit dialog saves
+directly, without a redundant confirmation.
 
 Missing features include movable/resizable editor windows,
 block-to-file actions, lock interaction, backup/recovery modes,

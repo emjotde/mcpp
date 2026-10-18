@@ -240,6 +240,16 @@ if(MCPP_BUILD_TESTS)
                 ${MCPP_TMUX_EXECUTABLE}
         )
         set_tests_properties(mcpp_editor_parity PROPERTIES TIMEOUT 60)
+        add_test(
+            NAME mcpp_editor_save
+            COMMAND
+                ${MCPP_PYTHON_EXECUTABLE}
+                -B
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_editor_save.py
+                $<TARGET_FILE:mcpp>
+                ${MCPP_TMUX_EXECUTABLE}
+        )
+        set_tests_properties(mcpp_editor_save PROPERTIES TIMEOUT 60)
         if(EXISTS "/review/.operation-regressions-disposable")
             add_test(
                 NAME mcpp_operation_controls
@@ -251,6 +261,17 @@ if(MCPP_BUILD_TESTS)
                     ${MCPP_TMUX_EXECUTABLE}
             )
             set_tests_properties(mcpp_operation_controls PROPERTIES TIMEOUT 60)
+            add_test(
+                NAME mcpp_editor_save_failures
+                COMMAND
+                    ${MCPP_PYTHON_EXECUTABLE}
+                    -B
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_editor_save.py
+                    $<TARGET_FILE:mcpp>
+                    ${MCPP_TMUX_EXECUTABLE}
+                    --failures
+            )
+            set_tests_properties(mcpp_editor_save_failures PROPERTIES TIMEOUT 60)
         endif()
     endif()
 endif()

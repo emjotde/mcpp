@@ -324,6 +324,8 @@ background_notice() {
     done
     printf 'AFTER-' >&3
     send '\033OQ'
+    wait_log 'Save file'
+    send '\r'
     printf 'DIRTY-AFTER-ORIGINAL\n' >"$current/expected/edited"
     until cmp -s "$current/expected/edited" "$current/dst/note.txt"; do
         ((SECONDS < deadline)) || { fail 'editor input/save lost after background error'; return 1; }

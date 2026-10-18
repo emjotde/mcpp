@@ -262,7 +262,7 @@ def open_file(terminal, path):
 
 
 def save(terminal, path, expected):
-    terminal.step("F2")
+    terminal.save_editor()
     terminal.wait_editor(dirty=False)
     terminal.wait_file(path, expected)
 
