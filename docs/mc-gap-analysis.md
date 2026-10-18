@@ -628,6 +628,10 @@ review.
 
 ## Coverage limits
 
+The next execution plan is [100 additional parity and UI cases](mc-parity-ui-test-plan.md).
+All are planned, not executed; the six open E/U findings and existing regressions
+are tracked separately and are not included in that count.
+
 ### Original audit-fix verification (`13c9c34`)
 
 | Build | Functional checks |
