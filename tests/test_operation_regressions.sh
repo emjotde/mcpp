@@ -424,6 +424,9 @@ panelized_skip() {
     wait_log 'Source mask:'
     checkpoint
     send '\r'
+    wait_log 'Destination exists'
+    checkpoint
+    send 'n'
     wait_log 'Copy incomplete: 1 skipped'
     has_log 'destination exists:'
     ! has_log 'Copy complete'
@@ -458,12 +461,15 @@ disk_full() {
     wait_log 'Destination exists'
     checkpoint
     send '\r'
-    wait_log 'Error:'
+    wait_log 'File operation error'
     cmp -s "$current/expected/old" "$destination/a.bin"
     [[ "$(stat -c %a "$destination/a.bin")" == 640 ]]
     [[ "$(stat -c %s "$current/src/a.bin")" == 16777216 ]]
     [[ -z "$(find "$destination" -name '.mcpp-*' -print)" ]]
     snapshot after "$destination"
+    checkpoint
+    send '\033'
+    wait_log 'Operation cancelled'
     quit_session
 }
 
@@ -484,9 +490,6 @@ move_directory_alias() {
     start_session
     send '\033[B\033[2~\033[17~'
     wait_log 'Source mask:'
-    send '\r'
-    wait_log 'Destination exists'
-    checkpoint
     send '\r'
     wait_log 'Error:'
     cmp -s "$current/expected/important" "$current/src/tree/important.txt"
@@ -516,9 +519,6 @@ move_hardlink() {
     if [[ "$exact" == true ]]; then
         replace_destination "$current/dst" "$current/dst/a.txt"
     fi
-    send '\r'
-    wait_log 'Destination exists'
-    checkpoint
     send '\r'
     wait_log 'Move incomplete: 1 skipped'
     has_log 'same file'

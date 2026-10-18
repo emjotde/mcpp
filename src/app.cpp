@@ -85,6 +85,32 @@ enum class Mode {
     delete_dialog,
     operation_progress,
     conflict_dialog,
+    operation_error_dialog,
+    jobs,
+};
+
+enum class OperationChoice {
+    overwrite,
+    skip,
+    overwrite_all,
+    skip_all,
+    older,
+    retry,
+    ignore_all,
+    cancel,
+};
+
+struct OperationPolicy {
+    std::optional<CollisionDecision> collisions;
+    bool older{false};
+    bool ignore_errors{false};
+};
+
+struct OperationJob {
+    std::uint64_t id{0};
+    std::string label;
+    std::string destination;
+    std::string status;
 };
 
 enum class PromptAction {
@@ -711,7 +737,6 @@ struct App::Impl {
     TextInputState command_input;
     std::string input_clipboard;
     std::array<ftxui::Box, 7> operation_dialog_boxes{};
-    std::string pending_destination;
     std::string status{"Ready"};
     std::optional<std::string> pending_operation_notice;
     OperationEngine operations;
@@ -842,6 +867,22 @@ struct App::Impl {
     std::atomic_bool operation_skip{false};
     std::mutex operation_pause_mutex;
     std::condition_variable operation_pause_condition;
+    std::mutex operation_prompt_mutex;
+    std::condition_variable operation_prompt_condition;
+    std::optional<OperationChoice> operation_answer;
+    std::atomic_bool operation_prompt_pending{false};
+    std::optional<Entry> operation_prompt_source;
+    std::optional<Entry> operation_prompt_destination;
+    std::string operation_prompt_error;
+    Mode operation_return_mode{Mode::panels};
+    std::size_t operation_return_focus{0};
+    std::array<ftxui::Box, 6> operation_choice_boxes{};
+    std::vector<OperationJob> jobs;
+    std::optional<std::size_t> active_job;
+    std::size_t job_cursor{0};
+    std::uint64_t next_job_id{1};
+    std::array<ftxui::Box, 4> job_button_boxes{};
+    std::vector<ftxui::Box> job_row_boxes;
     std::jthread traversal_thread;
     std::atomic_bool traversal_running{false};
     Cancellation traversal_cancellation;
@@ -852,9 +893,6 @@ struct App::Impl {
     std::optional<std::string> tree_refresh_pending;
     bool tree_refresh_notify_pending{false};
     std::string operation_label{"File operation"};
-    bool pending_move{false};
-    bool pending_exact{false};
-    bool pending_background{false};
     int rendered_width{0};
     int rendered_height{0};
     std::optional<Entry> tree_operation_source;
@@ -1780,6 +1818,84 @@ struct App::Impl {
             );
         }
         operation_pause_condition.notify_all();
+        operation_prompt_condition.notify_all();
+    }
+
+    OperationChoice ask_operation(
+        Entry source,
+        std::optional<Entry> destination,
+        std::string error = {}
+    ) {
+        {
+            std::lock_guard lock(operation_prompt_mutex);
+            operation_answer.reset();
+            operation_prompt_pending.store(true, std::memory_order_release);
+        }
+        post_ui([
+            this, source = std::move(source),
+            destination = std::move(destination), error = std::move(error)
+        ]() mutable {
+            if (!operation_prompt_pending.load(std::memory_order_acquire) ||
+                operation_cancellation.requested()) {
+                return;
+            }
+            operation_return_mode = mode;
+            operation_return_focus = dialog_focus;
+            operation_prompt_source = std::move(source);
+            operation_prompt_destination = std::move(destination);
+            operation_prompt_error = std::move(error);
+            dialog_focus = 0;
+            mode = operation_prompt_destination
+                       ? Mode::conflict_dialog
+                       : Mode::operation_error_dialog;
+        });
+        std::unique_lock lock(operation_prompt_mutex);
+        while (!operation_answer && !operation_cancellation.requested()) {
+            operation_prompt_condition.wait_for(lock, std::chrono::milliseconds(100));
+        }
+        operation_prompt_pending.store(false, std::memory_order_release);
+        operation_cancellation.throw_if_requested();
+        return *operation_answer;
+    }
+
+    void answer_operation(const OperationChoice answer) {
+        mode = operation_return_mode;
+        dialog_focus = operation_return_focus;
+        {
+            std::lock_guard lock(operation_prompt_mutex);
+            operation_answer = answer;
+        }
+        operation_prompt_condition.notify_all();
+    }
+
+    OperationErrorResolver error_handler(
+        const std::shared_ptr<OperationPolicy>& policy
+    ) {
+        return [this, policy](const Entry& source, const std::string& message) {
+            if (policy->ignore_errors) {
+                return OperationErrorDecision::skip;
+            }
+            switch (ask_operation(source, std::nullopt, message)) {
+                case OperationChoice::retry:
+                    return OperationErrorDecision::retry;
+                case OperationChoice::ignore_all:
+                    policy->ignore_errors = true;
+                    return OperationErrorDecision::skip;
+                case OperationChoice::skip:
+                    return OperationErrorDecision::skip;
+                default:
+                    return OperationErrorDecision::cancel;
+            }
+        };
+    }
+
+    void start_job(const std::string& destination) {
+        if (jobs.size() >= 20U) {
+            jobs.erase(jobs.begin());
+        }
+        jobs.push_back({next_job_id++, operation_label, destination, "Running"});
+        active_job = jobs.size() - 1U;
+        job_cursor = *active_job;
     }
 
     void exit_terminal() {
@@ -1825,6 +1941,10 @@ struct App::Impl {
         const std::vector<std::string>& completed_sources = {},
         bool notify = false
     ) {
+        if (mode == Mode::conflict_dialog || mode == Mode::operation_error_dialog) {
+            mode = operation_return_mode;
+            dialog_focus = operation_return_focus;
+        }
         const bool background =
             mode != Mode::panels && mode != Mode::operation_progress;
         if (mode == Mode::operation_progress) {
@@ -1848,6 +1968,9 @@ struct App::Impl {
         }
         if (background && notify) {
             pending_operation_notice = status;
+        }
+        if (active_job) {
+            jobs[*active_job].status = status;
         }
     }
 
@@ -2293,44 +2416,11 @@ struct App::Impl {
         }
         dialog_exact = sources.size() == 1U &&
                        !destination_directory;
-        if (dialog_exact) {
-            if (config.confirm_overwrite &&
-                destination_provider->exists(dialog_destination)) {
-                pending_destination = dialog_destination;
-                pending_move = dialog_move;
-                pending_exact = true;
-                pending_background = dialog_background;
-                dialog_focus = 0;
-                mode = Mode::conflict_dialog;
-                return;
-            }
-            run_operation(
-                dialog_move,
-                dialog_destination,
-                !config.confirm_overwrite,
-                true
-            );
-            if (dialog_background) {
-                mode = Mode::panels;
-                status =
-                    operation_label + " running in background";
-            }
-            return;
-        }
-        if (config.confirm_overwrite &&
-            has_collision(dialog_destination)) {
-            pending_destination = dialog_destination;
-            pending_move = dialog_move;
-            pending_exact = false;
-            pending_background = dialog_background;
-            dialog_focus = 0;
-            mode = Mode::conflict_dialog;
-            return;
-        }
         run_operation(
             dialog_move,
             dialog_destination,
-            !config.confirm_overwrite
+            !config.confirm_overwrite,
+            dialog_exact
         );
         if (dialog_background) {
             mode = Mode::panels;
@@ -2385,16 +2475,44 @@ struct App::Impl {
                 ? tree_operation_source_index
                 : active_index
         ];
+        const auto policy = std::make_shared<OperationPolicy>();
         const OperationOptions options{
             .overwrite = overwrite,
             .preserve_permissions = dialog_preserve_attributes,
             .preserve_symlinks = dialog_preserve_symlinks,
             .collision =
-                [overwrite](const Entry&, const Entry&) {
-                    return overwrite
-                               ? CollisionDecision::overwrite
-                               : CollisionDecision::skip;
+                [this, policy](const Entry& source, const Entry& target) {
+                    if (policy->collisions) {
+                        return *policy->collisions;
+                    }
+                    if (policy->older) {
+                        return source.kind == EntryKind::directory ||
+                                       source.modified > target.modified
+                                   ? CollisionDecision::overwrite
+                                   : CollisionDecision::skip;
+                    }
+                    switch (ask_operation(source, target)) {
+                        case OperationChoice::overwrite:
+                            return CollisionDecision::overwrite;
+                        case OperationChoice::skip:
+                            return CollisionDecision::skip;
+                        case OperationChoice::overwrite_all:
+                            policy->collisions = CollisionDecision::overwrite;
+                            return CollisionDecision::overwrite;
+                        case OperationChoice::skip_all:
+                            policy->collisions = CollisionDecision::skip;
+                            return CollisionDecision::skip;
+                        case OperationChoice::older:
+                            policy->older = true;
+                            return source.kind == EntryKind::directory ||
+                                           source.modified > target.modified
+                                       ? CollisionDecision::overwrite
+                                       : CollisionDecision::skip;
+                        default:
+                            return CollisionDecision::cancel;
+                    }
                 },
+            .error = error_handler(policy),
         };
         clear_tree_operation_context();
         operation_running.store(true, std::memory_order_release);
@@ -2403,6 +2521,7 @@ struct App::Impl {
         operation_skip.store(false, std::memory_order_release);
         mode = Mode::operation_progress;
         operation_label = move_operation ? "Move" : "Copy";
+        start_job(destination);
         status = move_operation ? "Starting move" : "Starting copy";
         try {
             operation_thread = std::jthread(
@@ -2573,33 +2692,17 @@ struct App::Impl {
                     });
                 }
             });
-        } catch (...) {
+        } catch (const std::exception& error) {
             operation_running.store(
                 false,
                 std::memory_order_release
             );
+            if (active_job) {
+                jobs[*active_job].status = "Error: " + std::string(error.what());
+            }
+            mode = Mode::panels;
             throw;
         }
-    }
-
-    bool has_collision(const std::string& destination) {
-        const auto sources = matching_operation_sources();
-        const auto provider =
-            tree_operation_source
-                ? tree_operation_destination_provider
-                : passive().provider();
-        return std::any_of(
-            sources.begin(),
-            sources.end(),
-            [&](const Entry& entry) {
-                return provider->exists(
-                    provider->join(
-                        destination,
-                        entry.name
-                    )
-                );
-            }
-        );
     }
 
     void run_remove_operation() {
@@ -2636,10 +2739,12 @@ struct App::Impl {
         operation_skip.store(false, std::memory_order_release);
         mode = Mode::operation_progress;
         operation_label = "Delete";
+        start_job({});
+        const auto resolve_error = error_handler(std::make_shared<OperationPolicy>());
         status = "Starting delete";
         try {
             operation_thread = std::jthread(
-            [this, provider, entries, source_id] {
+            [this, provider, entries, source_id, resolve_error] {
                 OperationResult result;
                 try {
                     operations.remove(
@@ -2676,17 +2781,23 @@ struct App::Impl {
                                     ")";
                             });
                         },
-                        &result
+                        &result,
+                        resolve_error
                     );
                     post_ui([
                         this,
                         source_id,
-                        completed = std::move(result.completed_sources)
+                        result = std::move(result)
                     ] {
                         finish_operation(
-                            "Delete complete",
+                            result.skipped.empty()
+                                ? "Delete complete"
+                                : "Delete incomplete: " +
+                                      std::to_string(result.skipped.size()) +
+                                      " skipped",
                             source_id,
-                            completed
+                            result.completed_sources,
+                            !result.skipped.empty()
                         );
                     });
                 } catch (const OperationCancelled&) {
@@ -2719,11 +2830,15 @@ struct App::Impl {
                     });
                 }
             });
-        } catch (...) {
+        } catch (const std::exception& error) {
             operation_running.store(
                 false,
                 std::memory_order_release
             );
+            if (active_job) {
+                jobs[*active_job].status = "Error: " + std::string(error.what());
+            }
+            mode = Mode::panels;
             throw;
         }
     }
@@ -4462,7 +4577,7 @@ struct App::Impl {
                 {"Viewed/edited files history   M-E", -1},
                 {"Directory hotlist             C-\\", 7},
                 {"Active VFS list               C-x a", -1},
-                {"Background jobs               C-x j", -1},
+                {"Background jobs               C-x j", 10},
                 {"Screen list                   M-`", -1},
                 {"", -2},
                 {"Undelete files (ext2fs only)", -1},
@@ -4887,6 +5002,9 @@ struct App::Impl {
                 case 8:
                     mode = Mode::user_menu;
                     return;
+                case 10:
+                    open_jobs();
+                    return;
                 default:
                     break;
             }
@@ -5181,32 +5299,134 @@ struct App::Impl {
                borderStyled(LIGHT) | size(WIDTH, EQUAL, 72);
     }
 
-    ftxui::Element render_conflict_dialog() const {
+    ftxui::Element render_conflict_dialog() {
         using namespace ftxui;
-        const auto focused = [&](Element element, const std::size_t index) {
-            return dialog_focus == index
-                       ? element | inverted | focus
-                       : element;
+        const bool error = mode == Mode::operation_error_dialog;
+        const std::vector<std::string> labels =
+            error ? std::vector<std::string>{"Retry", "Skip", "Ignore all", "Abort"}
+                  : std::vector<std::string>{
+                        "Overwrite", "Skip", "All", "None", "Older", "Cancel"
+                    };
+        Elements rows{
+            text(error ? "File operation error" : "Destination exists") | bold | center,
+            separator(),
         };
+        if (operation_prompt_source) {
+            rows.push_back(paragraph(
+                "Source: " + display_text(operation_prompt_source->path)
+            ));
+            rows.push_back(text(
+                "Size: " + format_size(operation_prompt_source->size) +
+                "  Modified: " + format_time(operation_prompt_source->modified)
+            ));
+        }
+        if (operation_prompt_destination) {
+            rows.push_back(paragraph(
+                "Destination: " + display_text(operation_prompt_destination->path)
+            ));
+            rows.push_back(text(
+                "Size: " + format_size(operation_prompt_destination->size) +
+                "  Modified: " + format_time(operation_prompt_destination->modified)
+            ));
+        }
+        if (error) {
+            rows.push_back(paragraph(display_text(operation_prompt_error)));
+        }
+        rows.push_back(separator());
+        Elements buttons;
+        for (std::size_t index = 0; index < labels.size(); ++index) {
+            auto button = text(" [ " + labels[index] + " ] ");
+            if (dialog_focus == index) {
+                button = button | inverted | focus;
+            }
+            buttons.push_back(
+                std::move(button) | reflect(operation_choice_boxes[index])
+            );
+        }
+        if (error) {
+            rows.push_back(hbox(std::move(buttons)) | center);
+            rows.push_back(text("R retry  S skip  I ignore all  Esc abort") | center);
+        } else {
+            Elements first, second;
+            for (std::size_t index = 0; index < buttons.size(); ++index) {
+                (index < 3U ? first : second).push_back(std::move(buttons[index]));
+            }
+            rows.push_back(hbox(std::move(first)) | center);
+            rows.push_back(hbox(std::move(second)) | center);
+            rows.push_back(text("Y overwrite  N skip  A all  S none  O older  Esc abort") | center);
+        }
+        return vbox(std::move(rows)) | borderStyled(LIGHT) |
+               size(WIDTH, LESS_THAN, std::min(90, Terminal::Size().dimx));
+    }
+
+    void open_jobs() {
+        if (active_job) {
+            job_cursor = *active_job;
+        } else if (!jobs.empty()) {
+            job_cursor = jobs.size() - 1U;
+        }
+        mode = Mode::jobs;
+    }
+
+    ftxui::Element render_jobs() {
+        using namespace ftxui;
+        Elements rows;
+        job_row_boxes.assign(jobs.size(), {});
+        for (std::size_t index = 0; index < jobs.size(); ++index) {
+            auto state = jobs[index].status;
+            if (active_job == index &&
+                operation_running.load(std::memory_order_acquire)) {
+                state = operation_prompt_pending.load(std::memory_order_acquire)
+                            ? "Waiting for decision"
+                            : operation_paused.load(std::memory_order_acquire)
+                                  ? "Paused"
+                                  : "Running";
+            }
+            auto row = text(
+                std::to_string(jobs[index].id) + "  " +
+                jobs[index].label + "  " +
+                middle_truncate(
+                    display_text(state),
+                    std::max(1, std::min(68, Terminal::Size().dimx - 12))
+                )
+            );
+            if (job_cursor == index) {
+                row = row | inverted | focus;
+            }
+            rows.push_back(std::move(row) | reflect(job_row_boxes[index]));
+        }
+        if (rows.empty()) {
+            rows.push_back(text("No file-operation jobs"));
+        }
+        Elements buttons;
+        const std::array<std::string, 4> labels{
+            "Pause/Resume F2", "Show F3", "Abort F8", "Close"
+        };
+        for (std::size_t index = 0; index < labels.size(); ++index) {
+            buttons.push_back(
+                text(" [ " + labels[index] + " ] ") |
+                reflect(job_button_boxes[index])
+            );
+        }
         return vbox({
-                   text("Destination exists") | bold | center,
+                   text("Background jobs") | bold | center,
                    separator(),
-                   text(display_text(pending_destination)),
+                   vbox(std::move(rows)) | yframe |
+                       size(HEIGHT, LESS_THAN, std::max(1, Terminal::Size().dimy - 9)),
+                   separator(),
                    text(
-                       pending_exact
-                           ? "Replace this destination?"
-                           : "Some destination entries already exist."
+                       job_cursor < jobs.size()
+                           ? middle_truncate(
+                                 display_text(jobs[job_cursor].destination),
+                                 std::max(1, Terminal::Size().dimx - 8)
+                             )
+                           : ""
                    ),
-                   separator(),
-                   hbox({
-                       focused(text(" [ Overwrite all ] "), 0),
-                       text(" "),
-                       focused(text(" [ Skip all ] "), 1),
-                       text(" "),
-                       focused(text(" [ Cancel ] "), 2),
-                   }) | center,
+                   hbox({buttons[0], buttons[1]}) | center,
+                   hbox({buttons[2], buttons[3]}) | center,
                }) |
-               borderStyled(LIGHT) | size(WIDTH, EQUAL, 72);
+               borderStyled(LIGHT) |
+               size(WIDTH, LESS_THAN, std::min(90, Terminal::Size().dimx));
     }
 
     ftxui::Element render_search_results() const {
@@ -5576,27 +5796,31 @@ struct App::Impl {
         }
         rendered_width = terminal_dimensions.dimx;
         rendered_height = terminal_dimensions.dimy;
+        const auto display_mode =
+            mode == Mode::conflict_dialog || mode == Mode::operation_error_dialog
+                ? operation_return_mode
+                : mode;
         const bool editor_context =
-            mode == Mode::editor ||
-            mode == Mode::editor_menu ||
-            mode == Mode::editor_help ||
-            mode == Mode::editor_error ||
-            mode == Mode::editor_search_dialog ||
-            mode == Mode::editor_replace_dialog ||
-            mode == Mode::editor_replace_confirm ||
-            mode == Mode::editor_close_dialog ||
-            mode == Mode::editor_options_dialog ||
-            mode == Mode::editor_history ||
-            mode == Mode::editor_buffer_list ||
+            display_mode == Mode::editor ||
+            display_mode == Mode::editor_menu ||
+            display_mode == Mode::editor_help ||
+            display_mode == Mode::editor_error ||
+            display_mode == Mode::editor_search_dialog ||
+            display_mode == Mode::editor_replace_dialog ||
+            display_mode == Mode::editor_replace_confirm ||
+            display_mode == Mode::editor_close_dialog ||
+            display_mode == Mode::editor_options_dialog ||
+            display_mode == Mode::editor_history ||
+            display_mode == Mode::editor_buffer_list ||
             (
-                mode == Mode::prompt &&
+                display_mode == Mode::prompt &&
                 mode_before_prompt == Mode::editor
             );
         const bool viewer_context =
-            mode == Mode::viewer ||
-            mode == Mode::viewer_message ||
+            display_mode == Mode::viewer ||
+            display_mode == Mode::viewer_message ||
             (
-                mode == Mode::prompt &&
+                display_mode == Mode::prompt &&
                 mode_before_prompt == Mode::viewer
             );
         Element body;
@@ -6121,10 +6345,16 @@ struct App::Impl {
                 document,
                 centered_modal(render_operation_progress()),
             });
-        } else if (mode == Mode::conflict_dialog) {
+        } else if (mode == Mode::conflict_dialog ||
+                   mode == Mode::operation_error_dialog) {
             document = dbox({
                 document,
                 centered_modal(render_conflict_dialog()),
+            });
+        } else if (mode == Mode::jobs) {
+            document = dbox({
+                document,
+                centered_modal(render_jobs()),
             });
         } else if (
             mode == Mode::pulldown &&
@@ -8500,53 +8730,117 @@ struct App::Impl {
     }
 
     bool handle_conflict_dialog(const ftxui::Event& event) {
-        if (event == ftxui::Event::Escape) {
-            mode = Mode::panels;
-            status = "Operation cancelled";
-            pending_destination.clear();
-            pending_background = false;
-            clear_tree_operation_context();
+        const bool error = mode == Mode::operation_error_dialog;
+        const std::vector<OperationChoice> choices =
+            error ? std::vector<OperationChoice>{
+                        OperationChoice::retry, OperationChoice::skip,
+                        OperationChoice::ignore_all, OperationChoice::cancel
+                    }
+                  : std::vector<OperationChoice>{
+                        OperationChoice::overwrite, OperationChoice::skip,
+                        OperationChoice::overwrite_all, OperationChoice::skip_all,
+                        OperationChoice::older, OperationChoice::cancel
+                    };
+        if (event == ftxui::Event::Escape || event == ftxui::Event::F10) {
+            answer_operation(OperationChoice::cancel);
+            return true;
+        }
+        if (event.is_mouse()) {
+            auto mouse_event = event;
+            const auto& mouse = mouse_event.mouse();
+            for (std::size_t index = 0; index < choices.size(); ++index) {
+                if (operation_choice_boxes[index].Contain(mouse.x, mouse.y)) {
+                    dialog_focus = index;
+                    if (mouse.button == ftxui::Mouse::Left &&
+                        mouse.motion == ftxui::Mouse::Pressed) {
+                        answer_operation(choices[index]);
+                    }
+                    break;
+                }
+            }
             return true;
         }
         if (event == ftxui::Event::ArrowLeft ||
             event == ftxui::Event::TabReverse) {
-            dialog_focus = (dialog_focus + 2U) % 3U;
+            dialog_focus = (dialog_focus + choices.size() - 1U) % choices.size();
             return true;
         }
         if (event == ftxui::Event::ArrowRight ||
             event == ftxui::Event::Tab) {
-            dialog_focus = (dialog_focus + 1U) % 3U;
+            dialog_focus = (dialog_focus + 1U) % choices.size();
             return true;
         }
-        if (event != ftxui::Event::Return) {
+        if (event.is_character() && event.character().size() == 1U) {
+            const auto key = static_cast<char>(std::tolower(
+                static_cast<unsigned char>(event.character().front())
+            ));
+            const std::string shortcuts = error ? "rsia" : "ynasoc";
+            const auto position = shortcuts.find(key);
+            if (position != std::string::npos) {
+                answer_operation(choices[position]);
+                return true;
+            }
+        }
+        if (event == ftxui::Event::Return) {
+            answer_operation(choices[dialog_focus]);
+            return true;
+        }
+        return false;
+    }
+
+    bool handle_jobs(const ftxui::Event& event) {
+        if (event == ftxui::Event::Escape || event == ftxui::Event::F10) {
+            mode = Mode::panels;
+            return true;
+        }
+        if (event.is_mouse()) {
+            auto mouse_event = event;
+            const auto& mouse = mouse_event.mouse();
+            if (mouse.button == ftxui::Mouse::Left &&
+                mouse.motion == ftxui::Mouse::Pressed) {
+                for (std::size_t index = 0; index < job_row_boxes.size(); ++index) {
+                    if (job_row_boxes[index].Contain(mouse.x, mouse.y)) {
+                        job_cursor = index;
+                        return true;
+                    }
+                }
+                const std::array<ftxui::Event, 4> actions{
+                    ftxui::Event::F2, ftxui::Event::F3,
+                    ftxui::Event::F8, ftxui::Event::Escape
+                };
+                for (std::size_t index = 0; index < job_button_boxes.size(); ++index) {
+                    if (job_button_boxes[index].Contain(mouse.x, mouse.y)) {
+                        return handle_jobs(actions[index]);
+                    }
+                }
+            }
+            return true;
+        }
+        if (event == ftxui::Event::ArrowUp && job_cursor > 0U) {
+            --job_cursor;
+        } else if (event == ftxui::Event::ArrowDown && job_cursor + 1U < jobs.size()) {
+            ++job_cursor;
+        } else if (event == ftxui::Event::F2 || event == ftxui::Event::F3 ||
+                   event == ftxui::Event::F8 || event == ftxui::Event::Return) {
+            if (active_job != job_cursor ||
+                !operation_running.load(std::memory_order_acquire)) {
+                status = "No running job selected";
+                return true;
+            }
+            if (event == ftxui::Event::F2) {
+                operation_paused.store(
+                    !operation_paused.load(std::memory_order_acquire),
+                    std::memory_order_release
+                );
+                operation_pause_condition.notify_all();
+            } else if (event == ftxui::Event::F8) {
+                request_operation_cancel();
+            } else {
+                mode = Mode::operation_progress;
+            }
+        } else {
             return false;
         }
-        if (dialog_focus == 2U) {
-            mode = Mode::panels;
-            status = "Operation cancelled";
-            pending_destination.clear();
-            pending_background = false;
-            clear_tree_operation_context();
-            return true;
-        }
-        try {
-            run_operation(
-                pending_move,
-                pending_destination,
-                dialog_focus == 0U,
-                pending_exact
-            );
-            if (pending_background) {
-                mode = Mode::panels;
-                status = operation_label + " running in background";
-            }
-        } catch (const std::exception& error) {
-            set_error(error);
-            mode = Mode::panels;
-            clear_tree_operation_context();
-        }
-        pending_destination.clear();
-        pending_background = false;
         return true;
     }
 
@@ -8715,6 +9009,8 @@ struct App::Impl {
                     execute_pulldown_action(1U, 9);
                 } else if (event == ftxui::Event::d) {
                     execute_pulldown_action(2U, 1);
+                } else if (event == ftxui::Event::j) {
+                    open_jobs();
                 } else if (
                     event == ftxui::Event::Character('!')
                 ) {
@@ -9636,8 +9932,11 @@ struct App::Impl {
         if (mode == Mode::operation_progress) {
             return handle_operation_progress(event);
         }
-        if (mode == Mode::conflict_dialog) {
+        if (mode == Mode::conflict_dialog || mode == Mode::operation_error_dialog) {
             return handle_conflict_dialog(event);
+        }
+        if (mode == Mode::jobs) {
+            return handle_jobs(event);
         }
         return handle_panels(event);
     }

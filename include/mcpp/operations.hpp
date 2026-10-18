@@ -19,11 +19,23 @@ using CollisionResolver = std::function<CollisionDecision(
     const Entry& destination
 )>;
 
+enum class OperationErrorDecision {
+    retry,
+    skip,
+    cancel,
+};
+
+using OperationErrorResolver = std::function<OperationErrorDecision(
+    const Entry& source,
+    const std::string& message
+)>;
+
 struct OperationOptions {
     bool overwrite{false};
     bool preserve_permissions{true};
     bool preserve_symlinks{true};
     CollisionResolver collision;
+    OperationErrorResolver error{};
 };
 
 struct SkippedSource {
@@ -88,7 +100,8 @@ public:
         const std::vector<Entry>& entries,
         const Cancellation& cancellation,
         const ProgressCallback& progress = {},
-        OperationResult* result = nullptr
+        OperationResult* result = nullptr,
+        const OperationErrorResolver& error = {}
     ) const;
 
 private:
@@ -99,6 +112,17 @@ private:
     );
 
     static bool copy_entry(
+        Provider& source_provider,
+        const Entry& source,
+        Provider& destination_provider,
+        std::string_view destination,
+        const OperationOptions& options,
+        const Cancellation& cancellation,
+        TransferProgress& state,
+        const ProgressCallback& progress,
+        std::string& skip_reason
+    );
+    static bool copy_entry_once(
         Provider& source_provider,
         const Entry& source,
         Provider& destination_provider,

@@ -18,6 +18,9 @@ Azure Blob Storage through azcpp. SSH/SFTP work is currently paused.
 - F2 user menu, F3 range/hex viewer, and F4 conflict-aware editor
 - F5 copy, F6 move, F7 mkdir, F8 delete, F9 menu, and F10 quit
 - Asynchronous copy/move/delete progress and cancellation
+- Per-file overwrite, skip, all/none and newer-source-only choices
+- Retry, skip, ignore-all or abort on transfer/removal errors
+- `Ctrl-X j` background jobs view with recent results and pause/resume/show/abort
 - Background completion preserves the current editor, viewer, or prompt
 - Background failures remain visible on return to panels; `Esc` dismisses the notice
 - Copy/move destinations accept directories or single-file exact names;

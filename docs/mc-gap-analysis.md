@@ -141,9 +141,16 @@ Failures, skipped-source results, and cancellation during another full-screen
 view remain pending instead of closing that view or losing the result.
 The commander shows `Background [Esc]` on return; Escape dismisses the notice.
 
-This is still not MC's full operation controller. Rich per-file overwrite
-choices, retry/ignore workflows, background job management, recursive-delete
-choices, append/reget, and resumable disk-full recovery are not equivalent.
+Collisions now offer per-file Overwrite/Skip, All/None, Older (overwrite only
+when the source is newer), and Cancel. Transfer, rename and removal errors offer
+Retry, Skip, Ignore all, and Abort. Skipped items remain selected and produce
+an incomplete result. `Ctrl-X j` opens recent job results and active-job
+pause/resume, show-progress and abort controls.
+
+This is still not MC's full operation controller. Only one operation can run
+at once, job history is session-local, and initial traversal/measurement errors
+still abort the operation. Recursive-delete choices, append/reget, and resuming
+a partially copied file remain gaps; Retry restarts the failed file.
 ACLs, xattrs, sparse layout, hard-link sets, and all failure/rollback
 combinations were not established by this review.
 
