@@ -32,6 +32,7 @@ Azure Blob Storage through azcpp. SSH/SFTP work is currently paused.
 - Persisted editor tab width, indentation, auto-indent, and whitespace markers
 - Persistent linear/column blocks and atomic cross-session editor clipboard
 - Persistent editor history and switchable multi-buffer editing
+- Clickable editor menus and mouse-drag linear/Alt-drag column blocks
 
 The implementation is behaviorally familiar but does not use Midnight
 Commander source code, resources, strings, tests, or artwork. A shallow MC
@@ -130,6 +131,10 @@ disabled, and `Ctrl-X !` reports that it is unavailable.
 Each editor buffer keeps its own search query, options, selection scope, cursor,
 mark, and undo history. Moving a block keeps its destination marked. Rectangular
 copies preserve real spaces without filling virtual source cells.
+
+Click the editor header or press `F9` to open its menus, then click a category
+or action. Drag with the left mouse button to mark text; hold `Alt` while
+starting a drag to mark columns. Shift-click extends from the current cursor.
 
 File > Close or `Esc` closes the active buffer. `F10` or File > Quit checks every
 dirty buffer, including inactive buffers. Cancel keeps all buffers open, and

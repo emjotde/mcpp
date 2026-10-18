@@ -220,6 +220,16 @@ if(MCPP_BUILD_TESTS)
                 ${CMAKE_CURRENT_BINARY_DIR}/editor-ui
         )
         set_tests_properties(mcpp_editor_workflows PROPERTIES TIMEOUT 180)
+        add_test(
+            NAME mcpp_editor_mouse
+            COMMAND
+                ${MCPP_PYTHON_EXECUTABLE}
+                -B
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_editor_mouse.py
+                $<TARGET_FILE:mcpp>
+                ${MCPP_TMUX_EXECUTABLE}
+        )
+        set_tests_properties(mcpp_editor_mouse PROPERTIES TIMEOUT 60)
     endif()
 endif()
 

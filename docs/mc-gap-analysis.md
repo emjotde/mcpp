@@ -124,7 +124,7 @@ custom keymaps remain gaps. Grayscale chrome is intentional.
 
 Generic inputs now have usable controls but remain simpler than MC's input
 widgets: full cursor/word editing, selection, completion, and input history
-are not implemented. Editor-menu mouse behavior is not complete.
+are not implemented. Editor menus now support mouse category/action selection.
 
 ### File operations and search
 
@@ -178,8 +178,10 @@ F10 and File > Quit check inactive dirty buffers as well as the current one.
 Cancel retains every buffer, including after an earlier No decision. File >
 Close and Escape still close only the current buffer.
 
-Missing features include movable/resizable editor windows, full mouse block
-selection, block-to-file actions, lock interaction, backup/recovery modes,
+Mouse dragging supports linear blocks and Alt-drag column blocks.
+
+Missing features include movable/resizable editor windows,
+block-to-file actions, lock interaction, backup/recovery modes,
 macros, spell checking, literal insertion, completion, all-charsets search,
 navigable Find All results, replace-again, formatting, and external filters.
 Binary/non-printable editing and grapheme-cluster editing are not claimed
