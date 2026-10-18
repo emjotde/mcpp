@@ -3,7 +3,10 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <cwchar>
+#include <cwctype>
 #include <limits>
+#include <locale.h>
 #include <regex.h>
 #include <stdexcept>
 
@@ -20,6 +23,86 @@ std::string lowercase(std::string value) {
         }
     );
     return value;
+}
+
+class Utf8CType {
+public:
+    Utf8CType() {
+        struct Locale {
+            locale_t value{newlocale(LC_CTYPE_MASK, "C.UTF-8", nullptr)};
+
+            Locale() {
+                if (value == nullptr) {
+                    throw std::runtime_error("C.UTF-8 locale is unavailable");
+                }
+            }
+
+            ~Locale() {
+                freelocale(value);
+            }
+        };
+        static const Locale locale;
+        previous_ = uselocale(locale.value);
+        if (previous_ == nullptr) {
+            throw std::runtime_error("cannot select UTF-8 search locale");
+        }
+    }
+
+    ~Utf8CType() {
+        uselocale(previous_);
+    }
+
+    Utf8CType(const Utf8CType&) = delete;
+    Utf8CType& operator=(const Utf8CType&) = delete;
+
+private:
+    locale_t previous_{nullptr};
+};
+
+struct FoldedText {
+    std::u32string characters;
+    std::vector<std::size_t> offsets;
+};
+
+FoldedText fold_utf8(const std::string_view text) {
+    const Utf8CType locale;
+    FoldedText result;
+    std::mbstate_t state{};
+    std::size_t offset = 0;
+    while (offset < text.size()) {
+        result.offsets.push_back(offset);
+        wchar_t character{};
+        auto length = std::mbrtowc(
+            &character,
+            text.data() + offset,
+            text.size() - offset,
+            &state
+        );
+        if (length == static_cast<std::size_t>(-1) ||
+            length == static_cast<std::size_t>(-2)) {
+            state = {};
+            // Keep invalid bytes distinct from valid Unicode characters.
+            result.characters.push_back(
+                static_cast<char32_t>(
+                    0x110000U +
+                    static_cast<unsigned char>(text[offset])
+                )
+            );
+            length = 1U;
+        } else {
+            result.characters.push_back(
+                static_cast<char32_t>(
+                    std::towlower(static_cast<wint_t>(character))
+                )
+            );
+            if (length == 0U) {
+                length = 1U;
+            }
+        }
+        offset += length;
+    }
+    result.offsets.push_back(text.size());
+    return result;
 }
 
 bool word_byte(const unsigned char value) {
@@ -42,6 +125,49 @@ bool whole_word(
             static_cast<unsigned char>(text[match.end])
         );
     return !left && !right;
+}
+
+std::vector<EditorSearchMatch> utf8_literal_matches(
+    const std::string_view text,
+    const std::string_view pattern,
+    const std::size_t range_begin,
+    const std::size_t range_end,
+    const EditorSearchOptions& options,
+    const bool overlap,
+    const std::size_t limit
+) {
+    const auto haystack = fold_utf8(text);
+    const auto needle = fold_utf8(pattern);
+    auto cursor = static_cast<std::size_t>(std::distance(
+        haystack.offsets.begin(),
+        std::lower_bound(
+            haystack.offsets.begin(),
+            haystack.offsets.end(),
+            range_begin
+        )
+    ));
+    std::vector<EditorSearchMatch> result;
+    while (cursor < haystack.characters.size()) {
+        const auto found = haystack.characters.find(needle.characters, cursor);
+        if (found == std::u32string::npos) {
+            break;
+        }
+        const EditorSearchMatch candidate{
+            haystack.offsets[found],
+            haystack.offsets[found + needle.characters.size()],
+        };
+        if (candidate.end > range_end) {
+            break;
+        }
+        if (!options.whole_words || whole_word(text, candidate)) {
+            result.push_back(candidate);
+            if (result.size() >= limit) {
+                break;
+            }
+        }
+        cursor = found + (overlap ? 1U : needle.characters.size());
+    }
+    return result;
 }
 
 std::string hexadecimal_pattern(const std::string_view pattern) {
@@ -348,6 +474,18 @@ std::vector<EditorSearchMatch> literal_matches(
             : std::string(pattern);
     if (bytes.empty()) {
         return {};
+    }
+    const auto non_ascii = [](const std::string_view value) {
+        return std::ranges::any_of(value, [](const unsigned char character) {
+            return character >= 0x80U;
+        });
+    };
+    if (options.mode == EditorSearchMode::normal &&
+        !options.case_sensitive &&
+        (non_ascii(text) || non_ascii(bytes))) {
+        return utf8_literal_matches(
+            text, bytes, range_begin, range_end, options, overlap, limit
+        );
     }
     const auto haystack =
         options.case_sensitive ||

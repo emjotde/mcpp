@@ -103,6 +103,20 @@ if(MCPP_BUILD_TESTS)
     target_link_libraries(mcpp_tests PRIVATE mcpp_core)
     mcpp_target_defaults(mcpp_tests)
     add_test(NAME mcpp_tests COMMAND mcpp_tests)
+    if(EXISTS "/review/.operation-regressions-disposable")
+        set_tests_properties(
+            mcpp_tests PROPERTIES ENVIRONMENT
+            "MCPP_DISPOSABLE_TESTS=1;TMPDIR=/review/runtime"
+        )
+    endif()
+    add_executable(mcpp_editor_regressions tests/test_editor_regressions.cpp)
+    target_link_libraries(mcpp_editor_regressions PRIVATE mcpp_core)
+    mcpp_target_defaults(mcpp_editor_regressions)
+    add_test(
+        NAME mcpp_editor_regressions
+        COMMAND mcpp_editor_regressions
+                ${CMAKE_CURRENT_BINARY_DIR}/editor-regression-state
+    )
     find_program(MCPP_SCRIPT_EXECUTABLE script)
     find_program(MCPP_TIMEOUT_EXECUTABLE timeout)
     if(MCPP_SCRIPT_EXECUTABLE AND MCPP_TIMEOUT_EXECUTABLE)
@@ -151,6 +165,61 @@ if(MCPP_BUILD_TESTS)
                 ${MCPP_SCRIPT_EXECUTABLE}
                 ${MCPP_TIMEOUT_EXECUTABLE}
         )
+    endif()
+    find_program(MCPP_PYTHON_EXECUTABLE python3)
+    find_program(MCPP_TMUX_EXECUTABLE tmux)
+    if(MCPP_PYTHON_EXECUTABLE AND MCPP_TMUX_EXECUTABLE)
+        add_test(
+            NAME mcpp_save_setup
+            COMMAND
+                ${MCPP_PYTHON_EXECUTABLE}
+                -B
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_save_setup.py
+                $<TARGET_FILE:mcpp>
+                ${MCPP_TMUX_EXECUTABLE}
+        )
+        set_tests_properties(mcpp_save_setup PROPERTIES TIMEOUT 45)
+        add_test(
+            NAME mcpp_viewer_navigation
+            COMMAND
+                ${MCPP_PYTHON_EXECUTABLE}
+                -B
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_viewer_navigation.py
+                $<TARGET_FILE:mcpp>
+                ${MCPP_TMUX_EXECUTABLE}
+        )
+        set_tests_properties(mcpp_viewer_navigation PROPERTIES TIMEOUT 45)
+        add_test(
+            NAME mcpp_tree_workflows
+            COMMAND
+                ${MCPP_PYTHON_EXECUTABLE}
+                -B
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_tree_workflows.py
+                $<TARGET_FILE:mcpp>
+                ${MCPP_TMUX_EXECUTABLE}
+        )
+        set_tests_properties(mcpp_tree_workflows PROPERTIES TIMEOUT 240)
+        add_test(
+            NAME mcpp_panel_prompts
+            COMMAND
+                ${MCPP_PYTHON_EXECUTABLE}
+                -B
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_panel_prompts.py
+                $<TARGET_FILE:mcpp>
+                ${MCPP_TMUX_EXECUTABLE}
+        )
+        set_tests_properties(mcpp_panel_prompts PROPERTIES TIMEOUT 90)
+        add_test(
+            NAME mcpp_editor_workflows
+            COMMAND
+                ${MCPP_PYTHON_EXECUTABLE}
+                -B
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_editor_workflows.py
+                $<TARGET_FILE:mcpp>
+                ${MCPP_TMUX_EXECUTABLE}
+                ${CMAKE_CURRENT_BINARY_DIR}/editor-ui
+        )
+        set_tests_properties(mcpp_editor_workflows PROPERTIES TIMEOUT 180)
     endif()
 endif()
 

@@ -4,6 +4,7 @@
 #include <array>
 #include <cctype>
 #include <cerrno>
+#include <cstdlib>
 #include <cstring>
 #include <dirent.h>
 #include <fstream>
@@ -33,6 +34,24 @@ bool path_is_within(
         }
     }
     return root_it == root.end();
+}
+
+bool lstat_if_present(
+    const std::filesystem::path& path,
+    struct stat& status
+) {
+    if (::lstat(path.c_str(), &status) == 0) {
+        return true;
+    }
+    const auto failure = errno;
+    if (failure == ENOENT || failure == ENOTDIR) {
+        return false;
+    }
+    throw std::filesystem::filesystem_error(
+        "cannot inspect file identity",
+        path,
+        std::error_code(failure, std::generic_category())
+    );
 }
 
 std::string lowercase(std::string value) {
@@ -874,6 +893,44 @@ void LocalProvider::remove(
     }
 }
 
+void LocalProvider::validate_directory_target(
+    const std::string_view source,
+    const LocalProvider& destination_provider,
+    const std::string_view destination
+) const {
+    if (!std::filesystem::is_directory(
+            std::filesystem::symlink_status(resolve(source))
+        )) {
+        return;
+    }
+    if (path_is_within(
+            resolve_follow(source),
+            destination_provider.resolve_follow(destination)
+        )) {
+        throw std::invalid_argument(
+            "cannot move or copy a directory into itself"
+        );
+    }
+}
+
+bool LocalProvider::same_file(
+    const std::string_view source,
+    const LocalProvider& destination_provider,
+    const std::string_view destination
+) const {
+    struct stat source_status {};
+    struct stat destination_status {};
+    if (!lstat_if_present(resolve(source), source_status) ||
+        !lstat_if_present(
+            destination_provider.resolve(destination),
+            destination_status
+        )) {
+        return false;
+    }
+    return source_status.st_dev == destination_status.st_dev &&
+           source_status.st_ino == destination_status.st_ino;
+}
+
 void LocalProvider::rename(
     const std::string_view source,
     const std::string_view destination,
@@ -889,6 +946,12 @@ void LocalProvider::rename(
     if (source_path == destination_path) {
         return;
     }
+    validate_directory_target(source, *this, destination);
+    if (same_file(source, *this, destination)) {
+        throw std::invalid_argument(
+            "source and destination are the same file"
+        );
+    }
     if (!overwrite) {
         if (!rename_no_replace(source_path, destination_path)) {
             throw std::runtime_error(
@@ -897,45 +960,7 @@ void LocalProvider::rename(
         }
         return;
     }
-    if (overwrite) {
-        std::optional<std::filesystem::path> backup;
-        if (exists(destination_path.string())) {
-            for (unsigned int attempt = 0; attempt < 100U; ++attempt) {
-                const auto candidate =
-                    destination_path.parent_path() /
-                    (
-                        ".mcpp-replaced-" +
-                        std::to_string(getpid()) + "-" +
-                        std::to_string(attempt)
-                    );
-                if (rename_no_replace(
-                        destination_path,
-                        candidate
-                    )) {
-                    backup = candidate;
-                    break;
-                }
-            }
-            if (!backup) {
-                throw std::runtime_error(
-                    "cannot allocate rename backup"
-                );
-            }
-        }
-        try {
-            std::filesystem::rename(source_path, destination_path);
-        } catch (...) {
-            if (backup) {
-                std::filesystem::rename(*backup, destination_path);
-            }
-            throw;
-        }
-        if (backup) {
-            std::error_code ignored;
-            std::filesystem::remove_all(*backup, ignored);
-        }
-        return;
-    }
+    std::filesystem::rename(source_path, destination_path);
 }
 
 bool LocalProvider::copy_direct(
@@ -955,11 +980,7 @@ bool LocalProvider::copy_direct(
     }
     const auto source_entry = stat(source_path.string(), cancellation);
     if (source_entry.kind == EntryKind::directory) {
-        if (path_is_within(source_path, destination_path)) {
-            throw std::invalid_argument(
-                "cannot copy a directory into itself"
-            );
-        }
+        validate_directory_target(source, *this, destination);
         const bool created = !exists(destination_path.string());
         bool copied_all = true;
         create_directory(destination_path.string());
@@ -1004,18 +1025,19 @@ bool LocalProvider::copy_direct(
         return copied_all;
     }
     if (source_entry.kind == EntryKind::symlink) {
-        if (overwrite) {
-            std::error_code ignored;
-            std::filesystem::remove(destination_path, ignored);
-        }
-        create_symlink(source_entry.target, destination_path.string());
         if (progress) {
             progress({
-                .files_done = 1,
+                .files_done = 0,
                 .files_total = 1,
                 .current_path = destination_path.string(),
             });
         }
+        create_symlink(
+            source_entry.target,
+            destination_path.string(),
+            overwrite,
+            cancellation
+        );
         return true;
     }
     if (source_entry.kind != EntryKind::file) {
@@ -1097,12 +1119,51 @@ void LocalProvider::set_owner(
 
 void LocalProvider::create_symlink(
     const std::string_view target,
-    const std::string_view path
+    const std::string_view path,
+    const bool overwrite,
+    const Cancellation& cancellation
 ) {
-    std::filesystem::create_symlink(
-        std::filesystem::path(target),
-        resolve(path)
-    );
+    cancellation.throw_if_requested();
+    const auto destination = resolve(path);
+    if (destination == root_) {
+        throw std::invalid_argument(
+            "refusing to replace provider root with a symbolic link"
+        );
+    }
+    std::filesystem::create_directories(destination.parent_path());
+    auto pattern = (
+        destination.parent_path() / ".mcpp-link-XXXXXX"
+    ).string();
+    std::vector<char> buffer(pattern.begin(), pattern.end());
+    buffer.push_back('\0');
+    // Reserve the staging link name inside a private directory.
+    if (mkdtemp(buffer.data()) == nullptr) {
+        throw std::runtime_error(
+            "cannot stage symbolic link: " +
+            std::string(std::strerror(errno))
+        );
+    }
+    const std::filesystem::path directory(buffer.data());
+    const auto temporary = directory / "link";
+    try {
+        std::filesystem::create_symlink(
+            std::filesystem::path(target),
+            temporary
+        );
+        cancellation.throw_if_requested();
+        rename(
+            temporary.string(),
+            destination.string(),
+            overwrite
+        );
+    } catch (...) {
+        std::error_code ignored;
+        std::filesystem::remove(temporary, ignored);
+        std::filesystem::remove(directory, ignored);
+        throw;
+    }
+    std::error_code ignored;
+    std::filesystem::remove(directory, ignored);
 }
 
 void LocalProvider::create_hardlink(

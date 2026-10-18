@@ -26,6 +26,17 @@ struct OperationOptions {
     CollisionResolver collision;
 };
 
+struct SkippedSource {
+    std::string path;
+    std::string reason;
+};
+
+struct OperationResult {
+    // Completed sources remain available if a later source fails or cancels.
+    std::vector<std::string> completed_sources;
+    std::vector<SkippedSource> skipped;
+};
+
 class OperationEngine {
 public:
     void copy(
@@ -35,7 +46,19 @@ public:
         std::string_view destination_directory,
         const OperationOptions& options,
         const Cancellation& cancellation,
-        const ProgressCallback& progress = {}
+        const ProgressCallback& progress = {},
+        OperationResult* result = nullptr
+    ) const;
+
+    void copy_exact(
+        Provider& source_provider,
+        const Entry& source,
+        Provider& destination_provider,
+        std::string_view destination,
+        const OperationOptions& options,
+        const Cancellation& cancellation,
+        const ProgressCallback& progress = {},
+        OperationResult* result = nullptr
     ) const;
 
     void move(
@@ -45,7 +68,8 @@ public:
         std::string_view destination_directory,
         const OperationOptions& options,
         const Cancellation& cancellation,
-        const ProgressCallback& progress = {}
+        const ProgressCallback& progress = {},
+        OperationResult* result = nullptr
     ) const;
 
     void move_exact(
@@ -55,14 +79,16 @@ public:
         std::string_view destination,
         const OperationOptions& options,
         const Cancellation& cancellation,
-        const ProgressCallback& progress = {}
+        const ProgressCallback& progress = {},
+        OperationResult* result = nullptr
     ) const;
 
     void remove(
         Provider& provider,
         const std::vector<Entry>& entries,
         const Cancellation& cancellation,
-        const ProgressCallback& progress = {}
+        const ProgressCallback& progress = {},
+        OperationResult* result = nullptr
     ) const;
 
 private:
@@ -80,7 +106,8 @@ private:
         const OperationOptions& options,
         const Cancellation& cancellation,
         TransferProgress& state,
-        const ProgressCallback& progress
+        const ProgressCallback& progress,
+        std::string& skip_reason
     );
 };
 

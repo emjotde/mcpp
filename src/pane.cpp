@@ -351,6 +351,12 @@ void Pane::clear_selection() {
     selected_.clear();
 }
 
+void Pane::unmark_paths(const std::vector<std::string>& paths) {
+    for (const auto& path : paths) {
+        selected_.erase(path);
+    }
+}
+
 void Pane::select_paths(const std::vector<std::string>& paths) {
     selected_.clear();
     selected_.insert(paths.begin(), paths.end());
@@ -399,7 +405,8 @@ void Pane::select_pattern(
 
 void Pane::invert_selection() {
     for (const auto& entry : entries_) {
-        if (is_parent_entry(entry)) {
+        if (is_parent_entry(entry) ||
+            entry.kind == EntryKind::directory) {
             continue;
         }
         if (selected_.contains(entry.path)) {

@@ -26,6 +26,7 @@ public:
     void toggle_selected(int movement = 1);
     void select_all();
     void clear_selection();
+    void unmark_paths(const std::vector<std::string>& paths);
     void select_paths(const std::vector<std::string>& paths);
     void set_panelized(std::vector<Entry> entries);
     [[nodiscard]] bool panelized() const noexcept;

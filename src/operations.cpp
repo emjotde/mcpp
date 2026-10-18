@@ -1,4 +1,5 @@
 #include "mcpp/operations.hpp"
+#include "mcpp/local_provider.hpp"
 
 #include <cerrno>
 #include <cstring>
@@ -9,6 +10,7 @@
 #include <stdexcept>
 #include <streambuf>
 #include <unistd.h>
+#include <utility>
 
 namespace mcpp {
 namespace {
@@ -20,6 +22,139 @@ void emit_progress(
     if (callback) {
         callback(progress);
     }
+}
+
+void emit_completed_progress(
+    const ProgressCallback& callback,
+    const TransferProgress& progress
+) {
+    try {
+        emit_progress(callback, progress);
+    } catch (const SkipCurrent&) {
+        // A skip after publication cannot undo the completed entry.
+    }
+}
+
+void record_completed(
+    OperationResult* result,
+    const Entry& source
+) {
+    if (result != nullptr) {
+        result->completed_sources.push_back(source.path);
+    }
+}
+
+void record_skipped(
+    OperationResult* result,
+    const Entry& source,
+    std::string reason
+) {
+    if (result != nullptr) {
+        result->skipped.push_back({source.path, std::move(reason)});
+    }
+}
+
+bool directory_destination(
+    Provider& provider,
+    const std::string_view destination,
+    const Cancellation& cancellation
+) {
+    if (destination.ends_with('/')) {
+        return true;
+    }
+    if (!provider.exists(destination)) {
+        return false;
+    }
+    const auto entry = provider.stat(destination, cancellation);
+    return entry.kind == EntryKind::directory ||
+           entry.target_is_directory;
+}
+
+void validate_directory_target(
+    Provider& source_provider,
+    const std::string_view source,
+    Provider& destination_provider,
+    const std::string_view destination
+) {
+    const auto* local_source =
+        dynamic_cast<const LocalProvider*>(&source_provider);
+    const auto* local_destination =
+        dynamic_cast<const LocalProvider*>(&destination_provider);
+    if (local_source != nullptr && local_destination != nullptr) {
+        local_source->validate_directory_target(
+            source, *local_destination, destination
+        );
+    }
+}
+
+bool same_move_file(
+    Provider& source_provider,
+    const std::string_view source,
+    Provider& destination_provider,
+    const std::string_view destination
+) {
+    const auto* local_source =
+        dynamic_cast<const LocalProvider*>(&source_provider);
+    const auto* local_destination =
+        dynamic_cast<const LocalProvider*>(&destination_provider);
+    if (local_source != nullptr && local_destination != nullptr) {
+        return local_source->normalize(source) ==
+                   local_destination->normalize(destination) ||
+               local_source->same_file(
+                   source, *local_destination, destination
+               );
+    }
+    return source_provider.id() == destination_provider.id() &&
+           source_provider.normalize(source) ==
+               destination_provider.normalize(destination);
+}
+
+void validate_move_target(
+    Provider& source_provider,
+    const Entry& source,
+    Provider& destination_provider,
+    const std::string_view destination,
+    const Cancellation& cancellation
+) {
+    validate_directory_target(
+        source_provider, source.path, destination_provider, destination
+    );
+    if (destination_provider.exists(destination)) {
+        const auto target = destination_provider.stat(destination, cancellation);
+        if ((source.kind == EntryKind::directory) !=
+            (target.kind == EntryKind::directory)) {
+            throw std::invalid_argument(
+                "cannot move between a directory and a non-directory"
+            );
+        }
+    }
+}
+
+bool rename_fallback_allowed(
+    const std::filesystem::filesystem_error& error,
+    Provider& source_provider,
+    const Entry& source,
+    Provider& destination_provider,
+    const std::string_view destination,
+    const Cancellation& cancellation
+) {
+    const auto code = error.code();
+    if (code != std::errc::cross_device_link &&
+        code != std::errc::directory_not_empty &&
+        code != std::errc::file_exists) {
+        return false;
+    }
+    const auto current_source = source_provider.stat(source.path, cancellation);
+    if (!destination_provider.exists(destination)) {
+        return code == std::errc::cross_device_link;
+    }
+    const auto target = destination_provider.stat(destination, cancellation);
+    if (code == std::errc::cross_device_link) {
+        return (current_source.kind == EntryKind::directory) ==
+               (target.kind == EntryKind::directory);
+    }
+    return current_source.kind == EntryKind::directory &&
+           target.kind == EntryKind::directory;
 }
 
 bool is_descendant_path(
@@ -257,13 +392,15 @@ bool OperationEngine::copy_entry(
     const OperationOptions& options,
     const Cancellation& cancellation,
     TransferProgress& state,
-    const ProgressCallback& progress
+    const ProgressCallback& progress,
+    std::string& skip_reason
 ) {
     cancellation.throw_if_requested();
     const auto destination_path = std::string(destination);
     if (source_provider.id() == destination_provider.id() &&
         source_provider.normalize(source.path) ==
             destination_provider.normalize(destination_path)) {
+        skip_reason = "source and destination are the same";
         return false;
     }
     if (source.kind == EntryKind::directory &&
@@ -291,11 +428,15 @@ bool OperationEngine::copy_entry(
               )
             : false;
     if (destination_exists && !overwrite) {
+        skip_reason = "destination exists: " + destination_path;
         return false;
     }
 
     state.current_path = source.path;
     emit_progress(progress, state);
+    validate_directory_target(
+        source_provider, source.path, destination_provider, destination_path
+    );
 
     if (&source_provider == &destination_provider &&
         options.preserve_permissions &&
@@ -330,7 +471,9 @@ bool OperationEngine::copy_entry(
             );
             state.bytes_done += completed.bytes_total;
             state.files_done += completed.files_total;
-            emit_progress(progress, state);
+            emit_completed_progress(progress, state);
+        } else if (skip_reason.empty()) {
+            skip_reason = "one or more descendants were skipped";
         }
         return copied_all;
     }
@@ -343,6 +486,12 @@ bool OperationEngine::copy_entry(
     }
 
     if (effective_source.kind == EntryKind::directory) {
+        validate_directory_target(
+            source_provider,
+            effective_source.path,
+            destination_provider,
+            destination_path
+        );
         if (!destination_exists) {
             destination_provider.create_directory(destination_path);
         }
@@ -366,10 +515,14 @@ bool OperationEngine::copy_entry(
                     options,
                     cancellation,
                     state,
-                    progress
+                    progress,
+                    skip_reason
                 ) && copied_all;
             } catch (const SkipCurrent&) {
                 copied_all = false;
+                if (skip_reason.empty()) {
+                    skip_reason = "user skipped: " + child.path;
+                }
             }
         }
         if (options.preserve_permissions &&
@@ -395,7 +548,9 @@ bool OperationEngine::copy_entry(
         )) {
         destination_provider.create_symlink(
             source.target,
-            destination_path
+            destination_path,
+            overwrite,
+            cancellation
         );
     } else {
         TemporaryTransferFile temporary;
@@ -427,7 +582,8 @@ bool OperationEngine::copy_entry(
         );
     }
 
-    if (options.preserve_permissions &&
+    if (effective_source.kind != EntryKind::symlink &&
+        options.preserve_permissions &&
         has_capability(
             destination_provider.capabilities(),
             ProviderCapability::permissions
@@ -441,7 +597,7 @@ bool OperationEngine::copy_entry(
     }
     state.bytes_done += effective_source.size;
     ++state.files_done;
-    emit_progress(progress, state);
+    emit_completed_progress(progress, state);
     return true;
 }
 
@@ -452,12 +608,14 @@ void OperationEngine::copy(
     const std::string_view destination_directory,
     const OperationOptions& options,
     const Cancellation& cancellation,
-    const ProgressCallback& progress
+    const ProgressCallback& progress,
+    OperationResult* result
 ) const {
     auto state = measure(source_provider, sources, cancellation);
     for (const auto& source : sources) {
         try {
-            static_cast<void>(copy_entry(
+            std::string skip_reason;
+            const auto copied = copy_entry(
                 source_provider,
                 source,
                 destination_provider,
@@ -468,11 +626,69 @@ void OperationEngine::copy(
                 options,
                 cancellation,
                 state,
-                progress
-            ));
+                progress,
+                skip_reason
+            );
+            if (copied) {
+                record_completed(result, source);
+            } else {
+                record_skipped(result, source, std::move(skip_reason));
+            }
         } catch (const SkipCurrent&) {
+            record_skipped(result, source, "user requested skip");
             continue;
         }
+    }
+}
+
+void OperationEngine::copy_exact(
+    Provider& source_provider,
+    const Entry& source,
+    Provider& destination_provider,
+    const std::string_view destination,
+    const OperationOptions& options,
+    const Cancellation& cancellation,
+    const ProgressCallback& progress,
+    OperationResult* result
+) const {
+    cancellation.throw_if_requested();
+    if (directory_destination(
+            destination_provider,
+            destination,
+            cancellation
+        )) {
+        copy(
+            source_provider,
+            {source},
+            destination_provider,
+            destination,
+            options,
+            cancellation,
+            progress,
+            result
+        );
+        return;
+    }
+    auto state = measure(source_provider, {source}, cancellation);
+    try {
+        std::string skip_reason;
+        if (copy_entry(
+                source_provider,
+                source,
+                destination_provider,
+                destination,
+                options,
+                cancellation,
+                state,
+                progress,
+                skip_reason
+            )) {
+            record_completed(result, source);
+        } else {
+            record_skipped(result, source, std::move(skip_reason));
+        }
+    } catch (const SkipCurrent&) {
+        record_skipped(result, source, "user requested skip");
     }
 }
 
@@ -483,7 +699,8 @@ void OperationEngine::move(
     const std::string_view destination_directory,
     const OperationOptions& options,
     const Cancellation& cancellation,
-    const ProgressCallback& progress
+    const ProgressCallback& progress,
+    OperationResult* result
 ) const {
     if (&source_provider == &destination_provider &&
         has_capability(
@@ -497,12 +714,27 @@ void OperationEngine::move(
             try {
                 emit_progress(progress, state);
             } catch (const SkipCurrent&) {
+                record_skipped(result, source, "user requested skip");
                 continue;
             }
             const auto destination = destination_provider.join(
                 destination_directory,
                 source.name
             );
+            validate_move_target(
+                source_provider, source, destination_provider,
+                destination, cancellation
+            );
+            if (same_move_file(
+                    source_provider, source.path,
+                    destination_provider, destination
+                )) {
+                record_skipped(
+                    result, source,
+                    "source and destination are the same file"
+                );
+                continue;
+            }
             bool overwrite = options.overwrite;
             if (destination_provider.exists(destination) &&
                 !overwrite) {
@@ -519,17 +751,44 @@ void OperationEngine::move(
                         overwrite = true;
                         break;
                     case CollisionDecision::skip:
+                        record_skipped(
+                            result,
+                            source,
+                            "destination exists: " + destination
+                        );
                         continue;
                     case CollisionDecision::cancel:
                         throw OperationCancelled{};
                 }
             }
+            bool renamed = false;
             try {
                 source_provider.rename(
                     source.path,
                     destination,
                     overwrite
                 );
+                renamed = true;
+            } catch (const std::filesystem::filesystem_error& error) {
+                if (!rename_fallback_allowed(
+                        error, source_provider, source,
+                        destination_provider, destination, cancellation
+                    )) {
+                    throw;
+                }
+            }
+            if (renamed) {
+                if (same_move_file(
+                        source_provider, source.path,
+                        destination_provider, destination
+                    )) {
+                    record_skipped(
+                        result, source,
+                        "source and destination are the same file"
+                    );
+                    continue;
+                }
+                record_completed(result, source);
                 TransferProgress completed;
                 accumulate_entry(
                     destination_provider,
@@ -547,36 +806,50 @@ void OperationEngine::move(
                     emit_progress(progress, state);
                 } catch (const SkipCurrent&) {
                 }
-            } catch (const std::filesystem::filesystem_error&) {
-                try {
-                    const auto copied = copy_entry(
-                        source_provider,
-                        source,
-                        destination_provider,
-                        destination,
-                        {
-                            .overwrite = overwrite,
-                            .preserve_permissions =
-                                options.preserve_permissions,
-                            .preserve_symlinks =
-                                options.preserve_symlinks,
-                            .collision = options.collision,
-                        },
-                        cancellation,
-                        state,
-                        progress
+                continue;
+            }
+            try {
+                std::string skip_reason;
+                const auto copied = copy_entry(
+                    source_provider,
+                    source,
+                    destination_provider,
+                    destination,
+                    {
+                        .overwrite = overwrite,
+                        .preserve_permissions =
+                            options.preserve_permissions,
+                        .preserve_symlinks =
+                            options.preserve_symlinks,
+                        .collision = options.collision,
+                    },
+                    cancellation,
+                    state,
+                    progress,
+                    skip_reason
+                );
+                if (copied) {
+                    validate_move_target(
+                        source_provider, source, destination_provider,
+                        destination, cancellation
                     );
-                    if (copied) {
-                        source_provider.remove(
-                            source.path,
-                            source.kind == EntryKind::directory,
-                            cancellation,
-                            {}
-                        );
-                    }
-                } catch (const SkipCurrent&) {
-                    continue;
+                    source_provider.remove(
+                        source.path,
+                        source.kind == EntryKind::directory,
+                        cancellation,
+                        {}
+                    );
+                    record_completed(result, source);
+                } else {
+                    record_skipped(
+                        result,
+                        source,
+                        std::move(skip_reason)
+                    );
                 }
+            } catch (const SkipCurrent&) {
+                record_skipped(result, source, "user requested skip");
+                continue;
             }
         }
         return;
@@ -584,28 +857,52 @@ void OperationEngine::move(
     auto state = measure(source_provider, sources, cancellation);
     for (const auto& source : sources) {
         try {
+            const auto destination = destination_provider.join(
+                destination_directory, source.name
+            );
+            validate_move_target(
+                source_provider, source, destination_provider,
+                destination, cancellation
+            );
+            if (same_move_file(
+                    source_provider, source.path,
+                    destination_provider, destination
+                )) {
+                record_skipped(
+                    result, source,
+                    "source and destination are the same file"
+                );
+                continue;
+            }
+            std::string skip_reason;
             const auto copied = copy_entry(
                 source_provider,
                 source,
                 destination_provider,
-                destination_provider.join(
-                    destination_directory,
-                    source.name
-                ),
+                destination,
                 options,
                 cancellation,
                 state,
-                progress
+                progress,
+                skip_reason
             );
             if (copied) {
+                validate_move_target(
+                    source_provider, source, destination_provider,
+                    destination, cancellation
+                );
                 source_provider.remove(
                     source.path,
                     source.kind == EntryKind::directory,
                     cancellation,
                     {}
                 );
+                record_completed(result, source);
+            } else {
+                record_skipped(result, source, std::move(skip_reason));
             }
         } catch (const SkipCurrent&) {
+            record_skipped(result, source, "user requested skip");
             continue;
         }
     }
@@ -615,7 +912,8 @@ void OperationEngine::remove(
     Provider& provider,
     const std::vector<Entry>& entries,
     const Cancellation& cancellation,
-    const ProgressCallback& progress
+    const ProgressCallback& progress,
+    OperationResult* result
 ) const {
     TransferProgress state;
     for (const auto& entry : entries) {
@@ -636,6 +934,7 @@ void OperationEngine::remove(
                 emit_progress(progress, state);
             }
         );
+        record_completed(result, entry);
         if (!reported) {
             ++state.files_done;
             state.current_path = entry.path;
@@ -651,12 +950,45 @@ void OperationEngine::move_exact(
     const std::string_view destination,
     const OperationOptions& options,
     const Cancellation& cancellation,
-    const ProgressCallback& progress
+    const ProgressCallback& progress,
+    OperationResult* result
 ) const {
     cancellation.throw_if_requested();
     if (source_provider.id() == destination_provider.id() &&
         source_provider.normalize(source.path) ==
             destination_provider.normalize(destination)) {
+        record_skipped(result, source, "source and destination are the same");
+        return;
+    }
+    if (directory_destination(
+            destination_provider,
+            destination,
+            cancellation
+        )) {
+        move(
+            source_provider,
+            {source},
+            destination_provider,
+            destination,
+            options,
+            cancellation,
+            progress,
+            result
+        );
+        return;
+    }
+    validate_move_target(
+        source_provider, source, destination_provider,
+        destination, cancellation
+    );
+    if (same_move_file(
+            source_provider, source.path,
+            destination_provider, destination
+        )) {
+        record_skipped(
+            result, source,
+            "source and destination are the same file"
+        );
         return;
     }
     bool overwrite = options.overwrite;
@@ -674,6 +1006,11 @@ void OperationEngine::move_exact(
                 overwrite = true;
                 break;
             case CollisionDecision::skip:
+                record_skipped(
+                    result,
+                    source,
+                    "destination exists: " + std::string(destination)
+                );
                 return;
             case CollisionDecision::cancel:
                 throw OperationCancelled{};
@@ -684,6 +1021,7 @@ void OperationEngine::move_exact(
     try {
         emit_progress(progress, state);
     } catch (const SkipCurrent&) {
+        record_skipped(result, source, "user requested skip");
         return;
     }
     if (&source_provider == &destination_provider &&
@@ -691,12 +1029,34 @@ void OperationEngine::move_exact(
             source_provider.capabilities(),
             ProviderCapability::rename
         )) {
-        try {
-            source_provider.rename(
+            bool renamed = false;
+            try {
+                source_provider.rename(
                 source.path,
                 destination,
                 overwrite
             );
+            renamed = true;
+        } catch (const std::filesystem::filesystem_error& error) {
+            if (!rename_fallback_allowed(
+                    error, source_provider, source,
+                    destination_provider, destination, cancellation
+                )) {
+                throw;
+            }
+        }
+        if (renamed) {
+            if (same_move_file(
+                    source_provider, source.path,
+                    destination_provider, destination
+                )) {
+                record_skipped(
+                    result, source,
+                    "source and destination are the same file"
+                );
+                return;
+            }
+            record_completed(result, source);
             state.bytes_done = state.bytes_total;
             state.files_done = state.files_total;
             try {
@@ -704,10 +1064,24 @@ void OperationEngine::move_exact(
             } catch (const SkipCurrent&) {
             }
             return;
-        } catch (const std::filesystem::filesystem_error&) {
         }
     }
+    validate_move_target(
+        source_provider, source, destination_provider,
+        destination, cancellation
+    );
+    if (same_move_file(
+            source_provider, source.path,
+            destination_provider, destination
+        )) {
+        record_skipped(
+            result, source,
+            "source and destination are the same file"
+        );
+        return;
+    }
     bool copied = false;
+    std::string skip_reason;
     try {
         copied = copy_entry(
             source_provider,
@@ -722,18 +1096,27 @@ void OperationEngine::move_exact(
             },
             cancellation,
             state,
-            progress
+            progress,
+            skip_reason
         );
     } catch (const SkipCurrent&) {
+        record_skipped(result, source, "user requested skip");
         return;
     }
     if (copied) {
+        validate_move_target(
+            source_provider, source, destination_provider,
+            destination, cancellation
+        );
         source_provider.remove(
             source.path,
             source.kind == EntryKind::directory,
             cancellation,
             {}
         );
+        record_completed(result, source);
+    } else {
+        record_skipped(result, source, std::move(skip_reason));
     }
 }
 

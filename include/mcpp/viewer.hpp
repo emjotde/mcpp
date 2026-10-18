@@ -18,6 +18,8 @@ public:
         const Cancellation& cancellation = {}
     );
     void close();
+    void go_to_start();
+    void go_to_end(std::size_t viewport_width, std::size_t viewport_lines);
     void scroll_lines(int amount, std::size_t viewport_width);
     void page(
         int direction,
@@ -47,6 +49,22 @@ public:
     );
 
 private:
+    [[nodiscard]] std::vector<std::uint64_t> text_offsets_before(
+        std::uint64_t end,
+        std::size_t width,
+        std::size_t count
+    );
+    [[nodiscard]] std::string_view window_at(
+        std::uint64_t offset,
+        std::size_t minimum,
+        const Cancellation& cancellation
+    );
+    [[nodiscard]] std::uint64_t read_text_row(
+        std::uint64_t offset,
+        std::size_t width,
+        std::string* output,
+        const Cancellation& cancellation
+    );
     void load_window(
         std::uint64_t offset,
         std::size_t size,

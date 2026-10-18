@@ -12,6 +12,7 @@
 #include "mcpp/viewer.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -21,6 +22,7 @@
 #include <string>
 #include <string_view>
 #include <sys/stat.h>
+#include <thread>
 #include <unistd.h>
 
 namespace {
@@ -44,10 +46,12 @@ void check_equal(
 
 class TemporaryDirectory {
 public:
-    TemporaryDirectory() {
+    explicit TemporaryDirectory(
+        const std::filesystem::path& directory =
+            std::filesystem::temp_directory_path()
+    ) {
         auto pattern =
-            (std::filesystem::temp_directory_path() /
-             "mcpp-test-XXXXXX").string();
+            (directory / "mcpp-test-XXXXXX").string();
         auto buffer = std::vector<char>(
             pattern.begin(),
             pattern.end()
@@ -96,6 +100,38 @@ std::string read_file(const std::filesystem::path& path) {
         std::istreambuf_iterator<char>(input),
         std::istreambuf_iterator<char>(),
     };
+}
+
+struct FileSnapshot {
+    struct stat status {};
+    std::string bytes;
+};
+
+FileSnapshot snapshot_file(const std::filesystem::path& path) {
+    FileSnapshot result;
+    check(::lstat(path.c_str(), &result.status) == 0, "snapshot lstat");
+    check(S_ISREG(result.status.st_mode), "snapshot regular file");
+    result.bytes = read_file(path);
+    return result;
+}
+
+void check_unchanged(
+    const std::filesystem::path& path,
+    const FileSnapshot& before
+) {
+    const auto after = snapshot_file(path);
+    check_equal(after.bytes, before.bytes, "target bytes unchanged");
+    check(
+        after.status.st_dev == before.status.st_dev &&
+            after.status.st_ino == before.status.st_ino &&
+            after.status.st_mode == before.status.st_mode &&
+            after.status.st_uid == before.status.st_uid &&
+            after.status.st_gid == before.status.st_gid &&
+            after.status.st_nlink == before.status.st_nlink &&
+            after.status.st_mtim.tv_sec == before.status.st_mtim.tv_sec &&
+            after.status.st_mtim.tv_nsec == before.status.st_mtim.tv_nsec,
+        "target identity, mode, ownership, links and mtime unchanged"
+    );
 }
 
 void test_local_provider() {
@@ -391,8 +427,34 @@ void test_pane() {
     pane.invert_selection();
     check_equal(
         pane.selected_entries().size(),
-        std::size_t{3},
+        std::size_t{2},
         "pane invert selection"
+    );
+    const auto marked = [&](const std::string_view name) {
+        return std::ranges::any_of(
+            pane.entries(),
+            [&](const auto& entry) {
+                return entry.name == name && pane.is_selected(entry);
+            }
+        );
+    };
+    check(
+        marked("one.txt") && marked("sub-link") &&
+            !marked("sub") && !marked("two.txt"),
+        "inversion skips real directories but includes directory symlinks"
+    );
+    pane.select_pattern("sub", true);
+    pane.invert_selection();
+    check(
+        marked("sub") && marked("two.txt") &&
+            !marked("sub-link") && !marked("one.txt"),
+        "inversion preserves marked directories and unmarks directory symlinks"
+    );
+    pane.invert_selection();
+    check(
+        marked("sub") && marked("sub-link") &&
+            marked("one.txt") && !marked("two.txt"),
+        "repeated inversion retains directory marks"
     );
     pane.clear_selection();
     pane.set_filter("one*");
@@ -1036,6 +1098,886 @@ void test_operations() {
     );
 }
 
+void test_operation_destinations() {
+    TemporaryDirectory temporary;
+    const auto root = temporary.path();
+    mcpp::LocalProvider provider(root);
+    mcpp::OperationEngine operations;
+    mcpp::OperationOptions overwrite;
+    overwrite.overwrite = true;
+
+    const auto source = root / "source" / "a.txt";
+    const auto bucket = root / "destination" / "bucket";
+    write_file(source, "SOURCE\n");
+    write_file(bucket / "KEEP", "DIRECTORY-SENTINEL\n");
+    const auto source_before = snapshot_file(source);
+    const auto keep = snapshot_file(bucket / "KEEP");
+    operations.move_exact(
+        provider, provider.stat(source.string(), {}), provider,
+        bucket.string(), overwrite, {}
+    );
+    check(
+        std::filesystem::is_directory(bucket) &&
+            !std::filesystem::exists(source) &&
+            read_file(bucket / "a.txt") == "SOURCE\n",
+        "exact move interprets existing directory as destination directory"
+    );
+    check_unchanged(bucket / "a.txt", source_before);
+    check_unchanged(bucket / "KEEP", keep);
+
+    const auto copy_source = root / "source" / "copy.txt";
+    const auto exact_target = root / "destination" / "renamed.txt";
+    write_file(copy_source, "EXACT-COPY\n");
+    std::filesystem::permissions(
+        copy_source, std::filesystem::perms::owner_all
+    );
+    const auto original_copy = snapshot_file(copy_source);
+    operations.copy_exact(
+        provider, provider.stat(copy_source.string(), {}), provider,
+        exact_target.string(), overwrite, {}
+    );
+    check(
+        std::filesystem::is_regular_file(exact_target) &&
+            read_file(exact_target) == original_copy.bytes &&
+            std::filesystem::status(exact_target).permissions() ==
+                std::filesystem::status(copy_source).permissions(),
+        "exact copy creates named file and preserves permissions"
+    );
+    check_unchanged(copy_source, original_copy);
+    write_file(exact_target, "OLD\n");
+    operations.copy_exact(
+        provider, provider.stat(copy_source.string(), {}), provider,
+        exact_target.string(), overwrite, {}
+    );
+    check_equal(read_file(exact_target), original_copy.bytes,
+                "exact copy overwrites named file");
+    check_unchanged(bucket / "KEEP", keep);
+
+    const auto tree = root / "source" / "tree";
+    const auto destination_tree = root / "destination" / "tree";
+    write_file(tree / "new.txt", "NEW\n");
+    write_file(destination_tree / "KEEP", "MERGE-SENTINEL\n");
+    const auto merge_keep = snapshot_file(destination_tree / "KEEP");
+    operations.move(
+        provider, {provider.stat(tree.string(), {})}, provider,
+        (root / "destination").string(), overwrite, {}
+    );
+    check(
+        !std::filesystem::exists(tree) &&
+            read_file(destination_tree / "new.txt") == "NEW\n",
+        "directory move merges rather than replacing unrelated subtree"
+    );
+    check_unchanged(destination_tree / "KEEP", merge_keep);
+
+    const auto guarded_source = root / "guarded-source";
+    const auto guarded_directory = root / "guarded-directory";
+    write_file(guarded_source, "DO-NOT-REMOVE\n");
+    write_file(guarded_directory / "KEEP", "PROVIDER-SENTINEL\n");
+    const auto guarded_before = snapshot_file(guarded_source);
+    const auto guarded_keep = snapshot_file(guarded_directory / "KEEP");
+    bool rejected = false;
+    try {
+        provider.rename(
+            guarded_source.string(), guarded_directory.string(), true
+        );
+    } catch (const std::exception&) {
+        rejected = true;
+    }
+    check(rejected && std::filesystem::is_directory(guarded_directory),
+          "provider overwrite refuses file over real directory");
+    check_unchanged(guarded_source, guarded_before);
+    check_unchanged(guarded_directory / "KEEP", guarded_keep);
+
+    const auto race_source = root / "race-source";
+    const auto race_target = root / "race-target";
+    write_file(race_source, "RACE-SOURCE\n");
+    write_file(race_target, "INITIAL-FILE\n");
+    const auto race_before = snapshot_file(race_source);
+    FileSnapshot race_keep;
+    bool changed_type = false;
+    rejected = false;
+    try {
+        operations.move_exact(
+            provider, provider.stat(race_source.string(), {}), provider,
+            race_target.string(), overwrite, {},
+            [&](const mcpp::TransferProgress& value) {
+                if (!changed_type && value.files_done == 0U) {
+                    std::filesystem::remove(race_target);
+                    write_file(race_target / "KEEP", "RACE-SENTINEL\n");
+                    race_keep = snapshot_file(race_target / "KEEP");
+                    changed_type = true;
+                }
+            }
+        );
+    } catch (const std::exception&) {
+        rejected = true;
+    }
+    check(changed_type && rejected &&
+              std::filesystem::is_directory(race_target),
+          "exact move refuses target changed to directory before publication");
+    check_unchanged(race_source, race_before);
+    check_unchanged(race_target / "KEEP", race_keep);
+
+    const auto alias_source = root / "alias-source" / "tree";
+    const auto alias_parent = root / "alias-destination";
+    const auto alias_target = alias_parent / "tree";
+    write_file(alias_source / "important.txt", "ONLY-SOURCE-COPY\n");
+    write_file(alias_source / "child" / "KEEP", "DESCENDANT-SENTINEL\n");
+    std::filesystem::create_directory(alias_parent);
+    const auto important = snapshot_file(alias_source / "important.txt");
+    const auto descendant = snapshot_file(alias_source / "child" / "KEEP");
+    auto marks_provider = std::make_shared<mcpp::LocalProvider>(root);
+    mcpp::Pane marks(marks_provider, alias_source.parent_path().string());
+    const auto alias_entry = provider.stat(alias_source.string(), {});
+    for (const auto* link_target :
+         {"../alias-source/tree", "../alias-source/tree/child"}) {
+        std::filesystem::create_directory_symlink(link_target, alias_target);
+        struct stat link_before {};
+        check(::lstat(alias_target.c_str(), &link_before) == 0,
+              "directory alias lstat");
+        for (int method = 0; method < 4; ++method) {
+            marks.select_paths({alias_entry.path});
+            mcpp::OperationResult refused;
+            bool alias_rejected = false;
+            try {
+                if (method == 0) {
+                    operations.move(
+                        provider, {alias_entry}, provider,
+                        alias_parent.string(), overwrite, {}, {}, &refused
+                    );
+                } else if (method == 1) {
+                    operations.move_exact(
+                        provider, alias_entry, provider,
+                        alias_target.string(), overwrite, {}, {}, &refused
+                    );
+                } else if (method == 2) {
+                    mcpp::LocalProvider other(root);
+                    operations.move(
+                        provider, {alias_entry}, other,
+                        alias_parent.string(), overwrite, {}, {}, &refused
+                    );
+                } else {
+                    mcpp::LocalProvider confined(alias_source.parent_path());
+                    operations.move(
+                        confined, {alias_entry}, provider,
+                        alias_parent.string(), overwrite, {}, {}, &refused
+                    );
+                }
+            } catch (const std::exception&) {
+                alias_rejected = true;
+            }
+            check(alias_rejected && refused.completed_sources.empty(),
+                  "physical self/descendant move alias is refused");
+            check_unchanged(alias_source / "important.txt", important);
+            check_unchanged(alias_source / "child" / "KEEP", descendant);
+            struct stat link_after {};
+            check(::lstat(alias_target.c_str(), &link_after) == 0 &&
+                      link_after.st_dev == link_before.st_dev &&
+                      link_after.st_ino == link_before.st_ino &&
+                      link_after.st_mode == link_before.st_mode &&
+                      std::filesystem::read_symlink(alias_target) == link_target,
+                  "refused move preserves destination symlink object");
+            marks.unmark_paths(refused.completed_sources);
+            marks.refresh();
+            check(marks.marked_count() == 1U &&
+                      marks.selected_entries().front().path == alias_entry.path,
+                  "refused alias move retains the source mark");
+        }
+        bool direct_rejected = false;
+        try {
+            provider.copy_direct(
+                alias_source.string(), alias_target.string(), true, {}, {}
+            );
+        } catch (const std::exception&) {
+            direct_rejected = true;
+        }
+        check(direct_rejected, "direct directory copy rejects physical aliases");
+        check_unchanged(alias_source / "important.txt", important);
+        check_unchanged(alias_source / "child" / "KEEP", descendant);
+        std::filesystem::remove(alias_target);
+    }
+    std::cout << "  [PASS] physical directory aliases, data, inode and marks\n";
+
+    const auto restricted_parent = root / "restricted";
+    const auto restricted_source = restricted_parent / "stuck.txt";
+    const auto restricted_target = root / "restricted-target" / "stuck.txt";
+    write_file(restricted_source, "RENAME-MUST-FAIL\n");
+    write_file(restricted_target, "DO-NOT-COPY-OVER-ME\n");
+    const auto restricted_before = snapshot_file(restricted_source);
+    const auto restricted_destination = snapshot_file(restricted_target);
+    std::filesystem::permissions(
+        restricted_parent,
+        std::filesystem::perms::owner_read |
+            std::filesystem::perms::owner_exec |
+            std::filesystem::perms::group_read |
+            std::filesystem::perms::group_exec |
+            std::filesystem::perms::others_read |
+            std::filesystem::perms::others_exec
+    );
+    mcpp::OperationResult permission_result;
+    bool permission_refused = false;
+    try {
+        operations.move(
+            provider, {provider.stat(restricted_source.string(), {})}, provider,
+            restricted_target.parent_path().string(), overwrite, {}, {},
+            &permission_result
+        );
+    } catch (const std::exception&) {
+        permission_refused = true;
+    }
+    std::filesystem::permissions(
+        restricted_parent, std::filesystem::perms::owner_all
+    );
+    check(permission_refused && permission_result.completed_sources.empty(),
+          "permission failure is not converted into copy fallback");
+    check_unchanged(restricted_source, restricted_before);
+    check_unchanged(restricted_target, restricted_destination);
+    std::cout << "  [PASS] non-fallback rename errors preserve both files\n";
+
+    if (std::filesystem::is_directory("/review/crossfs")) {
+        TemporaryDirectory cross("/review/crossfs");
+        struct stat source_filesystem {};
+        struct stat destination_filesystem {};
+        check(::stat(root.c_str(), &source_filesystem) == 0 &&
+                  ::stat(cross.path().c_str(), &destination_filesystem) == 0 &&
+                  source_filesystem.st_dev != destination_filesystem.st_dev,
+              "cross-device regression uses a separate filesystem");
+        mcpp::LocalProvider filesystem;
+        const auto cross_source = root / "cross-source.txt";
+        write_file(cross_source, "CROSS-DEVICE\n");
+        operations.move_exact(
+            filesystem, filesystem.stat(cross_source.string(), {}), filesystem,
+            (cross.path() / "moved.txt").string(), overwrite, {}
+        );
+        check(!std::filesystem::exists(cross_source) &&
+                  read_file(cross.path() / "moved.txt") == "CROSS-DEVICE\n",
+              "EXDEV still permits a complete file move");
+        const auto cross_tree = root / "cross-tree";
+        write_file(cross_tree / "new.txt", "CROSS-TREE\n");
+        write_file(cross.path() / "cross-tree" / "KEEP", "CROSS-KEEP\n");
+        const auto cross_keep =
+            snapshot_file(cross.path() / "cross-tree" / "KEEP");
+        operations.move(
+            filesystem, {filesystem.stat(cross_tree.string(), {})}, filesystem,
+            cross.path().string(), overwrite, {}
+        );
+        check(!std::filesystem::exists(cross_tree) &&
+                  read_file(cross.path() / "cross-tree" / "new.txt") ==
+                      "CROSS-TREE\n",
+              "EXDEV directory merge preserves unrelated destination entries");
+        check_unchanged(cross.path() / "cross-tree" / "KEEP", cross_keep);
+        std::cout << "  [PASS] permitted cross-device file and directory fallback\n";
+    }
+}
+
+void test_atomic_symlink_copy() {
+    TemporaryDirectory temporary;
+    const auto root = temporary.path();
+    const auto source = root / "source" / "link";
+    const auto destination = root / "destination" / "link";
+    const auto new_target = root / "targets" / "new";
+    const auto old_target = root / "targets" / "old";
+    write_file(new_target, "NEW-TARGET\n");
+    write_file(old_target, "OLD-TARGET\n");
+    std::filesystem::permissions(
+        new_target,
+        std::filesystem::perms::owner_read |
+            std::filesystem::perms::owner_write
+    );
+    const auto new_before = snapshot_file(new_target);
+    const auto old_before = snapshot_file(old_target);
+    std::filesystem::create_directories(source.parent_path());
+    std::filesystem::create_directories(destination.parent_path());
+    std::filesystem::create_symlink("../targets/new", source);
+    std::filesystem::create_symlink("../targets/old", destination);
+    mcpp::LocalProvider provider(root);
+    mcpp::LocalProvider second_provider(root);
+    mcpp::OperationEngine operations;
+    mcpp::OperationOptions options;
+    options.overwrite = true;
+    options.preserve_permissions = false;
+    operations.copy(
+        provider, {provider.stat(source.string(), {})}, provider,
+        destination.parent_path().string(), options, {}
+    );
+    check_equal(
+        std::filesystem::read_symlink(destination),
+        std::filesystem::path("../targets/new"),
+        "permissions-off overwrite replaces only the symbolic link"
+    );
+    check_unchanged(new_target, new_before);
+    check_unchanged(old_target, old_before);
+
+    options.preserve_permissions = true;
+    operations.copy(
+        provider, {provider.stat(source.string(), {})}, second_provider,
+        destination.parent_path().string(), options, {}
+    );
+    check_unchanged(new_target, new_before);
+    check_unchanged(old_target, old_before);
+
+    const mcpp::Cancellation cancellation;
+    cancellation.request();
+    bool cancelled = false;
+    try {
+        provider.create_symlink(
+            "../targets/old", destination.string(), true, cancellation
+        );
+    } catch (const mcpp::OperationCancelled&) {
+        cancelled = true;
+    }
+    check(cancelled &&
+              std::filesystem::read_symlink(destination) == "../targets/new",
+          "cancelled symlink publication retains old link");
+    bool rejected = false;
+    try {
+        provider.create_symlink(
+            "../targets/old", destination.string(), false
+        );
+    } catch (const std::exception&) {
+        rejected = true;
+    }
+    check(rejected &&
+              std::filesystem::read_symlink(destination) == "../targets/new",
+          "no-clobber symbolic link leaves existing link intact");
+
+    write_file(root / "directory" / "KEEP", "LINK-DIRECTORY-SENTINEL\n");
+    const auto keep = snapshot_file(root / "directory" / "KEEP");
+    rejected = false;
+    try {
+        provider.create_symlink(
+            "../targets/new", (root / "directory").string(), true
+        );
+    } catch (const std::exception&) {
+        rejected = true;
+    }
+    check(rejected && std::filesystem::is_directory(root / "directory"),
+          "symlink publication cannot replace a real directory");
+    check_unchanged(root / "directory" / "KEEP", keep);
+
+    std::atomic_bool missing{false};
+    std::atomic_uint observations{0};
+    std::jthread observer([&](const std::stop_token stop) {
+        while (!stop.stop_requested()) {
+            std::error_code error;
+            const auto target = std::filesystem::read_symlink(
+                destination, error
+            );
+            observations.fetch_add(1U, std::memory_order_relaxed);
+            if (error ||
+                (target != "../targets/new" && target != "../targets/old")) {
+                missing.store(true, std::memory_order_relaxed);
+                return;
+            }
+        }
+    });
+    while (observations.load(std::memory_order_relaxed) == 0U) {
+        std::this_thread::yield();
+    }
+    for (unsigned int index = 0; index < 64U; ++index) {
+        provider.create_symlink(
+            index % 2U == 0U ? "../targets/new" : "../targets/old",
+            source.string(),
+            true
+        );
+        options.preserve_permissions = index % 2U == 0U;
+        operations.copy(
+            provider, {provider.stat(source.string(), {})}, provider,
+            destination.parent_path().string(), options, {}
+        );
+    }
+    observer.request_stop();
+    observer.join();
+    check(!missing.load(std::memory_order_relaxed),
+          "atomic link replacement never exposes a missing destination");
+    check_unchanged(new_target, new_before);
+    check_unchanged(old_target, old_before);
+    for (const auto& entry : std::filesystem::recursive_directory_iterator(root)) {
+        check(!entry.path().filename().string().starts_with(".mcpp-"),
+              "symlink staging is cleaned after success and failure");
+    }
+}
+
+void test_operation_results() {
+    TemporaryDirectory temporary;
+    const auto root = temporary.path();
+    write_file(root / "a" / "same.txt", "FIRST\n");
+    write_file(root / "b" / "same.txt", "SECOND\n");
+    std::filesystem::create_directory(root / "destination");
+    auto provider = std::make_shared<mcpp::LocalProvider>(root);
+    mcpp::OperationEngine operations;
+    const std::vector<mcpp::Entry> sources{
+        provider->stat((root / "a" / "same.txt").string(), {}),
+        provider->stat((root / "b" / "same.txt").string(), {}),
+    };
+    const auto first = snapshot_file(sources[0].path);
+    const auto second = snapshot_file(sources[1].path);
+    mcpp::OperationOptions options;
+    options.collision = [](const mcpp::Entry&, const mcpp::Entry&) {
+        return mcpp::CollisionDecision::skip;
+    };
+    mcpp::OperationResult result;
+    operations.copy(
+        *provider, sources, *provider, (root / "destination").string(),
+        options, {}, {}, &result
+    );
+    check_equal(result.completed_sources,
+                std::vector<std::string>{sources[0].path},
+                "duplicate basename reports only the completed source");
+    check(result.skipped.size() == 1U &&
+              result.skipped[0].path == sources[1].path &&
+              result.skipped[0].reason.find("destination exists:") !=
+                  std::string::npos,
+          "late collision reports source and reason");
+    check_equal(read_file(root / "destination" / "same.txt"), first.bytes,
+                "late skip preserves first published bytes");
+    check_unchanged(sources[0].path, first);
+    check_unchanged(sources[1].path, second);
+    mcpp::Pane pane(provider, root.string());
+    pane.set_panelized(sources);
+    pane.select_all();
+    pane.unmark_paths(result.completed_sources);
+    check(pane.marked_count() == 1U &&
+              pane.selected_entries().front().path == sources[1].path,
+          "only completed source marks are removed");
+
+    const auto fifo = root / "pipe";
+    check(::mkfifo(fifo.c_str(), 0600) == 0, "result FIFO fixture");
+    std::filesystem::create_directory(root / "partial");
+    mcpp::OperationResult partial;
+    bool failed = false;
+    try {
+        operations.copy(
+            *provider,
+            {sources[0], provider->stat(fifo.string(), {})},
+            *provider, (root / "partial").string(),
+            options, {}, {}, &partial
+        );
+    } catch (const std::exception&) {
+        failed = true;
+    }
+    check(failed &&
+              partial.completed_sources ==
+                  std::vector<std::string>{sources[0].path} &&
+              read_file(root / "partial" / "same.txt") == first.bytes &&
+              !std::filesystem::exists(root / "partial" / "pipe"),
+          "completed sources survive a later operation error");
+    check_unchanged(sources[0].path, first);
+    check_unchanged(sources[1].path, second);
+
+    const auto hard_source = root / "hard-source" / "a.txt";
+    const auto hard_parent = root / "hard-destination";
+    const auto hard_target = hard_parent / "a.txt";
+    write_file(hard_source, "HARDLINK-SOURCE\n");
+    std::filesystem::create_directory(hard_parent);
+    std::filesystem::create_hard_link(hard_source, hard_target);
+    const auto hard_before = snapshot_file(hard_source);
+    check(hard_before.status.st_nlink == 2U, "hardlink fixture link count");
+    const auto hard_entry = provider->stat(hard_source.string(), {});
+    mcpp::Pane hard_marks(provider, hard_source.parent_path().string());
+    mcpp::OperationOptions overwrite;
+    overwrite.overwrite = true;
+    for (int method = 0; method < 4; ++method) {
+        hard_marks.select_paths({hard_entry.path});
+        mcpp::OperationResult skipped;
+        if (method == 0) {
+            operations.move(
+                *provider, {hard_entry}, *provider, hard_parent.string(),
+                overwrite, {}, {}, &skipped
+            );
+        } else if (method == 1) {
+            operations.move_exact(
+                *provider, hard_entry, *provider, hard_target.string(),
+                overwrite, {}, {}, &skipped
+            );
+        } else {
+            mcpp::LocalProvider other(root);
+            if (method == 2) {
+                operations.move(
+                    *provider, {hard_entry}, other, hard_parent.string(),
+                    overwrite, {}, {}, &skipped
+                );
+            } else {
+                operations.move_exact(
+                    *provider, hard_entry, other, hard_target.string(),
+                    overwrite, {}, {}, &skipped
+                );
+            }
+        }
+        check(skipped.completed_sources.empty() && skipped.skipped.size() == 1U &&
+                  skipped.skipped.front().path == hard_entry.path &&
+                  skipped.skipped.front().reason.find("same file") !=
+                      std::string::npos,
+              "same-inode move reports skip rather than successful no-op");
+        check_unchanged(hard_source, hard_before);
+        check_unchanged(hard_target, hard_before);
+        hard_marks.unmark_paths(skipped.completed_sources);
+        hard_marks.refresh();
+        check(hard_marks.marked_count() == 1U &&
+                  hard_marks.selected_entries().front().path == hard_entry.path,
+              "same-inode move retains its original source mark");
+    }
+    bool direct_refused = false;
+    try {
+        provider->rename(hard_source.string(), hard_target.string(), true);
+    } catch (const std::exception&) {
+        direct_refused = true;
+    }
+    check(direct_refused, "provider refuses a same-inode rename no-op");
+    check_unchanged(hard_source, hard_before);
+    check_unchanged(hard_target, hard_before);
+    std::cout << "  [PASS] hardlink normal/exact moves retain inode, links and marks\n";
+
+    const auto late_source = root / "late-source";
+    const auto late_target = root / "late-target";
+    write_file(late_source, "LATE-HARDLINK\n");
+    write_file(late_target, "REPLACEABLE-FIXTURE\n");
+    FileSnapshot late_before;
+    bool linked_late = false;
+    bool late_refused = false;
+    mcpp::OperationResult late_result;
+    try {
+        operations.move_exact(
+            *provider, provider->stat(late_source.string(), {}), *provider,
+            late_target.string(), overwrite, {},
+            [&](const mcpp::TransferProgress& value) {
+                if (!linked_late && value.files_done == 0U) {
+                    std::filesystem::remove(late_target);
+                    std::filesystem::create_hard_link(late_source, late_target);
+                    late_before = snapshot_file(late_source);
+                    linked_late = true;
+                }
+            },
+            &late_result
+        );
+    } catch (const std::exception&) {
+        late_refused = true;
+    }
+    check(linked_late && late_refused && late_result.completed_sources.empty(),
+          "same-inode alias introduced after progress is refused");
+    check_unchanged(late_source, late_before);
+    check_unchanged(late_target, late_before);
+
+    const auto object_target = root / "object-target";
+    write_file(object_target / "KEEP", "SYMLINK-TARGET\n");
+    const auto object_keep = snapshot_file(object_target / "KEEP");
+    const auto object_file = root / "object-file";
+    write_file(object_file, "SYMLINK-FILE-TARGET\n");
+    const auto object_file_before = snapshot_file(object_file);
+    for (const bool exact : {false, true}) {
+        const auto name = exact ? "exact-symbol" : "normal-symbol";
+        const auto source_link = root / "hard-source" / name;
+        const auto target_link = hard_parent / name;
+        const auto target = exact ? object_file : object_target;
+        std::filesystem::create_symlink(target, source_link);
+        std::filesystem::create_symlink(target, target_link);
+        struct stat source_link_before {};
+        check(::lstat(source_link.c_str(), &source_link_before) == 0,
+              "symlink object source lstat");
+        mcpp::OperationResult moved;
+        if (exact) {
+            operations.move_exact(
+                *provider, provider->stat(source_link.string(), {}), *provider,
+                target_link.string(),
+                overwrite, {}, {}, &moved
+            );
+        } else {
+            operations.move(
+                *provider, {provider->stat(source_link.string(), {})}, *provider,
+                hard_parent.string(), overwrite, {}, {}, &moved
+            );
+        }
+        struct stat published_link {};
+        check(moved.skipped.empty() && moved.completed_sources.size() == 1U &&
+                  !std::filesystem::exists(
+                      std::filesystem::symlink_status(source_link)
+                  ) &&
+                  ::lstat(target_link.c_str(), &published_link) == 0 &&
+                  S_ISLNK(published_link.st_mode) &&
+                  published_link.st_ino == source_link_before.st_ino &&
+                  std::filesystem::read_symlink(target_link) == target,
+              "symlink objects move without following equal targets");
+        check_unchanged(object_target / "KEEP", object_keep);
+        check_unchanged(object_file, object_file_before);
+    }
+    for (const bool exact : {false, true}) {
+        const auto name = exact ? "hardlinked-exact-symbol" : "hardlinked-normal-symbol";
+        const auto source_link = root / "hard-source" / name;
+        const auto target_link = hard_parent / name;
+        std::filesystem::create_symlink(object_file, source_link);
+        check(::link(source_link.c_str(), target_link.c_str()) == 0,
+              "hardlink symbolic link object");
+        struct stat before {};
+        check(::lstat(source_link.c_str(), &before) == 0 &&
+                  S_ISLNK(before.st_mode) && before.st_nlink == 2U,
+              "hardlinked symlink fixture identity");
+        const auto entry = provider->stat(source_link.string(), {});
+        mcpp::Pane marks(provider, source_link.parent_path().string());
+        marks.select_paths({entry.path});
+        mcpp::OperationResult skipped;
+        if (exact) {
+            operations.move_exact(
+                *provider, entry, *provider, target_link.string(),
+                overwrite, {}, {}, &skipped
+            );
+        } else {
+            operations.move(
+                *provider, {entry}, *provider, hard_parent.string(),
+                overwrite, {}, {}, &skipped
+            );
+        }
+        check(skipped.completed_sources.empty() && skipped.skipped.size() == 1U &&
+                  skipped.skipped.front().path == entry.path,
+              "hardlinked symlink move reports a same-object skip");
+        for (const auto& path : {source_link, target_link}) {
+            struct stat after {};
+            check(::lstat(path.c_str(), &after) == 0 &&
+                      after.st_dev == before.st_dev &&
+                      after.st_ino == before.st_ino &&
+                      after.st_mode == before.st_mode &&
+                      after.st_uid == before.st_uid &&
+                      after.st_gid == before.st_gid &&
+                      after.st_nlink == before.st_nlink &&
+                      after.st_mtim.tv_sec == before.st_mtim.tv_sec &&
+                      after.st_mtim.tv_nsec == before.st_mtim.tv_nsec &&
+                      std::filesystem::read_symlink(path) == object_file,
+                  "hardlinked symlink names, identity and target remain unchanged");
+        }
+        marks.unmark_paths(skipped.completed_sources);
+        marks.refresh();
+        check(marks.marked_count() == 1U &&
+                  marks.selected_entries().front().path == entry.path,
+              "hardlinked symlink move retains its source mark");
+        check_unchanged(object_file, object_file_before);
+    }
+    std::cout << "  [PASS] hardlinked symlink normal/exact moves retain identity and marks\n";
+}
+
+void test_viewer_text_windows() {
+    TemporaryDirectory temporary;
+    auto provider =
+        std::make_shared<mcpp::LocalProvider>(temporary.path());
+    const auto path = temporary.path() / "viewer-windows.txt";
+    mcpp::ViewerModel viewer;
+
+    write_file(path, "A\tB\nAFTER-TAB\nLAST\n");
+    viewer.open(provider, path.string());
+    check_equal(
+        viewer.lines(80, 3),
+        std::vector<std::string>{"A       B", "AFTER-TAB", "LAST"},
+        "viewer expands tabs without hiding following lines"
+    );
+    check_equal(viewer.view_end(), viewer.size(), "tabbed displayed end");
+    viewer.page(1, 80, 1);
+    check_equal(viewer.offset(), std::uint64_t{4}, "tabbed next page offset");
+    check_equal(
+        viewer.lines(80, 1).front(),
+        std::string("AFTER-TAB"),
+        "tabbed page continues after its newline"
+    );
+    viewer.page(-1, 80, 1);
+    viewer.set_wrap(false);
+    viewer.scroll_columns(4);
+    check_equal(
+        viewer.lines(5, 1).front(),
+        std::string("    B"),
+        "unwrapped horizontal clipping inside a tab"
+    );
+    check_equal(viewer.view_end(), std::uint64_t{4}, "clipped tab byte count");
+
+    write_file(path, "1234567\tX\nNEXT\n");
+    viewer.open(provider, path.string());
+    viewer.set_wrap(true);
+    check_equal(
+        viewer.lines(8, 2),
+        std::vector<std::string>{"1234567 ", "X"},
+        "tab at exact row width wraps without an extra row"
+    );
+    check_equal(viewer.view_end(), std::uint64_t{10}, "wrapped tab byte count");
+    viewer.page(1, 8, 2);
+    check_equal(viewer.offset(), std::uint64_t{10}, "wrapped tab page continuity");
+    check_equal(
+        viewer.lines(8, 1).front(),
+        std::string("NEXT"),
+        "wrapped tab page preserves the following line"
+    );
+    viewer.page(-1, 8, 2);
+    check_equal(viewer.offset(), std::uint64_t{0}, "wrapped tab page up");
+
+    constexpr std::size_t window_bytes = 256U * 1024U;
+    constexpr std::size_t width = 80U;
+    constexpr std::size_t height = 22U;
+    std::string content(window_bytes + 2U * width * height, 'x');
+    for (std::size_t offset = 0; offset + width <= content.size();
+         offset += width) {
+        const auto marker = std::to_string(offset);
+        content.replace(offset, marker.size(), marker);
+    }
+    write_file(path, content + "\nTAIL\n");
+    viewer.open(provider, path.string());
+    for (int page = 0; page < 148; ++page) {
+        viewer.page(1, width, height);
+    }
+    const auto check_block = [&](const std::size_t columns,
+                                 const std::size_t rows) {
+        const auto begin = viewer.offset();
+        const auto displayed = viewer.lines(columns, rows);
+        check_equal(displayed.size(), rows, "viewer fills page across cache edge");
+        for (std::size_t row = 0; row < rows; ++row) {
+            check_equal(
+                displayed[row],
+                content.substr(
+                    static_cast<std::size_t>(begin) + row * columns,
+                    columns
+                ),
+                "viewer preserves every byte across cache edge"
+            );
+        }
+        check_equal(
+            viewer.view_end(),
+            begin + columns * rows,
+            "viewer displayed end crosses cache edge"
+        );
+        return displayed;
+    };
+    const auto before_boundary = viewer.offset();
+    check_equal(before_boundary, std::uint64_t{260480}, "boundary page start");
+    const auto first_page = check_block(width, height);
+    const auto displayed_end = viewer.view_end();
+    viewer.page(1, width, height);
+    check_equal(viewer.offset(), displayed_end, "next page starts at displayed end");
+    static_cast<void>(check_block(width, height));
+    viewer.page(-1, width, height);
+    check_equal(viewer.offset(), before_boundary, "cache-edge page up offset");
+    check_equal(check_block(width, height), first_page, "cache-edge page up content");
+
+    viewer.open(provider, path.string());
+    viewer.scroll_lines(static_cast<int>(window_bytes / 64U - 1U), 64);
+    check_equal(viewer.offset(), window_bytes - 64U, "exact 256 KiB boundary start");
+    static_cast<void>(check_block(64, 2));
+    viewer.page(1, 64, 2);
+    check_equal(viewer.offset(), window_bytes + 64U, "exact boundary page continuity");
+    static_cast<void>(check_block(64, 2));
+
+    viewer.open(provider, path.string());
+    viewer.set_wrap(false);
+    check_equal(
+        viewer.lines(width, 2),
+        std::vector<std::string>{content.substr(0, width), "TAIL"},
+        "unwrapped huge line refills without hiding following lines"
+    );
+    check_equal(viewer.view_end(), viewer.size(), "unwrapped huge displayed end");
+    viewer.scroll_lines(1, width);
+    check_equal(
+        viewer.offset(),
+        content.size() + 1U,
+        "unwrapped scroll skips the logical line, not the read window"
+    );
+
+    write_file(
+        path,
+        std::string(window_bytes - 2U, 'x') + "\n界e\u0301\tZ\nTAIL\n"
+    );
+    viewer.open(provider, path.string());
+    viewer.scroll_lines(1, 16);
+    check_equal(viewer.offset(), window_bytes - 1U, "UTF-8 straddles cache edge");
+    viewer.set_wrap(true);
+    check_equal(
+        viewer.lines(16, 2),
+        std::vector<std::string>{"界e\u0301     Z", "TAIL"},
+        "cache refill preserves UTF-8, combining marks, and tabs"
+    );
+    check_equal(viewer.view_end(), viewer.size(), "UTF-8 source byte count");
+
+    write_file(path, std::string(window_bytes + 32U, 'h'));
+    mcpp::ViewerModel hex_viewer;
+    hex_viewer.open(provider, path.string());
+    hex_viewer.toggle_hex();
+    hex_viewer.scroll_lines(static_cast<int>(window_bytes / 16U - 1U), width);
+    const auto hex_rows = hex_viewer.lines(width, 2);
+    check_equal(hex_rows.size(), std::size_t{2}, "hex fills page across cache edge");
+    check(hex_rows[1].starts_with("00040000"), "hex row after exact cache boundary");
+    check_equal(hex_viewer.view_end(), window_bytes + 16U, "hex displayed byte count");
+}
+
+void test_viewer_home_end() {
+    TemporaryDirectory temporary;
+    auto provider =
+        std::make_shared<mcpp::LocalProvider>(temporary.path());
+    const auto path = temporary.path() / "viewer-home-end.txt";
+    std::string wrapped;
+    for (int row = 0; row < 13; ++row) {
+        const auto number = std::to_string(row);
+        wrapped += std::string(3U - number.size(), '0') + number +
+                   ":" + std::string(36, '.');
+    }
+    write_file(path, wrapped + "FINAL\n");
+    mcpp::ViewerModel viewer;
+    viewer.open(provider, path.string());
+    viewer.go_to_end(40, 6);
+    check_equal(viewer.offset(), std::uint64_t{320}, "End aligns wrapped last page");
+    const auto last_page = viewer.lines(40, 6);
+    check_equal(last_page.size(), std::size_t{6}, "End fills the final page");
+    check_equal(last_page.back(), std::string("FINAL"), "End reveals final content");
+    check_equal(viewer.view_end(), viewer.size(), "End displayed end");
+    viewer.page(-1, 40, 6);
+    check_equal(viewer.offset(), std::uint64_t{80}, "PageUp after End");
+    viewer.go_to_start();
+    check_equal(viewer.offset(), std::uint64_t{0}, "Home seeks first byte");
+    check_equal(viewer.lines(40, 1).front(), wrapped.substr(0, 40), "Home first content");
+
+    std::string many_lines;
+    for (int row = 0; row < 20000; ++row) {
+        const auto number = std::to_string(row);
+        many_lines += number + std::string(15U - number.size(), 'x') + "\n";
+    }
+    write_file(path, many_lines);
+    viewer.open(provider, path.string());
+    viewer.go_to_end(80, 3);
+    check_equal(viewer.offset(), std::uint64_t{19997U * 16U}, "End seeks file tail");
+    check_equal(
+        viewer.lines(80, 3).back(),
+        many_lines.substr(many_lines.size() - 16U, 15),
+        "End reveals content beyond the initial read window"
+    );
+    check_equal(viewer.view_end(), viewer.size(), "large End displayed end");
+
+    write_file(path, wrapped + "FINAL\nAFTER\nLAST\n");
+    viewer.open(provider, path.string());
+    viewer.set_wrap(false);
+    viewer.scroll_columns(12);
+    viewer.go_to_end(40, 2);
+    check_equal(viewer.horizontal_offset(), std::size_t{0}, "End resets column");
+    check_equal(
+        viewer.lines(40, 2),
+        std::vector<std::string>{"AFTER", "LAST"},
+        "unwrapped End uses logical last lines"
+    );
+    viewer.go_to_start();
+    check_equal(viewer.offset(), std::uint64_t{0}, "unwrapped Home offset");
+
+    mcpp::ViewerModel hex_viewer;
+    hex_viewer.open(provider, path.string());
+    hex_viewer.toggle_hex();
+    hex_viewer.go_to_end(80, 2);
+    check_equal(
+        hex_viewer.offset(),
+        ((hex_viewer.size() - 1U) / 16U - 1U) * 16U,
+        "hex End aligns the last two rows"
+    );
+    static_cast<void>(hex_viewer.lines(80, 2));
+    check_equal(hex_viewer.view_end(), hex_viewer.size(), "hex End shows final byte");
+    hex_viewer.go_to_start();
+    check(hex_viewer.lines(80, 1).front().starts_with("00000000"), "hex Home");
+
+    write_file(path, "");
+    viewer.open(provider, path.string());
+    viewer.go_to_end(40, 6);
+    viewer.go_to_start();
+    check_equal(viewer.offset(), std::uint64_t{0}, "empty Home/End offset");
+    check(viewer.lines(40, 6).empty(), "empty Home/End viewport");
+}
+
 void test_viewer_editor() {
     TemporaryDirectory temporary;
     const auto path = temporary.path() / "document.txt";
@@ -1477,7 +2419,7 @@ void test_viewer_editor() {
     check(editor.column_selection(), "editor column block mode");
     check_equal(
         *editor.selected_text(),
-        std::string("bc\nb \n b"),
+        std::string("bc\nb\n b"),
         "editor rectangular block text"
     );
     check(editor.delete_selection(), "delete rectangular block");
@@ -2390,7 +3332,7 @@ void test_user_menu() {
 }  // namespace
 
 int main() {
-    const std::vector<std::pair<
+    std::vector<std::pair<
         std::string_view,
         void (*)()
     >> tests{
@@ -2398,6 +3340,8 @@ int main() {
         {"pane", test_pane},
         {"special paths", test_special_paths},
         {"operations", test_operations},
+        {"viewer text windows", test_viewer_text_windows},
+        {"viewer Home/End", test_viewer_home_end},
         {"viewer/editor", test_viewer_editor},
         {"config", test_config},
         {"editor clipboard", test_editor_clipboard},
@@ -2406,6 +3350,25 @@ int main() {
         {"editor search", test_editor_search},
         {"user menu", test_user_menu},
     };
+    const auto* disposable = std::getenv("MCPP_DISPOSABLE_TESTS");
+    const auto* temporary_root = std::getenv("TMPDIR");
+    if (disposable != nullptr &&
+        std::string_view(disposable) == "1" &&
+        temporary_root != nullptr &&
+        std::filesystem::path(temporary_root).lexically_normal() ==
+            std::filesystem::path("/review/runtime") &&
+        std::filesystem::exists("/.dockerenv") &&
+        std::filesystem::exists(
+            "/review/.operation-regressions-disposable"
+        )) {
+        tests.emplace_back("operation destinations", test_operation_destinations);
+        tests.emplace_back("atomic symbolic links", test_atomic_symlink_copy);
+        tests.emplace_back("operation results", test_operation_results);
+    } else {
+        std::cout
+            << "[SKIP] operation regression groups require "
+               "tests/run_operation_regressions.sh\n";
+    }
     int failures = 0;
     for (const auto& [name, test] : tests) {
         try {

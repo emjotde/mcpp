@@ -1,509 +1,234 @@
-# mcpp versus GNU Midnight Commander: gap analysis
+# mcpp versus GNU Midnight Commander
 
 Review date: 2026-10-17
 
-Compared versions:
-
-- GNU Midnight Commander 4.8.30, installed at `/usr/bin/mc`
-- mcpp working tree based on commit `37263dc`
-
-## Conclusion
-
-mcpp now provides a comparable Linux local-filesystem workflow for the common
-commander, viewer, and editor paths covered below. It is not a complete clone
-of GNU Midnight Commander.
-
-A ten-topic GNU Screen audit captured 115 matched MC/mcpp pairs covering panel
-navigation, menus, selection, Quick view, viewer, editor, operations,
-metadata/links, and terminal layouts. The comparison drove fixes for menu
-activation, shortcuts, focused Quick view, viewer paging/chrome, selection
-masks, editor indentation/clipboard behavior, operation cancellation redraw,
-terminal sizing, and shell transitions.
-
-The largest remaining gaps are advanced panel modes, richer operation and
-metadata dialogs, persistent subshell integration, help/jobs, macros,
-archive/VFS support, and SSH/cloud providers.
+This is a functional review of the supported Linux local-filesystem workflows,
+not a claim that mcpp is a complete MC clone. Archive, SSH/SFTP, Azure, and
+spelling support remain deferred.
 
 ## Review method
 
-The review used:
+The comparison used GNU Midnight Commander 4.8.30 and a frozen mcpp baseline
+at `7af99c29378e798f00b0f110a3c94734aec47387`. The baseline executable's SHA-256
+was `43c17efc44b2aed84056cc1325188e937f9d14bd1dbf96711843eac4c4533d0c`.
+The corrections described below belong to the subsequent review changes.
 
-1. MC's installed binary, help, configure flags, and VFS installation.
-2. MC's default keymap: 201 unique action names and 393
-   context/action combinations across file manager, panel, input, menu,
-   dialog, tree, help, editor, viewer, hex viewer, and diff viewer contexts.
-3. MC's manual sections for panels, menus, operations, search, hotlist,
-   options, viewer, editor, subshell, and VFS.
-4. Behavioral inspection of the upstream source dispatch and operation code.
-5. Side-by-side GNU Screen sessions at 80x24, 100x30, 120x34-40,
-   72x22, and resized layouts.
-6. A ten-topic matrix of 115 matched hardcopy pairs, with raw captures and
-   per-topic findings retained as audit artifacts.
-7. Review of mcpp source plus Debug, Release, ASan, and UBSan test matrices.
+Four independent reviews covered panels/menus, operations/search, editor, and
+viewer/terminal/configuration. Tree and cross-feature checks were integrated
+separately. Each terminal had private HOME, configuration, cache, and fixtures.
+The four reviews recorded 88 representative case groups, including partial
+comparisons and unsupported actions rather than counting those as passes.
 
-MC source was inspected only to understand behavior. No MC code or resources
-were reused.
+Evidence includes rendered PNGs, ANSI/cell captures, exact keystrokes, saved
+configuration bytes, and before/after filesystem metadata and hashes.
+Destructive and error-injection operation checks used disposable Docker
+containers without host mounts. Actual GNU Screen sessions covered both
+`altscreen on` and `altscreen off`.
 
-## What mcpp currently does
+MC controls were calibrated before comparing results: its delayed Escape
+handling, Tree static/dynamic mode, radio selection, and dialog focus differ
+from simple assumptions. MC source was inspected to understand behavior;
+its implementation and resources were not copied.
 
-The following local functionality works in basic cases:
+Screenshots were opened and inspected, not just counted. A screenshot alone
+does not prove selection identity, operation targets, saved bytes, or the
+absence of a late asynchronous update. The new regressions check those
+outcomes directly.
 
-- two directory panes with `..`, file metadata, free space, and hidden files;
-- keyboard and mouse pane focus;
-- cursor movement, page movement, history, sorting, and hotlist;
-- marking, masks, inversion, and selected-item operations;
-- F2 user menu and F9 category pull-down state;
-- F3 text/hex viewer;
-- F4 basic text editor with save conflict checks and undo/redo;
-- F5 copy, F6 move/rename, F7 mkdir, and F8 delete;
-- local symbolic links, hard links, chmod, and chown;
-- asynchronous copy/move/delete with status updates and cancellation;
-- recursive filename/content search and directory comparison;
-- quick view and file information;
-- local shell commands and an interactive child shell;
-- atomic regular-file output, root deletion protection, and symlink
-  confinement;
-- Debug, Release, ASan/UBSan, pseudo-terminal, and Docker tests.
+## Defects addressed by this review
 
-These are useful foundations, not parity.
+| Area | Baseline defect | Required corrected behavior |
+|---|---|---|
+| Tree | Expansion inserts rows before the cursor and changes the selected path | Retain selection by path and keep operation targets consistent |
+| Tree | Rescan resets selection and expanded descendants to startup ancestry | Rescan the chosen branch, retain surviving expansions, and discover new children |
+| Tree | Failed rescan retains children but marks their branch collapsed | Keep cached expansion state consistent so collapse and retry still work |
+| Tree | Wide rescan merges repeatedly search the entire cached subtree | Index child subtrees once, keeping the merge linear instead of freezing the UI |
+| Tree | Enter executes a pending commander command | Open/expand the Tree selection; retain pending text for the listing |
+| Tree | Narrow UTF-8 names are fitted by bytes | Fit whole glyphs by display columns |
+| Quick view | Home/End move the retained listing cursor | Navigate the viewer without changing the listing target |
+| Prompts | Tab cannot reach Cancel; clicking Cancel does nothing | Real input/OK/Cancel focus, reverse Tab, keyboard activation, and mouse controls |
+| Selection | Plain `*` also selects real directories | Invert files and directory symlinks; retain existing real-directory marks |
+| Menus | View file... immediately opens the cursor file | Prompt for a filename; resolve relative paths against the active pane |
+| Menus | External panelize launches a filename-glob prompt | Disable the unsupported external-command action; name the local helper accurately |
+| Viewer | A tab hides subsequent content and paging skips it | Expand tabs while tracking original source bytes |
+| Viewer | A 256 KiB cache boundary produces a short page and omitted bytes | Refill bounded reads through the viewport and preserve page continuity |
+| Configuration | Live Save setup serializes old panel preferences | Save current panel state immediately, not only on exit |
+| Editor | F6 clears the moved block mark, so F8 deletes unrelated text | Keep the destination block marked and preserve undo behavior |
+| Editor | Search state leaks between open buffers | Restore each buffer's query, options, and selection scope |
+| Editor | Quit behaves like closing just the active buffer | Check all dirty buffers before quitting; Cancel retains the clean active buffer and pending discard decisions |
+| Editor | Case-insensitive normal search misses uppercase UTF-8 letters | Match under the UTF-8 locale and retain original byte offsets |
+| Editor | Rectangular copy invents spaces for nonexistent source cells | Preserve empty source rows and pad only the destination as needed |
+| Move | A single-file F6 target replaces an existing directory and deletes its contents | Treat an existing directory as a directory destination; preserve unrelated entries |
+| Move | Fallback copies through a destination alias to the source and then deletes the source | Reject physical self/descendant targets and restrict fallback to supported rename failures |
+| Move | Same-inode hardlink rename is reported as a completed move although the source remains | Compare `lstat` identity for regular files and symlink objects; retain both names and the mark |
+| Copy | A single-file F5 filename is treated as a directory | Support an exact new filename as well as an existing directory |
+| Background operations | Completion hides a dirty editor, allowing unsaved edits to be lost | Preserve the current editor/viewer/dialog and its close protection |
+| Background operations | A hidden error is replaced by the editor's later status | Retain a pending failure/skip/cancellation notice and show it on return to panels |
+| Background operations | A pane swap makes completion clear unrelated marks | Track the source pane after swapping and retain unrelated marks |
+| Symlinks | Confirmed overwrite fails with Preserve permissions off | Replace the link safely without changing either target file |
+| Panelized copy | A duplicate basename is silently skipped while reporting completion | Report skipped sources and an incomplete result explicitly |
 
-## Correctness issues in the current implementation
+Integration checks also cover cancelling an in-flight or queued Tree rescan,
+preserving the requested rescan path while selection moves, retrying a failed
+expansion, and keeping operation results visible after automatic Tree refresh.
+These checks caught additional mistakes during the corrections.
 
-### Blockers
+## Workflows exercised
 
-1. **Dangling capture in asynchronous collision handling**
+| Area | Checks and outcome boundaries |
+|---|---|
+| Tree | Left/right current directories, hidden cwd, Enter/open/expand, deep connectors, narrow Unicode fitting, asynchronous selection, real delete-dialog target, Tab round-trips, rescan, collapse/re-expand, permission retry, and GNU Screen resize |
+| Listings | Parent cursor restoration, directory history, failed change-directory preserving marks, masks, inversion, filters, refresh, swapping, and restoring listing modes |
+| Quick/Info | Preview scrolling, panel switching, mouse focus, restored cursors/marks, and File-menu operation targets |
+| Menus/dialogs | Implemented File/Command routes and shortcuts; disabled actions remain visibly unavailable; generic prompt cancellation and filename entry |
+| Operations | Exact bytes/modes, directory destinations, overwrite/skip policies, source masks, preserve/follow links, self-copy rejection, pause/resume/skip/abort, staging cleanup, background state, and unrelated selection preservation |
+| Failure handling | Internal tmpfs disk-full, read-only destinations, cancelled deletion, symlink-only deletion, and retaining the previous destination before publication |
+| Find/panelize | Nested matches, result navigation, cancellation without late publication, no traversal into symlink directories, stale-result rejection after navigation, nested refresh/filter/link actions, and duplicate basenames |
+| Compare | Equal, size-mismatched, and one-sided entries; replacement rather than accumulation of marks |
+| Viewer | Wrap/unwrapped paging, tabs, horizontal scroll, text/hex switching, Home/End, search/repeat, cache boundaries, empty/error states, panel return, and resize |
+| Editor | UTF-8/tabs/preferred column, overwrite, undo/redo, persistent blocks, rectangular operations, cross-process clipboard, search modes/errors, selection-scoped replacement, save conflicts, symlink saves, new/save-as/close, and multiple buffers |
+| Configuration | Live Save setup, fresh-profile restart, ordinary-exit persistence, malformed widths, and escaped strings |
+| Shell/terminal | Commands, child-shell input/output, return to panels, working canonical/echo state, and Screen history behavior |
 
-   `src/app.cpp` constructs the operation collision callback with `[&]`,
-   capturing the stack parameter `overwrite` by reference, then copies that
-   callback into a worker thread. If a collision is discovered after the
-   preflight check, invoking the callback reads a dead stack reference.
-   This is undefined behavior.
+The operations background-editor comparison with MC was inconclusive: the
+isolated MC attempts did not reach an editor before timeout. mcpp's unsaved
+edit loss was independently established from its screen, exit state, and
+unchanged disk bytes; no MC behavior was inferred.
 
-2. **Worker can outlive the terminal object**
+The cold standalone MC editor history comparison was also partial: its
+private history files remained empty. mcpp history persistence/reopen was
+exercised, but equivalent MC history-item/cursor restoration was not proved.
 
-   Background threads store and call a raw `ftxui::App*`. F10 blocks normal
-   exit while an operation is running, but signals, terminal failures, or
-   exceptions can end the event loop first. The local FTXUI object is then
-   destroyed before the `Impl` and its `std::jthread`, allowing a late
-   `terminal->Post()` through a dangling pointer.
+MC Info did not take focus in the tested Tab/mouse attempts. Its retained
+listing operations were observed, but they are not an equivalent control
+for mcpp's explicitly focused Info mode.
 
-3. **Unsupported special files can block indefinitely**
+## Current local functionality and remaining gaps
 
-   Local copy distinguishes directories and symlinks, then treats every other
-   entry as a regular stream. Opening a FIFO for input can block indefinitely;
-   sockets, devices, and other special files have undefined or misleading
-   behavior. MC identifies these types and applies explicit policies.
+### Panels and menus
 
-4. **Operation UI is not an operation controller**
+mcpp supports two local listings, parent navigation and history, sorting,
+hidden files, case-sensitive filename filters, masks, selection, Quick view,
+live Info, Tree, pane swapping, hotlist, and filename-search panelization.
 
-   The status line cannot skip the current item, pause/continue, retry an
-   error, ignore one/all errors, or inspect failures. Cancellation is
-   all-or-nothing. This is unsafe for large multi-item operations because the
-   user cannot resolve an individual failure.
+Tree opens at the chosen pane's cwd. Enter opens the selected directory in
+the opposite listing and expands it. Right expands/moves to a child; Left
+selects the parent. Space toggles, `+` expands, and `-` collapses. A single
+click focuses a node and a double-click opens it. Explicit collapse controls
+and Enter expansion are requested mcpp behavior, not an assertion that all
+MC Tree modes use the same controls.
 
-### High priority
+Unavailable listing formats, multi-column layouts, split/resizing controls,
+directory-size calculation, codepage selection, full help, key learning, and
+custom keymaps remain gaps. Grayscale chrome is intentional.
 
-5. **Copy/move metadata semantics are incomplete**
+Generic inputs now have usable controls but remain simpler than MC's input
+widgets: full cursor/word editing, selection, completion, and input history
+are not implemented. Editor-menu mouse behavior is not complete.
 
-   Regular copies preserve mode only. They do not preserve timestamps,
-   ownership, xattrs, ACLs, sparse layout, hard-link relationships, filesystem
-   attributes, or stable relative symlinks. There is no follow-links option,
-   dive-into-subdirectories option, reflink/preallocation behavior, or umask
-   policy.
+### File operations and search
 
-6. **Overwrite behavior is far below MC**
+The copy/move dialog includes source masks, destination input, preserve/follow
+link and permission options, background choice, and OK/Cancel. The running
+operation supports progress, pause/resume, skipping, and cancellation.
+Regular-file publication uses staging/no-clobber behavior rather than writing
+over the visible destination while copying.
 
-   mcpp offers a whole-operation yes/no overwrite confirmation. MC offers
-   per-file Yes, No, Append, Reget, All, Older, None, Smaller, Size differs,
-   zero-length protection, and Abort, with both source and destination
-   metadata shown.
+Failures, skipped-source results, and cancellation during another full-screen
+view remain pending instead of closing that view or losing the result.
+The commander shows `Background [Esc]` on return; Escape dismisses the notice.
 
-7. **User-menu loading is not secure or compatible**
+This is still not MC's full operation controller. Rich per-file overwrite
+choices, retry/ignore workflows, background job management, recursive-delete
+choices, append/reget, and resumable disk-full recovery are not equivalent.
+ACLs, xattrs, sparse layout, hard-link sets, and all failure/rollback
+combinations were not established by this review.
 
-   MC checks ownership and world-writability of local and user menu files.
-   mcpp uses a different one-line format and does not validate ownership or
-   permissions. Placeholder replacement is sequential, so a filename
-   containing `%d` or `%D` can be rewritten after `%f` expansion, corrupting
-   quoting and command meaning.
-
-8. **Configuration writes are not hardened**
-
-   Configuration uses a predictable `.tmp` pathname through `std::ofstream`.
-   It does not use exclusive no-follow creation, fsync, mode enforcement, or
-   robust replacement/rollback.
-
-9. **Provider operations still run synchronously on the UI thread**
-
-   Directory refresh, collision preflight, recursive search, compare, viewer
-   range loads, quick view, stat, and free-space queries can block rendering.
-   This is already visible with large or slow local directories and would be
-   unacceptable for Blob or SSH providers.
-
-10. **Terminal and operation lifetimes are not modeled explicitly**
-
-    There is no state machine that owns operation start, progress, conflict
-    prompts, cancellation, completion, terminal shutdown, and worker join.
-    UI state and worker state are coupled inside a 2,500-line `app.cpp`.
-
-### Medium priority
-
-11. `getpwuid()` and `getgrgid()` are non-reentrant but can be reached while
-    worker operations and UI refreshes overlap.
-12. Undo always marks the editor dirty, even when undo returns to the saved
-    state.
-13. UTF-8 editing is byte-aware but not grapheme- or display-column-aware.
-14. UI truncation counts bytes, not terminal cell width.
-15. Directory comparison supports one fixed size/time strategy and has no
-    thorough byte comparison.
-16. Search has no regex, whole-word, ignored-directory, pause/resume, or
-    panelize semantics.
-17. A dead legacy internal-menu handler remains in `app.cpp`, separate from
-    the active user-menu implementation.
-18. Cross-device move rollback and destination backup cleanup are not
-    failure-injection tested.
-
-## Behavioral comparison
-
-### Main screen and panels
-
-| Capability | MC | mcpp | Status |
-|---|---|---|---|
-| Equal dual panes | Yes | Yes | Working |
-| Parent row | Yes | Yes | Working |
-| Full Name/Size/Time view | Yes | Yes | Basic |
-| Brief view | 1-9 columns | One column | Partial |
-| Long `ls -l` view | Yes | No | Missing |
-| User-defined panel format | Yes | No | Missing |
-| Sort modes | 8 plus unsorted/natural options | Name, extension, size, mtime | Partial |
-| Reverse sorting | Yes | Yes | Working |
-| Panel filters | Glob/regex, files-only, case options | Case-sensitive glob filter | Partial |
-| Quick search | Incremental panel search | Incremental Ctrl-S/Alt-S search | Working |
-| Directory sizes | On demand | Shows directory inode size | Missing |
-| Tree panel | Dynamic/static global tree | Lazy global tree with current-directory ancestry, async expansion, mouse/keyboard navigation, and explicit collapse controls | Close |
-| Info panel | Full panel mode | Live metadata panel | Close |
-| Quick-view panel | Viewer-capable panel | Fixed-width preview with Tab/mouse focus and scrolling | Partial |
-| Panelize | Find/external command results become panel | Asynchronous cancellable name results become panel | Partial |
-| Horizontal split and resizing | Yes | No | Missing |
-| Swap/synchronize panes | Yes | No | Missing |
-| File highlighting | Rules, types, permissions | Built-in grayscale type/mode cues | Partial |
-| Codepage selection | Yes | No | Missing |
-| Tiny terminal adaptation | Truncates fields/keybar intentionally | Compact fields and keybar | Working |
-
-At 60x15, both programs keep panel navigation and current-item information
-usable. mcpp keeps all ten compact key labels visible, while MC drops later
-labels when necessary.
-
-The follow-up source and side-by-side review aligned Ctrl-PageUp/Down
-directory traversal, parent-row cursor restoration,
-Alt-Y/Alt-U history movement, Shift-Up/Down marking, pointed-pane mouse
-wheel behavior, Space command-line input, and incremental quick search.
-Remaining navigation differences are MC's directory-history popup,
-multi-column horizontal movement, richer panel-filter options,
-directory-size calculation, and extension/executable Enter actions.
-
-### Menus and input widgets
-
-| Capability | MC | mcpp | Status |
-|---|---|---|---|
-| F2 user menu | Local/user/system lookup, conditions, multiline commands | One global `key|label|command` file | Partial |
-| F9 pull-down | Full Left/File/Command/Options/Right menus | Matching menu rows with implemented actions enabled and unavailable rows faded | Partial |
-| Dialog widgets | Buttons, checkboxes, radio, tab order, hotkeys | Buttons, checks, radio-like modes, tab order | Partial |
-| Input editing | Cursor, words, kill/yank, selection, history, completion | Append/backspace only | Missing |
-| Mouse in menus/dialogs | Yes | Panel rows and commander pull-downs; editor/dialog mouse incomplete | Partial |
-| Hypertext help | Contextual, indexed, links/history | Static key summary | Missing |
-| Learn/redefine keys | Yes | No | Missing |
-
-### Copy, move, and delete
-
-The side-by-side F5 test demonstrates the gap directly.
-
-MC's copy dialog includes:
-
-- source and destination masks;
-- shell-pattern mode;
-- follow links;
-- preserve attributes;
-- stable symlinks;
-- dive into existing subdirectories;
-- foreground/background choice;
-- OK and Cancel buttons.
-
-mcpp's dialog contains only a destination text field.
-
-Further missing operation behavior:
-
-- per-file conflict decisions and apply-to-all variants;
-- skip, suspend/continue, retry, ignore, and ignore-all;
-- current-file and total progress bars;
-- accurate recursive totals before operation;
-- background job list with stop/restart/kill;
-- recursive delete choices Yes/No/All/None/Abort;
-- source/target mask transforms and case conversion;
-- successful-only unmarking;
-- disk-full recovery and resume/reget;
-- external filesystem and special-file policies.
+Find and filename panelization are asynchronous and cancellable. They are
+not an external-command panelizer. Saved external panelize commands,
+advanced Find options/context, thorough byte comparison, and diff/merge
+remain unavailable.
 
 ### Viewer
 
-| Capability | MC viewer | mcpp viewer |
-|---|---|---|
-| Dedicated full-screen UI/keybar | Yes | Yes; unavailable actions are faded |
-| File offset/size/percentage | Yes | Displayed end, size, and percentage |
-| Wrap | Yes | Yes |
-| Hex view | Yes | Basic |
-| Hex editing/save | Yes | No |
-| Goto offset/line/percent | Yes | No |
-| Forward/backward search and continue | Yes | One forward search |
-| Raw/nroff modes | Yes | No |
-| Ruler | Yes | No |
-| Bookmarks | Yes | No |
-| Next/previous file | Yes | No |
-| Codepages | Yes | No |
-| Viewer history/screen selector | Yes | No |
-| Horizontal scrolling | Yes | No |
+The viewer has its own full-screen header/keybar, bounded range reads,
+text/hex display, wrap, horizontal scroll, Home/End, search, and repeat search.
+Goto, raw/nroff, format, bookmarks, hex editing/save, next/previous file,
+codepages, and screen selection remain unavailable.
 
-The mcpp viewer uses the same full-screen shape as `mcview`: a status line,
-file content, and a viewer-specific function-key bar. Goto, raw/nroff,
-formatting, bookmarks, and horizontal scrolling remain unavailable.
+Known differences: repeat search wraps automatically instead of asking to
+continue from the beginning; standalone `--view` returns to panels on F3
+instead of exiting like `mcview`; hex-to-text offset alignment differs.
+In the tested far-right unwrapped search, neither program automatically
+revealed the match. That is not counted as a mcpp-only defect.
 
 ### Editor
 
-This comparison used `/usr/bin/mcedit` from MC 4.8.30, its installed manual
-and default keymap, every pull-down menu, and paired pseudo-terminal editing
-checks. The current mcpp editor now looks like mcedit at first glance, but it
-is not behaviorally equivalent.
+mcpp has switchable buffers, per-buffer editing/search state, persistent file
+history, linear/rectangular blocks, persistent clipboard, overwrite,
+undo/redo, preferred display columns, horizontal scrolling, and
+normal/regex/wildcard/hex search with replacement options.
 
-What is already close:
+Atomic saves reject external changes and preserve a regular-file symlink
+when writing its target. New buffers, save-as, dirty-close decisions, and
+independent buffer undo/save are supported. Files larger than 16 MiB remain
+rejected rather than using MC's large-file confirmation workflow.
 
-- a dedicated full-screen editor with an editor-specific header and keybar;
-- a character cursor, UTF-8 code-point movement, and horizontal scrolling;
-- persistent linear F3/Shift-arrow marking and F5/F6/F8 block operations;
-- insert/overwrite modes and mcedit-compatible core navigation keys;
-- F7 literal search, F4 single replacement, save-as, and goto-line;
-- undo/redo, atomic saves, external-change detection, and dirty-close
-  confirmation;
-- regular-file symlink editing that updates the target without replacing the
-  link;
-- visible save errors and readable narrow-terminal rendering.
+F10 and File > Quit check inactive dirty buffers as well as the current one.
+Cancel retains every buffer, including after an earlier No decision. File >
+Close and Escape still close only the current buffer.
 
-#### File and window lifecycle
+Missing features include movable/resizable editor windows, full mouse block
+selection, block-to-file actions, lock interaction, backup/recovery modes,
+macros, spell checking, literal insertion, completion, all-charsets search,
+navigable Find All results, replace-again, formatting, and external filters.
+Binary/non-printable editing and grapheme-cluster editing are not claimed
+equivalent to mcedit.
 
-| Capability | mcedit | mcpp | Gap |
-|---|---|---|---|
-| Existing file | Yes | Yes | Close |
-| New/open another file | File menu and `Ctrl-N` | Single-buffer File menu and `Ctrl-N` | Partial |
-| Multiple files/windows | Multiple movable/resizable windows | One buffer | Missing |
-| File history | Persistent history dialog | Persistent 20-file history | Close |
-| Save/save-as | Confirmation, overwrite handling, save modes | Save and no-clobber save-as | Partial |
-| Insert/copy block to file | Yes | No | Missing |
-| Concurrent-edit lock | Lock file and user decision | Revision conflict detected only at save | Partial |
-| Backups/recovery | Configurable save modes and recovery support | Atomic replacement only | Partial |
-| Large-file handling | Warns at 64 MiB and offers to continue | Hard rejection above 16 MiB | Different |
-| Binary/non-printable editing | Supported | Bytes load, but display/edit behavior is incomplete | Incorrect |
+Syntax colors use a built-in Dark+-style scheme; the rest of the UI stays
+grayscale. External syntax databases, encoding selection, and richer options
+remain gaps.
 
-The mcpp safety baseline is good: writes are atomic, stale revisions are
-rejected, and symlink targets are resolved once when opened. It does not yet
-offer mcedit's save-mode choices, lock interaction, or recovery workflow.
-Multiple open buffers can be listed and switched from the Window menu.
+### Shell, configuration, and providers
 
-#### Editing and navigation
+`Ctrl-O` launches a disposable interactive child shell, not MC's persistent
+subshell toggle. Use `exit` to return. A child `cd` does not change the pane
+cwd, and a later shell starts at the pane directory rather than resuming the
+previous shell. Terminal restoration working does not close this gap.
 
-| Behavior | mcedit | mcpp |
-|---|---|---|
-| Insert/overwrite | `Insert` toggles mode | `Insert` toggles mode |
-| Word movement | `Ctrl-Left/Right`, `Ctrl-Z/X` | Same core bindings |
-| File top/bottom | `Ctrl-Home/End` | Same |
-| Delete word/line/to-EOL | Dedicated bindings | Line and EOL; word deletion missing |
-| Desired column on vertical move | Preserved across short lines | Preserved across short lines |
-| Page Up/Down | Uses the visible editor height | Uses the visible editor height | Close |
-| Tab handling | Configurable real/fake tabs and tab width | Configurable space indentation stops |
-| Existing tabs | Configurable width | Configurable width |
-| Auto-indent | Configurable | Configurable |
-| Literal insertion | `Ctrl-Q` | No |
-| Completion | `Alt-Tab` | No |
-| Matching bracket | `Alt-B` | Same |
-| Paragraph formatting/sort/filter | Yes | No |
+Configuration persists panel paths and common preferences, editor options,
+history, and hotlist. Full per-pane preferences, skins, localization,
+extension handlers, and MC's complete options dialogs remain absent.
 
-Paired checks now produce the same results for overwrite insertion,
-Shift-arrow marking with F8 deletion, `Ctrl-U` undo, `Alt-R` redo, word
-movement, and viewport-sized Page Up/Down.
+Only the local Linux provider is enabled. Archive/extfs, FTP, SSH/SFTP/FISH,
+Azure, undelete, and VFS cache controls are not part of this completed local
+review.
 
-#### Selection and clipboard
+## Coverage limits
 
-mcpp implements one persistent linear F3/Shift-arrow selection and can copy,
-move, delete, or repeatedly copy it. Rectangular F13/Alt-arrow blocks support
-copy, move, delete, rendering, and clipboard operations. Typing and ordinary
-character deletion do not consume a linear block. mcedit additionally
-supports:
+### Final verification
 
-- word, file-boundary, and scrolling selection variants beyond the basic
-  Shift-arrow/Home/End/Page bindings;
-- line/word marking and block indentation;
-- mouse drag block selection.
+| Build | Functional checks |
+|---|---|
+| Debug | 12/12 CTest entries passed; all 15 standalone operation cases passed |
+| Release | 12/12 CTest entries passed; all 15 standalone operation cases passed |
+| ASan + UBSan | 11/12 passed together; the remaining Tree workflow passed its bounded targeted rerun |
 
-mcpp supports copy/cut/paste through `Ctrl-Insert`, `Shift-Delete`, and
-`Shift-Insert` and safely persists both clip text and column-mode metadata in
-a mode-0600 atomic cache file across processes.
+Guarded filesystem models and the dedicated editor regressions also passed
+with fatal sanitizer diagnostics enabled. All destructive/error-injection
+checks used disposable containers without host mounts.
 
-#### Search and replace
+Extended sanitizer background-race automation did not complete reliably and
+is not counted as passing. This review stopped further stress-test tuning;
+the Debug/Release operation results above are the verified functional result.
 
-| Capability | mcedit | mcpp |
-|---|---|---|
-| Forward literal search | Yes | Yes |
-| Case-sensitive option | Yes | Yes |
-| Backward search | Yes | Yes |
-| Regular expression/wildcard/hex | Yes | Yes |
-| Whole words/in selection | Yes | Yes |
-| All-charsets search | Yes | No |
-| Search again | `F17` | Yes |
-| Find all | Results action | Match count |
-| Failed-search feedback | Dialog | Dialog |
-| Interactive replace choices | Replace/skip/all/one | Yes, literal search |
-| Replace again | `F14` | No |
+The committed model and terminal regressions reproduce concrete failures,
+not every MC action or filesystem condition. They do not establish behavior
+for millions of entries, every Unicode sequence, resize/signal storms,
+crash durability on every filesystem, arbitrary special devices, or all
+metadata combinations. Some local provider and viewer work is synchronous;
+remote-latency behavior has not been evaluated.
 
-mcpp's F4 flow provides Normal, Regular expression, Wildcard, and Hexadecimal
-modes plus case, direction, whole-word, and selection-scope options, followed
-by Replace, Skip, All, One, and Cancel decisions. Remaining differences are
-all-charsets search, a navigable Find All results list, and F14 replace-again.
-
-#### Key compatibility
-
-The core bindings now align. Two default mcedit actions remain unavailable:
-
-| Action/key | mcedit | mcpp |
-|---|---|---|
-| `Ctrl-F` | Save block to file | Unavailable notice |
-
-Esc, undo/redo, goto-line, insert/overwrite, word navigation, and file
-top/bottom now use mcedit's default bindings. `Ctrl-S` toggles built-in syntax
-highlighting. `Ctrl-F` remains reserved for an unimplemented mcedit action
-rather than silently performing the old conflicting search action.
-
-#### Menus, status, and options
-
-mcpp shows the same seven top-level editor menu names. File, Edit, and Search
-contain a working subset, and Command can toggle syntax highlighting. Window
-supports next/previous/list buffer actions; Format remains a placeholder.
-Options provides general indentation and
-whitespace settings plus persistent Save Setup. mcedit additionally exposes
-insert/copy file,
-bookmarks, syntax selection and encoding, macros, spell checking, literal
-insertion, formatting, external filters, richer window management,
-options, save modes, and key learning. mcpp editor menus also lack mouse item
-activation and menu hotkeys.
-
-The mcedit header reports insert/overwrite state, selection size, line and
-column details, total lines/bytes, character code, and window state. mcpp
-reports path, modified/overwrite state, line/column, selection/cursor/total
-bytes, and Unicode character value. It provides
-built-in VS Code Dark+-style highlighting for common C-family, Rust, Go,
-JavaScript, Python, shell, JSON, Markdown, and configuration files, but no
-external rule database or syntax chooser. Line numbers are toggleable with
-Alt-N. Visible tabs and trailing spaces are configurable, and Tab uses the
-fake-indent width in leading indentation and the real tab width after text.
-Bookmarks, codepages, spell checking, macros, and session recovery are absent.
-
-The next editor work should focus on mouse drag selection and richer
-multi-window commands. Macros, spell checking, and code navigation are later
-parity work, not requirements for a dependable basic editor.
-
-### Command line and subshell
-
-mcpp can run `/bin/sh -c` and launch an interactive child shell, but it does
-not implement MC's synchronized persistent subshell.
-
-Missing behavior:
-
-- prompt/input cursor editing and word operations;
-- shell/file/variable/user/host completion;
-- command history dialog and persistent history;
-- path/file insertion shortcuts;
-- `cd` internal semantics and CDPATH handling;
-- macro substitution used by menus and extension handlers;
-- pause-after-run modes;
-- panel toggle showing previous command output;
-- shell directory synchronization when returning from Ctrl-O;
-- screen/session selector.
-
-### Search, tree, panelize, and compare
-
-- Search lacks regex/shell-pattern selection, whole words, ignored
-  directories, pause/resume, repeated search, and content-result context.
-- Search results are not a persistent panel mode and cannot be restored.
-- External panelize and saved panelize commands are absent.
-- Directory tree view and tree maintenance are absent.
-- Compare has no quick/thorough/size-only choice and no visual diff viewer.
-- File diff/merge and dynamic diff editing are absent.
-
-### Configuration and customization
-
-Missing:
-
-- complete configuration, layout, panel, confirmation, appearance, key
-  learning, and VFS dialogs;
-- custom keymap loading;
-- skins and shadows;
-- arbitrary listing formats;
-- extension handlers/file associations;
-- filename highlight rules;
-- per-panel persisted settings;
-- locale/i18n;
-- appropriate terminal capability handling beyond FTXUI defaults;
-- XTerm title updates;
-- multiple simultaneous viewer/editor screens.
-
-### VFS and archives
-
-Only the local provider is enabled. All of the following MC capabilities are
-missing or intentionally paused:
-
-- tar/archive VFS;
-- extfs archive/package adapters;
-- FTP;
-- SFTP;
-- shell/FISH VFS;
-- undelete VFS;
-- VFS cache controls;
-- Azure Blob provider and direct Blob-to-Blob operations.
-
-## Test gaps
-
-Current tests are valuable but narrow. Missing test coverage includes:
-
-- operation conflict races and the dangling callback path;
-- SIGINT/SIGTERM while worker operations are posting UI events;
-- FIFOs, sockets, devices, sparse files, xattrs, ACLs, and hard-link sets;
-- disk full, permission changes during operation, I/O errors, and rollback;
-- very large directories and millions of entries;
-- tiny terminals, resize storms, tmux/Screen variants, mouse sequences, and
-  Unicode display widths;
-- every F-key dialog and pull-down action;
-- background pause/retry/skip behavior;
-- viewer/editor keymap conformance;
-- command completion and subshell directory synchronization;
-- differential behavioral tests against MC;
-- fuzzing for paths, menu expansion, config parsing, terminal events, and
-  provider responses.
-
-## Recommended order
-
-1. **Stop feature expansion and fix correctness blockers.**
-   Remove dangling captures, define terminal/worker ownership, reject or
-   support special files, harden config/menu files, and add failure injection.
-2. **Build reusable input, dialog, and operation controllers.**
-   Current one-field prompts cannot support MC behavior.
-3. **Complete local panel semantics.**
-   Listing formats, filters, quick search, tree, panelize, layout, resizing,
-   and small-terminal behavior.
-4. **Complete file-operation semantics.**
-   Masks, metadata, hardlinks, sparse files, overwrite choices, retries,
-   pause/continue, background jobs, and detailed progress.
-5. **Separate and deepen viewer/editor applications.**
-   Give each its own state, keybar, menus, tests, and full-screen lifecycle.
-6. **Implement persistent subshell and command-line editing.**
-7. **Add configuration/help/customization.**
-8. **Only then resume archive, SSH, or Blob providers.**
-
-The Azure Blob integration should not start until local operation semantics and
-worker lifetime are stable; otherwise remote latency and failure modes will
-amplify the current problems.
+Passing these checks or matching selected screenshots is evidence for the
+listed workflows only. Deferred providers and advanced MC features should
+not be presented as implemented.

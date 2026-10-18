@@ -161,8 +161,6 @@ sleep 0.5
 printf '\033' >&6
 sleep 0.3
 printf '\033[21~' >&6
-sleep 0.5
-printf '\033[21~' >&6
 set +e
 wait "$buffer_runner"
 buffer_status=$?

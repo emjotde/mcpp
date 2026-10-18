@@ -22,6 +22,16 @@ public:
     ) const override;
     [[nodiscard]] std::string parent(std::string_view path) const override;
     [[nodiscard]] std::string basename(std::string_view path) const override;
+    void validate_directory_target(
+        std::string_view source,
+        const LocalProvider& destination_provider,
+        std::string_view destination
+    ) const;
+    [[nodiscard]] bool same_file(
+        std::string_view source,
+        const LocalProvider& destination_provider,
+        std::string_view destination
+    ) const;
     [[nodiscard]] std::vector<Entry> list(
         std::string_view path,
         const ListRequest& request,
@@ -85,7 +95,9 @@ public:
     ) override;
     void create_symlink(
         std::string_view target,
-        std::string_view path
+        std::string_view path,
+        bool overwrite = false,
+        const Cancellation& cancellation = {}
     ) override;
     void create_hardlink(
         std::string_view target,

@@ -162,6 +162,7 @@ private:
         std::optional<EditorPosition> selection_end;
         bool marking{false};
         bool column_selection{false};
+        std::optional<std::size_t> column_selection_width;
         std::size_t byte_size{0};
     };
 
@@ -170,6 +171,14 @@ private:
     [[nodiscard]] std::size_t offset(EditorPosition position) const;
     [[nodiscard]] EditorPosition position(std::size_t offset) const;
     void update_mark();
+    [[nodiscard]] std::pair<std::size_t, std::size_t>
+    column_selection_columns() const;
+    void mark_column_block(
+        std::size_t row,
+        std::size_t height,
+        std::size_t left,
+        std::size_t width
+    );
     void replace_range(
         EditorPosition begin,
         EditorPosition end,
@@ -200,6 +209,7 @@ private:
     std::optional<EditorPosition> selection_end_;
     bool marking_{false};
     bool column_selection_{false};
+    std::optional<std::size_t> column_selection_width_;
     bool overwrite_{false};
     bool new_file_{false};
     std::size_t tab_width_{8};

@@ -4,7 +4,8 @@ set -euo pipefail
 binary="$1"
 script_command="$2"
 timeout_command="$3"
-temporary="$(mktemp -d /tmp/mcpp-operation-ui.XXXXXX)"
+temporary="${TMPDIR:-$PWD}/mcpp-operation-ui.$BASHPID.$RANDOM"
+(umask 077; mkdir -- "$temporary")
 trap 'rm -rf -- "$temporary"' EXIT
 mkdir -p "$temporary/left" "$temporary/right"
 dd if=/dev/zero of="$temporary/left/a.bin" \
@@ -33,7 +34,8 @@ sleep 1
 printf 's' >&3
 sleep 3
 redraw_complete=false
-if grep -aFq 'Copy complete' "$temporary/output"; then
+if grep -aFq 'Copy incomplete:' "$temporary/output" &&
+   grep -aFq '1 skipped' "$temporary/output"; then
     redraw_complete=true
 fi
 printf '\033[21~' >&3

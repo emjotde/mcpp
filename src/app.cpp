@@ -31,6 +31,7 @@
 #include <stdexcept>
 #include <sys/wait.h>
 #include <thread>
+#include <unordered_map>
 #include <utility>
 #include <unistd.h>
 
@@ -44,6 +45,18 @@
 
 namespace mcpp {
 namespace {
+
+struct EditorSearchState {
+    std::string needle;
+    EditorSearchOptions options;
+    bool in_selection{false};
+    std::optional<std::pair<EditorPosition, EditorPosition>> scope;
+    std::uint64_t change_id{0};
+};
+
+struct EditorBuffer : EditorModel {
+    EditorSearchState search;
+};
 
 enum class Mode {
     panels,
@@ -77,6 +90,7 @@ enum class PromptAction {
     none,
     rename,
     mkdir,
+    view_file,
     viewer_find,
     quick_viewer_find,
     editor_open,
@@ -432,21 +446,55 @@ std::string middle_truncate(
     const std::string& value,
     const std::size_t width
 ) {
-    if (value.size() <= width) {
+    if (static_cast<std::size_t>(
+            std::max(0, ftxui::string_width(value))
+        ) <= width) {
         return value;
     }
-    if (width <= 3U) {
-        return value.substr(0, width);
+    if (width == 0U) {
+        return {};
     }
-    auto left = (width - 1U) / 2U;
-    if (const auto separator = value.rfind('/', left);
+    const auto glyphs = ftxui::Utf8ToGlyphs(value);
+    const auto left_budget = (width - 1U) / 2U;
+    std::size_t left_bytes = 0;
+    std::size_t left_width = 0;
+    for (const auto& glyph : glyphs) {
+        const auto glyph_width = static_cast<std::size_t>(
+            std::max(0, ftxui::string_width(glyph))
+        );
+        if (left_width + glyph_width > left_budget) {
+            break;
+        }
+        left_bytes += glyph.size();
+        left_width += glyph_width;
+    }
+    if (const auto separator = value.rfind('/', left_bytes);
         separator != std::string::npos && separator > 0U) {
-        left = separator + 1U;
+        if (separator < left_bytes) {
+            left_bytes = separator + 1U;
+            left_width = static_cast<std::size_t>(
+                std::max(
+                    0,
+                    ftxui::string_width(value.substr(0, left_bytes))
+                )
+            );
+        }
     }
-    const auto right =
-        width > left + 1U ? width - left - 1U : 0U;
-    return value.substr(0, left) + "~" +
-           value.substr(value.size() - right);
+    const auto right_budget = width - left_width - 1U;
+    std::size_t right_bytes = 0;
+    std::size_t right_width = 0;
+    for (auto glyph = glyphs.rbegin(); glyph != glyphs.rend(); ++glyph) {
+        const auto glyph_width = static_cast<std::size_t>(
+            std::max(0, ftxui::string_width(*glyph))
+        );
+        if (right_width + glyph_width > right_budget) {
+            break;
+        }
+        right_bytes += glyph->size();
+        right_width += glyph_width;
+    }
+    return value.substr(0, left_bytes) + "~" +
+           value.substr(value.size() - right_bytes);
 }
 
 std::string type_prefix(const Entry& entry) {
@@ -614,13 +662,18 @@ struct App::Impl {
     Pane left;
     Pane right;
     int active_index{0};
+    std::array<int, 2> pane_ids{0, 1};
     Mode mode{Mode::panels};
     Mode mode_before_prompt{Mode::panels};
     PromptAction prompt_action{PromptAction::none};
     std::string prompt_title;
     std::string prompt_value;
+    std::string prompt_error;
+    std::size_t prompt_focus{0};
+    std::array<ftxui::Box, 3> prompt_boxes{};
     std::string pending_destination;
     std::string status{"Ready"};
+    std::optional<std::string> pending_operation_notice;
     OperationEngine operations;
     Cancellation operation_cancellation;
     TransferProgress progress;
@@ -628,8 +681,8 @@ struct App::Impl {
     std::string viewer_search_needle;
     std::string viewer_message_title{"Viewer"};
     std::string viewer_message;
-    EditorModel editor;
-    std::vector<EditorModel> editor_buffers;
+    EditorBuffer editor;
+    std::vector<EditorBuffer> editor_buffers;
     std::vector<std::string> editor_history;
     std::size_t editor_list_cursor{0};
     bool exit_after_editor{false};
@@ -649,16 +702,8 @@ struct App::Impl {
     std::size_t editor_first_row{0};
     std::string editor_clipboard;
     bool editor_clipboard_column{false};
-    std::string editor_search_needle;
-    EditorSearchOptions editor_search_options;
-    bool editor_search_in_selection{false};
     EditorSearchOptions editor_dialog_options;
     bool editor_dialog_in_selection{false};
-    std::optional<std::pair<
-        EditorPosition,
-        EditorPosition
-    >> editor_search_scope;
-    std::uint64_t editor_search_change_id{0};
     std::optional<std::pair<
         EditorPosition,
         EditorPosition
@@ -674,6 +719,8 @@ struct App::Impl {
     std::size_t editor_menu_item{0};
     bool editor_menu_dropped{false};
     std::size_t editor_close_choice{0};
+    bool editor_quit_requested{false};
+    std::size_t editor_quit_index{0};
     std::size_t editor_options_focus{0};
     std::array<bool, 2> editor_options_touched{};
     std::string editor_options_tab_width;
@@ -752,6 +799,9 @@ struct App::Impl {
     std::jthread tree_thread;
     std::atomic_bool tree_expansion_running{false};
     Cancellation tree_expansion_cancellation;
+    std::uint64_t tree_generation{0};
+    std::optional<std::string> tree_refresh_pending;
+    bool tree_refresh_notify_pending{false};
     std::string operation_label{"File operation"};
     bool pending_move{false};
     bool pending_exact{false};
@@ -846,33 +896,13 @@ struct App::Impl {
         );
     }
 
-    void refresh() {
+    void refresh(const bool notify_tree = false) {
         left.refresh();
         right.refresh();
         quick_viewer.close();
         quick_view_path.clear();
         if (tree_panel) {
-            const auto panel_index = *tree_panel;
-            auto& pane = panel_index == 0 ? left : right;
-            const auto selected =
-                tree_cursor < tree_nodes.size()
-                    ? tree_nodes[tree_cursor].path
-                    : pane.path();
-            std::size_t current_path = 0;
-            tree_nodes = build_tree_nodes(pane, current_path);
-            tree_cursor = current_path;
-            const auto match = std::find_if(
-                tree_nodes.begin(),
-                tree_nodes.end(),
-                [&](const TreeNode& node) {
-                    return node.path == selected;
-                }
-            );
-            if (match != tree_nodes.end()) {
-                tree_cursor = static_cast<std::size_t>(
-                    std::distance(tree_nodes.begin(), match)
-                );
-            }
+            refresh_tree(notify_tree);
         }
     }
 
@@ -948,6 +978,9 @@ struct App::Impl {
     }
 
     void close_tree_panel(const bool restore_focus = true) {
+        invalidate_tree_loading();
+        tree_refresh_pending.reset();
+        tree_refresh_notify_pending = false;
         if (tree_expansion_running.load(
                 std::memory_order_acquire
             )) {
@@ -968,6 +1001,106 @@ struct App::Impl {
         tree_cursor = 0;
         tree_search_mode = false;
         tree_search.clear();
+    }
+
+    void invalidate_tree_loading() {
+        ++tree_generation;
+        if (tree_expansion_running.load(std::memory_order_acquire)) {
+            tree_expansion_cancellation.request();
+        }
+        for (auto& node : tree_nodes) {
+            node.loading = false;
+        }
+    }
+
+    void restore_tree_selection(std::string path) {
+        if (!tree_panel || tree_nodes.empty()) {
+            tree_cursor = 0;
+            return;
+        }
+        const auto provider =
+            (*tree_panel == 0 ? left : right).provider();
+        while (!path.empty()) {
+            const auto match = std::find_if(
+                tree_nodes.begin(),
+                tree_nodes.end(),
+                [&](const TreeNode& node) {
+                    return node.path == path;
+                }
+            );
+            if (match != tree_nodes.end()) {
+                tree_cursor = static_cast<std::size_t>(
+                    std::distance(tree_nodes.begin(), match)
+                );
+                return;
+            }
+            const auto parent = provider->parent(path);
+            if (parent == path) {
+                break;
+            }
+            path = parent;
+        }
+        tree_cursor = 0;
+    }
+
+    void refresh_tree(
+        const bool notify = false,
+        std::optional<std::string> requested_path = std::nullopt
+    ) {
+        if (!tree_panel || tree_nodes.empty()) {
+            return;
+        }
+        const auto selected_path = tree_nodes[tree_cursor].path;
+        auto path = requested_path.value_or(selected_path);
+        if (tree_expansion_running.load(std::memory_order_acquire)) {
+            invalidate_tree_loading();
+            if (!tree_refresh_pending || notify ||
+                !tree_refresh_notify_pending) {
+                tree_refresh_pending = std::move(path);
+                tree_refresh_notify_pending = notify;
+            }
+            return;
+        }
+        const auto original_path = path;
+        const auto provider =
+            (*tree_panel == 0 ? left : right).provider();
+        while (!provider->exists(path)) {
+            const auto parent = provider->parent(path);
+            if (parent == path) {
+                break;
+            }
+            path = parent;
+        }
+        const auto match = std::find_if(
+            tree_nodes.begin(),
+            tree_nodes.end(),
+            [&](const TreeNode& node) { return node.path == path; }
+        );
+        if (match == tree_nodes.end()) {
+            status = "Tree branch is no longer visible";
+            return;
+        }
+        if (selected_path == original_path && path != original_path) {
+            restore_tree_selection(path);
+        }
+        expand_tree_node(
+            static_cast<std::size_t>(
+                std::distance(tree_nodes.begin(), match)
+            ),
+            true,
+            notify
+        );
+    }
+
+    void finish_tree_loading() {
+        tree_expansion_running.store(false, std::memory_order_release);
+        if (tree_refresh_pending) {
+            auto path = std::move(*tree_refresh_pending);
+            const bool notify = tree_refresh_notify_pending;
+            tree_refresh_pending.reset();
+            tree_refresh_notify_pending = false;
+            refresh_tree(notify, std::move(path));
+        }
     }
 
     std::vector<TreeNode> tree_children(
@@ -1039,27 +1172,39 @@ struct App::Impl {
         return nodes;
     }
 
-    void expand_tree_node(const std::size_t index) {
+    void collapse_tree_node(const std::size_t index) {
+        invalidate_tree_loading();
+        tree_refresh_pending.reset();
+        tree_refresh_notify_pending = false;
+        const auto depth = tree_nodes[index].depth;
+        auto end = index + 1U;
+        while (end < tree_nodes.size() &&
+               tree_nodes[end].depth > depth) {
+            ++end;
+        }
+        tree_nodes.erase(
+            tree_nodes.begin() +
+                static_cast<std::ptrdiff_t>(index + 1U),
+            tree_nodes.begin() +
+                static_cast<std::ptrdiff_t>(end)
+        );
+        tree_nodes[index].expanded = false;
+        status = "Tree branch collapsed";
+    }
+
+    void expand_tree_node(
+        const std::size_t index,
+        const bool rescan = false,
+        const bool notify = true
+    ) {
         if (!tree_panel || index >= tree_nodes.size()) {
             return;
         }
-        if (tree_nodes[index].expanded) {
-            const auto depth = tree_nodes[index].depth;
-            auto end = index + 1U;
-            while (end < tree_nodes.size() &&
-                   tree_nodes[end].depth > depth) {
-                ++end;
-            }
-            tree_nodes.erase(
-                tree_nodes.begin() +
-                    static_cast<std::ptrdiff_t>(index + 1U),
-                tree_nodes.begin() +
-                    static_cast<std::ptrdiff_t>(end)
-            );
-            tree_nodes[index].expanded = false;
+        if (tree_nodes[index].expanded && !rescan) {
+            collapse_tree_node(index);
             return;
         }
-        if (tree_nodes[index].loaded &&
+        if (!rescan && tree_nodes[index].loaded &&
             !tree_nodes[index].has_children &&
             !tree_nodes[index].inaccessible) {
             status = "Tree branch has no children";
@@ -1079,6 +1224,7 @@ struct App::Impl {
             (panel_index == 0 ? left : right).provider();
         const auto path = tree_nodes[index].path;
         const auto depth = tree_nodes[index].depth + 1U;
+        const auto generation = tree_generation;
         tree_nodes[index].loading = true;
         tree_nodes[index].inaccessible = false;
         tree_expansion_cancellation = Cancellation{};
@@ -1086,14 +1232,19 @@ struct App::Impl {
             true,
             std::memory_order_release
         );
-        status = "Expanding tree...";
+        if (notify) {
+            status = rescan ? "Rescanning tree..." : "Expanding tree...";
+        }
         try {
             tree_thread = std::jthread([
                 this,
                 provider,
                 path,
                 depth,
-                panel_index
+                panel_index,
+                generation,
+                rescan,
+                notify
             ] {
                 try {
                     std::vector<TreeNode> children;
@@ -1116,14 +1267,15 @@ struct App::Impl {
                         this,
                         children = std::move(children),
                         path,
-                        panel_index
+                        panel_index,
+                        generation,
+                        rescan,
+                        notify
                     ]() mutable {
-                        tree_expansion_running.store(
-                            false,
-                            std::memory_order_release
-                        );
                         if (!tree_panel ||
-                            *tree_panel != panel_index) {
+                            *tree_panel != panel_index ||
+                            tree_generation != generation) {
+                            finish_tree_loading();
                             return;
                         }
                         const auto match = std::find_if(
@@ -1135,6 +1287,7 @@ struct App::Impl {
                         );
                         if (match == tree_nodes.end() ||
                             !match->loading) {
+                            finish_tree_loading();
                             return;
                         }
                         const auto node_index =
@@ -1144,38 +1297,94 @@ struct App::Impl {
                                     match
                                 )
                             );
+                        const auto selected_path =
+                            tree_cursor < tree_nodes.size()
+                                ? tree_nodes[tree_cursor].path
+                                : path;
+                        const auto old_depth = match->depth;
+                        auto old_end = node_index + 1U;
+                        while (old_end < tree_nodes.size() &&
+                               tree_nodes[old_end].depth > old_depth) {
+                            ++old_end;
+                        }
+                        std::unordered_map<
+                            std::string,
+                            std::pair<std::size_t, std::size_t>
+                        > cached_children;
+                        cached_children.reserve(children.size());
+                        for (auto begin = node_index + 1U; begin < old_end;) {
+                            auto end = begin + 1U;
+                            while (end < old_end &&
+                                   tree_nodes[end].depth >
+                                       tree_nodes[begin].depth) {
+                                ++end;
+                            }
+                            cached_children.emplace(
+                                tree_nodes[begin].path,
+                                std::pair{begin, end}
+                            );
+                            begin = end;
+                        }
+                        std::vector<TreeNode> replacement;
+                        replacement.reserve(children.size());
+                        for (auto& child : children) {
+                            const auto previous =
+                                cached_children.find(child.path);
+                            if (previous == cached_children.end()) {
+                                replacement.push_back(std::move(child));
+                                continue;
+                            }
+                            replacement.insert(
+                                replacement.end(),
+                                tree_nodes.begin() +
+                                    static_cast<std::ptrdiff_t>(
+                                        previous->second.first
+                                    ),
+                                tree_nodes.begin() +
+                                    static_cast<std::ptrdiff_t>(
+                                        previous->second.second
+                                    )
+                            );
+                        }
                         auto& node = tree_nodes[node_index];
                         node.loaded = true;
                         node.inaccessible = false;
                         node.loading = false;
                         node.has_children = !children.empty();
                         node.expanded = !children.empty();
+                        tree_nodes.erase(
+                            tree_nodes.begin() +
+                                static_cast<std::ptrdiff_t>(
+                                    node_index + 1U
+                                ),
+                            tree_nodes.begin() +
+                                static_cast<std::ptrdiff_t>(old_end)
+                        );
                         tree_nodes.insert(
                             tree_nodes.begin() +
                                 static_cast<std::ptrdiff_t>(
                                     node_index + 1U
                                 ),
-                            std::make_move_iterator(children.begin()),
-                            std::make_move_iterator(children.end())
+                            std::make_move_iterator(replacement.begin()),
+                            std::make_move_iterator(replacement.end())
                         );
-                        status = "Ready";
+                        restore_tree_selection(selected_path);
+                        if (notify) {
+                            status = rescan ? "Tree refreshed" : "Ready";
+                        }
+                        finish_tree_loading();
                     });
                 } catch (const OperationCancelled&) {
                     post_ui([this] {
-                        tree_expansion_running.store(
-                            false,
-                            std::memory_order_release
-                        );
+                        finish_tree_loading();
                     });
                 } catch (const std::exception& error) {
                     const auto message = std::string(error.what());
-                    post_ui([this, path, panel_index, message] {
-                        tree_expansion_running.store(
-                            false,
-                            std::memory_order_release
-                        );
+                    post_ui([this, path, panel_index, generation, notify, message] {
                         if (!tree_panel ||
-                            *tree_panel != panel_index) {
+                            *tree_panel != panel_index ||
+                            tree_generation != generation) {
+                            finish_tree_loading();
                             return;
                         }
                         const auto match = std::find_if(
@@ -1188,10 +1397,13 @@ struct App::Impl {
                         if (match != tree_nodes.end()) {
                             match->loaded = true;
                             match->inaccessible = true;
-                            match->expanded = false;
                             match->loading = false;
                         }
-                        status = "Tree: " + message;
+                        status =
+                            notify
+                                ? "Tree: " + message
+                                : status + "; Tree refresh failed: " + message;
+                        finish_tree_loading();
                     });
                 }
             });
@@ -1209,6 +1421,9 @@ struct App::Impl {
         auto& pane = panel_index == 0 ? left : right;
         std::size_t selected = 0;
         auto nodes = build_tree_nodes(pane, selected);
+        invalidate_tree_loading();
+        tree_refresh_pending.reset();
+        tree_refresh_notify_pending = false;
         const bool was_active = active_index == panel_index;
         if (quick_view_panel) {
             close_quick_view(false);
@@ -1232,6 +1447,21 @@ struct App::Impl {
         return active_index == 0
                    ? left.selected_entries()
                    : right.selected_entries();
+    }
+
+    std::vector<Entry> matching_operation_sources() const {
+        auto sources = current_operation_sources();
+        std::erase_if(
+            sources,
+            [&](const Entry& entry) {
+                return fnmatch(
+                           dialog_source_mask.c_str(),
+                           entry.name.c_str(),
+                           0
+                       ) != 0;
+            }
+        );
+        return sources;
     }
 
     void clear_tree_operation_context() {
@@ -1267,13 +1497,7 @@ struct App::Impl {
         }
         dialog_move = move_operation;
         dialog_exact = move_operation;
-        dialog_destination =
-            move_operation
-                ? active().provider()->join(
-                      active().path(),
-                      tree_operation_source->name
-                  )
-                : active().path();
+        dialog_destination = active().path();
         dialog_source_mask = "*";
         dialog_preserve_attributes = true;
         dialog_preserve_symlinks = true;
@@ -1299,6 +1523,7 @@ struct App::Impl {
 
     void swap_panels() {
         std::swap(left, right);
+        std::swap(pane_ids[0], pane_ids[1]);
         active_index = 1 - active_index;
         if (quick_view_panel) {
             quick_view_panel = 1 - *quick_view_panel;
@@ -1308,6 +1533,9 @@ struct App::Impl {
         }
         if (tree_panel) {
             tree_panel = 1 - *tree_panel;
+            if (tree_expansion_running.load(std::memory_order_acquire)) {
+                refresh_tree();
+            }
         }
     }
 
@@ -1318,6 +1546,13 @@ struct App::Impl {
                 : false;
         active().set_sort(field, descending);
         status = descending ? "Sort descending" : "Sort ascending";
+    }
+
+    void store_panel_options_in_config() {
+        config.show_hidden = left.show_hidden();
+        config.directories_first = left.directories_first();
+        config.sort = left.sort_field();
+        config.sort_descending = left.descending();
     }
 
     void store_editor_options_in_config() {
@@ -1498,6 +1733,16 @@ struct App::Impl {
 
     void exit_terminal() {
         if (!exiting) {
+            if (editor.dirty() ||
+                std::ranges::any_of(
+                    editor_buffers,
+                    [](const auto& buffer) {
+                        return buffer.dirty();
+                    }
+                )) {
+                request_editor_quit();
+                return;
+            }
             exiting = true;
             const auto size = ftxui::Terminal::Size();
             std::string blank;
@@ -1525,22 +1770,33 @@ struct App::Impl {
 
     void finish_operation(
         std::string message,
-        const std::optional<int> clear_selection = std::nullopt
+        const std::optional<int> source_id = std::nullopt,
+        const std::vector<std::string>& completed_sources = {},
+        bool notify = false
     ) {
-        mode = Mode::panels;
+        const bool background =
+            mode != Mode::panels && mode != Mode::operation_progress;
+        if (mode == Mode::operation_progress) {
+            mode = Mode::panels;
+        }
         operation_running.store(false, std::memory_order_release);
-        clear_tree_operation_context();
         try {
-            if (clear_selection) {
-                (*clear_selection == 0 ? left : right)
-                    .clear_selection();
+            if (source_id == pane_ids[0]) {
+                left.unmark_paths(completed_sources);
+            } else if (source_id == pane_ids[1]) {
+                right.unmark_paths(completed_sources);
             }
             refresh();
             status = std::move(message);
         } catch (const std::exception& error) {
+            // A refresh error must not dismiss the foreground editor or dialog.
             status =
                 std::move(message) +
                 "; refresh failed: " + error.what();
+            notify = true;
+        }
+        if (background && notify) {
+            pending_operation_notice = status;
         }
     }
 
@@ -1549,11 +1805,22 @@ struct App::Impl {
         std::string title,
         std::string value = {}
     ) {
-        mode_before_prompt = mode;
+        mode_before_prompt =
+            mode == Mode::pulldown ? Mode::panels : mode;
         mode = Mode::prompt;
         prompt_action = action;
         prompt_title = std::move(title);
         prompt_value = std::move(value);
+        prompt_error.clear();
+        prompt_focus = 0;
+        prompt_boxes = {};
+    }
+
+    void cancel_prompt() {
+        mode = mode_before_prompt;
+        prompt_action = PromptAction::none;
+        prompt_value.clear();
+        prompt_error.clear();
     }
 
     void start_operation_dialog(
@@ -1567,13 +1834,7 @@ struct App::Impl {
         }
         dialog_move = move_operation;
         dialog_exact = exact && sources.size() == 1U;
-        dialog_destination =
-            dialog_exact
-                ? passive().provider()->join(
-                      passive().path(),
-                      sources.front().name
-                  )
-                : passive().path();
+        dialog_destination = passive().path();
         dialog_preserve_attributes = true;
         dialog_preserve_symlinks = true;
         dialog_background = false;
@@ -1586,11 +1847,46 @@ struct App::Impl {
         if (dialog_destination.empty()) {
             throw std::runtime_error("destination is empty");
         }
+        const auto sources = matching_operation_sources();
+        if (sources.empty()) {
+            throw std::runtime_error(
+                "source mask matches no selected entries"
+            );
+        }
+        const auto destination_provider =
+            tree_operation_source
+                ? tree_operation_destination_provider
+                : passive().provider();
+        bool destination_directory = dialog_destination.ends_with('/');
+        if (std::filesystem::path(dialog_destination).is_relative()) {
+            dialog_destination = destination_provider->join(
+                active().path(),
+                dialog_destination
+            );
+        }
+        if (destination_provider->exists(dialog_destination)) {
+            const auto destination = destination_provider->stat(
+                dialog_destination,
+                {}
+            );
+            const bool is_directory =
+                destination.kind == EntryKind::directory ||
+                destination.target_is_directory;
+            if (destination_directory && !is_directory) {
+                throw std::runtime_error(
+                    "destination is not a directory"
+                );
+            }
+            destination_directory = is_directory;
+            if (sources.size() > 1U && !is_directory) {
+                throw std::runtime_error(
+                    "multiple sources require a directory destination"
+                );
+            }
+        }
+        dialog_exact = sources.size() == 1U &&
+                       !destination_directory;
         if (dialog_exact) {
-            const auto destination_provider =
-                tree_operation_source
-                    ? tree_operation_destination_provider
-                    : passive().provider();
             if (config.confirm_overwrite &&
                 destination_provider->exists(dialog_destination)) {
                 pending_destination = dialog_destination;
@@ -1658,17 +1954,7 @@ struct App::Impl {
                 "cannot start an operation while search is running"
             );
         }
-        auto sources = current_operation_sources();
-        std::erase_if(
-            sources,
-            [&](const Entry& entry) {
-                return fnmatch(
-                           dialog_source_mask.c_str(),
-                           entry.name.c_str(),
-                           0
-                       ) != 0;
-            }
-        );
+        const auto sources = matching_operation_sources();
         if (sources.empty()) {
             throw std::runtime_error(
                 "source mask matches no selected entries"
@@ -1687,10 +1973,11 @@ struct App::Impl {
             tree_operation_source
                 ? tree_operation_destination_provider
                 : passive().provider();
-        const auto source_index =
+        const auto source_id = pane_ids[
             tree_operation_source
                 ? tree_operation_source_index
-                : active_index;
+                : active_index
+        ];
         const OperationOptions options{
             .overwrite = overwrite,
             .preserve_permissions = dialog_preserve_attributes,
@@ -1702,6 +1989,7 @@ struct App::Impl {
                                : CollisionDecision::skip;
                 },
         };
+        clear_tree_operation_context();
         operation_running.store(true, std::memory_order_release);
         operation_started = std::chrono::steady_clock::now();
         operation_paused.store(false, std::memory_order_release);
@@ -1719,9 +2007,10 @@ struct App::Impl {
                 destination_provider,
                 destination,
                 options,
-                source_index,
+                source_id,
                 exact
             ]() {
+                OperationResult result;
                 try {
                     const auto callback =
                         [this, move_operation](
@@ -1784,7 +2073,8 @@ struct App::Impl {
                             destination,
                             options,
                             operation_cancellation,
-                            callback
+                            callback,
+                            &result
                         );
                     } else if (move_operation) {
                         operations.move(
@@ -1794,7 +2084,19 @@ struct App::Impl {
                             destination,
                             options,
                             operation_cancellation,
-                            callback
+                            callback,
+                            &result
+                        );
+                    } else if (exact) {
+                        operations.copy_exact(
+                            *source_provider,
+                            sources.front(),
+                            *destination_provider,
+                            destination,
+                            options,
+                            operation_cancellation,
+                            callback,
+                            &result
                         );
                     } else {
                         operations.copy(
@@ -1804,30 +2106,62 @@ struct App::Impl {
                             destination,
                             options,
                             operation_cancellation,
-                            callback
+                            callback,
+                            &result
                         );
                     }
                     post_ui([
                         this,
                         move_operation,
-                        source_index
+                        source_id,
+                        result = std::move(result)
                     ] {
+                        const std::string label =
+                            move_operation ? "Move" : "Copy";
+                        auto message = label + " complete";
+                        if (!result.skipped.empty()) {
+                            message =
+                                label + " incomplete: " +
+                                std::to_string(result.skipped.size()) +
+                                " skipped (" +
+                                display_text(result.skipped.front().reason) +
+                                "; " +
+                                display_text(result.skipped.front().path) +
+                                ")";
+                        }
                         finish_operation(
-                            move_operation
-                                ? "Move complete"
-                                : "Copy complete",
-                            source_index
+                            std::move(message),
+                            source_id,
+                            result.completed_sources,
+                            !result.skipped.empty()
                         );
                     });
                 } catch (const OperationCancelled&) {
-                    post_ui([this] {
-                        finish_operation("Operation cancelled");
+                    post_ui([
+                        this,
+                        source_id,
+                        completed = std::move(result.completed_sources)
+                    ] {
+                        finish_operation(
+                            "Operation cancelled",
+                            source_id,
+                            completed,
+                            true
+                        );
                     });
                 } catch (const std::exception& error) {
                     const auto message = std::string(error.what());
-                    post_ui([this, message] {
+                    post_ui([
+                        this,
+                        message,
+                        source_id,
+                        completed = std::move(result.completed_sources)
+                    ] {
                         finish_operation(
-                            "Error: " + message
+                            "Error: " + message,
+                            source_id,
+                            completed,
+                            true
                         );
                     });
                 }
@@ -1842,7 +2176,7 @@ struct App::Impl {
     }
 
     bool has_collision(const std::string& destination) {
-        const auto sources = current_operation_sources();
+        const auto sources = matching_operation_sources();
         const auto provider =
             tree_operation_source
                 ? tree_operation_destination_provider
@@ -1851,13 +2185,6 @@ struct App::Impl {
             sources.begin(),
             sources.end(),
             [&](const Entry& entry) {
-                if (fnmatch(
-                        dialog_source_mask.c_str(),
-                        entry.name.c_str(),
-                        0
-                    ) != 0) {
-                    return false;
-                }
                 return provider->exists(
                     provider->join(
                         destination,
@@ -1888,10 +2215,12 @@ struct App::Impl {
             tree_operation_source
                 ? tree_operation_source_provider
                 : active().provider();
-        const auto source_index =
+        const auto source_id = pane_ids[
             tree_operation_source
                 ? tree_operation_source_index
-                : active_index;
+                : active_index
+        ];
+        clear_tree_operation_context();
         operation_cancellation = Cancellation{};
         progress = {};
         operation_running.store(true, std::memory_order_release);
@@ -1903,7 +2232,8 @@ struct App::Impl {
         status = "Starting delete";
         try {
             operation_thread = std::jthread(
-            [this, provider, entries, source_index] {
+            [this, provider, entries, source_id] {
+                OperationResult result;
                 try {
                     operations.remove(
                         *provider,
@@ -1938,23 +2268,46 @@ struct App::Impl {
                                     std::to_string(value.files_total) +
                                     ")";
                             });
-                        }
+                        },
+                        &result
                     );
-                    post_ui([this, source_index] {
+                    post_ui([
+                        this,
+                        source_id,
+                        completed = std::move(result.completed_sources)
+                    ] {
                         finish_operation(
                             "Delete complete",
-                            source_index
+                            source_id,
+                            completed
                         );
                     });
                 } catch (const OperationCancelled&) {
-                    post_ui([this] {
-                        finish_operation("Delete cancelled");
+                    post_ui([
+                        this,
+                        source_id,
+                        completed = std::move(result.completed_sources)
+                    ] {
+                        finish_operation(
+                            "Delete cancelled",
+                            source_id,
+                            completed,
+                            true
+                        );
                     });
                 } catch (const std::exception& error) {
                     const auto message = std::string(error.what());
-                    post_ui([this, message] {
+                    post_ui([
+                        this,
+                        message,
+                        source_id,
+                        completed = std::move(result.completed_sources)
+                    ] {
                         finish_operation(
-                            "Error: " + message
+                            "Error: " + message,
+                            source_id,
+                            completed,
+                            true
                         );
                     });
                 }
@@ -2050,6 +2403,30 @@ struct App::Impl {
     void execute_prompt() {
         try {
             switch (prompt_action) {
+                case PromptAction::view_file: {
+                    if (prompt_value.empty()) {
+                        throw std::invalid_argument(
+                            "filename is empty"
+                        );
+                    }
+                    const auto provider = active().provider();
+                    const auto path = provider->join(
+                        active().path(),
+                        prompt_value
+                    );
+                    if (!can_open_file(provider->stat(path, {}))) {
+                        throw std::runtime_error(
+                            "not a regular file: " + path
+                        );
+                    }
+                    viewer.open(provider, path);
+                    viewer_search_needle.clear();
+                    prompt_action = PromptAction::none;
+                    prompt_value.clear();
+                    prompt_error.clear();
+                    mode = Mode::viewer;
+                    return;
+                }
                 case PromptAction::rename: {
                     const auto* entry = active().current();
                     if (entry == nullptr || prompt_value.empty()) {
@@ -2265,6 +2642,11 @@ struct App::Impl {
                     break;
             }
         } catch (const std::exception& error) {
+            if (prompt_action == PromptAction::view_file) {
+                prompt_error = error.what();
+                prompt_focus = 0;
+                return;
+            }
             if (mode_before_prompt == Mode::editor) {
                 editor_replace_needle.clear();
                 editor_replace_text.clear();
@@ -3089,7 +3471,7 @@ struct App::Impl {
                 {"", -2},
                 {"About...", -1},
                 {"", -2},
-                {"Quit  F10", 2},
+                {"Quit  F10", 6},
             },
             {
                 {"Undo  C-u", 0},
@@ -3225,7 +3607,12 @@ struct App::Impl {
                    text("Close file") | bold | center,
                    separator(),
                    text(
-                       "File " + display_text(editor.path()) +
+                       "File " +
+                       display_text(
+                           editor_quit_requested && editor_quit_index > 0U
+                               ? editor_buffers[editor_quit_index - 1U].path()
+                               : editor.path()
+                       ) +
                        " was modified."
                    ),
                    text("Save before close?") | center,
@@ -3256,7 +3643,7 @@ struct App::Impl {
                    text("F7        Search"),
                    text("F8        Delete block or character"),
                    text("F9        Pull-down menu"),
-                   text("F10       Close editor"),
+                   text("F10       Quit editor (all buffers)"),
                    text("F12       Save as"),
                    text("Ctrl-U/M-R Undo/redo"),
                    text("Alt-L      Go to line"),
@@ -3623,13 +4010,13 @@ struct App::Impl {
                 {"FTP link...", -1},
                 {"Shell link...", -1},
                 {"SFTP link...", -1},
-                {"Panelize", 15},
+                {"Panelize by name...", 15},
                 {"", -2},
                 {"Rescan             C-r", 7},
             },
             {
                 {"View              F3", 0},
-                {"View file...", 0},
+                {"View file...", 18},
                 {"Filtered view     M-!", -1},
                 {"Edit              F4", 1},
                 {"Copy              F5", 2},
@@ -3660,7 +4047,7 @@ struct App::Impl {
                 {"Switch panels on/off          C-o", 3},
                 {"Compare directories           C-x d", 1},
                 {"Compare files                 C-x C-d", -1},
-                {"External panelize             C-x !", 9},
+                {"External panelize             C-x !", -1},
                 {"Show directory sizes          C-Space", -1},
                 {"", -2},
                 {"Command history               M-h", -1},
@@ -3702,7 +4089,7 @@ struct App::Impl {
                 {"FTP link...", -1},
                 {"Shell link...", -1},
                 {"SFTP link...", -1},
-                {"Panelize", 15},
+                {"Panelize by name...", 15},
                 {"", -2},
                 {"Rescan             C-r", 7},
             },
@@ -3993,6 +4380,23 @@ struct App::Impl {
                 case 17:
                     active().invert_selection();
                     break;
+                case 18: {
+                    auto filename =
+                        entry == nullptr ? std::string{} : entry->name;
+                    if (entry != nullptr &&
+                        active().provider()->join(
+                            active().path(),
+                            filename
+                        ) != entry->path) {
+                        filename = entry->path;
+                    }
+                    start_prompt(
+                        PromptAction::view_file,
+                        "View file",
+                        std::move(filename)
+                    );
+                    return;
+                }
                 default:
                     break;
             }
@@ -4075,13 +4479,6 @@ struct App::Impl {
                 case 8:
                     mode = Mode::user_menu;
                     return;
-                case 9:
-                    start_prompt(
-                        PromptAction::panelize_search,
-                        "Panelize name pattern",
-                        "*"
-                    );
-                    return;
                 default:
                     break;
             }
@@ -4101,6 +4498,7 @@ struct App::Impl {
                         !config.confirm_overwrite;
                     break;
                 case 3:
+                    store_panel_options_in_config();
                     store_editor_options_in_config();
                     config.save(default_config_path());
                     status = "Setup saved";
@@ -4956,12 +5354,14 @@ struct App::Impl {
             std::string(user == nullptr ? "user" : user) + "@" +
             hostname.data() + ":" + active().path() + "$";
         const auto hint =
-            status == "Ready"
-                ? tree_panel && tree_panel_focused
-                      ? "Tree: Enter open/expand  Space toggle  "
-                        "+/- branch  Tab panel"
-                      : "Hint: Tab changes your current panel."
-                : status + progress_text;
+            pending_operation_notice
+                ? "Background [Esc]: " + *pending_operation_notice
+                : status == "Ready"
+                      ? tree_panel && tree_panel_focused
+                            ? "Tree: Enter open/expand  Space toggle  "
+                              "+/- branch  Tab panel"
+                            : "Hint: Tab changes your current panel."
+                      : status + progress_text;
         static const std::array<std::string, 5> menu_names{
             "  Left     ",
             "File     ",
@@ -5085,6 +5485,13 @@ struct App::Impl {
             });
         };
         if (mode == Mode::prompt) {
+            const auto focused = [&](Element element,
+                                     const std::size_t index) {
+                if (prompt_focus == index) {
+                    element = element | inverted;
+                }
+                return element | reflect(prompt_boxes[index]);
+            };
             Elements prompt_rows{
                 text(prompt_title) | bold | center,
                 separator(),
@@ -5139,16 +5546,30 @@ struct App::Impl {
                                                      PromptAction::mkdir
                                                  ? "Directory name:"
                                                  : "Value:";
-            prompt_rows.push_back(text(field_label));
             prompt_rows.push_back(
-                text("> " + display_text(prompt_value)) |
-                inverted
+                text(
+                    prompt_action == PromptAction::view_file
+                        ? "Filename:"
+                        : field_label
+                )
             );
+            prompt_rows.push_back(
+                focused(
+                    text("> " + display_text(prompt_value)),
+                    0
+                )
+            );
+            if (!prompt_error.empty()) {
+                prompt_rows.push_back(
+                    text("Error: " + display_text(prompt_error)) |
+                    bold
+                );
+            }
             prompt_rows.push_back(separator());
             prompt_rows.push_back(
                 hbox({
-                    text(" [ OK ] ") | inverted,
-                    text("  [ Cancel ] "),
+                    focused(text(" [ OK ] "), 1),
+                    focused(text("  [ Cancel ] "), 2),
                 }) | center
             );
             auto prompt_dialog = vbox(std::move(prompt_rows)) |
@@ -5304,20 +5725,68 @@ struct App::Impl {
 
     bool handle_prompt(const ftxui::Event& event) {
         if (event == ftxui::Event::Escape) {
-            mode = mode_before_prompt;
-            prompt_action = PromptAction::none;
+            cancel_prompt();
             return true;
         }
-        if (event == ftxui::Event::Return) {
-            execute_prompt();
+        if (event == ftxui::Event::Tab) {
+            prompt_focus = (prompt_focus + 1U) % 3U;
+            return true;
+        }
+        if (event == ftxui::Event::TabReverse) {
+            prompt_focus = (prompt_focus + 2U) % 3U;
+            return true;
+        }
+        if (event.is_mouse()) {
+            auto mouse_event = event;
+            const auto& mouse = mouse_event.mouse();
+            if (mouse.button == ftxui::Mouse::Left &&
+                mouse.motion == ftxui::Mouse::Pressed) {
+                for (std::size_t index = 0;
+                     index < prompt_boxes.size();
+                     ++index) {
+                    if (!prompt_boxes[index].Contain(
+                            mouse.x,
+                            mouse.y
+                        )) {
+                        continue;
+                    }
+                    prompt_focus = index;
+                    if (index == 1U) {
+                        execute_prompt();
+                    } else if (index == 2U) {
+                        cancel_prompt();
+                    }
+                    break;
+                }
+            }
+            return true;
+        }
+        if (event == ftxui::Event::Return ||
+            (prompt_focus != 0U &&
+             event == ftxui::Event::Character(' '))) {
+            if (prompt_focus == 2U) {
+                cancel_prompt();
+            } else {
+                execute_prompt();
+            }
+            return true;
+        }
+        if (prompt_focus != 0U) {
+            return false;
+        }
+        if (event == ftxui::Event::CtrlU) {
+            prompt_value.clear();
+            prompt_error.clear();
             return true;
         }
         if (event == ftxui::Event::Backspace) {
             erase_last_utf8(prompt_value);
+            prompt_error.clear();
             return true;
         }
         if (event.is_character()) {
             prompt_value += event.character();
+            prompt_error.clear();
             return true;
         }
         return false;
@@ -5339,6 +5808,14 @@ struct App::Impl {
         }
         if (event == ftxui::Event::ArrowUp) {
             viewer.scroll_lines(-1, viewport_width);
+            return true;
+        }
+        if (event == ftxui::Event::Home) {
+            viewer.go_to_start();
+            return true;
+        }
+        if (event == ftxui::Event::End) {
+            viewer.go_to_end(viewport_width, viewport_lines);
             return true;
         }
         if (event == ftxui::Event::ArrowLeft) {
@@ -5422,13 +5899,13 @@ struct App::Impl {
     }
 
     void start_editor_search_dialog(const bool replace) {
-        editor_dialog_query = editor_search_needle;
+        editor_dialog_query = editor.search.needle;
         editor_dialog_replacement =
             replace ? editor_replace_text : std::string{};
         editor_dialog_scope = editor.selection();
-        editor_dialog_options = editor_search_options;
+        editor_dialog_options = editor.search.options;
         editor_dialog_in_selection =
-            editor_search_in_selection && editor_dialog_scope.has_value();
+            editor.search.in_selection && editor_dialog_scope.has_value();
         if (!editor_dialog_scope) {
             editor_dialog_in_selection = false;
         }
@@ -5447,11 +5924,11 @@ struct App::Impl {
             EditorPosition
         >> scope
     ) {
-        editor_search_needle = query;
-        editor_search_options = options;
-        editor_search_in_selection = in_selection;
-        editor_search_scope = scope;
-        editor_search_change_id = editor.change_id();
+        editor.search.needle = query;
+        editor.search.options = options;
+        editor.search.in_selection = in_selection;
+        editor.search.scope = scope;
+        editor.search.change_id = editor.change_id();
     }
 
     void reset_editor_view_state() {
@@ -5479,13 +5956,14 @@ struct App::Impl {
         const std::string& path,
         const bool create
     ) {
-        EditorModel next;
+        EditorBuffer next;
         next.set_tab_width(editor.tab_width());
         if (create) {
             next.create(provider, path);
         } else {
             next.open(provider, path);
         }
+        next.search.change_id = next.change_id();
         if (editor.open()) {
             editor_buffers.push_back(std::move(editor));
         }
@@ -5530,6 +6008,7 @@ struct App::Impl {
     void close_editor() {
         reset_editor_view_state();
         editor.close();
+        editor.search = {};
         if (!editor_buffers.empty()) {
             editor = std::move(editor_buffers.back());
             editor_buffers.pop_back();
@@ -5552,12 +6031,37 @@ struct App::Impl {
     }
 
     void request_editor_close() {
+        editor_quit_requested = false;
         if (editor.dirty()) {
             editor_close_choice = 0;
             mode = Mode::editor_close_dialog;
         } else {
             close_editor();
         }
+    }
+
+    void continue_editor_quit() {
+        while (editor_quit_index <= editor_buffers.size()) {
+            const auto& buffer =
+                editor_quit_index == 0U
+                    ? editor
+                    : editor_buffers[editor_quit_index - 1U];
+            if (buffer.dirty()) {
+                editor_close_choice = 0;
+                mode = Mode::editor_close_dialog;
+                return;
+            }
+            ++editor_quit_index;
+        }
+        editor_quit_requested = false;
+        editor_buffers.clear();
+        close_editor();
+    }
+
+    void request_editor_quit() {
+        editor_quit_requested = true;
+        editor_quit_index = 0;
+        continue_editor_quit();
     }
 
     void store_editor_clipboard(const bool cut) {
@@ -5612,22 +6116,22 @@ struct App::Impl {
     }
 
     void repeat_editor_search() {
-        if (editor_search_needle.empty()) {
+        if (editor.search.needle.empty()) {
             start_editor_search_dialog(false);
             return;
         }
-        if (editor_search_change_id != editor.change_id()) {
-            editor_search_scope.reset();
-            editor_search_in_selection = false;
-            editor_search_change_id = editor.change_id();
+        if (editor.search.change_id != editor.change_id()) {
+            editor.search.scope.reset();
+            editor.search.in_selection = false;
+            editor.search.change_id = editor.change_id();
         }
         try {
             if (!editor.find(
-                    editor_search_needle,
-                    editor_search_options,
+                    editor.search.needle,
+                    editor.search.options,
                     false,
                     false,
-                    editor_search_scope
+                    editor.search.scope
                 )) {
                 show_editor_message(
                     "Search",
@@ -5674,6 +6178,8 @@ struct App::Impl {
                     "Save as",
                     editor.path()
                 );
+            } else if (item == 6U) {
+                request_editor_quit();
             } else {
                 editor_list_cursor = 0;
                 mode = Mode::editor_history;
@@ -5805,6 +6311,7 @@ struct App::Impl {
         }
         if (category == 6U && item == 1) {
             try {
+                store_panel_options_in_config();
                 store_editor_options_in_config();
                 config.save(default_config_path());
                 status = "Setup saved";
@@ -6140,6 +6647,7 @@ struct App::Impl {
 
     bool handle_editor_close_dialog(const ftxui::Event& event) {
         if (event == ftxui::Event::Escape) {
+            editor_quit_requested = false;
             mode = Mode::editor;
             return true;
         }
@@ -6165,18 +6673,29 @@ struct App::Impl {
             return false;
         }
         if (editor_close_choice == 2U) {
+            editor_quit_requested = false;
             mode = Mode::editor;
             return true;
         }
         if (editor_close_choice == 0U) {
             try {
-                editor.save(false);
+                auto& buffer =
+                    editor_quit_requested && editor_quit_index > 0U
+                        ? editor_buffers[editor_quit_index - 1U]
+                        : editor;
+                buffer.save(false);
             } catch (const std::exception& error) {
+                editor_quit_requested = false;
                 show_editor_error(error);
                 return true;
             }
         }
-        close_editor();
+        if (editor_quit_requested) {
+            ++editor_quit_index;
+            continue_editor_quit();
+        } else {
+            close_editor();
+        }
         return true;
     }
 
@@ -6370,7 +6889,7 @@ struct App::Impl {
                 scope
             );
             if (replace) {
-                editor_replace_needle = editor_search_needle;
+                editor_replace_needle = editor.search.needle;
                 editor_replace_text = editor_dialog_replacement;
                 editor_replace_choice = 0;
                 editor_replacements = 0;
@@ -6423,10 +6942,10 @@ struct App::Impl {
         if (editor_replace_choice == 1U) {
             if (!editor.find(
                     editor_replace_needle,
-                    editor_search_options,
+                    editor.search.options,
                     false,
                     true,
-                    editor_search_scope
+                    editor.search.scope
                 )) {
                 finish_editor_replace(
                     std::to_string(editor_replacements) +
@@ -6440,10 +6959,10 @@ struct App::Impl {
                 editor_replacements += editor.replace_all(
                     editor_replace_needle,
                     editor_replace_text,
-                    editor_search_options,
-                    editor_search_scope
+                    editor.search.options,
+                    editor.search.scope
                 );
-                editor_search_change_id = editor.change_id();
+                editor.search.change_id = editor.change_id();
             } catch (const std::exception& error) {
                 show_editor_error(error);
                 return true;
@@ -6460,7 +6979,7 @@ struct App::Impl {
             replacement = editor.replacement_for_selection(
                 editor_replace_needle,
                 editor_replace_text,
-                editor_search_options
+                editor.search.options
             );
         } catch (const std::exception& error) {
             show_editor_error(error);
@@ -6469,21 +6988,21 @@ struct App::Impl {
         const auto match = editor.selection();
         if (editor.replace_selection(
                 replacement,
-                &editor_search_scope
+                &editor.search.scope
             )) {
             ++editor_replacements;
-            editor_search_change_id = editor.change_id();
+            editor.search.change_id = editor.change_id();
         }
-        if (editor_search_options.backwards && match) {
+        if (editor.search.options.backwards && match) {
             editor.set_position(match->first);
         }
         if (editor_replace_choice == 3U ||
             !editor.find(
                 editor_replace_needle,
-                editor_search_options,
+                editor.search.options,
                 false,
                 false,
-                editor_search_scope
+                editor.search.scope
             )) {
             finish_editor_replace(
                 std::to_string(editor_replacements) +
@@ -6726,8 +7245,11 @@ struct App::Impl {
             mode = Mode::editor_menu;
             return true;
         }
-        if (event == ftxui::Event::F10 ||
-            event == ftxui::Event::Escape) {
+        if (event == ftxui::Event::F10) {
+            request_editor_quit();
+            return true;
+        }
+        if (event == ftxui::Event::Escape) {
             request_editor_close();
             return true;
         }
@@ -7370,6 +7892,10 @@ struct App::Impl {
     }
 
     bool handle_panels(ftxui::Event event) {
+        if (event == ftxui::Event::Escape && pending_operation_notice) {
+            pending_operation_notice.reset();
+            status = "Ready";
+        }
         if (event.is_mouse() &&
             (
                 event.mouse().motion == ftxui::Mouse::Moved ||
@@ -7533,7 +8059,7 @@ struct App::Impl {
                 } else if (
                     event == ftxui::Event::Character('!')
                 ) {
-                    execute_pulldown_action(2U, 9);
+                    status = "External panelize is not implemented";
                 } else if (event != ftxui::Event::Escape) {
                     status = "Unknown C-x command";
                 } else {
@@ -7597,7 +8123,11 @@ struct App::Impl {
             event == ftxui::Event::F8 ||
             event == ftxui::Event::F9 ||
             event == ftxui::Event::F10;
-        if (command_mode && !panel_shortcut &&
+        const bool listing_focused =
+            !(tree_panel && tree_panel_focused) &&
+            !(quick_view_panel && quick_view_focused) &&
+            !(information_panel && information_panel_focused);
+        if (command_mode && listing_focused && !panel_shortcut &&
             !panel_search_confirmed) {
             if (event == ftxui::Event::Escape) {
                 command_mode = false;
@@ -7904,6 +8434,14 @@ struct App::Impl {
                     quick_viewer.scroll_lines(-1, viewport_width);
                     return true;
                 }
+                if (event == ftxui::Event::Home) {
+                    quick_viewer.go_to_start();
+                    return true;
+                }
+                if (event == ftxui::Event::End) {
+                    quick_viewer.go_to_end(viewport_width, viewport_lines);
+                    return true;
+                }
                 if (event == ftxui::Event::ArrowLeft) {
                     quick_viewer.scroll_columns(-1);
                     return true;
@@ -7940,49 +8478,40 @@ struct App::Impl {
                 if (event == ftxui::Event::Character(' ') ||
                     event == ftxui::Event::Character('+')) {
                     if (tree_cursor < tree_nodes.size() &&
-                        tree_nodes[tree_cursor].loading) {
+                        (tree_nodes[tree_cursor].loading ||
+                         tree_refresh_pending ==
+                             tree_nodes[tree_cursor].path)) {
                         if (event == ftxui::Event::Character(' ')) {
-                            tree_expansion_cancellation.request();
-                            tree_nodes[tree_cursor].loading = false;
-                            status = "Tree branch collapsed";
+                            collapse_tree_node(tree_cursor);
                         } else {
                             status = "Tree branch is loading";
                         }
                         return true;
                     }
-                    const bool was_expanded =
-                        tree_cursor < tree_nodes.size() &&
-                        tree_nodes[tree_cursor].expanded;
-                    if (tree_cursor < tree_nodes.size() &&
-                        (
-                            event == ftxui::Event::Character(' ') ||
-                            !tree_nodes[tree_cursor].expanded
-                        )) {
-                        expand_tree_node(tree_cursor);
+                    if (tree_cursor < tree_nodes.size()) {
+                        if (event == ftxui::Event::Character('+') &&
+                            tree_nodes[tree_cursor].expanded) {
+                            status = "Tree branch already expanded";
+                        } else {
+                            expand_tree_node(tree_cursor);
+                        }
                     }
-                    status =
-                        was_expanded &&
-                                event ==
-                                    ftxui::Event::Character('+')
-                            ? "Tree branch already expanded"
-                            : was_expanded
-                                  ? "Tree branch collapsed"
-                                  : "Expanding tree branch";
                     return true;
                 }
                 if (event == ftxui::Event::Character('-')) {
                     if (tree_cursor < tree_nodes.size() &&
-                        tree_nodes[tree_cursor].loading) {
-                        tree_expansion_cancellation.request();
-                        tree_nodes[tree_cursor].loading = false;
-                        status = "Tree branch collapsed";
+                        (tree_nodes[tree_cursor].loading ||
+                         tree_refresh_pending ==
+                             tree_nodes[tree_cursor].path)) {
+                        collapse_tree_node(tree_cursor);
                         return true;
                     }
                     if (tree_cursor < tree_nodes.size() &&
                         tree_nodes[tree_cursor].expanded) {
                         expand_tree_node(tree_cursor);
+                    } else {
+                        status = "Tree branch already collapsed";
                     }
-                    status = "Tree branch collapsed";
                     return true;
                 }
                 if (event == ftxui::Event::F1 ||
@@ -7999,11 +8528,13 @@ struct App::Impl {
                     return true;
                 }
                 if (event == ftxui::Event::F2) {
-                    refresh();
-                    status = "Tree refreshed";
+                    refresh(true);
                     return true;
                 }
                 if (event == ftxui::Event::F3) {
+                    invalidate_tree_loading();
+                    tree_refresh_pending.reset();
+                    tree_refresh_notify_pending = false;
                     if (tree_cursor > 0U &&
                         tree_cursor < tree_nodes.size()) {
                         const auto depth =
@@ -8024,6 +8555,7 @@ struct App::Impl {
                         if (tree_cursor >= tree_nodes.size()) {
                             --tree_cursor;
                         }
+                        sync_dynamic_tree();
                     }
                     return true;
                 }
@@ -8216,8 +8748,11 @@ struct App::Impl {
             } else if (event == ftxui::Event::CtrlA) {
                 active().select_all();
             } else if (event == ftxui::Event::CtrlR) {
-                refresh();
-                status = "Refreshed";
+                refresh(true);
+                if (!tree_panel ||
+                    !tree_expansion_running.load(std::memory_order_acquire)) {
+                    status = "Refreshed";
+                }
             } else if (event == ftxui::Event::CtrlU) {
                 swap_panels();
             } else if (
@@ -8574,12 +9109,8 @@ int App::run() {
     );
     terminal.Loop(std::move(component));
     operation_guard.finish();
-    impl_->config.show_hidden = impl_->left.show_hidden();
-    impl_->config.directories_first =
-        impl_->left.directories_first();
+    impl_->store_panel_options_in_config();
     impl_->store_editor_options_in_config();
-    impl_->config.sort = impl_->left.sort_field();
-    impl_->config.sort_descending = impl_->left.descending();
     try {
         impl_->config.save(default_config_path());
     } catch (...) {

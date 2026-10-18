@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <deque>
 #include <iomanip>
 #include <sstream>
 #include <stdexcept>
@@ -41,89 +42,6 @@ std::size_t next_utf8(
         ++next;
     }
     return next;
-}
-
-std::size_t append_text_line(
-    std::vector<std::string>& output,
-    const std::string_view line,
-    const std::size_t width,
-    const std::size_t height,
-    const bool wrap,
-    const std::size_t horizontal_offset
-) {
-    if (width == 0U) {
-        output.emplace_back(line);
-        return line.size();
-    }
-    std::string current;
-    std::size_t current_width = 0;
-    std::size_t consumed = 0;
-    std::size_t source_width = 0;
-    for (const auto& glyph : ftxui::Utf8ToGlyphs(line)) {
-        if (glyph.empty()) {
-            continue;
-        }
-        std::string displayed = glyph;
-        auto glyph_width = static_cast<std::size_t>(
-            std::max(0, ftxui::string_width(glyph))
-        );
-        if (glyph == "\t") {
-            constexpr std::size_t tab_width = 8U;
-            glyph_width =
-                tab_width -
-                (wrap ? current_width : source_width) %
-                    tab_width;
-            displayed.assign(glyph_width, ' ');
-        }
-        if (!wrap) {
-            const auto glyph_begin = source_width;
-            source_width += glyph_width;
-            consumed += glyph.size();
-            if (source_width <= horizontal_offset) {
-                continue;
-            }
-            if (glyph_begin < horizontal_offset) {
-                if (glyph == "\t") {
-                    const auto skipped =
-                        horizontal_offset - glyph_begin;
-                    displayed.erase(
-                        0,
-                        std::min(skipped, displayed.size())
-                    );
-                    glyph_width = displayed.size();
-                } else {
-                    continue;
-                }
-            }
-            if (current_width + glyph_width > width) {
-                break;
-            }
-            current += displayed;
-            current_width += glyph_width;
-            continue;
-        }
-        if (current_width + glyph_width > width &&
-            !current.empty()) {
-            output.push_back(std::move(current));
-            if (output.size() >= height) {
-                return consumed;
-            }
-            current.clear();
-            current_width = 0;
-            if (glyph == "\t") {
-                constexpr std::size_t tab_width = 8U;
-                glyph_width = tab_width;
-                displayed.assign(glyph_width, ' ');
-            }
-        }
-        current += displayed;
-        current_width += glyph_width;
-        consumed += glyph.size();
-    }
-    if (output.size() < height) {
-        output.push_back(std::move(current));
-    }
-    return wrap ? consumed : line.size();
 }
 
 }  // namespace
@@ -168,6 +86,33 @@ bool ViewerModel::open() const noexcept {
     return provider_ != nullptr;
 }
 
+void ViewerModel::go_to_start() {
+    offset_ = 0;
+    view_end_ = 0;
+    previous_offsets_.clear();
+    horizontal_offset_ = 0;
+}
+
+void ViewerModel::go_to_end(
+    const std::size_t viewport_width,
+    const std::size_t viewport_lines
+) {
+    if (!open()) {
+        return;
+    }
+    previous_offsets_.clear();
+    horizontal_offset_ = 0;
+    const auto height = std::max<std::size_t>(1U, viewport_lines);
+    if (hex_) {
+        const auto rows = size_ == 0U ? 0U : (size_ - 1U) / 16U + 1U;
+        offset_ = (rows - std::min<std::uint64_t>(rows, height)) * 16U;
+    } else {
+        const auto offsets = text_offsets_before(size_, viewport_width, height);
+        offset_ = offsets.empty() ? 0U : offsets.front();
+    }
+    view_end_ = offset_;
+}
+
 void ViewerModel::scroll_lines(
     const int amount,
     const std::size_t viewport_width
@@ -176,7 +121,7 @@ void ViewerModel::scroll_lines(
         return;
     }
     if (offset_ < window_offset_ ||
-        offset_ > window_offset_ + window_.size()) {
+        offset_ >= window_offset_ + window_.size()) {
         load_window(offset_, window_size, {});
     }
     if (amount > 0) {
@@ -187,86 +132,13 @@ void ViewerModel::scroll_lines(
             if (hex_) {
                 next_offset =
                     std::min<std::uint64_t>(size_, offset_ + 16U);
-            } else if (!wrap_) {
-                const auto local = static_cast<std::size_t>(
-                    offset_ - window_offset_
-                );
-                const auto next = window_.find('\n', local);
-                next_offset =
-                    next == std::string::npos
-                        ? std::min<std::uint64_t>(
-                              size_,
-                              window_offset_ + window_.size()
-                          )
-                        : window_offset_ + next + 1U;
             } else {
-                const auto width = std::max<std::size_t>(
-                    1U,
-                    viewport_width
+                next_offset = read_text_row(
+                    offset_,
+                    viewport_width,
+                    nullptr,
+                    {}
                 );
-                std::size_t display_width = 0;
-                while (next_offset < size_) {
-                    if (next_offset < window_offset_ ||
-                        next_offset >=
-                            window_offset_ + window_.size()) {
-                        load_window(next_offset, window_size, {});
-                        if (window_.empty()) {
-                            next_offset = size_;
-                            break;
-                        }
-                    }
-                    const auto local = static_cast<std::size_t>(
-                        next_offset - window_offset_
-                    );
-                    if (window_[local] == '\n') {
-                        ++next_offset;
-                        break;
-                    }
-                    const auto next_local =
-                        next_utf8(window_, local);
-                    const auto glyph = std::string_view(window_).substr(
-                        local,
-                        next_local - local
-                    );
-                    auto glyph_width = static_cast<std::size_t>(
-                        std::max(0, ftxui::string_width(glyph))
-                    );
-                    if (glyph == "\t") {
-                        constexpr std::size_t tab_width = 8U;
-                        glyph_width =
-                            tab_width -
-                            display_width % tab_width;
-                    }
-                    if (display_width > 0U &&
-                        display_width + glyph_width > width) {
-                        break;
-                    }
-                    next_offset += next_local - local;
-                    display_width += glyph_width;
-                    if (display_width >= width) {
-                        if (next_offset < size_) {
-                            if (next_offset < window_offset_ ||
-                                next_offset >=
-                                    window_offset_ +
-                                        window_.size()) {
-                                load_window(
-                                    next_offset,
-                                    window_size,
-                                    {}
-                                );
-                            }
-                            const auto next_byte =
-                                static_cast<std::size_t>(
-                                    next_offset - window_offset_
-                                );
-                            if (next_byte < window_.size() &&
-                                window_[next_byte] == '\n') {
-                                ++next_offset;
-                            }
-                        }
-                        break;
-                    }
-                }
             }
             if (next_offset <= offset_) {
                 break;
@@ -281,29 +153,21 @@ void ViewerModel::scroll_lines(
                     offset_ >= 16U ? offset_ - 16U : 0U;
                 continue;
             }
-            if (!previous_offsets_.empty()) {
-                offset_ = previous_offsets_.back();
-                previous_offsets_.pop_back();
-                continue;
+            if (previous_offsets_.empty()) {
+                previous_offsets_ = text_offsets_before(
+                    offset_,
+                    viewport_width,
+                    static_cast<std::size_t>(
+                        static_cast<long long>(line) - amount
+                    )
+                );
             }
-            if (offset_ <= window_offset_ + 1U) {
-                const auto begin =
-                    offset_ > window_size
-                        ? offset_ - window_size
-                        : 0U;
-                load_window(begin, window_size, {});
+            if (previous_offsets_.empty()) {
+                offset_ = 0;
+                break;
             }
-            const auto local = static_cast<std::size_t>(
-                offset_ - window_offset_
-            );
-            const auto before =
-                local > 1U
-                    ? window_.rfind('\n', local - 2U)
-                    : std::string::npos;
-            offset_ =
-                before == std::string::npos
-                    ? window_offset_
-                    : window_offset_ + before + 1U;
+            offset_ = previous_offsets_.back();
+            previous_offsets_.pop_back();
         }
     }
 }
@@ -372,6 +236,153 @@ const std::string& ViewerModel::path() const noexcept {
     return path_;
 }
 
+std::vector<std::uint64_t> ViewerModel::text_offsets_before(
+    const std::uint64_t end,
+    const std::size_t width,
+    const std::size_t count
+) {
+    if (end == 0U || count == 0U) {
+        return {};
+    }
+    std::uint64_t begin = 0;
+    std::size_t newlines = 0;
+    for (auto cursor = end; cursor > 0U;) {
+        const auto chunk_begin = cursor > window_size ? cursor - window_size : 0U;
+        load_window(
+            chunk_begin,
+            static_cast<std::size_t>(cursor - chunk_begin),
+            {}
+        );
+        for (auto local = window_.size(); local > 0U; --local) {
+            const auto position = chunk_begin + local - 1U;
+            if (window_[local - 1U] == '\n' && position + 1U < end &&
+                ++newlines == count) {
+                begin = position + 1U;
+                break;
+            }
+        }
+        if (newlines == count) {
+            break;
+        }
+        cursor = chunk_begin;
+    }
+    // Only the last viewport's row offsets are retained, even for huge lines.
+    std::deque<std::uint64_t> offsets;
+    for (auto cursor = begin; cursor < end;) {
+        const auto next = read_text_row(cursor, width, nullptr, {});
+        if (next <= cursor) {
+            break;
+        }
+        offsets.push_back(cursor);
+        if (offsets.size() > count) {
+            offsets.pop_front();
+        }
+        cursor = std::min(next, end);
+    }
+    return {offsets.begin(), offsets.end()};
+}
+
+std::string_view ViewerModel::window_at(
+    const std::uint64_t offset,
+    const std::size_t minimum,
+    const Cancellation& cancellation
+) {
+    if (offset >= size_) {
+        return {};
+    }
+    const auto end = window_offset_ + window_.size();
+    if (offset < window_offset_ || offset >= end ||
+        end - offset <
+            std::min<std::uint64_t>(minimum, size_ - offset)) {
+        load_window(offset, window_size, cancellation);
+    }
+    if (offset < window_offset_ ||
+        offset >= window_offset_ + window_.size()) {
+        return {};
+    }
+    return std::string_view(window_).substr(
+        static_cast<std::size_t>(offset - window_offset_)
+    );
+}
+
+std::uint64_t ViewerModel::read_text_row(
+    std::uint64_t offset,
+    const std::size_t viewport_width,
+    std::string* output,
+    const Cancellation& cancellation
+) {
+    const auto width = std::max<std::size_t>(1U, viewport_width);
+    std::size_t column = 0;
+    std::size_t displayed_width = 0;
+    bool clipped = false;
+    while (offset < size_) {
+        cancellation.throw_if_requested();
+        // Keep a complete UTF-8 code point when refilling the bounded window.
+        const auto bytes = window_at(offset, 4U, cancellation);
+        if (bytes.empty()) {
+            break;
+        }
+        if (!wrap_ && (output == nullptr || clipped)) {
+            const auto newline = bytes.find('\n');
+            if (newline != std::string_view::npos) {
+                return offset + newline + 1U;
+            }
+            offset += bytes.size();
+            continue;
+        }
+        if (bytes.front() == '\n') {
+            return offset + 1U;
+        }
+        const auto length = next_utf8(bytes, 0);
+        const auto glyph = bytes.substr(0, length);
+        const bool tab = glyph == "\t";
+        const auto first = static_cast<unsigned char>(glyph.front());
+        if (!tab && (first < 32U || first == 127U)) {
+            offset += length;
+            continue;
+        }
+        auto glyph_width = static_cast<std::size_t>(
+            std::max(0, ftxui::string_width(glyph))
+        );
+        if (tab) {
+            constexpr std::size_t tab_width = 8U;
+            glyph_width = tab_width - column % tab_width;
+        }
+        if (wrap_ && glyph_width > 0U && column > 0U &&
+            column + glyph_width > width) {
+            return offset;
+        }
+        const auto glyph_begin = column;
+        column += glyph_width;
+        offset += length;
+        if (output == nullptr) {
+            continue;
+        }
+        if (!wrap_) {
+            if (column <= horizontal_offset_) {
+                continue;
+            }
+            if (glyph_begin < horizontal_offset_) {
+                if (!tab) {
+                    continue;
+                }
+                glyph_width = column - horizontal_offset_;
+            }
+            if (displayed_width + glyph_width > width) {
+                clipped = true;
+                continue;
+            }
+        }
+        if (tab) {
+            output->append(glyph_width, ' ');
+        } else if (glyph_width > 0U || !output->empty()) {
+            output->append(glyph);
+        }
+        displayed_width += glyph_width;
+    }
+    return offset;
+}
+
 void ViewerModel::load_window(
     const std::uint64_t offset,
     const std::size_t size,
@@ -401,31 +412,30 @@ std::vector<std::string> ViewerModel::lines(
         view_end_ = 0;
         return {};
     }
-    if (offset_ < window_offset_ ||
-        offset_ >= window_offset_ + window_.size()) {
-        load_window(offset_, window_size, cancellation);
-    }
-    const auto local = static_cast<std::size_t>(
-        offset_ - window_offset_
-    );
     std::vector<std::string> result;
     result.reserve(height);
+    view_end_ = offset_;
     if (hex_) {
         constexpr std::size_t bytes_per_line = 16U;
         for (std::size_t row = 0; row < height; ++row) {
-            const auto begin = local + row * bytes_per_line;
-            if (begin >= window_.size()) {
+            const auto bytes = window_at(
+                view_end_,
+                bytes_per_line,
+                cancellation
+            );
+            if (bytes.empty()) {
                 break;
             }
+            const auto count = std::min(bytes_per_line, bytes.size());
             std::ostringstream line;
             line << std::hex << std::setfill('0') << std::setw(8)
-                 << (window_offset_ + begin) << "  ";
+                 << view_end_ << "  ";
             for (std::size_t index = 0; index < bytes_per_line; ++index) {
-                if (begin + index < window_.size()) {
+                if (index < count) {
                     line << std::setw(2)
                          << static_cast<unsigned int>(
                                 static_cast<unsigned char>(
-                                    window_[begin + index]
+                                    bytes[index]
                                 )
                             )
                          << ' ';
@@ -434,47 +444,34 @@ std::vector<std::string> ViewerModel::lines(
                 }
             }
             line << " ";
-            for (std::size_t index = 0; index < bytes_per_line &&
-                                        begin + index < window_.size();
-                 ++index) {
+            for (std::size_t index = 0; index < count; ++index) {
                 const auto character = static_cast<unsigned char>(
-                    window_[begin + index]
+                    bytes[index]
                 );
                 line << (std::isprint(character)
                              ? static_cast<char>(character)
                              : '.');
             }
             result.push_back(line.str());
+            view_end_ += count;
         }
-        view_end_ = std::min<std::uint64_t>(
-            size_,
-            offset_ + result.size() * bytes_per_line
-        );
         return result;
     }
 
-    std::istringstream input(window_.substr(local));
-    std::string line;
-    std::size_t consumed = 0;
-    while (result.size() < height && std::getline(input, line)) {
-        const auto displayed = append_text_line(
-            result,
-            line,
+    while (result.size() < height && view_end_ < size_) {
+        std::string line;
+        const auto next = read_text_row(
+            view_end_,
             width,
-            height,
-            wrap_,
-            horizontal_offset_
+            &line,
+            cancellation
         );
-        consumed += displayed;
-        if (displayed < line.size()) {
+        if (next <= view_end_) {
             break;
         }
-        if (local + consumed < window_.size() &&
-            window_[local + consumed] == '\n') {
-            ++consumed;
-        }
+        result.push_back(std::move(line));
+        view_end_ = next;
     }
-    view_end_ = std::min<std::uint64_t>(size_, offset_ + consumed);
     return result;
 }
 

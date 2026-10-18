@@ -155,7 +155,9 @@ public:
     ) = 0;
     virtual void create_symlink(
         std::string_view target,
-        std::string_view path
+        std::string_view path,
+        bool overwrite = false,
+        const Cancellation& cancellation = {}
     ) = 0;
     virtual void create_hardlink(
         std::string_view target,

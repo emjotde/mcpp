@@ -8,10 +8,15 @@ RUN apt-get update \
         ca-certificates \
         cmake \
         ninja-build \
+        python3 \
+        tmux \
         util-linux \
     && rm -rf /var/lib/apt/lists/*
 
-RUN useradd --create-home --shell /bin/bash mcpp
+RUN useradd --create-home --shell /bin/bash mcpp \
+    && mkdir -p /review/runtime \
+    && chown mcpp:mcpp /review/runtime \
+    && touch /review/.operation-regressions-disposable
 
 WORKDIR /home/mcpp/src
 COPY --chown=mcpp:mcpp . .
