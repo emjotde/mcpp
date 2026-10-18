@@ -102,6 +102,64 @@ Source inspection, compilation, and a similar-looking screenshot are different
 forms of evidence and must not be counted interchangeably. Sanitizers and
 optional profiling are not part of this audit.
 
+## Additional audit: operation policy, replacement and save metadata
+
+This extends the source audit against the same product code; the previous
+report commit `2f5c6eb` changed documentation only. The following B findings
+are additional to A01-A16. Error/destructive cases were reproduced in a
+non-root disposable container without host mounts. Editor model probes and
+actual terminal workflows are identified separately.
+
+| ID | Priority | Additional finding | Evidence and consequence |
+|---|---|---|---|
+| B01 | P1 | A directory-merge decision becomes blanket permission to overwrite child files. Even choosing Older can replace a newer destination with an older source and then delete the source tree. | `src/operations.cpp:864-878,938,1213` passes the root's accepted overwrite into the fallback copy; `should_overwrite():326-327` then bypasses every child resolver. A model resolver that would skip children was never called. In the actual F6/Older workflow, `NEWER-TARGET` became `OLDER-SOURCE` and the source tree disappeared. MC keeps the per-file Older check in `src/filemanager/filegui.c:1262-1267`. Permission to merge a directory must not mean All. |
+| B02 | P1 | Chmod ignores marked targets and can change `..` instead. Chown has the same target-selection code path. | `src/app.cpp:3165-3225` reads `active().current()` at acceptance rather than the marked entries. With `a.txt` marked and the cursor on `..`, chmod 0700 left the file at 0644 and changed its parent directory from 0755 to 0700. MC uses `panel_get_marked_file()` in `src/filemanager/chmod.c:514` and `chown.c:388`. This is a wrong-target bug, not just a missing bulk-dialog option. Chmod was reproduced; Chown is source-confirmed. |
+| B03 | P1 | Saving a file discards its user xattrs and POSIX access ACL, even though the displayed mode bits stay unchanged. | `src/editor.cpp:1554-1580` uses `LocalProvider::write`, which creates a fresh inode, copies mode bits, and renames it into place (`src/local_provider.cpp:664-826`). A real editor save removed both `user.mcpp_audit` and `system.posix_acl_access` while keeping mode 0640. A named user's access grant was lost. MC's default quick-save path writes the existing inode (`src/editor/editcmd.c:210-247`). Preserve appropriate metadata without blindly retaining executable capabilities. |
+| B04 | P1 | Ctrl-K destroys the persistent mark before recording Undo. Undo restores the bytes but not the mark, so a subsequent F8 deletes the whole line rather than the restored block. | `src/editor.cpp:1149-1161` calls `clear_selection()` before `record_undo()`. Reproduced with `alpha beta` marked at `alpha`: after Ctrl-K/Undo/F8, mcpp saved only `gamma`; MC saved ` beta` followed by `gamma`. MC deletes through the normal edit/undo machinery in `src/editor/edit.c:1380-1384`. |
+| B05 | P2 | Replacement can reject the valid regex match that its own selection-scoped search just found. | `EditorSearch::replacement()` (`src/editor_search.cpp:667-700`) reruns the expression through the rest of the document, not the original search boundary. For `abc def`, `.*` restricted to `[0,3)` matches `abc`; expanding the replacement then throws `selected text no longer matches the expression` despite no edit. Preserve the original match/captures and bounds. MC's replacement consumes the search engine's recorded match (`src/editor/editsearch.c:974`), rather than using mcpp's re-search procedure. |
+| B06 | P2 | Valid zero-width regexes are discarded. Finding/replacing a line-start anchor such as `^` cannot work. | `src/editor_search.cpp:397-417` rejects every equal begin/end match; the editor also represents an empty match as no selection. The model returned zero matches for `^` in two nonempty lines. MC's actual Replace accepted `^` and inserted `>` at the first line start; its continuation code explicitly handles zero-length matches (`src/editor/editsearch.c:1000`). |
+| B07 | P2 | Editor wildcard matching/replacement does not implement MC's greedy captures, and regex replacement escapes remain literal. | `src/editor_search.cpp:292-362,667-754` matched only `a1b` for `a*b` in `a1b2b`, returned literal `x*` as replacement, and returned bytes `5c6e` for regex replacement `\n`. MC's actual wildcard replacement produced `x1b2`, and regex `\n` produced byte `0a`. Compare MC `lib/search/glob.c:50-126,130-205` and `lib/search/regex.c:711-716`. These are enabled replacement modes, not disabled optional actions. |
+| B08 | P2 | Atomic-save permission semantics are not exposed or checked: a file opened with mode 0400 can be changed by an ordinary Save without a read-only warning. | The non-root model probe opened the already-read-only file, inserted `X`, and `save(false)` replaced it successfully. `LocalProvider::write` checks directory publication and mode copying but not file writability (`src/local_provider.cpp:664-826`). MC's default quick save opens the existing file for writing and falls back to Save As on failure (`src/editor/editcmd.c:243-245,443`). This is a missing permission/mode decision, not a claim that Unix forbids an owner from replacing a directory entry. |
+| B09 | P2 | Copy onto a different hardlink of the same file silently breaks the link and reports completion instead of identifying the same-file operation. | `src/operations.cpp:525-532` checks path equality for copy, while the stronger identity helper is only used by moves. The model copied `source` onto its hardlinked `alias`; the names ceased to share an inode and the result reported one completed source. MC checks device/inode before overwrite (`src/filemanager/file.c:911-921,2396`). This differs from preserving a group of hardlinks during an ordinary copy. |
+| B10 | P2 | Ctrl-Right skips across the newline when the last word ends at EOL, instead of first stopping at the end of that line. | `src/editor.cpp:530-573` unconditionally advances to the next row after reaching EOL. With `alpha\nbeta\n`, Ctrl-Right then `X` produced `alpha\nXbeta\n` in the model; MC's same keys produced `alphaX\nbeta\n`. The UI routes Ctrl-Right directly to this model method. |
+| B11 | P2 limitation | Near the supported file-size limit, the undo budget retains only a few keystrokes rather than a useful history. | `src/editor.cpp:1474-1510` stores entire documents per edit and limits all snapshots to 64 MiB. On an allowed 16 MiB document, six inserted characters left only three undo steps. MC records edit actions rather than whole-document snapshots and defaults to a much larger action history (`src/editor/edit.c:108,1359-1375`). This is an observable capacity limitation, not a profiling or micro-optimization finding. |
+
+### Additional shared hazard, not an MC-only miss
+
+**H03, P1: regex and wildcard character searches can split UTF-8 and save
+invalid text.** Searching `.` in regex mode or `?` in wildcard mode against
+`é` selected only byte `c3`. Replacing one match with `X` saved
+`58 a9 0a` (`X`, a stray UTF-8 continuation byte, newline). Both editor model
+probes and actual mcpp F4/One/F2 workflows reproduced this.
+
+The regex path does not select a UTF-8 locale, unlike the normal literal
+search's `Utf8CType` guard; wildcard matching advances bytes directly
+(`src/editor_search.cpp:214-278,292-362,366-429`). Hex-mode byte editing is not
+the issue: these are the character-oriented regex/wildcard modes.
+
+The installed MC 4.8.30 control also produced those invalid bytes in the
+tested profiles. Its result is therefore not a correctness oracle, and this
+is not claimed as a runtime-certified difference from reference MC 4.8.33.
+The reference search engine has explicit UTF-8 versus raw-codepage paths
+(`lib/search/regex.c:790-823`). mcpp should protect valid UTF-8 independently
+of reproducing an older MC hazard.
+
+### Control outcomes and limits of this pass
+
+- MC controls confirmed the Ctrl-K/Undo mark difference, zero-width
+  replacement, greedy wildcard capture replacement, regex escape expansion,
+  and the word-motion line boundary.
+- The selection-scoped greedy MC control also consumed a boundary byte.
+  That result is not a reason to expand mcpp's selection. B05 is the
+  independently reproduced inconsistency between mcpp's own match and its
+  replacement validation.
+- Whole-word matching beside a nonbreaking space and editing at a CRLF line
+  end showed comparable limitations in the tested MC setup. They were not
+  counted as additional MC parity misses.
+- The temporary probes, exact saved bytes, UI captures, and metadata results
+  are retained in the session's `mc-source-audit/more` artifacts. This pass
+  changed the report, not the product, and used no sanitizers or profiling.
+
 ## Earlier behavioral review
 
 ## Review method
