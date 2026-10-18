@@ -160,6 +160,65 @@ of reproducing an older MC hazard.
   are retained in the session's `mc-source-audit/more` artifacts. This pass
   changed the report, not the product, and used no sanitizers or profiling.
 
+## UI and usability audit
+
+This pass exercised visible controls rather than inferring usability from
+keyboard-only tests. Normal terminal probes used the unchanged product code
+from `14b7a82`; the later commits up to `467cefc` added audit reports.
+Screenshots were rendered and inspected, and control outcomes were compared
+with MC 4.8.30 and the reference source where applicable.
+
+Related failures are grouped by interaction, not counted once per button.
+The following ten C findings are additional to A/B/H findings.
+
+| ID | Priority | UI/usability failure | Evidence and interpretation |
+|---|---|---|---|
+| C01 | P2 | The function-key bars look clickable but ignore mouse activation. | Main Help, editor Save and viewer UnWrap clicks did nothing, while the corresponding keyboard actions work. The keybars are rendered as elements without button hit routing in `src/app.cpp:3430-3530,3990-4040,6106-6195`. MC's actual editor keybar opened Save, and its buttonbar routes clicks in `lib/widget/buttonbar.c:219-235`. |
+| C02 | P2 | Basic dialog behavior is inconsistent: visible No/Cancel/OK buttons ignore clicks, Space does not activate focused buttons, and F10 is not a reliable modal cancel. | Clicks were ignored on delete, dirty-editor close, replace confirmation and error acknowledgement. Space failed on delete/dirty-close; F10 failed on delete/generic Save As. Clicking No left the default Yes focus unchanged; no destructive acceptance was issued by the probe. Save confirmation already supports mouse/Space/F10, so this is inconsistent within mcpp as well as unlike MC's standard widgets. See `handle_delete_dialog`, `handle_editor_close_dialog`, `handle_editor_replace_confirm`, `handle_prompt`, and the editor-error dispatch in `src/app.cpp`. MC mouse Cancel closed the dirty-editor dialog. |
+| C03 | P2 | Prefilled fields are not initially selected for replacement. Starting to type a new name appends it to the existing value. | In F12 Save As, typing `renamed.txt` produced `/.../original.txtrenamed.txt`; the MC field became just `renamed.txt`. `TextInputState::reset()` at `src/app.cpp:707-715` clears the anchor and puts the caret at the end. MC's first-edit handling deletes the initial marked region (`lib/widget/input.c:1112-1118`). Generic prompts and copy destinations need deliberate initial-value selection, without changing normal history/cursor editing. |
+| C04 | P2 | Clicking the command line does not position the caret or select text, although dialog inputs support those mouse operations. | After typing `abcdef`, clicking between `b` and `c` and typing `X` produced `abcdefX`, not `abXcdef`. `command_input` is rendered through the shared input renderer, but the panel mouse path does not call `input_mouse()` for it (`src/app.cpp:6176-6188,9287-9470`). MC's input widget sets the caret and drag mark in `lib/widget/input.c:906-939`. |
+| C05 | P2 | Full-screen viewer mouse-wheel scrolling is a no-op. | Wheel Down over the viewer left `ROW_000` at the top; Arrow Down moved to `ROW_001`. Quick view and the editor already handle the wheel, making the same file behave differently between views. `handle_viewer()` in `src/app.cpp:6572-6660` has no mouse path. MC handles viewer scroll events in `src/viewer/mcviewer.c:169-184`. This is distinct from the previously recorded missing keyboard aliases. |
+| C06 | P2 | Search results advertise normal View/Edit actions but do not implement them. | The results screen keeps an enabled-looking F3 View/F4 Edit keybar; pressing either leaves the results screen unchanged. `handle_search_results()` at `src/app.cpp:8665-8696` only supports arrows, Enter and leaving. Users must navigate to the file's directory to inspect it. MC exposes View-F3/Edit-F4 in `src/filemanager/find.c:192-193,1596-1620`. Implement the workflow and return to the same result/cursor afterward; merely retaining an unrelated main keybar is misleading. |
+| C07 | P2 | Long paths obscure the identifying filename, including during an unsaved-file decision. | At 100 columns the editor header showed only a common directory prefix. With a long path, neither the header nor the Close-file dialog showed a recognizable part of the basename. The tested MC header retained a distinguishing `~saved-document.txt` suffix even though its close-dialog text was also clipped. mcpp uses a full-path text element with `flex` in `render_editor()` and a nonwrapping full-path line in `render_editor_close_dialog()`. Viewer and pane titles also favor a leading path prefix. Prioritize the basename/distinguishing suffix and make the full path available separately. |
+| C08 | P2 | File-pane scrolling recenters prematurely instead of keeping the view stable while the cursor is still visible. | With an 80-file list at 100x30, fifteen Down presses made mcpp's first visible file `item_004`; MC still showed `item_000`. `render_pane()` rebuilds a focused `yframe` without a retained top row (`src/app.cpp:3250-3414`). MC adjusts its top row by as little as necessary (`src/filemanager/panel.c:1313-1351`). The earlier editor viewport correction did not change listing panes. |
+| C09 | P2 | Auxiliary lists are keyboard fragments rather than fully interactive lists. | Clicking a different buffer-list entry did not select it; Enter kept the current empty buffer. `handle_editor_list()` at `src/app.cpp:7428-7512` has no mouse or PageUp/PageDown handling. Hotlist and search-result list handlers likewise lack normal pointer selection/scroll behavior (`:8622-8696`). MC's listbox supports mouse selection, scrolling and page commands (`lib/widget/listbox.c:300-303,510-566`). Buffer-list clicking was reproduced; the related list routes were source-checked. |
+| C10 | P2 | Short-terminal Search/Replace forms hide actions and options without a visible scrolling cue or mouse access to the hidden area. | At 40x12, initial F7/F4 screens omitted OK, Cancel and lower options. Wheel Down did not move the form. Repeated Tab did reveal the buttons, so they are not permanently unreachable: this is a discoverability and mouse-access failure, not absence of all scrolling. The form has a focus-following `yframe` (`src/app.cpp:4289-4410`) but the mouse handler does not scroll it. Keep primary actions visible or provide explicit scrolling and usable pointer/page controls. |
+
+### U01: Tree pointer behavior is a shared limitation, not a new MC regression
+
+Single-clicking `beta` while `left` was selected left `left` selected, and
+wheel scrolling changed neither the selection nor the view. The implementation
+focuses the pane on a single click and selects/opens a node only on a double
+click (`src/app.cpp:9340-9394`).
+
+The reference MC tree does essentially the same thing and leaves wheel handling
+as a TODO (`src/filemanager/tree.c:1212-1265`). Its behavior is not a reason to
+call this usable: single-click selection and wheel navigation would be reasonable
+improvements. They should be explicit choices beyond MC parity, not falsely
+reported as existing behavior. The previous description saying a single click
+"focuses a node" overstated the implementation.
+
+### UI audit controls and next fixes
+
+- MC controls confirmed clickable keybars and Cancel buttons, initial replacement
+  of a prefilled filename, and stable pane scrolling.
+- A one-field Save As prompt remained usable at 40x12. It was not counted as a
+  failure merely because its source requests a width of 72. The layout finding
+  concerns longer forms, hidden actions, and absent pointer scrolling.
+- Search and Replace did scroll when keyboard focus reached hidden buttons.
+  The report does not equate an initially clipped screenshot with permanently
+  inaccessible controls.
+- Exact input events, before/after text, ANSI captures, inspected PNGs and result
+  JSON are retained in the session's `mc-ui-audit` artifacts.
+
+Prioritize reliable visible controls and modal dismissal first, then input
+defaults/caret positioning and search-result inspection, followed by filename
+legibility, stable scrolling, list navigation and constrained layouts. Reuse
+consistent keyboard/mouse activation rules across dialogs instead of treating
+each text-rendered button as an unrelated special case. Tree pointer changes
+need an explicit usability decision. No product behavior was changed by this
+audit.
+
 ## Earlier behavioral review
 
 ## Review method
@@ -270,8 +329,9 @@ live Info, Tree, pane swapping, hotlist, and filename-search panelization.
 Tree opens at the chosen pane's cwd. Enter opens the selected directory in
 the opposite listing and expands it. Right expands/moves to a child; Left
 selects the parent. Space toggles, `+` expands, and `-` collapses. A single
-click focuses a node and a double-click opens it. Explicit collapse controls
-and Enter expansion are requested mcpp behavior, not an assertion that all
+click focuses the Tree pane; a double-click selects and opens a node.
+Explicit collapse controls and Enter expansion are requested mcpp behavior,
+not an assertion that all
 MC Tree modes use the same controls.
 
 Unavailable listing formats, multi-column layouts, split/resizing controls,
