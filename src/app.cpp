@@ -896,6 +896,16 @@ struct TreeNode {
     bool loading{false};
 };
 
+enum class ViewerGotoMode { line, percent, decimal, hexadecimal };
+
+struct ViewerRow {
+    ftxui::Box box;
+    std::uint64_t offset{0};
+    std::size_t hex_column{0};
+    std::size_t first_column{0};
+    std::size_t bytes{0};
+};
+
 struct TextInputState {
     std::size_t cursor{0};
     std::optional<std::size_t> anchor;
@@ -954,6 +964,7 @@ struct App::Impl {
     TextInputState command_input;
     std::string input_clipboard;
     std::array<ftxui::Box, 7> operation_dialog_boxes{};
+    ftxui::Box operation_dialog_viewport;
     std::string status{"Ready"};
     std::optional<std::string> pending_operation_notice;
     OperationEngine operations;
@@ -973,6 +984,9 @@ struct App::Impl {
     std::array<ftxui::Box, 2> viewer_wrap_boxes{};
     bool viewer_search_quick{false};
     std::size_t viewer_hex_first_column{0};
+    ViewerGotoMode viewer_goto_mode{ViewerGotoMode::line};
+    std::vector<ViewerRow> viewer_rows;
+    std::string viewer_rendered_path;
     EditorBuffer editor;
     std::vector<EditorBuffer> editor_buffers;
     std::vector<std::string> editor_history;
@@ -1113,6 +1127,7 @@ struct App::Impl {
     bool pulldown_dropped{false};
     std::array<ftxui::Box, 5> top_menu_boxes{};
     std::vector<ftxui::Box> pulldown_item_boxes;
+    ftxui::Box pulldown_viewport;
     bool dialog_move{false};
     bool dialog_exact{false};
     std::string dialog_destination;
@@ -3530,16 +3545,35 @@ struct App::Impl {
                     run_viewer_search(false, false);
                     return;
                 case PromptAction::viewer_goto: {
-                    std::size_t parsed = 0;
-                    const auto offset = std::stoull(
-                        prompt_value, &parsed,
-                        prompt_value.starts_with("0x") || prompt_value.starts_with("0X")
-                            ? 16 : 10
-                    );
-                    if (parsed != prompt_value.size() || offset > viewer.size()) {
-                        throw std::runtime_error("offset is outside the file");
+                    auto input = std::string_view(prompt_value);
+                    const bool hexadecimal = viewer_goto_mode == ViewerGotoMode::hexadecimal;
+                    if (hexadecimal && (input.starts_with("0x") || input.starts_with("0X"))) {
+                        input.remove_prefix(2);
                     }
-                    viewer.goto_offset(offset);
+                    std::uint64_t value = 0;
+                    const auto parsed = std::from_chars(
+                        input.data(), input.data() + input.size(), value, hexadecimal ? 16 : 10
+                    );
+                    if (parsed.ec != std::errc{} || parsed.ptr != input.data() + input.size()) {
+                        throw std::invalid_argument("enter a valid nonnegative number");
+                    }
+                    if (viewer_goto_mode == ViewerGotoMode::line) {
+                        viewer.goto_line(value);
+                    } else if (viewer_goto_mode == ViewerGotoMode::percent) {
+                        if (value > 100U) {
+                            throw std::out_of_range("percentage must be between 0 and 100");
+                        }
+                        viewer.goto_percent(static_cast<unsigned int>(value));
+                        if (value == 100U) {
+                            const auto [width, height] = viewer_dimensions();
+                            viewer.go_to_end(width, height);
+                        }
+                    } else {
+                        if (value > viewer.size()) {
+                            throw std::out_of_range("offset is outside the file");
+                        }
+                        viewer.goto_offset(value);
+                    }
                     break;
                 }
                 case PromptAction::viewer_path:
@@ -3705,6 +3739,7 @@ struct App::Impl {
         } catch (const std::exception& error) {
             if (prompt_action == PromptAction::view_file ||
                 prompt_action == PromptAction::viewer_find ||
+                prompt_action == PromptAction::viewer_goto ||
                 prompt_action == PromptAction::quick_viewer_find) {
                 prompt_error = error.what();
                 prompt_focus = 0;
@@ -3908,6 +3943,12 @@ struct App::Impl {
         const auto [width, height] = viewer_dimensions();
         const auto rows = viewer.lines(width, height);
         Elements elements;
+        viewer_rows.assign(rows.size(), {});
+        viewer_rendered_path = viewer.path();
+        const auto low_nibble =
+            viewer.hex_editing() && viewer.hex_low_nibble() ? 1U : 0U;
+        const auto cursor_width =
+            viewer.hex_ascii() || viewer.hex_editing() ? 1U : 2U;
         if (viewer.hex() && !rows.empty() && viewer.hex_cursor() >= viewer.offset()) {
             const auto cursor_row = (viewer.hex_cursor() - viewer.offset()) / 16U;
             if (cursor_row < rows.size()) {
@@ -3915,8 +3956,8 @@ struct App::Impl {
                 const auto byte = static_cast<std::size_t>(
                     (viewer.hex_cursor() - viewer.offset()) % 16U
                 );
-                const auto cursor = prefix + (viewer.hex_ascii() ? 49U + byte : byte * 3U);
-                const auto cursor_width = viewer.hex_ascii() ? 1U : 2U;
+                const auto cursor = prefix +
+                    (viewer.hex_ascii() ? 49U + byte : byte * 3U + low_nibble);
                 if (cursor < viewer_hex_first_column) {
                     viewer_hex_first_column = cursor;
                 } else if (cursor + cursor_width > viewer_hex_first_column + width) {
@@ -3927,28 +3968,41 @@ struct App::Impl {
         for (std::size_t index = 0; index < rows.size(); ++index) {
             const auto& row = rows[index];
             const auto row_offset = viewer.offset() + index * 16U;
+            auto& rendered = viewer_rows[index];
+            rendered.offset = row_offset;
+            rendered.first_column = viewer_hex_first_column;
+            if (viewer.hex()) {
+                rendered.hex_column = row.find("  ") + 2U;
+                rendered.bytes = static_cast<std::size_t>(
+                    std::min<std::uint64_t>(16U, viewer.size() - row_offset)
+                );
+            }
+            Element line;
             if (viewer.hex() && viewer.hex_cursor() >= row_offset &&
                 viewer.hex_cursor() - row_offset < 16U) {
                 const auto byte = static_cast<std::size_t>(viewer.hex_cursor() - row_offset);
                 const auto prefix = row.find("  ") + 2U;
-                const auto cursor = prefix + (viewer.hex_ascii() ? 49U + byte : byte * 3U);
-                const auto cursor_width = viewer.hex_ascii() ? 1U : 2U;
+                const auto cursor = prefix +
+                    (viewer.hex_ascii() ? 49U + byte : byte * 3U + low_nibble);
                 const auto first = std::min(viewer_hex_first_column, row.size());
                 if (cursor < row.size() && cursor >= first) {
-                    elements.push_back(hbox({
+                    const auto end = std::min(row.size(), first + width);
+                    line = hbox({
                         text(row.substr(first, cursor - first)),
                         text(row.substr(cursor, cursor_width)) | inverted | bold |
                             focusCursorBlock,
-                        text(row.substr(cursor + cursor_width)),
-                    }));
-                    continue;
+                        text(row.substr(cursor + cursor_width, end - cursor - cursor_width)),
+                    });
                 }
             }
-            elements.push_back(text(
-                viewer.hex()
-                    ? row.substr(std::min(viewer_hex_first_column, row.size()))
-                    : row
-            ));
+            if (!line) {
+                line = text(
+                    viewer.hex()
+                        ? row.substr(std::min(viewer_hex_first_column, row.size()), width)
+                        : row
+                );
+            }
+            elements.push_back(std::move(line) | reflect(rendered.box));
         }
         const auto key = [this](
                              const std::string& number,
@@ -3960,15 +4014,7 @@ struct App::Impl {
                 label, enabled && mode == Mode::viewer
             );
         };
-        const auto percent =
-            viewer.size() == 0U
-                ? 100U
-                : static_cast<unsigned int>(
-                      std::min<std::uint64_t>(
-                          100U,
-                          viewer.view_end() * 100U / viewer.size()
-                      )
-                  );
+        const auto percent = viewer.position_percent();
         const auto screen_width =
             static_cast<std::size_t>(
                 std::max(1, Terminal::Size().dimx)
@@ -5347,6 +5393,9 @@ struct App::Impl {
         return gray_menu(
             (
                 vbox(std::move(rows)) |
+                yframe |
+                size(HEIGHT, LESS_THAN, std::max(1, Terminal::Size().dimy - 3)) |
+                reflect(pulldown_viewport) |
                 borderStyled(LIGHT)
             ) |
             size(
@@ -5790,73 +5839,63 @@ struct App::Impl {
     ftxui::Element render_operation_dialog() {
         using namespace ftxui;
         const auto sources = current_operation_sources();
+        operation_dialog_boxes = {};
         const auto focused = [&](Element element, const std::size_t index) {
             if (dialog_focus == index) {
                 element = element | inverted | focus;
             }
             return element | reflect(operation_dialog_boxes[index]);
         };
-        return vbox({
-                   text(
-                       dialog_move ? "Move / Rename" : "Copy"
-                   ) | bold | center,
-                   separator(),
-                   text(
-                       std::to_string(sources.size()) +
-                       " selected item(s)"
-                   ),
-                   text(
-                       sources.size() == 1U
-                           ? "Source: " +
-                                 display_text(sources.front().name)
-                           : ""
-                   ),
-                   separator(),
-                   text("To:"),
-                   render_input(
-                       dialog_destination, destination_input, dialog_focus == 0U
-                   ) | reflect(operation_dialog_boxes[0]),
-                   text("Source mask:"),
-                   render_input(
-                       dialog_source_mask, mask_input, dialog_focus == 1U
-                   ) | reflect(operation_dialog_boxes[1]),
-                   separator(),
-                   focused(
-                       text(
-                           std::string(
-                               dialog_preserve_attributes
-                                   ? "[x] "
-                                   : "[ ] "
-                           ) + "Preserve permissions"
-                       ),
-                       2
-                   ),
-                   focused(
-                       text(
-                           std::string(
-                               dialog_preserve_symlinks
-                                   ? "[x] "
-                                   : "[ ] "
-                           ) + "Preserve symbolic links"
-                       ),
-                       3
-                   ),
-                   focused(
-                       text(
-                           std::string(
-                               dialog_background ? "[x] " : "[ ] "
-                           ) + "Run in background"
-                       ),
-                       4
-                   ),
-                   separator(),
-                   hbox({
-                       focused(text(" [ OK ] "), 5),
-                       text(" "),
-                       focused(text(" [ Cancel ] "), 6),
-                   }) | center,
-               }) |
-               borderStyled(LIGHT) | size(WIDTH, EQUAL, 68);
+        Elements rows{
+            text("To:"),
+            render_input(
+                dialog_destination, destination_input, dialog_focus == 0U
+            ) | reflect(operation_dialog_boxes[0]),
+            text("Source mask:"),
+            render_input(
+                dialog_source_mask, mask_input, dialog_focus == 1U
+            ) | reflect(operation_dialog_boxes[1]),
+            separator(),
+            focused(
+                text(std::string(dialog_preserve_attributes ? "[x] " : "[ ] ") +
+                     "Preserve permissions"),
+                2
+            ),
+            focused(
+                text(std::string(dialog_preserve_symlinks ? "[x] " : "[ ] ") +
+                     "Preserve symbolic links"),
+                3
+            ),
+            focused(
+                text(std::string(dialog_background ? "[x] " : "[ ] ") +
+                     "Run in background"),
+                4
+            ),
+        };
+        const auto width = std::min(68, Terminal::Size().dimx);
+        const auto title = std::string(dialog_move ? "Move / Rename: " : "Copy: ") +
+                           (sources.size() == 1U
+                                ? display_text(sources.front().name)
+                                : std::to_string(sources.size()) + " selected item(s)");
+        Elements form{
+            text(path_label(title, static_cast<std::size_t>(std::max(1, width - 2)))) |
+                bold | center,
+            separator(),
+            vbox(std::move(rows)) | yframe | flex | reflect(operation_dialog_viewport),
+            separator(),
+            hbox({
+                focused(text(" [ OK ] "), 5),
+                text(" "),
+                focused(text(" [ Cancel ] "), 6),
+            }) | center,
+        };
+        if (Terminal::Size().dimy < 20) {
+            form.push_back(text("Wheel/PgUp/PgDn: more options") | dim | center);
+        }
+        return vbox(std::move(form)) |
+               size(HEIGHT, LESS_THAN, std::max(5, Terminal::Size().dimy - 2)) |
+               borderStyled(LIGHT) |
+               size(WIDTH, EQUAL, width);
     }
 
     ftxui::Element render_delete_dialog() {
@@ -6983,6 +7022,15 @@ struct App::Impl {
                     ] + "  (Left/Right)"),
                     3
                 ));
+            } else if (prompt_action == PromptAction::viewer_goto) {
+                static const std::array<std::string, 4> names{
+                    "Line number", "Percentage (0-100)", "Decimal offset", "Hexadecimal offset"
+                };
+                prompt_rows.push_back(focused(
+                    text("Mode: " + names[static_cast<std::size_t>(viewer_goto_mode)] +
+                         "  (Left/Right)"),
+                    3
+                ));
             }
             prompt_rows.push_back(separator());
             prompt_rows.push_back(
@@ -7193,18 +7241,20 @@ struct App::Impl {
 
     bool handle_prompt(const ftxui::Event& event) {
         const bool save_as = prompt_action == PromptAction::editor_save_as;
+        const bool viewer_goto = prompt_action == PromptAction::viewer_goto;
+        const bool options = save_as || viewer_goto;
         if (modal_cancel(event)) {
             cancel_prompt();
             return true;
         }
         if (event == ftxui::Event::Tab) {
-            prompt_focus = save_as
+            prompt_focus = options
                                ? std::array<std::size_t, 4>{3U, 2U, 0U, 1U}[prompt_focus]
                                : (prompt_focus + 1U) % 3U;
             return true;
         }
         if (event == ftxui::Event::TabReverse) {
-            prompt_focus = save_as
+            prompt_focus = options
                                ? std::array<std::size_t, 4>{2U, 3U, 1U, 0U}[prompt_focus]
                                : (prompt_focus + 2U) % 3U;
             return true;
@@ -7220,7 +7270,7 @@ struct App::Impl {
             if (mouse.button == ftxui::Mouse::Left &&
                 mouse.motion == ftxui::Mouse::Pressed) {
                 for (std::size_t index = 0;
-                     index < (save_as ? 4U : 3U);
+                     index < (options ? 4U : 3U);
                      ++index) {
                     if (!prompt_boxes[index].Contain(
                             mouse.x,
@@ -7244,14 +7294,20 @@ struct App::Impl {
             }
             return true;
         }
-        if (save_as && prompt_focus == 3U &&
+        if (options && prompt_focus == 3U &&
             (event == ftxui::Event::ArrowLeft ||
              event == ftxui::Event::ArrowRight ||
              event == ftxui::Event::Character(' '))) {
-            const auto current = static_cast<std::size_t>(editor_save_line_ending);
-            editor_save_line_ending = static_cast<EditorLineEnding>(
-                (current + (event == ftxui::Event::ArrowLeft ? 3U : 1U)) % 4U
-            );
+            const auto current = save_as
+                                     ? static_cast<std::size_t>(editor_save_line_ending)
+                                     : static_cast<std::size_t>(viewer_goto_mode);
+            const auto next = (current + (event == ftxui::Event::ArrowLeft ? 3U : 1U)) % 4U;
+            if (save_as) {
+                editor_save_line_ending = static_cast<EditorLineEnding>(next);
+            } else {
+                viewer_goto_mode = static_cast<ViewerGotoMode>(next);
+                prompt_error.clear();
+            }
             return true;
         }
         if (event == ftxui::Event::Return ||
@@ -7444,11 +7500,33 @@ struct App::Impl {
                     mouse.button == ftxui::Mouse::WheelDown) {
                     const auto amount = mouse.button == ftxui::Mouse::WheelUp ? -3 : 3;
                     if (viewer.hex()) {
-                        move_viewer_hex(amount * 16LL);
+                        viewer.scroll_hex_lines(amount);
                     } else {
                         viewer.scroll_lines(amount, width);
                     }
                     return true;
+                }
+                if (viewer.hex() && viewer_rendered_path == viewer.path() &&
+                    mouse.button == ftxui::Mouse::Left &&
+                    mouse.motion == ftxui::Mouse::Pressed) {
+                    for (const auto& row : viewer_rows) {
+                        if (!row.box.Contain(mouse.x, mouse.y)) {
+                            continue;
+                        }
+                        const auto column = static_cast<std::size_t>(
+                            mouse.x - row.box.x_min
+                        ) + row.first_column;
+                        const auto ascii_column = row.hex_column + 49U;
+                        if (column >= ascii_column && column - ascii_column < row.bytes) {
+                            viewer.set_hex_cursor(row.offset + column - ascii_column, true);
+                        } else if (column >= row.hex_column &&
+                                   column - row.hex_column < row.bytes * 3U &&
+                                   (column - row.hex_column) % 3U < 2U) {
+                            const auto cell = column - row.hex_column;
+                            viewer.set_hex_cursor(row.offset + cell / 3U, false, cell % 3U == 1U);
+                        }
+                        return true;
+                    }
                 }
                 return false;
             }
@@ -7456,9 +7534,9 @@ struct App::Impl {
                 viewer_message_title = "Viewer";
                 viewer_message =
                     "File: " + viewer.path() +
-                    ". F2 wrap/hex edit, F4 text/hex, F5 offset, F6 save hex edits, "
+                    ". F2 wrap/hex edit, F4 text/hex, F5 line/percent/offset, F6 save hex edits, "
                     "F7 search, n repeat, q quit. Wheel and paging scroll. "
-                    "Click the header to inspect or copy the full filename.";
+                    "Click a hex/ASCII byte to place the cursor, or the header for the full filename.";
                 mode = Mode::viewer_message;
                 return true;
             }
@@ -7476,9 +7554,15 @@ struct App::Impl {
                 return true;
             }
             if (event == Event::F5) {
+                viewer_goto_mode = viewer.hex() ? ViewerGotoMode::hexadecimal : ViewerGotoMode::line;
+                std::ostringstream position;
+                if (viewer.hex()) {
+                    position << "0x" << std::hex << viewer.hex_cursor();
+                } else {
+                    position << viewer.line_number();
+                }
                 start_prompt(
-                    PromptAction::viewer_goto, "Go to byte offset (decimal or 0xhex)",
-                    std::to_string(viewer.hex() ? viewer.hex_cursor() : viewer.offset())
+                    PromptAction::viewer_goto, "Go to", position.str()
                 );
                 return true;
             }
@@ -9627,6 +9711,14 @@ struct App::Impl {
         if (event.is_mouse()) {
             auto mouse_event = event;
             const auto& mouse = mouse_event.mouse();
+            if (pulldown_dropped && pulldown_viewport.Contain(mouse.x, mouse.y) &&
+                (mouse.button == ftxui::Mouse::WheelUp ||
+                 mouse.button == ftxui::Mouse::WheelDown)) {
+                for (int step = 0; step < 3; ++step) {
+                    move_pulldown_item(mouse.button == ftxui::Mouse::WheelUp ? -1 : 1);
+                }
+                return true;
+            }
             if (mouse.button == ftxui::Mouse::Left &&
                 mouse.motion == ftxui::Mouse::Pressed) {
                 for (std::size_t index = 0;
@@ -9646,6 +9738,7 @@ struct App::Impl {
                      index < pulldown_item_boxes.size();
                      ++index) {
                     if (!pulldown_dropped ||
+                        !pulldown_viewport.Contain(mouse.x, mouse.y) ||
                         !pulldown_item_boxes[index].Contain(
                             mouse.x,
                             mouse.y
@@ -9799,9 +9892,27 @@ struct App::Impl {
     }
 
     bool handle_operation_dialog(const ftxui::Event& event) {
+        const auto scroll_body = [&](const int amount) {
+            dialog_focus = static_cast<std::size_t>(std::clamp(
+                static_cast<int>(std::min<std::size_t>(dialog_focus, 4U)) + amount,
+                0, 4
+            ));
+        };
+        if (event == ftxui::Event::PageUp || event == ftxui::Event::PageDown) {
+            scroll_body(event == ftxui::Event::PageUp ? -3 : 3);
+            return true;
+        }
         if (event.is_mouse()) {
             auto mouse_event = event;
             const auto& mouse = mouse_event.mouse();
+            if (operation_dialog_viewport.Contain(mouse.x, mouse.y) &&
+                (mouse.button == ftxui::Mouse::WheelUp ||
+                 mouse.button == ftxui::Mouse::WheelDown)) {
+                destination_input.dragging = false;
+                mask_input.dragging = false;
+                scroll_body(mouse.button == ftxui::Mouse::WheelUp ? -2 : 2);
+                return true;
+            }
             if (destination_input.dragging) {
                 return input_mouse(dialog_destination, destination_input, mouse);
             }
@@ -9811,7 +9922,8 @@ struct App::Impl {
             if (mouse.button == ftxui::Mouse::Left &&
                 mouse.motion == ftxui::Mouse::Pressed) {
                 for (std::size_t index = 0; index < operation_dialog_boxes.size(); ++index) {
-                    if (!operation_dialog_boxes[index].Contain(mouse.x, mouse.y)) {
+                    if ((index < 5U && !operation_dialog_viewport.Contain(mouse.x, mouse.y)) ||
+                        !operation_dialog_boxes[index].Contain(mouse.x, mouse.y)) {
                         continue;
                     }
                     dialog_focus = index;

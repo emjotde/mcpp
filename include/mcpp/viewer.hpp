@@ -30,12 +30,19 @@ public:
     void scroll_columns(int amount);
     void toggle_hex();
     void goto_offset(std::uint64_t offset);
+    void goto_line(std::uint64_t line, const Cancellation& cancellation = {});
+    void goto_percent(unsigned int percent);
+    [[nodiscard]] std::uint64_t line_number(const Cancellation& cancellation = {});
+    [[nodiscard]] unsigned int position_percent() const noexcept;
     void toggle_hex_editing();
     [[nodiscard]] bool hex_editing() const noexcept;
     [[nodiscard]] bool hex_ascii() const noexcept;
     void toggle_hex_navigation();
     [[nodiscard]] std::uint64_t hex_cursor() const noexcept;
+    [[nodiscard]] bool hex_low_nibble() const noexcept;
+    void set_hex_cursor(std::uint64_t offset, bool ascii, bool low_nibble = false);
     void move_hex_cursor(long long delta);
+    void scroll_hex_lines(int amount);
     void edit_hex_digit(char digit);
     void edit_ascii_byte(char byte);
     [[nodiscard]] bool dirty() const noexcept;
@@ -86,6 +93,7 @@ private:
         const Cancellation& cancellation
     );
     void set_byte(std::uint64_t offset, unsigned char value);
+    void keep_hex_cursor_visible();
 
     ProviderPtr provider_;
     std::string path_;

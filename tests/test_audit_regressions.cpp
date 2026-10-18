@@ -377,6 +377,88 @@ void run(const fs::path& root) {
     viewer.go_to_start();
     check(viewer.find("Z", true, {}, false) == 0U, "approved search wrap restarts at zero");
 
+    mcpp::ViewerModel text_navigation;
+    write_file(root / "goto-lines", "one\r\ntwo\nthree\n");
+    text_navigation.open(provider, (root / "goto-lines").string());
+    text_navigation.goto_line(2);
+    check(text_navigation.offset() == 5U && text_navigation.line_number() == 2U,
+          "Go to uses logical CRLF/LF lines, not wrapped screen rows");
+    text_navigation.goto_line(3);
+    bool invalid_line = false;
+    try {
+        text_navigation.goto_line(4);
+    } catch (const std::out_of_range&) {
+        invalid_line = true;
+    }
+    check(invalid_line && text_navigation.offset() == 9U,
+          "out-of-range Go to leaves the visible position unchanged");
+    invalid_line = false;
+    try {
+        text_navigation.goto_line(0);
+    } catch (const std::invalid_argument&) {
+        invalid_line = true;
+    }
+    check(invalid_line, "Go to rejects zero-based line numbers explicitly");
+    write_file(root / "goto-long-line", std::string(300000U, 'x') + "\nsecond\n");
+    text_navigation.open(provider, (root / "goto-long-line").string());
+    text_navigation.goto_line(2);
+    check(text_navigation.offset() == 300001U && text_navigation.line_number() == 2U,
+          "line navigation crosses bounded read windows");
+    text_navigation.goto_percent(50);
+    check(text_navigation.offset() == text_navigation.size() / 2U,
+          "percentage navigation uses byte position without integer overflow");
+    bool invalid_percent = false;
+    try {
+        text_navigation.goto_percent(101);
+    } catch (const std::out_of_range&) {
+        invalid_percent = true;
+    }
+    check(invalid_percent, "Go to rejects invalid percentages explicitly");
+    write_file(root / "goto-empty", "");
+    text_navigation.open(provider, (root / "goto-empty").string());
+    text_navigation.goto_line(1);
+    text_navigation.goto_percent(100);
+    check(text_navigation.offset() == 0U, "Go to handles an empty file");
+
+    std::string hex_bytes(261U, '\0');
+    for (std::size_t index = 0; index < hex_bytes.size(); ++index) {
+        hex_bytes[index] = static_cast<char>(index % 256U);
+    }
+    write_file(root / "hex-navigation", hex_bytes);
+    mcpp::ViewerModel hex_navigation;
+    hex_navigation.open(provider, (root / "hex-navigation").string());
+    hex_navigation.toggle_hex();
+    static_cast<void>(hex_navigation.lines(80, 8));
+    check(hex_navigation.position_percent() == 0U,
+          "hex progress reports the active byte, not the visible range end");
+    hex_navigation.set_hex_cursor(16, false);
+    check(hex_navigation.position_percent() == 6U, "hex percentage follows the cursor");
+    hex_navigation.scroll_hex_lines(3);
+    check(hex_navigation.offset() == 48U && hex_navigation.hex_cursor() == 64U,
+          "hex wheel scrolls immediately and retains the cursor's relative row");
+    hex_navigation.scroll_hex_lines(-1000000);
+    check(hex_navigation.offset() == 0U && hex_navigation.hex_cursor() == 16U,
+          "hex wheel clamps at the start");
+    hex_navigation.scroll_hex_lines(1000000);
+    check(hex_navigation.offset() == 256U && hex_navigation.hex_cursor() == 260U,
+          "hex wheel clamps at the final partial row");
+    hex_navigation.toggle_hex_editing();
+    hex_navigation.set_hex_cursor(16, false);
+    hex_navigation.edit_hex_digit('a');
+    check(hex_navigation.hex_low_nibble(), "high-nibble editing advances the nibble cursor");
+    hex_navigation.set_hex_cursor(17, false, true);
+    hex_navigation.edit_hex_digit('f');
+    hex_navigation.set_hex_cursor(32, true);
+    hex_navigation.edit_ascii_byte('Z');
+    hex_navigation.set_hex_cursor(260, false, true);
+    hex_navigation.edit_hex_digit('f');
+    check(read_file(root / "hex-navigation") == hex_bytes, "pointed edits remain staged");
+    hex_navigation.save_changes();
+    const auto pointed = read_file(root / "hex-navigation");
+    check(pointed[0] == '\0' && static_cast<unsigned char>(pointed[16]) == 0xA0U &&
+              pointed[17] == '\x1f' && pointed[32] == 'Z' && pointed[260] == '\x0f',
+          "byte, nibble and ASCII targets preserve all other bytes");
+
     auto large = reopen(std::string(16U * 1024U * 1024U, 'x'));
     for (int count = 0; count < 6; ++count) {
         large.insert('y');

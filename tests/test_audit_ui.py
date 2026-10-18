@@ -340,6 +340,45 @@ class AuditUI(unittest.TestCase):
                 click(t, "[ Cancel ]")
                 t.wait_for("Search for:", present=False)
 
+    def test_short_operation_forms_keep_actions_and_scroll_options(self):
+        root, left, right = self.fixture()
+        path = left / "source.txt"
+        path.write_bytes(b"unchanged\n")
+        with self.terminal(root / "ui", [left, right], 40, 12) as t:
+            t.wait_for("source.txt")
+            for key in ("F5", "F6"):
+                t.press("Home", "Down", key)
+                t.wait_for("[ OK ]")
+                t.wait_for("[ Cancel ]")
+                t.wait_for(("Copy: " if key == "F5" else "Move / Rename: ") + path.name)
+                t.wait_for("Wheel/PgUp/PgDn")
+                mouse(t, 20, 4, 65)
+                mouse(t, 20, 4, 65)
+                t.wait_for("Run in background")
+                click(t, "Run in background")
+                t.wait_for("[x] Run in background")
+                t.press("PgUp", "PgUp")
+                t.wait_for("To:")
+                t.save("short-" + key.lower())
+                click(t, "[ Cancel ]")
+                t.wait_for("Operation cancelled")
+            self.assertEqual(path.read_bytes(), b"unchanged\n")
+            self.assertEqual(list(right.iterdir()), [])
+
+    def test_short_main_menu_keeps_selected_action_visible_and_clickable(self):
+        root, left, right = self.fixture()
+        with self.terminal(root / "ui", [left, right], 80, 12) as t:
+            t.wait_for("Name")
+            click(t, "Options", row=0)
+            t.wait_for("Save setup")
+            t.press("Up")
+            t.wait_for("Save setup")
+            t.wait(lambda: focused(t, "Save setup"), "Last menu action is visible and focused")
+            t.save("visible-save-setup")
+            click(t, "Save setup")
+            t.wait_for("Setup saved")
+            self.assertTrue((t.root / "config" / "mcpp" / "config").is_file())
+
     def test_editor_path_completion_uses_edited_file_parent(self):
         root, left, right = self.fixture()
         outside = root / "outside"
@@ -855,6 +894,147 @@ class AuditUI(unittest.TestCase):
             t.press("Space")
             t.wait_file(t.exit_file, b"0\n")
             self.assertEqual(path.read_bytes(), b"XYC")
+
+    def test_hex_wheel_scrolls_immediately_and_percentage_tracks_cursor(self):
+        root, left, _ = self.fixture()
+        path = left / "bytes.bin"
+        original = bytes(range(256)) + b"final"
+        path.write_bytes(original)
+        with self.terminal(root / "ui", ["--view", path], 80, 24) as t:
+            t.wait_for("bytes.bin")
+            t.press("F4")
+            t.wait_for("@0/261")
+            t.wait(lambda: t.text().splitlines()[0].rstrip().endswith(" 0%"),
+                   "First byte reports zero percent")
+            t.press("Down")
+            t.wait_for("@16/261")
+            t.wait(lambda: t.text().splitlines()[0].rstrip().endswith(" 6%"),
+                   "Percentage follows byte 16")
+            mouse(t, 30, 8, 65)
+            t.wait(lambda: t.text().splitlines()[1].startswith("00000030"),
+                   "Hex wheel changes the first visible row immediately")
+            t.wait_for("@64/261")
+            t.save("hex-wheel-and-progress")
+            mouse(t, 30, 8, 64)
+            t.wait(lambda: t.text().splitlines()[1].startswith("00000000"),
+                   "Hex wheel returns to the beginning")
+            self.assertEqual(path.read_bytes(), original)
+
+    def test_hex_click_places_byte_nibble_and_ascii_edit_targets(self):
+        root, left, _ = self.fixture()
+        path = left / "bytes.bin"
+        original = bytes(range(67))
+        path.write_bytes(original)
+        with self.terminal(root / "ui", ["--view", path], 80, 24) as t:
+            t.wait_for("bytes.bin")
+            t.press("F4", "F2")
+            t.wait_for("2View")
+            column = t.text().splitlines()[2].index(" 10 11") + 1
+            mouse(t, column, 2)
+            mouse(t, column, 2, motion="m")
+            t.wait_for("@16/67")
+            t.type("a")
+            t.wait_for("a0 11 12")
+            column = t.text().splitlines()[2].index(" 11 12") + 2
+            mouse(t, column, 2)
+            mouse(t, column, 2, motion="m")
+            t.wait_for("@17/67")
+            t.type("f")
+            t.wait_for("a0 1f 12")
+            line = t.text().splitlines()[3]
+            ascii_column = line.index("  ") + 2 + 49
+            mouse(t, ascii_column, 3)
+            mouse(t, ascii_column, 3, motion="m")
+            t.wait_for("@32/67")
+            t.type("Z")
+            t.wait_for("5a 21 22")
+            line = t.text().splitlines()[5]
+            blank_column = line.index("  ") + 2 + 15 * 3
+            mouse(t, blank_column, 5)
+            mouse(t, blank_column, 5, motion="m")
+            t.wait_idle()
+            self.assertIn("@33/67", t.text().splitlines()[0])
+            t.save("pointed-hex-edits")
+            self.assertEqual(path.read_bytes(), original)
+            expected = bytearray(original)
+            expected[16], expected[17], expected[32] = 0xA0, 0x1F, ord("Z")
+            t.press("F6")
+            t.wait_file(path, bytes(expected))
+
+    def test_hex_click_after_horizontal_crop_uses_the_visible_byte(self):
+        root, left, _ = self.fixture()
+        path = left / "narrow.bin"
+        original = bytes(range(64, 128))
+        path.write_bytes(original)
+        with self.terminal(root / "ui", ["--view", path], 40, 12) as t:
+            t.wait_for("narrow.bin")
+            t.press("F4", "F2", "Tab", *(["Right"] * 8))
+            t.wait(lambda: "H" in t.focused_text(),
+                   "All eight movements reach ASCII byte H before positioning the mouse")
+            column = t.text().splitlines()[1].index("@AB") + 2
+            mouse(t, column, 1)
+            mouse(t, column, 1, motion="m")
+            t.type("Z")
+            t.wait_for("@AZ")
+            t.save("cropped-ascii-click")
+            expected = bytearray(original)
+            expected[2] = ord("Z")
+            t.press("F6")
+            t.wait_file(path, bytes(expected))
+
+    def test_viewer_goto_line_percentage_decimal_and_hexadecimal(self):
+        root, left, _ = self.fixture()
+        path = left / "goto.txt"
+        path.write_text("".join(f"ROW_{index:03}\n" for index in range(100)))
+        with self.terminal(root / "ui", ["--view", path], 80, 24) as t:
+            t.wait_for("ROW_000")
+
+            def go(value, choice):
+                t.press("F5")
+                t.wait_for("Mode: Line number")
+                if choice:
+                    t.press("Tab", *(["Right"] * choice), "BTab")
+                t.type(str(value))
+                t.wait_for("> " + str(value))
+                t.save("goto-mode-" + str(choice))
+                t.press("Enter")
+                t.wait_for("Mode:", present=False)
+
+            go(20, 0)
+            t.wait(lambda: t.text().splitlines()[1].startswith("ROW_019"),
+                   "Go to uses one-based logical line numbers")
+            go(50, 1)
+            t.wait(lambda: t.text().splitlines()[1].startswith("ROW_050"),
+                   "Percentage mode reaches the middle of the file")
+            go(8, 2)
+            t.wait(lambda: t.text().splitlines()[1].startswith("ROW_001"),
+                   "Decimal offset mode uses bytes")
+            go("10", 3)
+            t.wait(lambda: t.text().splitlines()[1].startswith("ROW_002"),
+                   "Hexadecimal mode accepts bare hex digits")
+            go("0x18", 3)
+            t.wait(lambda: t.text().splitlines()[1].startswith("ROW_003"),
+                   "Hexadecimal mode also accepts a 0x prefix")
+            go(100, 1)
+            t.wait_for("ROW_099")
+            self.assertNotEqual(t.text().splitlines()[1].strip(), "")
+            t.press("F5", "Tab", "Right", "BTab")
+            t.type("101")
+            t.press("Enter")
+            t.wait_for("percentage must be between 0 and 100")
+            t.save("invalid-percentage")
+            t.press("C-u")
+            t.type("0")
+            t.press("Enter")
+            t.wait_for("Mode:", present=False)
+            t.wait_for("ROW_000")
+            t.press("F4", "F5")
+            t.wait_for("Mode: Hexadecimal offset")
+            t.type("10")
+            t.press("Enter")
+            t.wait_for("Mode:", present=False)
+            t.wait_for("@16/800")
+            t.save("hexadecimal-go-to")
 
     def test_compare_methods_and_tree_pointer_controls(self):
         root, left, right = self.fixture()

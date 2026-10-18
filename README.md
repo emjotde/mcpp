@@ -139,6 +139,9 @@ Cancel. Input Enter accepts; focused buttons accept Enter or Space, and can
 also be clicked. Escape cancels. File / View file... prompts for a filename;
 relative filenames are resolved against the active pane. Prefilled defaults
 are selected for replacement; recalled history and command drafts stay editable.
+Copy/Move keeps its action buttons and source identity visible while the options
+body scrolls with the wheel or PageUp/PageDown. Main menus scroll their selected
+action into view on short terminals.
 
 Text inputs support `Left`/`Right`, `Home`/`End`, `Ctrl-Left`/`Ctrl-Right`,
 Shift movement for selection, and Delete/Backspace at the cursor. `Ctrl-K`
@@ -154,6 +157,19 @@ relative paths against the edited file's directory.
 Left / Right / Panelize by name... performs local recursive filename matching.
 External-command panelization is not implemented: its Command menu entry is
 disabled, and `Ctrl-X !` reports that it is unavailable.
+
+## Viewer controls
+
+`F4` switches text/hex display. `F2` toggles text wrapping or hex editing.
+`F5` Go to supports one-based logical line numbers, percentages, decimal byte
+offsets and hexadecimal offsets. It defaults to lines in text mode and hex
+offsets in hex mode. Tab focuses Mode; Left/Right changes it. Invalid input
+stays in the dialog for correction, and 100% shows the final page.
+
+The wheel scrolls hex content immediately while retaining the cursor's relative
+row. Hex progress follows the active byte. Click a hex digit or ASCII byte to
+position the cursor, including the low nibble of a hex byte. Edits stay staged
+until `F6` Save or an explicit save decision on exit.
 
 ## Editor buffers
 

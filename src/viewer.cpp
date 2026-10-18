@@ -281,6 +281,75 @@ void ViewerModel::goto_offset(const std::uint64_t requested) {
     next_search_offset_ = offset_;
 }
 
+void ViewerModel::goto_line(
+    const std::uint64_t requested,
+    const Cancellation& cancellation
+) {
+    if (!open()) {
+        throw std::runtime_error("viewer is not open");
+    }
+    if (requested == 0U) {
+        throw std::invalid_argument("line numbers start at 1");
+    }
+    std::uint64_t position = 0;
+    std::uint64_t line = 1;
+    while (line < requested && position < size_) {
+        cancellation.throw_if_requested();
+        const auto bytes = window_at(position, 1U, cancellation);
+        if (bytes.empty()) {
+            throw std::runtime_error("file changed while locating the line");
+        }
+        const auto newline = bytes.find('\n');
+        if (newline == std::string_view::npos) {
+            position += bytes.size();
+        } else {
+            position += newline + 1U;
+            ++line;
+        }
+    }
+    if (line != requested || (position == size_ && requested != 1U)) {
+        throw std::out_of_range("line number is outside the file");
+    }
+    goto_offset(position);
+}
+
+void ViewerModel::goto_percent(const unsigned int percent) {
+    if (percent > 100U) {
+        throw std::out_of_range("percentage must be between 0 and 100");
+    }
+    goto_offset(size_ / 100U * percent + size_ % 100U * percent / 100U);
+}
+
+std::uint64_t ViewerModel::line_number(const Cancellation& cancellation) {
+    if (!open()) {
+        throw std::runtime_error("viewer is not open");
+    }
+    const auto end = hex_ ? hex_cursor_ : offset_;
+    std::uint64_t line = 1;
+    for (std::uint64_t position = 0; position < end;) {
+        cancellation.throw_if_requested();
+        const auto bytes = window_at(position, 1U, cancellation);
+        if (bytes.empty()) {
+            throw std::runtime_error("file changed while locating the line");
+        }
+        const auto count = static_cast<std::size_t>(
+            std::min<std::uint64_t>(bytes.size(), end - position)
+        );
+        line += static_cast<std::uint64_t>(std::count(
+            bytes.begin(), bytes.begin() + static_cast<std::ptrdiff_t>(count), '\n'
+        ));
+        position += count;
+    }
+    return line;
+}
+
+unsigned int ViewerModel::position_percent() const noexcept {
+    const auto position = hex_ ? hex_cursor_ : view_end_;
+    return size_ == 0U ? 100U : static_cast<unsigned int>(std::min(
+        100.0L, static_cast<long double>(position) * 100.0L / size_
+    ));
+}
+
 void ViewerModel::toggle_hex_editing() {
     if (!open()) {
         throw std::runtime_error("viewer is not open");
@@ -294,12 +363,27 @@ void ViewerModel::toggle_hex_editing() {
 bool ViewerModel::hex_editing() const noexcept { return hex_editing_; }
 bool ViewerModel::hex_ascii() const noexcept { return hex_ascii_; }
 std::uint64_t ViewerModel::hex_cursor() const noexcept { return hex_cursor_; }
+bool ViewerModel::hex_low_nibble() const noexcept { return hex_low_nibble_; }
 bool ViewerModel::dirty() const noexcept { return !edits_.empty(); }
 bool ViewerModel::search_can_wrap() const noexcept { return search_begin_ > 0U; }
 
 void ViewerModel::toggle_hex_navigation() {
     hex_ascii_ = !hex_ascii_;
     hex_low_nibble_ = false;
+}
+
+void ViewerModel::set_hex_cursor(
+    const std::uint64_t offset,
+    const bool ascii,
+    const bool low_nibble
+) {
+    if (!open() || !hex_ || offset >= size_) {
+        throw std::out_of_range("hex cursor is outside the file");
+    }
+    hex_cursor_ = offset;
+    hex_ascii_ = ascii;
+    hex_low_nibble_ = !ascii && low_nibble;
+    keep_hex_cursor_visible();
 }
 
 void ViewerModel::move_hex_cursor(const long long delta) {
@@ -312,13 +396,37 @@ void ViewerModel::move_hex_cursor(const long long delta) {
     } else {
         hex_cursor_ += std::min(size_ - 1U - hex_cursor_, static_cast<std::uint64_t>(delta));
     }
+    keep_hex_cursor_visible();
+    hex_low_nibble_ = false;
+}
+
+void ViewerModel::keep_hex_cursor_visible() {
     const auto row = hex_cursor_ / 16U;
     if (hex_cursor_ < offset_) {
         offset_ = row * 16U;
     } else if (row >= offset_ / 16U + hex_view_rows_) {
         offset_ = (row - hex_view_rows_ + 1U) * 16U;
     }
+}
+
+void ViewerModel::scroll_hex_lines(const int amount) {
+    if (!open() || !hex_) {
+        throw std::logic_error("hex scrolling requires an open hex viewer");
+    }
+    if (size_ == 0U || amount == 0) {
+        return;
+    }
+    const auto relative = hex_cursor_ >= offset_ ? hex_cursor_ - offset_ : 0U;
+    auto row = std::min(offset_ / 16U, (size_ - 1U) / 16U);
+    if (amount < 0) {
+        row -= std::min(row, static_cast<std::uint64_t>(-static_cast<long long>(amount)));
+    } else {
+        row += std::min((size_ - 1U) / 16U - row, static_cast<std::uint64_t>(amount));
+    }
+    offset_ = row * 16U;
+    hex_cursor_ = offset_ + std::min(relative, size_ - 1U - offset_);
     hex_low_nibble_ = false;
+    previous_offsets_.clear();
 }
 
 void ViewerModel::set_byte(const std::uint64_t offset, const unsigned char value) {

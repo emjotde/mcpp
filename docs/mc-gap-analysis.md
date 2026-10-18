@@ -9,8 +9,8 @@ spelling support remain deferred.
 ## Audit fix delivery
 
 The original 41 findings (A01-A16, B01-B11, C01-C10, H01-H03 and U01) were fixed
-in `13c9c34`. The follow-up walk below records additional open findings against
-`7a4370e`; the original regression results do not imply complete MC parity.
+in `13c9c34`. The six follow-up items D01-D05 and U02 are also resolved by the
+delivery below. The original regression results do not imply complete MC parity.
 The eight broader capability groups remain a separate feature backlog; the
 explicitly paused providers and spelling remain paused.
 The source excerpts and line numbers in the historical audit sections describe the old
@@ -23,8 +23,8 @@ search and replacement, linked saves, access ACLs/user attributes, read-only
 protection, line endings, directional/content comparison, partial Find errors,
 staged hex save, and useful undo depth on a 16 MiB document.
 
-Controller and usability changes are integrated and covered by 19 new terminal
-audit cases, including the filesystem outcomes and Cancel/error paths.
+The original batch added 19 terminal audit cases, including filesystem outcomes
+and Cancel/error paths. The follow-up adds six more, bringing that suite to 25.
 
 | Findings | Delivered changes |
 |---|---|
@@ -39,6 +39,27 @@ binary also passed the core audit regressions and all 19 new terminal audit
 cases. The older audit descriptions remain below as historical evidence, not
 current functionality claims.
 
+## Follow-up fix delivery
+
+All six items from the direct UI walk are resolved.
+
+| Findings | Delivered behavior |
+|---|---|
+| D01 | Copy and Move keep their source identity in the fitted title and OK/Cancel outside a height-bounded options body. Wheel, paging and focus navigation reveal options without hiding the actions. |
+| D02 | Main menus use a height-bounded scrolling body, keep their selected action visible and accept clicks only inside the visible menu body. |
+| D03-D04 | The hex wheel scrolls the viewport immediately and preserves the cursor's relative row. Hex percentage describes the active byte rather than the end of the displayed range. |
+| D05 | Go to offers logical line, percentage, decimal-offset and hexadecimal-offset modes through the existing Left/Right selector pattern. Lines start at 1, percentages accept 0-100, and 100% fills the final page. Invalid input retains its value and mode for correction. |
+| U02 | Clicking a hex digit or ASCII byte positions the corresponding cursor/nibble. This is a deliberate usability improvement over the tested MC behavior. Padded cells do not select nonexistent bytes; horizontal cropping is accounted for, and edits remain staged until Save. |
+
+Normal Release verification covered the core models, guarded audit regressions,
+viewer navigation, panel prompts, operation UI/controls and all 25 terminal
+audit cases. The new cases cover both Copy and Move at 40x12, main menus at
+80x12, hex wheel/progress, pointed byte/nibble/ASCII edits, horizontal cropping,
+all four Go to modes, and correction after invalid percentage input.
+Successful terminal captures are retained in this session's
+`ui-fixes-20261018` artifacts. No new dependencies, sanitizers or optional
+profiling were used.
+
 ## Follow-up UI walk: 2026-10-18
 
 This pass used the normal Release binary from product code `7a4370e`, after the
@@ -48,9 +69,11 @@ Each terminal used private HOME/XDG directories and owned fixtures. MC runtime
 results below are not assertions about the newer reference build.
 
 The walk found four UI defects, one partial viewer feature, and one shared
-usability limitation. These remain open; this pass changes the report, not
-the product. P2 denotes a normal workflow/usability problem; P3 denotes
-misleading display information without an observed file change.
+usability limitation. It originally changed only the report; the findings were
+subsequently corrected by the delivery above. The observations and source
+anchors below describe `7a4370e`, not the corrected code. P2 denotes a normal
+workflow/usability problem; P3 denotes misleading display information without
+an observed file change.
 
 | ID | Kind / priority | Finding and consequence | Direct comparison and source evidence |
 |---|---|---|---|
@@ -471,8 +494,8 @@ remain unavailable.
 ### Viewer
 
 The viewer has its own full-screen header/keybar, bounded range reads,
-text/hex display, wrap, horizontal scroll, Home/End, mouse wheel, decimal/hex
-byte-offset Go to, forward literal/hex search, and repeat search.
+text/hex display, wrap, horizontal scroll, Home/End, mouse wheel,
+line/percentage/decimal/hex Go to, forward literal/hex search, and repeat search.
 Hex/ASCII edits are staged until Save,
 with explicit save/discard/cancel decisions. Raw/nroff, format, bookmarks,
 backward/regex search, next/previous file, codepages, and screen selection
@@ -480,7 +503,9 @@ remain unavailable.
 
 Repeat search asks before wrapping. Standalone `--view` Quit exits rather
 than returning to panels. Hex view uses aligned 16-byte rows.
-Go to is byte-only; line/percentage entry is still missing (D05).
+Hex wheel scrolling moves the displayed rows immediately; the percentage follows
+the active byte. Hex/ASCII clicks position the byte/nibble cursor, including
+after horizontal cropping.
 In the tested far-right unwrapped search, neither program automatically
 revealed the match. That is not counted as a mcpp-only defect.
 
@@ -549,7 +574,7 @@ review.
 
 ## Coverage limits
 
-### Audit-fix verification
+### Original audit-fix verification (`13c9c34`)
 
 | Build | Functional checks |
 |---|---|
