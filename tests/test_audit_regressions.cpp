@@ -377,6 +377,45 @@ void run(const fs::path& root) {
     viewer.go_to_start();
     check(viewer.find("Z", true, {}, false) == 0U, "approved search wrap restarts at zero");
 
+    mcpp::ViewerModel text_search;
+    write_file(root / "viewer-highlights", "aaaaa\nab\té界tail\n");
+    text_search.open(provider, (root / "viewer-highlights").string());
+    const auto span = [](const std::size_t begin, const std::size_t end) {
+        return std::optional<std::pair<std::size_t, std::size_t>>{{begin, end}};
+    };
+    check(text_search.find("aa", true, {}, false) == 0U, "first text match starts at zero");
+    static_cast<void>(text_search.lines(80, 4));
+    check(text_search.text_highlight(0) == span(0, 2) && !text_search.text_highlight(1),
+          "only the current occurrence has a text highlight");
+    check(text_search.find("aa", true, {}, false) == 2U, "text continuation advances to next occurrence");
+    static_cast<void>(text_search.lines(80, 4));
+    check(text_search.text_highlight(0) == span(2, 4), "repeated search moves the displayed match");
+    check(text_search.find("é界", true, {}, false) == 9U, "text match retains original UTF-8 offsets");
+    auto highlighted = text_search.lines(80, 4);
+    check(highlighted[0] == "ab      é界tail" && text_search.text_highlight(0) == span(8, 13),
+          "expanded tabs and wide UTF-8 map to the rendered byte span");
+    highlighted = text_search.lines(9, 2);
+    check(highlighted == std::vector<std::string>{"ab      é", "界tail"} &&
+              text_search.text_highlight(0) == span(8, 10) &&
+              text_search.text_highlight(1) == span(0, 3),
+          "a match crossing a wrapped row highlights both visible parts");
+    text_search.set_wrap(false);
+    text_search.scroll_columns(9);
+    highlighted = text_search.lines(80, 1);
+    check(highlighted[0] == "界tail" && text_search.text_highlight(0) == span(0, 3) &&
+              !text_search.text_highlight(1),
+          "horizontal cropping and reduced height do not reuse stale highlight spans");
+    text_search.scroll_columns(-2);
+    highlighted = text_search.lines(80, 1);
+    check(highlighted[0] == " é界tail" && text_search.text_highlight(0) == span(1, 6),
+          "a partially cropped tab keeps highlight alignment");
+    check(!text_search.find("absent", true, {}, false), "new search can fail");
+    static_cast<void>(text_search.lines(80, 1));
+    check(!text_search.text_highlight(0), "failed new pattern clears the previous pattern's highlight");
+    text_search.go_to_start();
+    text_search.close();
+    check(!text_search.text_highlight(0), "closed viewer retains no rendered highlights");
+
     mcpp::ViewerModel text_navigation;
     write_file(root / "goto-lines", "one\r\ntwo\nthree\n");
     text_navigation.open(provider, (root / "goto-lines").string());

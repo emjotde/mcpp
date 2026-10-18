@@ -7,6 +7,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace mcpp {
@@ -62,6 +63,9 @@ public:
         std::size_t height,
         const Cancellation& cancellation = {}
     );
+    // Byte range in the last rendered row, after tab expansion and clipping.
+    [[nodiscard]] std::optional<std::pair<std::size_t, std::size_t>>
+    text_highlight(std::size_t row) const noexcept;
     [[nodiscard]] bool search_can_wrap() const noexcept;
     [[nodiscard]] std::optional<std::uint64_t> find(
         std::string_view needle,
@@ -85,7 +89,8 @@ private:
         std::uint64_t offset,
         std::size_t width,
         std::string* output,
-        const Cancellation& cancellation
+        const Cancellation& cancellation,
+        std::optional<std::pair<std::size_t, std::size_t>>* highlight = nullptr
     );
     void load_window(
         std::uint64_t offset,
@@ -109,6 +114,8 @@ private:
     bool wrap_{true};
     std::string last_search_;
     bool last_search_case_sensitive_{false};
+    std::optional<std::pair<std::uint64_t, std::uint64_t>> search_match_;
+    std::vector<std::optional<std::pair<std::size_t, std::size_t>>> text_highlights_;
     std::uint64_t next_search_offset_{0};
     std::uint64_t search_begin_{0};
     bool hex_editing_{false};

@@ -377,6 +377,18 @@ std::size_t editor_display_width(
     return width;
 }
 
+std::size_t editor_first_visible_column(
+    const std::string_view line,
+    const std::size_t first_column,
+    const std::size_t tab_width
+) {
+    const auto begin = editor_offset_for_width(line, first_column, tab_width);
+    const auto aligned = editor_display_width(line, begin, tab_width);
+    return begin < line.size() && line[begin] == '\t' && aligned < first_column
+               ? first_column
+               : aligned;
+}
+
 std::string editor_display_text(
     const std::string_view value,
     std::size_t display_column,
@@ -782,6 +794,39 @@ ftxui::Element mnemonic_label(
         text(label.substr(0, index)),
         text(label.substr(index, 1U)) | underlined | bold,
         text(label.substr(index + 1U)),
+    });
+}
+
+const std::array<std::string, 5> top_menu_names{
+    "  Left     ", "File     ", "Command     ", "Options     ", "Right "
+};
+constexpr std::array<std::size_t, 5> top_menu_mnemonics{2, 0, 0, 0, 0};
+
+ftxui::Element render_viewer_text(
+    const std::string& row,
+    const std::optional<std::pair<std::size_t, std::size_t>> highlight
+) {
+    using namespace ftxui;
+    if (!highlight) {
+        return text(row);
+    }
+    auto [begin, end] = *highlight;
+    std::size_t offset = 0;
+    for (const auto& glyph : Utf8ToGlyphs(row)) {
+        const auto next = offset + glyph.size();
+        if (offset <= highlight->first && highlight->first < next) {
+            begin = offset;
+        }
+        if (offset < highlight->second && highlight->second <= next) {
+            end = next;
+            break;
+        }
+        offset = next;
+    }
+    return hbox({
+        text(row.substr(0, begin)),
+        text(row.substr(begin, end - begin)) | inverted | bold,
+        text(row.substr(end)),
     });
 }
 
@@ -3683,10 +3728,18 @@ struct App::Impl {
                     status = "Link created";
                     break;
                 }
-                case PromptAction::quick_cd:
-                    active().change_directory(prompt_value);
+                case PromptAction::quick_cd: {
+                    auto destination = (
+                        std::filesystem::path(active().path()) / prompt_value
+                    ).lexically_normal();
+                    // Keep a trailing separator from resolving a logical symlink leaf.
+                    if (destination.filename().empty()) {
+                        destination = destination.parent_path();
+                    }
+                    active().change_directory(destination.string());
                     status = "Directory changed";
                     break;
+                }
                 case PromptAction::chmod: {
                     std::size_t parsed = 0;
                     const auto parsed_mode = std::stoul(
@@ -3994,6 +4047,9 @@ struct App::Impl {
                         text(row.substr(cursor + cursor_width, end - cursor - cursor_width)),
                     });
                 }
+            }
+            if (!viewer.hex()) {
+                line = render_viewer_text(row, viewer.text_highlight(index));
             }
             if (!line) {
                 line = text(
@@ -4486,22 +4542,8 @@ struct App::Impl {
         editor_line_first_columns.reserve(end - first);
         Elements elements;
         for (std::size_t index = first; index < end; ++index) {
-            const auto visible_begin = editor_offset_for_width(
-                lines[index],
-                first_column,
-                editor.tab_width()
-            );
-            const auto aligned_column = editor_display_width(
-                lines[index],
-                visible_begin,
-                editor.tab_width()
-            );
             editor_line_first_columns.push_back(
-                visible_begin < lines[index].size() &&
-                        lines[index][visible_begin] == '\t' &&
-                        aligned_column < first_column
-                    ? first_column
-                    : aligned_column
+                editor_first_visible_column(lines[index], first_column, editor.tab_width())
             );
             elements.push_back(
                 render_editor_line(
@@ -6274,11 +6316,11 @@ struct App::Impl {
             }
         }
         Elements rows;
-        for (const auto& line : quick_viewer.lines(
-                 content_width,
-                 content_height
-             )) {
-            rows.push_back(text(line));
+        const auto lines = quick_viewer.lines(content_width, content_height);
+        for (std::size_t index = 0; index < lines.size(); ++index) {
+            rows.push_back(render_viewer_text(
+                lines[index], quick_viewer.text_highlight(index)
+            ));
         }
         auto title =
             text("Quick view: " + path_label(
@@ -6749,9 +6791,10 @@ struct App::Impl {
             );
         }
         const auto* user = std::getenv("USER");
-        const auto prompt =
+        const auto prompt = display_text(
             std::string(user == nullptr ? "user" : user) + "@" +
-            hostname.data() + ":" + active().path() + "$";
+            hostname.data() + ":" + active().path() + "$"
+        );
         const auto hint =
             pending_operation_notice
                 ? "Background [Esc]: " + *pending_operation_notice
@@ -6761,21 +6804,11 @@ struct App::Impl {
                               "+/- branch  Tab panel"
                             : "Hint: Tab changes your current panel."
                       : status + progress_text;
-        static const std::array<std::string, 5> menu_names{
-            "  Left     ",
-            "File     ",
-            "Command     ",
-            "Options     ",
-            "Right "
-        };
-        static constexpr std::array<std::size_t, 5> mnemonic_indices{
-            2, 0, 0, 0, 0
-        };
         Elements menu_elements;
-        for (std::size_t index = 0; index < menu_names.size(); ++index) {
+        for (std::size_t index = 0; index < top_menu_names.size(); ++index) {
             auto item = mnemonic_label(
-                menu_names[index],
-                mnemonic_indices[index]
+                top_menu_names[index],
+                top_menu_mnemonics[index]
             );
             if (mode == Mode::pulldown &&
                 index == pulldown_category) {
@@ -6889,7 +6922,7 @@ struct App::Impl {
         auto document = vbox({
             gray_menu(hbox(std::move(menu_elements))),
             body | flex,
-            text(hint) |
+            text(display_text(hint)) |
                 color(Color::Grey11) |
                 bgcolor(Color::Grey62),
             render_input(
@@ -9120,17 +9153,31 @@ struct App::Impl {
         if (!clamp && !box.Contain(mouse.x, mouse.y)) {
             return std::nullopt;
         }
-        const auto row = std::min(
+        const auto rendered_row = std::min(
             editor.lines().size() - 1U, editor_rendered_first_row + index
         );
+        auto row = rendered_row;
+        // Moving past the drawn edge lets update_editor_view scroll the drag.
+        if (clamp && mouse.y < editor_line_boxes.front().y_min && row > 0U) {
+            --row;
+        } else if (clamp && mouse.y > editor_line_boxes.back().y_max &&
+                   row + 1U < editor.lines().size()) {
+            ++row;
+        }
         const auto cell = static_cast<std::size_t>(std::max(
             0, mouse.x - box.x_min - (editor_line_numbers ? 6 : 0)
         ));
+        const auto first_column =
+            row == rendered_row
+                ? editor_line_first_columns[index]
+                : editor_first_visible_column(
+                      editor.lines()[row], editor.first_column, editor.tab_width()
+                  );
         return EditorPosition{
             row,
             editor_offset_for_width(
                 editor.lines()[row],
-                editor_line_first_columns[index] + cell,
+                first_column + cell,
                 editor.tab_width()
             ),
         };
@@ -9185,14 +9232,14 @@ struct App::Impl {
                     editor_column_marking = false;
                     editor.finish_mark();
                     if (mouse.shift) {
-                        editor.begin_mark();
+                        editor.resume_mark();
                     } else {
                         editor.clear_selection();
                     }
                     editor.set_position(*position);
                     editor_mouse_dragging = true;
                     editor_mouse_marking = mouse.shift;
-                    editor_mouse_column = mouse.meta;
+                    editor_mouse_column = editor.column_selection() || mouse.meta;
                     return true;
                 }
             }
@@ -9707,6 +9754,23 @@ struct App::Impl {
         if (modal_cancel(event) || event == ftxui::Event::F9) {
             mode = Mode::panels;
             return true;
+        }
+        if (!pulldown_dropped && event.is_character() &&
+            event.character().size() == 1U) {
+            const auto key = static_cast<char>(std::tolower(
+                static_cast<unsigned char>(event.character()[0])
+            ));
+            for (std::size_t index = 0; index < top_menu_names.size(); ++index) {
+                const auto mnemonic = static_cast<unsigned char>(
+                    top_menu_names[index][top_menu_mnemonics[index]]
+                );
+                if (std::tolower(mnemonic) == key) {
+                    pulldown_category = index;
+                    reset_pulldown_item();
+                    pulldown_dropped = true;
+                    return true;
+                }
+            }
         }
         if (event.is_mouse()) {
             auto mouse_event = event;

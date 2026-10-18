@@ -147,6 +147,200 @@ class AuditUI(unittest.TestCase):
             t.wait(lambda: "Ångström.txt" in t.text().splitlines()[-5],
                    "Case-insensitive UTF-8 prefix selects Ångström")
 
+    def test_quick_cd_uses_the_active_directory(self):
+        root, left, right = self.fixture()
+        child = left / "child"
+        (child / "grandchild").mkdir(parents=True)
+        alias = left / "alias"
+        alias.symlink_to(child, target_is_directory=True)
+        (right / "other-child").mkdir()
+        with self.terminal(root / "ui", ["--printwd", root / "cwd", child, right]) as t:
+            t.wait_for("grandchild")
+            for value, expected in ((".", child), ("..", left),
+                                    ("child/grandchild", child / "grandchild"),
+                                    (str(alias), alias), (".", alias), ("..", left),
+                                    (str(child), child)):
+                t.press("M-c")
+                t.wait_for("Change directory")
+                t.press("C-u")
+                t.type(value)
+                t.press("Enter")
+                t.wait_for("Change directory", present=False)
+                t.wait(lambda: expected.name in t.text().splitlines()[1][:50],
+                       f"Quick cd enters {expected}")
+            t.press("Tab", "M-c")
+            t.wait_for("Change directory")
+            t.press("C-u")
+            t.type("other-child")
+            t.press("Enter")
+            t.wait_for("Change directory", present=False)
+            t.wait(lambda: "other-child" in t.text().splitlines()[1][50:],
+                   "Relative Quick cd follows the focused right pane")
+            t.press("M-c")
+            t.wait_for("Change directory")
+            t.press("C-u")
+            t.type("missing")
+            t.press("Enter")
+            t.wait_for("Change directory", present=False)
+            t.wait_for("Error:")
+            t.press("F10")
+            t.wait_file(t.exit_file, b"0\n")
+        self.assertEqual((root / "cwd").read_bytes(), (str(right / "other-child") + "\n").encode())
+
+    def test_newline_cwd_keeps_prompt_and_input_on_one_row(self):
+        root, left, right = self.fixture()
+        directory = left / "line\nbreak"
+        directory.mkdir()
+        with self.terminal(root / "ui", ["--printwd", root / "cwd", directory, right]) as t:
+            t.wait(lambda: "line\\nbreak$" in t.text().splitlines()[-2],
+                   "The command prompt escapes the cwd newline")
+            self.assertIn("line\\nbreak", t.text().splitlines()[1][:50])
+            t.type("abcdef")
+            t.wait_for("abcdef")
+            row = len(t.text().splitlines()) - 2
+            x = t.text().splitlines()[row].index("abcdef") + 2
+            mouse(t, x, row)
+            mouse(t, x, row, motion="m")
+            t.type("X")
+            t.wait_for("abXcdef")
+            t.press("Home", "C-k")
+            t.resize(240, 30)
+            t.type("cd .")
+            t.press("Enter")
+            t.wait(lambda: "line\\nbreak" in t.text().splitlines()[-3],
+                   "The cwd in command status is escaped too")
+            t.save("escaped-cwd-prompt")
+            t.press("F10")
+            t.wait_file(t.exit_file, b"0\n")
+        self.assertEqual(Path((root / "cwd").read_text().removesuffix("\n")), directory)
+
+    def test_main_menu_mnemonics_preserve_the_command_draft(self):
+        root, left, right = self.fixture()
+        with self.terminal(root / "ui", [left, right]) as t:
+            t.wait_for("Name")
+            t.type("touch should-not-run")
+            for key, item in (("f", "Quick cd"), ("C", "Find file"), ("o", "Save setup")):
+                t.press("F9")
+                t.type(key)
+                t.wait_for(item)
+                t.press("Escape")
+                t.wait_for(item, present=False)
+                self.assertTrue(t.text().splitlines()[-2].rstrip().endswith("touch should-not-run"))
+            t.press("F9")
+            t.type("F")
+            t.wait_for("Quick cd")
+            click(t, "Mkdir")
+            t.wait_for("New directory")
+            t.press("Escape")
+            t.wait_for("New directory", present=False)
+            self.assertTrue(t.text().splitlines()[-2].rstrip().endswith("touch should-not-run"))
+            t.save("mnemonic-modal-return")
+            t.press("Home", "C-k", "F10")
+            t.wait_file(t.exit_file, b"0\n")
+        self.assertFalse((left / "should-not-run").exists())
+
+    def test_text_viewer_highlights_current_match_and_utf8(self):
+        root, left, _ = self.fixture()
+        path = left / "matches.txt"
+        path.write_text("aaaaa\nab\tK界tail\n")
+        with self.terminal(root / "ui", ["--view", path]) as t:
+            t.wait_for("aaaaa")
+            t.press("F7")
+            t.wait_for("Find in file")
+            t.type("aa")
+            t.press("Enter")
+            t.wait_for("Find in file", present=False)
+            t.wait(lambda: t.styled_rows()[1]["spans"] == [(0, 2)],
+                   "The first actual occurrence is highlighted")
+            t.type("n")
+            t.wait(lambda: t.styled_rows()[1]["spans"] == [(2, 4)],
+                   "Search continuation visibly advances to the next occurrence")
+            t.press("F7")
+            t.wait_for("Find in file")
+            t.press("C-u")
+            t.type("k界")
+            t.press("Enter")
+            t.wait_for("Find in file", present=False)
+            t.wait(lambda: t.styled_rows()[1]["focused"] == "K界",
+                   "Case folding highlights the original wide UTF-8 glyphs after the tab")
+            t.save("text-search-highlight")
+            t.press("F10")
+            t.wait_file(t.exit_file, b"0\n")
+
+    def test_editor_word_navigation_keeps_mc_stops(self):
+        root, left, _ = self.fixture()
+        path = left / "words.txt"
+        original = "foo_bar-baz écho\nnext word\n".encode()
+        path.write_bytes(original)
+        with self.terminal(root / "ui", ["--edit", path]) as t:
+            t.wait_editor(offset=0)
+            for offset in (7, 8, 12, 17, 18, 23, 27):
+                t.press("C-Right")
+                t.wait_editor(offset=offset)
+            for offset in (23, 18, 17, 12, 8, 7, 0):
+                t.press("C-Left")
+                t.wait_editor(offset=offset)
+            t.save("mc-word-stops")
+        self.assertEqual(path.read_bytes(), original)
+
+    def test_shift_click_preserves_rectangle_anchor_after_horizontal_scroll(self):
+        root, left, _ = self.fixture()
+        path = left / "rectangle.txt"
+        line = "".join(f"{value:03}" for value in range(80))
+        original = (line + "\n") * 3
+        path.write_text(original)
+        with self.terminal(root / "ui", ["--edit", path]) as t:
+            t.wait_editor(offset=0)
+            t.press("Right", "Right")
+            t.raw(b"\x1b[25~")
+            t.press(*(["Right"] * 6), "Down")
+            t.raw(b"\x1b[25~")
+            t.press(*(["Right"] * 102))
+            t.wait_editor(mark="C", row=2, column=111)
+            visible = t.text().splitlines()[2]
+            first_column = line.find(visible[:20])
+            self.assertGreater(first_column, 0)
+            target = first_column + 7
+            mouse(t, 7, 2, button=4)
+            mouse(t, 7, 2, button=4, motion="m")
+            t.wait_editor(mark="C", row=2, column=target + 1, selection=2 * (target - 2) + 1)
+            t.save("extended-rectangle")
+            t.press("F8")
+            expected = ((line[:2] + line[target:] + "\n") * 2 + line + "\n").encode()
+            save(t, path, expected)
+
+    def test_selection_drag_scrolls_at_both_edges_and_clamps_at_eof(self):
+        root, left, _ = self.fixture()
+        path = left / "drag.txt"
+        original = "".join(f"ROW_{value:03} text\n" for value in range(120)).encode()
+        path.write_bytes(original)
+        with self.terminal(root / "ui", ["--edit", path], height=14) as t:
+            t.wait_for("ROW_000")
+            mouse(t, 3, 2)
+            mouse(t, 10, 13, button=32)
+            t.wait(lambda: t.text().splitlines()[1].startswith("ROW_001"),
+                   "Dragging below the viewport scrolls one line")
+            mouse(t, 10, 5, button=32)
+            t.wait_editor(row=6, column=11, mark="B")
+            mouse(t, 10, 5, motion="m")
+            t.save("drag-returned")
+            mouse(t, 4, 5)
+            mouse(t, 10, 0, button=32)
+            t.wait(lambda: t.text().splitlines()[1].startswith("ROW_000"),
+                   "Dragging above the viewport scrolls upward")
+            t.wait_editor(row=1, column=11, mark="B")
+            mouse(t, 10, 0, motion="m")
+            t.press("C-End")
+            t.wait_editor(offset=len(original))
+            mouse(t, 3, 2)
+            mouse(t, 10, 13, button=32)
+            t.wait_editor(offset=len(original), row=121)
+            mouse(t, 10, 13, button=32)
+            mouse(t, 10, 13, motion="m")
+            t.wait_editor(offset=len(original), row=121)
+            t.save("drag-eof-clamp")
+        self.assertEqual(path.read_bytes(), original)
+
     def test_copy_defaults_and_delete_buttons(self):
         root, left, right = self.fixture()
         target = left / "a.txt"

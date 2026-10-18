@@ -260,6 +260,61 @@ void test_jump_preferred_column(const std::filesystem::path& root) {
     check(editor.column() == 2, "jump back from EOF retains the preferred display column");
 }
 
+void test_word_navigation(const std::filesystem::path& root) {
+    auto editor = load(root / "word-navigation", "foo_bar-baz écho\nnext word\n");
+    for (const auto offset : {7U, 8U, 12U, 17U, 18U, 23U, 27U}) {
+        editor.move_word(1);
+        check(editor.cursor_offset() == offset, "forward word stop agrees with MC");
+    }
+    for (const auto offset : {23U, 18U, 17U, 12U, 8U, 7U, 0U}) {
+        editor.move_word(-1);
+        check(editor.cursor_offset() == offset, "backward word stop agrees with MC");
+    }
+    editor.move_word(-1);
+    check(editor.cursor_offset() == 0U, "word-left clamps at the start");
+    editor.set_position({1, 9});
+    editor.move_word(1);
+    check(editor.row() == 2U && editor.column() == 0U, "word-right crosses only the LF");
+    editor.move_word(1);
+    check(editor.cursor_offset() == editor.byte_size(), "word-right clamps at EOF");
+    editor.move_word(-1);
+    check(editor.row() == 1U && editor.column() == 9U, "word-left stops at previous EOL");
+}
+
+void test_resume_mark(const std::filesystem::path& root) {
+    auto editor = load(root / "resume-mark", "abcdef\nABCDEF\n123456\n");
+    editor.set_position({0, 2});
+    editor.begin_column_mark();
+    editor.set_position({1, 4});
+    editor.finish_mark();
+    editor.set_position({1, 5});
+    editor.resume_mark();
+    editor.set_position({2, 5});
+    editor.finish_mark();
+    check(editor.column_selection() && editor.selected_text() ==
+              std::optional<std::string>{"cde\nCDE\n345"},
+          "resuming a rectangle preserves its original anchor and shape");
+    editor.clear_selection();
+    editor.set_position({2, 5});
+    editor.begin_column_mark();
+    editor.set_position({1, 3});
+    editor.finish_mark();
+    editor.set_position({0, 0});
+    editor.resume_mark();
+    editor.set_position({0, 1});
+    editor.finish_mark();
+    check(editor.selected_text() == std::optional<std::string>{"bcde\nBCDE\n2345"},
+          "resuming a reverse rectangle retains the unsorted anchor");
+    editor.clear_selection();
+    editor.set_position({0, 1});
+    editor.resume_mark();
+    editor.set_position({0, 3});
+    editor.finish_mark();
+    check(!editor.column_selection() && editor.selected_text() ==
+              std::optional<std::string>{"bc"},
+          "Shift extension without a mark starts a linear block at the cursor");
+}
+
 }  // namespace
 
 int main(const int argc, char** argv) {
@@ -282,6 +337,8 @@ int main(const int argc, char** argv) {
         {"E3 embedded NUL", test_unicode_nul},
         {"F8 line and empty mark", test_delete_line_and_empty_mark},
         {"Document jump preferred column", test_jump_preferred_column},
+        {"MC word and newline stops", test_word_navigation},
+        {"Persistent mark extension", test_resume_mark},
     };
     int failures = 0;
     for (const auto& [name, test] : tests) {

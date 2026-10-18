@@ -142,6 +142,11 @@ are selected for replacement; recalled history and command drafts stay editable.
 Copy/Move keeps its action buttons and source identity visible while the options
 body scrolls with the wheel or PageUp/PageDown. Main menus scroll their selected
 action into view on short terminals.
+Press `F9`, then a main-menu category's underlined letter (`l`, `f`, `c`, `o`
+or `r`) to open it without changing the command draft. Uppercase works too.
+Quick cd resolves relative directories against the active pane and retains
+logical symlink paths. Paths in the prompt and status escape control characters
+instead of breaking the terminal layout.
 
 Text inputs support `Left`/`Right`, `Home`/`End`, `Ctrl-Left`/`Ctrl-Right`,
 Shift movement for selection, and Delete/Backspace at the cursor. `Ctrl-K`
@@ -165,6 +170,10 @@ disabled, and `Ctrl-X !` reports that it is unavailable.
 offsets and hexadecimal offsets. It defaults to lines in text mode and hex
 offsets in hex mode. Tab focuses Mode; Left/Right changes it. Invalid input
 stays in the dialog for correction, and 100% shows the final page.
+
+Text searches highlight the current occurrence in the viewer and Quick view.
+The highlight follows the original UTF-8 bytes through expanded tabs, wrapping
+and horizontal clipping; repeating a search moves it to the next occurrence.
 
 The wheel scrolls hex content immediately while retaining the cursor's relative
 row. Hex progress follows the active byte. Click a hex digit or ASCII byte to
@@ -194,6 +203,8 @@ move the view and cursor together, and the final page stays filled through EOF.
 `Ctrl-Home`/`Ctrl-End` go to the first/last line while retaining the preferred
 column; `Ctrl-PageUp`/`Ctrl-PageDown` go to the top/bottom visible line.
 `Ctrl-Up`/`Ctrl-Down` scroll one line; the mouse wheel scrolls two.
+`Ctrl-Left`/`Ctrl-Right` stop between word and punctuation runs and at line
+boundaries without splitting UTF-8 characters.
 `F8` deletes the marked block, or the whole current line if no block is marked.
 Delete still removes one character, and `Ctrl-U` undoes either deletion.
 
@@ -203,7 +214,10 @@ in the modified-file close/quit dialog saves without asking a second time.
 
 Click the editor header or press `F9` to open its menus, then click a category
 or action. Drag with the left mouse button to mark text; hold `Alt` while
-starting a drag to mark columns. Shift-click extends from the current cursor.
+starting a drag to mark columns. Dragging past the visible top or bottom edge
+scrolls to extend the selection, bounded by the document ends. Shift-click
+extends an existing mark from its original anchor without changing its linear
+or rectangular shape; without a mark, it starts from the current cursor.
 
 File > Close closes the active buffer. `Esc`, `F10` and File > Quit check every
 dirty buffer, including inactive buffers. Cancel keeps all buffers open, and

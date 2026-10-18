@@ -4,6 +4,8 @@ Status: **all 100 case IDs investigated; not 100 passes**. Prepared on
 2026-10-18 against repository `8a40e78`; investigation used plan commit
 `540e28b`, unchanged product code `e28a00d`, and installed GNU MC 4.8.30.
 Per-case outcomes are recorded below.
+The subsequent F01-F07 fix delivery is recorded separately below; the original
+investigation outcomes have not been relabelled as passes.
 
 These are 100 additional workflow cases, counted once even when both programs
 run them. Use paired MC controls where an equivalent exists; explicitly
@@ -285,9 +287,34 @@ or coverage beyond the recorded workflow.
 | Shared MC limitation | 1 |
 | **Total** | **100** |
 
-The seven new mcpp findings F01-F07 and shared limitation U04 are documented
+The seven mcpp findings F01-F07 and shared limitation U04 are documented
 with source anchors in [the gap analysis](mc-gap-analysis.md). The earlier
-E01-E05/U03 findings remain separate and open; no product fixes were made.
+E01-E05/U03 findings remain separate and open. The investigation itself did not
+change product code; the following delivery fixes F01-F07.
+
+### F01-F07 fix follow-up
+
+All seven confirmed mcpp bugs from this investigation are now fixed:
+
+| Original case | Finding | Follow-up outcome |
+|---|---|---|
+| UI-009 | F01 | Relative Quick cd retains the active cwd, including a logical symlink path. |
+| UI-002 | F02 | Newline cwd is escaped in both prompt and status; command caret clicks remain correct. |
+| UI-048 | F03 | Lowercase/uppercase main-menu mnemonics open the requested category/modal without changing the draft. |
+| UI-067 | F04 | The actual text occurrence is highlighted; continuation moves the highlight. |
+| UI-082 | F05 | All seven recorded forward stops and seven reverse stops match MC. |
+| UI-084 | F06 | Horizontal Shift-click preserves the rectangle's anchor/shape and exact column-delete/save bytes. |
+| UI-087 | F07 | Selection drag scrolls at both edges, returns to the correct visible row and clamps at EOF. |
+
+The 32-case terminal audit suite, focused core/editor regressions and guarded
+audit model checks passed. All seven original reproducers were repeated
+successfully against the rebuilt normal Release; paired screenshots were
+inspected against the retained MC 4.8.30 controls. Detailed delivery and evidence
+are in [the gap analysis](mc-gap-analysis.md#seven-finding-fix-delivery).
+
+This follow-up did not re-execute the remaining 93 original cases or resolve
+the missing capabilities, blocked/inconclusive controls, shared limitations or
+history behavior decision. The original categories below describe `e28a00d`.
 
 ### Environment and evidence
 

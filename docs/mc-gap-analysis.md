@@ -13,7 +13,8 @@ in `13c9c34`. The six follow-up items D01-D05 and U02 are also resolved by the
 delivery below. The later screenshot/code walk against `e28a00d` records open
 E01-E05 and shared limitation U03. The original regression results do not imply
 complete MC parity. The subsequent 100-case investigation below records new
-F01-F07 and shared limitation U04; those remain open.
+F01-F07 and shared limitation U04. F01-F07 are now fixed by the seven-finding
+delivery below; U04 remains a shared limitation.
 The eight broader capability groups remain a separate feature backlog; the
 explicitly paused providers and spelling remain paused.
 The source excerpts and line numbers in the historical audit sections describe the old
@@ -62,6 +63,41 @@ all four Go to modes, and correction after invalid percentage input.
 Successful terminal captures are retained in this session's
 `ui-fixes-20261018` artifacts. No new dependencies, sanitizers or optional
 profiling were used.
+
+## Seven-finding fix delivery
+
+All seven confirmed mcpp bugs F01-F07 from the 100-case investigation are fixed.
+The historical findings and baseline line numbers are retained below rather
+than rewritten as if the original investigation had passed.
+
+| Finding | Delivered behavior |
+|---|---|
+| F01 | Quick cd resolves `.`/`..`, nested relative paths and absolute paths from the active pane. Directory spelling is normalized before provider validation so `.` retains both the cwd and a logical symlink leaf; failed navigation leaves the original directory intact. |
+| F02 | The command prompt and status escape control characters in paths before fitting/rendering. A newline cwd remains one displayed row, and pointer placement still edits the intended command byte. |
+| F03 | F9 followed by a displayed main-menu mnemonic opens that category, case-insensitively. The displayed labels supply the keys; the command draft is neither changed nor executed. |
+| F04 | The viewer retains the actual matched byte range and maps it to rendered text. Full-screen and Quick view highlight the occurrence without splitting a displayed glyph; tabs, wrapped rows and horizontal clipping retain the correct span. |
+| F05 | Editor word movement retains the tested punctuation stops and stops at the previous EOL when crossing backwards. The complete forward/reverse ASCII/underscore/hyphen/UTF-8 sequence agrees with the recorded MC control. |
+| F06 | Shift-click resumes an existing mark without losing its anchor or rectangular mode. Visible horizontal coordinates determine the new endpoint; a subsequent rectangular delete/save changes only the expected columns. |
+| F07 | A selection dragged beyond the visible top/bottom moves to the next document row and scrolls it into view. Returning inside uses the new viewport; BOF/EOF remain bounded. |
+
+Seven new cases bring `tests/test_audit_ui.py` to **32 cases**. Focused core and
+editor regressions, the guarded audit model checks and all 32 terminal audit
+cases passed. The exact seven original reproducers also passed against the
+normal Release binary, SHA-256
+`17f624e181db734b9d2300100fb7ed9d2ebf049e4992b8831c6b564b1a4929d9`.
+Release was rebuilt with warnings as errors and `--parallel 12`; it remains in
+`build/release/mcpp`, not installed.
+
+All application/filesystem checks ran as UID 1001 in the owned disposable
+container with no host mounts or network. Final action/capture/result files,
+byte-outcome assertions, build/test logs and seven inspected paired screenshots
+are retained in this session's `f01-f07-fixes` artifacts. Screenshot comparisons
+use the retained canonical MC 4.8.30 controls; no new native MC run or complete
+parity claim is implied.
+
+This delivery does not close the earlier E01-E05/U03 findings, shared limitation
+U04, the missing sort/hotlist capabilities, blocked controls or the unresolved
+history decision. The original 100-case totals remain a historical record.
 
 ## Investigation of the 100 additional cases
 
@@ -125,7 +161,8 @@ inspected contact sheets are retained under `evidence-canonical/` and alongside
   safer difference, not a mcpp failure.
 
 The earlier E01-E05/U03 findings were neither fixed nor re-counted in these
-100 cases. This investigation changed documentation only.
+100 cases. That investigation changed documentation only; the subsequent
+F01-F07 fixes are documented above.
 
 ## Navigation, panes, viewer and editor walk (`e28a00d`)
 

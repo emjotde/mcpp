@@ -108,6 +108,8 @@ void ViewerModel::open(
     previous_offsets_.clear();
     horizontal_offset_ = 0;
     last_search_.clear();
+    search_match_.reset();
+    text_highlights_.clear();
     next_search_offset_ = 0;
     search_begin_ = 0;
     hex_cursor_ = 0;
@@ -131,6 +133,8 @@ void ViewerModel::close() {
     previous_offsets_.clear();
     horizontal_offset_ = 0;
     last_search_.clear();
+    search_match_.reset();
+    text_highlights_.clear();
     next_search_offset_ = 0;
     search_begin_ = 0;
     hex_cursor_ = 0;
@@ -151,6 +155,8 @@ void ViewerModel::go_to_start() {
     previous_offsets_.clear();
     horizontal_offset_ = 0;
     last_search_.clear();
+    search_match_.reset();
+    text_highlights_.clear();
     next_search_offset_ = 0;
     search_begin_ = 0;
 }
@@ -439,6 +445,7 @@ void ViewerModel::set_byte(const std::uint64_t offset, const unsigned char value
     if (original.size() != 1U) {
         throw std::runtime_error("file changed while editing hex data");
     }
+    search_match_.reset();
     if (static_cast<unsigned char>(original[0]) == value) {
         edits_.erase(offset);
     } else {
@@ -501,6 +508,7 @@ void ViewerModel::save_changes(const Cancellation& cancellation) {
 void ViewerModel::discard_changes() {
     edits_.clear();
     window_.clear();
+    search_match_.reset();
     hex_low_nibble_ = false;
 }
 
@@ -613,7 +621,8 @@ std::uint64_t ViewerModel::read_text_row(
     std::uint64_t offset,
     const std::size_t viewport_width,
     std::string* output,
-    const Cancellation& cancellation
+    const Cancellation& cancellation,
+    std::optional<std::pair<std::size_t, std::size_t>>* highlight
 ) {
     const auto width = std::max<std::size_t>(1U, viewport_width);
     std::size_t column = 0;
@@ -657,6 +666,8 @@ std::uint64_t ViewerModel::read_text_row(
             return offset;
         }
         const auto glyph_begin = column;
+        const bool matched = search_match_ &&
+            offset < search_match_->second && offset + length > search_match_->first;
         column += glyph_width;
         offset += length;
         if (output == nullptr) {
@@ -677,10 +688,18 @@ std::uint64_t ViewerModel::read_text_row(
                 continue;
             }
         }
+        const auto begin = output->size();
         if (tab) {
             output->append(glyph_width, ' ');
         } else if (glyph_width > 0U || !output->empty()) {
             output->append(glyph);
+        }
+        if (highlight != nullptr && matched && output->size() > begin) {
+            if (!*highlight) {
+                *highlight = std::pair{begin, output->size()};
+            } else {
+                (*highlight)->second = output->size();
+            }
         }
         displayed_width += glyph_width;
     }
@@ -716,6 +735,7 @@ std::vector<std::string> ViewerModel::lines(
     const std::size_t height,
     const Cancellation& cancellation
 ) {
+    text_highlights_.clear();
     if (!open()) {
         view_end_ = 0;
         return {};
@@ -770,19 +790,27 @@ std::vector<std::string> ViewerModel::lines(
 
     while (result.size() < height && view_end_ < size_) {
         std::string line;
+        std::optional<std::pair<std::size_t, std::size_t>> highlight;
         const auto next = read_text_row(
             view_end_,
             width,
             &line,
-            cancellation
+            cancellation,
+            &highlight
         );
         if (next <= view_end_) {
             break;
         }
         result.push_back(std::move(line));
+        text_highlights_.push_back(highlight);
         view_end_ = next;
     }
     return result;
+}
+
+std::optional<std::pair<std::size_t, std::size_t>>
+ViewerModel::text_highlight(const std::size_t row) const noexcept {
+    return row < text_highlights_.size() ? text_highlights_[row] : std::nullopt;
 }
 
 std::optional<std::uint64_t> ViewerModel::find(
@@ -852,6 +880,9 @@ std::optional<std::uint64_t> ViewerModel::find(
         found = search_range(0U, search_begin);
     }
     if (!found) {
+        if (!repeat) {
+            search_match_.reset();
+        }
         last_search_ = requested;
         last_search_case_sensitive_ = case_sensitive;
         next_search_offset_ = search_begin;
@@ -882,6 +913,7 @@ std::optional<std::uint64_t> ViewerModel::find(
     }
     previous_offsets_.clear();
     horizontal_offset_ = 0;
+    search_match_ = found;
     return found->first;
 }
 

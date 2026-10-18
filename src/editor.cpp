@@ -544,42 +544,50 @@ void EditorModel::move_word(const int direction) {
     if (lines_.empty() || direction == 0) {
         return;
     }
+    const auto whitespace = [&](const std::size_t column) {
+        return std::isspace(
+            static_cast<unsigned char>(lines_[row_][column])
+        ) != 0;
+    };
     if (direction < 0) {
         if (column_ == 0U && row_ > 0U) {
             --row_;
             column_ = lines_[row_].size();
-        }
-        while (column_ > 0U) {
-            const auto previous =
-                previous_character(lines_[row_], column_);
-            if (word_character(lines_[row_], previous)) {
-                break;
+        } else {
+            while (column_ > 0U) {
+                const auto previous = previous_character(lines_[row_], column_);
+                if (!whitespace(previous)) {
+                    break;
+                }
+                column_ = previous;
             }
-            column_ = previous;
-        }
-        while (column_ > 0U) {
-            const auto previous =
-                previous_character(lines_[row_], column_);
-            if (!word_character(lines_[row_], previous)) {
-                break;
+            if (column_ > 0U) {
+                const auto word = word_character(
+                    lines_[row_], previous_character(lines_[row_], column_)
+                );
+                while (column_ > 0U) {
+                    const auto previous = previous_character(lines_[row_], column_);
+                    if (whitespace(previous) ||
+                        word_character(lines_[row_], previous) != word) {
+                        break;
+                    }
+                    column_ = previous;
+                }
             }
-            column_ = previous;
         }
     } else {
         if (column_ == lines_[row_].size() && row_ + 1U < lines_.size()) {
             ++row_;
             column_ = 0;
-            preferred_display_column_ = 0;
-            update_mark();
-            return;
-        }
-        while (column_ < lines_[row_].size() &&
-               word_character(lines_[row_], column_)) {
-            column_ = next_character(lines_[row_], column_);
-        }
-        while (column_ < lines_[row_].size() &&
-               !word_character(lines_[row_], column_)) {
-            column_ = next_character(lines_[row_], column_);
+        } else {
+            const auto word = word_character(lines_[row_], column_);
+            while (column_ < lines_[row_].size() && !whitespace(column_) &&
+                   word_character(lines_[row_], column_) == word) {
+                column_ = next_character(lines_[row_], column_);
+            }
+            while (column_ < lines_[row_].size() && whitespace(column_)) {
+                column_ = next_character(lines_[row_], column_);
+            }
         }
     }
     preferred_display_column_ =
@@ -704,6 +712,16 @@ void EditorModel::begin_column_mark() {
     selection_end_ = selection_begin_;
     marking_ = true;
     column_selection_ = true;
+}
+
+void EditorModel::resume_mark() {
+    if (!selection_begin_) {
+        begin_mark();
+        return;
+    }
+    column_selection_width_.reset();
+    marking_ = true;
+    update_mark();
 }
 
 void EditorModel::finish_mark() {

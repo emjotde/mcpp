@@ -64,6 +64,7 @@ public:
     void toggle_column_mark();
     void begin_mark();
     void begin_column_mark();
+    void resume_mark();
     void finish_mark();
     void clear_selection();
     void select_all();
