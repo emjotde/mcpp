@@ -10,7 +10,9 @@ spelling support remain deferred.
 
 The original 41 findings (A01-A16, B01-B11, C01-C10, H01-H03 and U01) were fixed
 in `13c9c34`. The six follow-up items D01-D05 and U02 are also resolved by the
-delivery below. The original regression results do not imply complete MC parity.
+delivery below. The later screenshot/code walk against `e28a00d` records open
+E01-E05 and shared limitation U03. The original regression results do not imply
+complete MC parity.
 The eight broader capability groups remain a separate feature backlog; the
 explicitly paused providers and spelling remain paused.
 The source excerpts and line numbers in the historical audit sections describe the old
@@ -41,7 +43,7 @@ current functionality claims.
 
 ## Follow-up fix delivery
 
-All six items from the direct UI walk are resolved.
+All six items from the `7a4370e` walk (D01-D05 and U02) are resolved in `e28a00d`.
 
 | Findings | Delivered behavior |
 |---|---|
@@ -59,6 +61,58 @@ all four Go to modes, and correction after invalid percentage input.
 Successful terminal captures are retained in this session's
 `ui-fixes-20261018` artifacts. No new dependencies, sanitizers or optional
 profiling were used.
+
+## Navigation, panes, viewer and editor walk (`e28a00d`)
+
+This 2026-10-18 pass walked the current normal Release binary, rendered and
+inspected screenshots, and traced the relevant handlers/models. The executable
+SHA-256 was `c74838f79ff30ee4e8b9fe8516677b4a77f2744fd68378d6aff9a5420e270211`.
+Actual MC controls used installed MC 4.8.30 with fresh HOME/XDG profiles.
+Reference-source controls are identified separately; they are not runtime
+claims about that binary.
+
+Five additional failures and one shared editor limitation were recorded.
+These remain open; this pass changes the report, not the product.
+
+| ID | Priority | Finding and consequence | Runtime and code evidence |
+|---|---|---|---|
+| E01 | P1 | Hex Save silently splits hardlinked files. One pathname gets new bytes while its linked alias retains the old contents, without the editor's detach/preserve/cancel choice. | In a non-root disposable container without host mounts, F6 saved `edited.bin` as `ZBCD`, left `linked.bin` as `ABCD`, and changed one inode/link-count-2 group into two inode/link-count-1 files. The dirty indicator cleared without a decision or warning. `ViewerModel::save_changes()` (`src/viewer.cpp:485-498`) directly calls provider write, whose local publication replaces the inode (`src/local_provider.cpp:734-745,885-917`). The editor's link decision is at `src/app.cpp:7924`; the viewer F6 route at `:7570` has none. MC control is source-only here: reference `src/viewer/hex.c:369-404` opens the existing inode with `O_WRONLY`; no MC runtime hardlink-save case was run. |
+| E02 | P2 | Hex forward/repeat search ignores the active byte after ordinary cursor movement and can jump backward without a wrap decision. | With matches at bytes 32, 160 and 480, a fresh search from cursor 192 returned 32 in mcpp; MC returned 480. After Ctrl-Home/Down to cursor 224, repeat again returned 32 in mcpp and 480 in MC. MC's search form was explicitly switched to Hexadecimal before comparing. `src/viewer.cpp:795-804` starts fresh search at the viewport offset and repeats at cached `next_search_offset_`; cursor movement (`:390-400`) does not reset that origin. |
+| E03 | P2 | A failed wrapped search leaves the hex cursor outside the displayed viewport. | From EOF of a 4096-byte file, search for absent `FF FF`, accept wrap and acknowledge the failure. mcpp displays row `00000000` while its header still reports cursor 4095; no active byte is visible. MC restores the previous EOF viewport/cursor. The wrap route calls `go_to_start()` (`src/app.cpp:7411-7430`), which resets the viewport/search state but not `hex_cursor_` (`src/viewer.cpp:148-155`). |
+| E04 | P2 | Detailed file listings discard distinguishing suffixes and extensions, making different entries look identical. | At 100x30, `identical_common_name_prefix_A.txt`, `..._B.py` and `..._C.log` all displayed as `identical_common_name...` in mcpp. MC's fitted names retained the distinguishing suffixes/extensions. The name cell uses head-only truncation (`src/app.cpp:3782-3806`, helper `:464-490`), unlike the fitted pane/header paths. The full current filename can be inspected in the status row, but the list itself cannot be scanned reliably. |
+| E05 | P3 | Hex progress still reports 99% at the final byte. This is an uncovered endpoint case after D04's cursor-versus-viewport correction. | Ctrl-End put both programs at byte 4095 of 4096: mcpp showed 99%, MC 100%. `src/viewer.cpp:346-351` divides the active offset by the full size. Reference MC compensates the hex divisor by one (`src/viewer/lib.c:400-422`), consistent with the observed runtime result. |
+| U03 | P2 shared limitation | CR-only Save As collapses the document into one raw editing line, making the next F8 remove the entire draft. | Saving `alpha\nbeta\ngamma\n` as CR changed the visible line count from four to one in both programs; the following staged F8 emptied both drafts. No save followed that deletion. mcpp showed concatenated `alphabetagamma`; MC showed `^M` markers. mcpp converts the bytes and reloads them (`src/editor.cpp:1785-1804,1833-1841`) through a parser that splits only on LF (`:395-415`). Retaining logical editing lines after output conversion would be an explicit improvement over this tested MC behavior, not a new mcpp-only regression. |
+
+### Screenshots, coverage and exclusions
+
+The `ui-walk-20261018-round3` session artifacts retain the drivers, text/ANSI
+captures, result JSON, isolated hardlink metadata and rendered screenshots.
+Inspected images include:
+
+- `hex-save-hardlinks.png`: before/after F6 and the linked-file byte/inode outcome.
+- `hex-search-confirmed-first-match.png`: byte 32 versus byte 480 from the same
+  active search position.
+- `wrap-confirmed-after-failed-wrap.png`: stale hidden cursor versus restored
+  EOF position.
+- `filename-list-screen.png` and `hex-search-confirmed-last-byte.png`: filename
+  identification and the remaining progress endpoint.
+- `editor-conversion-after-save-as.png`: the shared CR-format editing limitation.
+- `editor-long-before-click.png` and `quick-view-resized.png`: passing controls,
+  not additional failures.
+
+The walk also covered Quick cd, directory history back/forward, Quick view
+focus/scrolling, pane swapping, resize/return to listings, and Info pane
+activation/resize/return. The editor's horizontal scrolling and click-to-place
+were compared with MC using a numbered long line: both displayed the same
+visible content and saved the inserted character at the expected byte 82.
+
+Directory-history return reset the selected file to `..` in both programs.
+That was not counted as an additional mcpp-only defect. Nor were intentional
+colors, paused providers or previously recorded disabled-feature groups.
+The hardlink publication probe stayed in an owned non-root container without
+host mounts; other writes were ordinary saves to new/private editor fixtures.
+No sanitizers, optional profiling or new dependencies were used. This is
+bounded workflow coverage, not a pass of every MC action or filesystem case.
 
 ## Follow-up UI walk: 2026-10-18
 
