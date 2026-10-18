@@ -12,7 +12,8 @@ The original 41 findings (A01-A16, B01-B11, C01-C10, H01-H03 and U01) were fixed
 in `13c9c34`. The six follow-up items D01-D05 and U02 are also resolved by the
 delivery below. The later screenshot/code walk against `e28a00d` records open
 E01-E05 and shared limitation U03. The original regression results do not imply
-complete MC parity.
+complete MC parity. The subsequent 100-case investigation below records new
+F01-F07 and shared limitation U04; those remain open.
 The eight broader capability groups remain a separate feature backlog; the
 explicitly paused providers and spelling remain paused.
 The source excerpts and line numbers in the historical audit sections describe the old
@@ -61,6 +62,70 @@ all four Go to modes, and correction after invalid percentage input.
 Successful terminal captures are retained in this session's
 `ui-fixes-20261018` artifacts. No new dependencies, sanitizers or optional
 profiling were used.
+
+## Investigation of the 100 additional cases
+
+All UI-001 through UI-100 from the
+[execution plan and per-case results](mc-parity-ui-test-plan.md) were
+investigated against unchanged product code `e28a00d`. This is not a claim of
+100 passes: 72 cases completed without a new mcpp fault, seven exposed confirmed
+mcpp bugs, six had approved/safety differences, six were blocked by missing
+sort UI, five lacked an equivalent MC Tree control, two MC completion controls
+remained inconclusive, one history-branch difference needs a decision, and one
+Unicode-mask limitation is shared with MC.
+
+The normal Release SHA-256 remained
+`c74838f79ff30ee4e8b9fe8516677b4a77f2744fd68378d6aff9a5420e270211`;
+MC 4.8.30's was `35a55f42a97c6685b950539d9ce1bcc9959be1049bc0cbb89d1525025fc4a7c8`.
+Both applications ran non-root in an owned Linux/arm64 container with no host
+mounts or network. MC controls used the installed runtime/resources, with its
+internal editor enabled explicitly where needed. No project dependencies,
+package installs, sanitizer checks or optional profiling were added.
+
+### Confirmed findings
+
+| ID | Case | Priority | Failure and evidence | Relevant code |
+|---|---|---|---|---|
+| F01 | UI-009 | P2 | Relative Quick cd uses the wrong base. Entering `.` from fixture B takes mcpp to `/`; MC stays in B. This is the Quick cd dialog, not the previously fixed commander's `cd` builtin. | `src/app.cpp:3686-3689` passes the raw relative value to `Pane::change_directory`; `src/local_provider.cpp:395-419` resolves relative paths against the provider root. |
+| F02 | UI-002 | P2 | A newline in the cwd is escaped in the pane title but emitted raw in the command prompt, splitting the prompt across lines. MC's directory display does not create that broken prompt. No command execution was attempted. | Raw path in `src/app.cpp:6752-6755`, passed through `command_text()` (`:492-515`) and `render_input()`'s unsanitized prefix (`:2703`). |
+| F03 | UI-048 | P2 | Displayed top-menu mnemonics do not select/open their menus. With a command draft present, F9 then `f` does not open File; MC opens File and the requested Mkdir modal without changing the draft. | `handle_pulldown()` (`src/app.cpp:9707-9803`) handles mouse, arrows and Enter but not mnemonic characters. The top menu still renders mnemonic styling. |
+| F04 | UI-067 | P2 | A successful text-viewer search gives no visible match span, so repeated occurrences within one displayed line cannot be distinguished. MC highlights the current `aa` in `aaaaa`. This prevents full visual verification of the planned overlap sequence. | `src/app.cpp:7411-7423` consumes the search result as a boolean; `render_viewer()` (`:3949-4005`) only renders a special cursor/span in hex mode, otherwise plain text. |
+| F05 | UI-082 | P2 | Editor word movement skips MC's punctuation and reverse line-end stops. First Ctrl-Right in `foo_bar-baz` stops at byte 8 in mcpp versus byte 7 before the hyphen in MC. Ctrl-Left from the next line also skips the previous EOL stop. | `src/editor.cpp:543-585` skips the word and following separators in one forward command, and continues scanning after crossing a line in reverse. |
+| F06 | UI-084 | P2 | Shift-click converts an existing rectangular mark into a linear mark. After horizontal navigation, mcpp shows block flag `B`; MC retains column flag `C`. Subsequent block actions would use a different shape. No deletion/publication was used in this probe. | `src/app.cpp:9180-9198` finishes the mark and calls the linear `begin_mark()` for Shift-click, then derives column mode only from the mouse modifier. |
+| F07 | UI-087 | P2 | Dragging a selection beyond the visible editor edge clamps to the last rendered row instead of scrolling. MC reveals another row; mcpp's first visible row stays unchanged. | `editor_mouse_position(..., true)` (`src/app.cpp:9107-9137`) clamps to rendered line boxes; the drag route (`:9151-9175`) moves the cursor without scrolling the viewport. |
+| U04 | UI-022 | P2 shared limitation | `?.txt` selects only ASCII `a.txt`, not the one-character Unicode basenames, in both programs. Actual mark totals are one file in each; normal colored MC filenames were not mistaken for marks. This is an improvement opportunity, not a mcpp-only MC regression. | mcpp's byte-oriented matcher (`src/pane.cpp:14-44`) advances one byte for `?`; `select_pattern()` (`:425-443`) uses it directly. |
+
+Each confirmed discrepancy was repeated with fresh fixtures/profiles and
+checked against the corresponding code. Paired decisive images are
+`case-009.png`, `case-002.png`, `case-048.png`, `case-067.png`, `case-082.png`,
+`case-084.png` and `case-087.png` in this session's `parity-ui-100` artifacts;
+`case-022.png` and recorded mark totals support U04. Full ANSI/text captures,
+action logs, applicable saved bytes/hashes, 200 per-application result records and
+inspected contact sheets are retained under `evidence-canonical/` and alongside
+`investigation-results.json`.
+
+### Blockers and differences, not extra confirmed bugs
+
+- The Sort order menu is disabled. The backend sort actions do not provide a
+  substitute for reaching the feature through the UI; six planned cases are
+  recorded as missing capability rather than passed.
+- MC Tree fixture ancestry remained unsuitable after bounded setup attempts.
+  UI-031 through UI-034 and UI-039 are blocked controls, not evidence of
+  parity or newly broken mcpp Tree behavior.
+- mcpp has no Add current hotlist action in this UI. Existing-entry navigation
+  and missing-entry recovery were investigated with seeded bookmark fixtures;
+  adding entries was not falsely counted as implemented.
+- MC completion controls UI-043/UI-044 remain inconclusive. The history branch
+  sequence in UI-008 ends in different directories; mcpp truncates forward
+  history (`src/pane.cpp:315-329`), while MC keeps its unique history list.
+  That behavior decision was not silently classified as a bug or approved.
+- mcpp's Unicode filename-class matching and publication guards were not made
+  worse to imitate MC. The tested MC overwrite/Undo/Redo sequence also produced
+  invalid UTF-8 where mcpp preserved the intended bytes; this was recorded as a
+  safer difference, not a mcpp failure.
+
+The earlier E01-E05/U03 findings were neither fixed nor re-counted in these
+100 cases. This investigation changed documentation only.
 
 ## Navigation, panes, viewer and editor walk (`e28a00d`)
 
@@ -628,9 +693,9 @@ review.
 
 ## Coverage limits
 
-The next execution plan is [100 additional parity and UI cases](mc-parity-ui-test-plan.md).
-All are planned, not executed; the six open E/U findings and existing regressions
-are tracked separately and are not included in that count.
+The [100 additional parity and UI cases](mc-parity-ui-test-plan.md) now have
+per-case investigation results. They are not 100 passes; the six earlier E/U
+findings and existing regressions remain outside that count.
 
 ### Original audit-fix verification (`13c9c34`)
 

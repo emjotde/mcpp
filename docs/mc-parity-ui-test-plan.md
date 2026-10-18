@@ -1,7 +1,9 @@
 # 100 additional MC parity and UI cases
 
-Status: **planned, not executed**. Prepared on 2026-10-18 against repository
-`8a40e78` (product code `e28a00d`) and installed GNU MC 4.8.30.
+Status: **all 100 case IDs investigated; not 100 passes**. Prepared on
+2026-10-18 against repository `8a40e78`; investigation used plan commit
+`540e28b`, unchanged product code `e28a00d`, and installed GNU MC 4.8.30.
+Per-case outcomes are recorded below.
 
 These are 100 additional workflow cases, counted once even when both programs
 run them. Use paired MC controls where an equivalent exists; explicitly
@@ -260,5 +262,169 @@ matching bytes do not prove a visible or clickable control.
   Do not mark a case passed while its required MC control, screenshot inspection or
   required filesystem assertion is missing.
 
-The initial execution status of **all UI-001 through UI-100 is planned**.
-No pass count, timing estimate or complete-parity claim is implied.
+The initial status was planned. The following investigation record supersedes
+that status without changing the case definitions or implying complete parity.
+
+## Investigation results
+
+All 100 IDs received an investigation and have 200 canonical per-program
+records. Setup corrections and confirmation reruns are not extra cases.
+`completed-no-new-failure` means the stated checks and inspected captures did
+not reveal a new mcpp fault; it is not a claim of pixel-identical MC behavior
+or coverage beyond the recorded workflow.
+
+| Outcome | Cases |
+|---|---:|
+| Completed, no new mcpp failure observed | 72 |
+| Confirmed mcpp bugs | 7 |
+| Missing mcpp capability blocked the full case | 6 |
+| Approved differences / safer mcpp behavior | 6 |
+| MC Tree control blocked | 5 |
+| Inconclusive MC completion control | 2 |
+| Other parity difference requiring a decision | 1 |
+| Shared MC limitation | 1 |
+| **Total** | **100** |
+
+The seven new mcpp findings F01-F07 and shared limitation U04 are documented
+with source anchors in [the gap analysis](mc-gap-analysis.md). The earlier
+E01-E05/U03 findings remain separate and open; no product fixes were made.
+
+### Environment and evidence
+
+- All application runs, including the write/error cases, used a disposable
+  Linux/arm64 container with no host mounts, no network and an unprivileged
+  user. Existing installed MC binaries/resources and their missing system
+  runtime files were copied for the control; no project dependencies or
+  packages were installed.
+- mcpp SHA-256: `c74838f79ff30ee4e8b9fe8516677b4a77f2744fd68378d6aff9a5420e270211`.
+  MC 4.8.30 SHA-256: `35a55f42a97c6685b950539d9ce1bcc9959be1049bc0cbb89d1525025fc4a7c8`.
+- Fresh private profiles, C.UTF-8 and independent fixtures were used. Cases
+  not depending on a large listing used only their named entries; this was
+  not an exhaustive expansion of every shared fixture preset.
+- MC manager-to-editor controls explicitly enabled its built-in editor/viewer
+  after an initial external-editor setup failure. Native column marking and
+  tagging were calibrated separately; literal-key and wrong-mode setup
+  artifacts were excluded. MC marks were checked using actual totals and
+  mark attributes, not ordinary colored filenames.
+- Every canonical case retains action logs, before/action/after ANSI/text
+  captures, runtime observations and applicable byte/metadata outcomes.
+  Paired decisive screenshots, 20 contact sheets and corrected control sheets
+  were opened and inspected. Source inspection confirmed the reported faults.
+- Canonical evidence is in this session's `parity-ui-100/evidence-canonical/`;
+  `investigation-results.json`, `capture-manifest.json`, `case-NNN.png` and
+  the drivers are alongside it. Older setup captures are not the result set.
+- The disabled Sort order entry blocked UI-011 through UI-014, UI-019 and
+  UI-021. No model/config substitute was counted as a UI sort pass.
+- MC Tree ancestry could not be established equivalently for UI-031 through
+  UI-034 and UI-039; these remain blocked, not passing.
+- Hotlist test entries were seeded as fixtures in mcpp because Add current is
+  not exposed in its UI. UI-057/UI-058 test existing-entry navigation/error
+  behavior, not an unimplemented Add operation.
+- MC completion interaction was not resolved sufficiently for UI-043/UI-044.
+  UI-008 has a real history-branch difference but no imposed behavior decision.
+  No sanitizers, optional profiling or stress expansion was used.
+
+### Per-case record
+
+| Case | Outcome | Observation |
+|---|---|---|
+| UI-001 | completed-no-new-failure | Trailing-space directory entered; parent navigation retained exact filename identity. |
+| UI-002 | confirmed-bug | F02: raw newline in cwd splits the command prompt; pane title itself is escaped. |
+| UI-003 | completed-no-new-failure | Dot components normalize without treating a..b as a parent component. |
+| UI-004 | completed-no-new-failure | Symlink entry, parent and history remained valid; logical spelling was retained. |
+| UI-005 | completed-no-new-failure | Failed Quick cd kept the marked files and original directory. |
+| UI-006 | completed-no-new-failure | Renamed cwd reports/recoveries differ, but both returned to a real, truthfully displayed directory. |
+| UI-007 | completed-no-new-failure | Removed cwd did not crash either manager; parent recovery remained usable. |
+| UI-008 | parity-difference | History branching differs: the same back/forward sequence ends at D in mcpp and B in MC. |
+| UI-009 | confirmed-bug | F01: relative Quick cd '.' resolves at provider root rather than the active pane. |
+| UI-010 | completed-no-new-failure | Renamed child appears; mcpp chooses a valid parent fallback and MC selects the renamed child. |
+| UI-011 | missing-capability | Disabled Sort order blocks name-sort UI comparison. |
+| UI-012 | missing-capability | Disabled Sort order blocks extension-sort UI comparison. |
+| UI-013 | missing-capability | Disabled Sort order blocks size-sort/tie UI comparison. |
+| UI-014 | missing-capability | Disabled Sort order blocks subsecond modification-sort UI comparison. |
+| UI-015 | completed-no-new-failure | Refresh updates size/time while the selected marked file remains visible. |
+| UI-016 | completed-no-new-failure | Filter/hidden intersections and clearing were captured; no stale target observed. |
+| UI-017 | completed-no-new-failure | No matching files leaves real/symlink directories and parent navigation. |
+| UI-018 | completed-no-new-failure | Deleted selected file is not reopened from cache; valid fallback policies differ. |
+| UI-019 | missing-capability | Panelized identities were prepared, but disabled sorting blocks the planned sort/activation sequence. |
+| UI-020 | completed-no-new-failure | Mixed-width names remain aligned and selected through resize. |
+| UI-021 | missing-capability | Marked sets prepared; unavailable sort UI blocks the full planned ownership sequence. |
+| UI-022 | shared-limitation | U04: both programs mark only ASCII a.txt for ?.txt; actual mark totals confirm one file. |
+| UI-023 | completed-no-new-failure | Parent entry is excluded from the marked Copy preview. |
+| UI-024 | completed-no-new-failure | Filtered Copy previews name the retained visible source set consistently. |
+| UI-025 | completed-no-new-failure | Marked real directory survives inversion after Quick view. |
+| UI-026 | completed-no-new-failure | Overlapping mask additions/removal do not leave duplicate marks. |
+| UI-027 | completed-no-new-failure | Cancelling Compare preserves pre-existing marks in both panes. |
+| UI-028 | completed-no-new-failure | Both mark the file sides and skip directory sources; MC mark attributes and totals confirm this. |
+| UI-029 | completed-no-new-failure | Case-different Linux names remain distinct comparison entries. |
+| UI-030 | completed-no-new-failure | Changed symlink referents are detected; subsecond age handling differs from MC's second resolution. |
+| UI-031 | blocked-control | MC Tree fixture ancestry could not be populated equivalently; no paired pass claimed. |
+| UI-032 | blocked-control | mcpp rescan captured; equivalent MC Tree ancestry remains blocked. |
+| UI-033 | blocked-control | mcpp duplicate-leaf search captured; equivalent MC Tree ancestry remains blocked. |
+| UI-034 | blocked-control | mcpp in-flight pane swap captured; paired MC Tree setup remains blocked. |
+| UI-035 | completed-no-new-failure | Directory/dangling-link selection no longer shows the previous regular-file preview. |
+| UI-036 | completed-no-new-failure | Switching source files replaces the hex preview identity and resets position. |
+| UI-037 | completed-no-new-failure | Dirty edit Cancel retains draft; discard returns to Quick view without publication. |
+| UI-038 | completed-no-new-failure | Info source metadata changes with file/link/directory/parent selection. |
+| UI-039 | blocked-control | Tree/Find return captured, but equal populated MC ancestry was not established. |
+| UI-040 | completed-no-new-failure | Auxiliary-mode cycle returns a Copy preview with the correct active source and destination. |
+| UI-041 | completed-no-new-failure | Menu cancellation preserves the command draft. |
+| UI-042 | completed-no-new-failure | Literal quote/backslash pathname opens the intended file. |
+| UI-043 | inconclusive-control | mcpp literal completion works; MC completion acceptance was not calibrated sufficiently for a pass. |
+| UI-044 | inconclusive-control | mcpp invalidates the edited completion cycle; MC completion-popup editing remains inconclusive. |
+| UI-045 | completed-no-new-failure | Bracketed paste opens the complete UTF-8 path without delimiters. |
+| UI-046 | completed-no-new-failure | UTF-8 field kill/yank restores the intended pathname. |
+| UI-047 | completed-no-new-failure | Old coordinates after resize do not publish; actual Cancel remains usable. |
+| UI-048 | confirmed-bug | F03: displayed File mnemonic does not open its menu; MC opens the requested modal. |
+| UI-049 | completed-no-new-failure | Help round-trip retains dirty draft, mark and viewport; disk stays unchanged. |
+| UI-050 | completed-no-new-failure | Cancelled edited Mkdir recall does not contaminate View file history. |
+| UI-051 | approved-difference | mcpp matches the intended Unicode class names; MC overmatches gamma. |
+| UI-052 | completed-no-new-failure | Escaped filename pattern returns the literal bracketed name. |
+| UI-053 | completed-no-new-failure | Only the second same-basename result is saved; the first stays unchanged in both controls. |
+| UI-054 | completed-no-new-failure | Stale result View reports an error while retaining results; mcpp error is nonmodal. |
+| UI-055 | completed-no-new-failure | Parent rename returns to retained results; subsequent stale activation reports failure. |
+| UI-056 | completed-no-new-failure | Results F10 returns to a usable manager instead of exiting. |
+| UI-057 | completed-no-new-failure | Seeded same-leaf hotlist entries activate distinct full paths at narrow width. |
+| UI-058 | completed-no-new-failure | Missing bookmark reports failure without changing the original cwd. |
+| UI-059 | completed-no-new-failure | Empty panelization recovers to a usable normal listing. |
+| UI-060 | completed-no-new-failure | Panelized refresh removes the deleted source, updates size and retains the surviving mark. |
+| UI-061 | completed-no-new-failure | Tab wrap boundaries and paging retain the adjacent marker. |
+| UI-062 | completed-no-new-failure | Wide-character boundary survives paging without a partial glyph. |
+| UI-063 | completed-no-new-failure | mcpp preserves the continued-row anchor; MC resets to hard-line start. Both meet the stated alternatives. |
+| UI-064 | completed-no-new-failure | Unwrapped horizontal position survives narrow/wide resize. |
+| UI-065 | completed-no-new-failure | ASCII search finds the original cross-window needle. |
+| UI-066 | completed-no-new-failure | Case-insensitive UTF-8 search finds the original split-window character. |
+| UI-067 | confirmed-bug | F04: text search provides no visible match span; MC highlights the actual occurrence. |
+| UI-068 | completed-no-new-failure | Cancelled search retains the exact text viewport. |
+| UI-069 | completed-no-new-failure | Paging traverses blank LF rows and reaches/returns from both markers. |
+| UI-070 | approved-difference | mcpp-only full-filename inspection leaves source and viewport unchanged. |
+| UI-071 | completed-no-new-failure | Completed nibble survives cancelled dirty-close and saves exactly once. |
+| UI-072 | completed-no-new-failure | Hex/ASCII transitions save exactly the intended three bytes. |
+| UI-073 | completed-no-new-failure | Half-byte survives resize; MC uses the actual last column of its adaptive row. |
+| UI-074 | completed-no-new-failure | Mode round-trip retains staged edits and does not publish until Save. |
+| UI-075 | completed-no-new-failure | Raw NUL/FF pattern matches across a common 16-byte row at width 80. |
+| UI-076 | completed-no-new-failure | Search sees staged bytes while disk stays unchanged. |
+| UI-077 | completed-no-new-failure | Final ASCII overwrite preserves file length. |
+| UI-078 | completed-no-new-failure | Read-only Save fails explicitly and retains draft; disk bytes remain original. |
+| UI-079 | approved-difference | mcpp rejects stale publication; MC merges changed bytes. Both preserve the external byte. |
+| UI-080 | completed-no-new-failure | 512 KiB Save has exactly the two expected changed bytes. |
+| UI-081 | completed-no-new-failure | Preferred display column through tabs/wide glyph and a short line agrees after index normalization. |
+| UI-082 | confirmed-bug | F05: word-right skips the hyphen stop and word-left skips the previous EOL stop. |
+| UI-083 | completed-no-new-failure | Linear mark/cursor survive narrow/wide resize. |
+| UI-084 | confirmed-bug | F06: Shift-click changes an existing rectangular mark into a linear mark. |
+| UI-085 | completed-no-new-failure | Tab-cell click saves the same surrounding byte sequence as MC. |
+| UI-086 | completed-no-new-failure | Gutter/wide-glyph click saves the exact expected UTF-8 sequence. |
+| UI-087 | confirmed-bug | F07: drag beyond viewport clamps at the last rendered row instead of scrolling. |
+| UI-088 | completed-no-new-failure | Gutter toggles preserve cursor byte and visible caret. |
+| UI-089 | completed-no-new-failure | Resized editor-menu interaction leaves document bytes unchanged. |
+| UI-090 | completed-no-new-failure | Backward UTF-8 match has the same original byte position as MC. |
+| UI-091 | completed-no-new-failure | Overlap move/Undo/Redo preserves original bytes in both programs. |
+| UI-092 | completed-no-new-failure | Calibrated column paste produces identical tab/short-line bytes in both programs. |
+| UI-093 | completed-no-new-failure | Column Delete/Undo restores exact original bytes, including the empty row. |
+| UI-094 | approved-difference | mcpp preserves expected UTF-8; this MC overwrite/Undo/Redo control saves invalid UTF-8. |
+| UI-095 | completed-no-new-failure | Capture/newline Replace All has exact grouped Undo/Redo bytes. |
+| UI-096 | completed-no-new-failure | Both show a modified-close prompt after Undo reaches saved bytes; shared behavior recorded. |
+| UI-097 | approved-difference | mcpp reports the missing old path and recovers via Save As; MC can recreate the old pathname. |
+| UI-098 | approved-difference | Appeared target is protected: mcpp refuses overwrite; MC presents a warning choice. |
+| UI-099 | completed-no-new-failure | Save As preserves the symlink and changes the intended referent. |
+| UI-100 | completed-no-new-failure | Earlier save persists; readonly draft survives failure, Save As recovery and final Quit. |
