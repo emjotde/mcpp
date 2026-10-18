@@ -13,11 +13,16 @@ enum class DifferenceKind {
     type,
     size,
     modified,
+    content,
 };
+
+enum class CompareMode { quick, size, thorough };
 
 struct Difference {
     std::string relative_path;
     DifferenceKind kind{DifferenceKind::size};
+    bool mark_left{false};
+    bool mark_right{false};
 };
 
 class DirectoryComparator {
@@ -28,7 +33,8 @@ public:
         Provider& right_provider,
         std::string_view right_root,
         bool recursive,
-        const Cancellation& cancellation
+        const Cancellation& cancellation,
+        CompareMode mode = CompareMode::quick
     ) const;
 };
 

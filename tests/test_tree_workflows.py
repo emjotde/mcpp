@@ -245,11 +245,21 @@ def run(binary, tmux):
             terminal.press("Tab")
             find_node(terminal, unicode_name)
             terminal.resize(64, 20)
+            inner_width = 64 // 2 - 2
+            depth = len((left / unicode_name).parts) - 1
+            connector_width = min(3 * depth + 1, inner_width - 12)
+            name_width = inner_width - connector_width
+            if len(unicode_name) <= name_width:
+                fitted_name = unicode_name
+            else:
+                head = (name_width - 1) // 2
+                tail = name_width - head - 1
+                fitted_name = unicode_name[:head] + "~" + unicode_name[-tail:]
             terminal.wait(
-                lambda: terminal.selected_tree_row().endswith("~é-suffix"),
+                lambda: terminal.selected_tree_row().endswith(fitted_name),
                 "Narrow Tree preserves complete Unicode glyphs",
             )
-            assert terminal.selected_tree_row().count("é") == 9, (
+            assert terminal.selected_tree_row().count("é") == fitted_name.count("é"), (
                 "Tree fitting must count display columns, not UTF-8 bytes"
             )
             terminal.save("unicode-fit")

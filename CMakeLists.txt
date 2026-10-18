@@ -117,6 +117,12 @@ if(MCPP_BUILD_TESTS)
         COMMAND mcpp_editor_regressions
                 ${CMAKE_CURRENT_BINARY_DIR}/editor-regression-state
     )
+    add_executable(mcpp_audit_regressions tests/test_audit_regressions.cpp)
+    target_link_libraries(mcpp_audit_regressions PRIVATE mcpp_core)
+    mcpp_target_defaults(mcpp_audit_regressions)
+    if(EXISTS "/review/.operation-regressions-disposable")
+        add_test(NAME mcpp_audit_regressions COMMAND mcpp_audit_regressions)
+    endif()
     find_program(MCPP_SCRIPT_EXECUTABLE script)
     find_program(MCPP_TIMEOUT_EXECUTABLE timeout)
     if(MCPP_SCRIPT_EXECUTABLE AND MCPP_TIMEOUT_EXECUTABLE)
@@ -251,6 +257,16 @@ if(MCPP_BUILD_TESTS)
         )
         set_tests_properties(mcpp_editor_save PROPERTIES TIMEOUT 60)
         if(EXISTS "/review/.operation-regressions-disposable")
+            add_test(
+                NAME mcpp_audit_ui
+                COMMAND
+                    ${MCPP_PYTHON_EXECUTABLE}
+                    -B
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_audit_ui.py
+                    $<TARGET_FILE:mcpp>
+                    ${MCPP_TMUX_EXECUTABLE}
+            )
+            set_tests_properties(mcpp_audit_ui PROPERTIES TIMEOUT 180)
             add_test(
                 NAME mcpp_operation_controls
                 COMMAND

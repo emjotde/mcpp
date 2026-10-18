@@ -4,7 +4,8 @@ set -euo pipefail
 binary="$1"
 script_command="$2"
 timeout_command="$3"
-temporary="$(mktemp -d /tmp/mcpp-editor-ui.XXXXXX)"
+temporary="$PWD/mcpp-editor-ui-$BASHPID"
+mkdir -m 700 -- "$temporary"
 trap 'rm -rf -- "$temporary"' EXIT
 mkdir -p "$temporary/left" "$temporary/right"
 printf 'alpha beta\n' >"$temporary/left/a.txt"
@@ -116,7 +117,7 @@ if ((options_status != 0)); then
 fi
 
 if [[ "$(cat "$temporary/options.txt")" != \
-      $'a b\tc       Y\n  X' ]]; then
+      $'a b\tc  \tY\n  X' ]]; then
     printf 'configured editor indentation was not applied\n' >&2
     exit 1
 fi

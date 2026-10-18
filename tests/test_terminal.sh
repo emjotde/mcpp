@@ -4,7 +4,8 @@ set -euo pipefail
 binary="$1"
 script_command="$2"
 timeout_command="$3"
-temporary="$(mktemp -d /tmp/mcpp-terminal-test.XXXXXX)"
+temporary="$PWD/mcpp-terminal-test-$BASHPID"
+mkdir -m 700 -- "$temporary"
 trap 'rm -rf -- "$temporary"' EXIT
 mkdir -p "$temporary/left" "$temporary/right"
 printf 'alpha\n' >"$temporary/left/a.txt"
@@ -27,7 +28,7 @@ printf '\033[B\033[13~' >&3
 sleep 1
 printf '\033[18~missing-value\r' >&3
 sleep 1
-printf '\r\033[13~\033[14~\033[FZ\033[12~\033[21~' >&3
+printf '\r\033[13~\033[14~\033[FZ\033[12~\r\033[21~' >&3
 sleep 1
 printf '\033[18~created\r' >&3
 sleep 1
@@ -96,8 +97,9 @@ if ! grep -aFq 'C_O_SHELL' "$temporary/output-clean"; then
 fi
 
 mkfifo "$temporary/default-input"
-printf -v default_command 'cd %q && XDG_CONFIG_HOME=%q %q' \
-    "$temporary/left" "$temporary/default-config" "$binary"
+printf -v default_command 'cd %q && XDG_CONFIG_HOME=%q %q --printwd %q' \
+    "$temporary/left" "$temporary/default-config" "$binary" \
+    "$temporary/default-cwd"
 "$timeout_command" 10s "$script_command" \
     -qefc "$default_command" /dev/null \
     <"$temporary/default-input" \
@@ -118,7 +120,8 @@ if ((default_status != 0)); then
     exit 1
 fi
 
-if ! grep -Fq "$temporary/left" "$temporary/default-output"; then
+if [[ ! -f "$temporary/default-cwd" ]] ||
+   [[ "$(cat "$temporary/default-cwd")" != "$temporary/left" ]]; then
     printf 'mcpp without paths did not open cwd\n' >&2
     exit 1
 fi

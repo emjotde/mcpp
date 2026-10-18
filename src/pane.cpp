@@ -1,7 +1,7 @@
 #include "mcpp/pane.hpp"
+#include "mcpp/editor_search.hpp"
 
 #include <algorithm>
-#include <cctype>
 #include <stdexcept>
 
 namespace mcpp {
@@ -102,6 +102,7 @@ void Pane::refresh(const Cancellation& cancellation) {
                 std::distance(entries_.begin(), match)
             );
         }
+        keep_cursor_visible();
         return;
     }
     entries_ = provider_->list(
@@ -168,11 +169,13 @@ void Pane::refresh(const Cancellation& cancellation) {
             }
         );
     });
+    keep_cursor_visible();
 }
 
 void Pane::move_cursor(const int amount) {
     if (entries_.empty()) {
         cursor_ = 0;
+        first_row_ = 0;
         return;
     }
     const auto current_index = static_cast<long long>(cursor_);
@@ -180,10 +183,40 @@ void Pane::move_cursor(const int amount) {
     cursor_ = static_cast<std::size_t>(
         std::clamp(current_index + amount, 0LL, last)
     );
+    keep_cursor_visible();
 }
 
 void Pane::page_cursor(const int amount) {
+    const auto maximum = entries_.size() > viewport_rows_
+                             ? entries_.size() - viewport_rows_
+                             : 0U;
+    first_row_ = static_cast<std::size_t>(std::clamp(
+        static_cast<long long>(first_row_) + amount,
+        0LL,
+        static_cast<long long>(maximum)
+    ));
     move_cursor(amount);
+}
+
+void Pane::set_viewport_rows(const std::size_t rows) {
+    viewport_rows_ = std::max<std::size_t>(1U, rows);
+    keep_cursor_visible();
+}
+
+std::size_t Pane::first_row() const noexcept {
+    return first_row_;
+}
+
+void Pane::keep_cursor_visible() {
+    const auto maximum = entries_.size() > viewport_rows_
+                             ? entries_.size() - viewport_rows_
+                             : 0U;
+    first_row_ = std::min(first_row_, maximum);
+    if (cursor_ < first_row_) {
+        first_row_ = cursor_;
+    } else if (cursor_ - first_row_ >= viewport_rows_) {
+        first_row_ = cursor_ - viewport_rows_ + 1U;
+    }
 }
 
 bool Pane::enter(const Cancellation& cancellation) {
@@ -229,6 +262,7 @@ void Pane::restore_child_cursor(
         cursor_ = static_cast<std::size_t>(
             std::distance(entries_.begin(), match)
         );
+        keep_cursor_visible();
     }
 }
 
@@ -256,6 +290,7 @@ void Pane::navigate(
     const auto previous_entries = entries_;
     const auto previous_selected = selected_;
     const auto previous_cursor = cursor_;
+    const auto previous_first_row = first_row_;
     const auto previous_panelized = panelized_;
     const auto previous_panelized_entries = panelized_entries_;
     path_ = std::move(normalized);
@@ -263,6 +298,7 @@ void Pane::navigate(
     panelized_entries_.clear();
     selected_.clear();
     cursor_ = 0;
+    first_row_ = 0;
     try {
         refresh(cancellation);
     } catch (...) {
@@ -270,6 +306,7 @@ void Pane::navigate(
         entries_ = previous_entries;
         selected_ = previous_selected;
         cursor_ = previous_cursor;
+        first_row_ = previous_first_row;
         panelized_ = previous_panelized;
         panelized_entries_ = previous_panelized_entries;
         throw;
@@ -377,6 +414,7 @@ void Pane::set_panelized(std::vector<Entry> entries) {
     }
     selected_.clear();
     cursor_ = 0;
+    first_row_ = 0;
     panelized_ = true;
 }
 
@@ -426,31 +464,19 @@ bool Pane::find(
     if (needle.empty() || entries_.empty()) {
         return false;
     }
-    const auto normalize = [&](std::string value) {
-        if (!case_sensitive) {
-            std::transform(
-                value.begin(),
-                value.end(),
-                value.begin(),
-                [](const unsigned char character) {
-                    return static_cast<char>(std::tolower(character));
-                }
-            );
-        }
-        return value;
-    };
-    const auto sought = normalize(std::string(needle));
     const auto first = include_current ? 0U : 1U;
     for (std::size_t offset = first;
          offset < entries_.size() + first;
          ++offset) {
         const auto index = (cursor_ + offset) % entries_.size();
-        const auto name = normalize(entries_[index].name);
-        if (
-            (prefix && name.starts_with(sought)) ||
-            (!prefix && name.find(sought) != std::string::npos)
-        ) {
+        const auto& name = entries_[index].name;
+        const auto match = EditorSearch::find(
+            name, needle, 0U, 0U, name.size(),
+            {.case_sensitive = case_sensitive}, false, false
+        );
+        if (match && (!prefix || match->begin == 0U)) {
             cursor_ = index;
+            keep_cursor_visible();
             return true;
         }
     }

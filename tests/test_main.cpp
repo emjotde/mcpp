@@ -2118,10 +2118,15 @@ void test_viewer_editor() {
         "viewer reaches wrapped byte offset"
     );
     hex_scroll_viewer.toggle_hex();
+    check_equal(
+        hex_scroll_viewer.offset(),
+        std::uint64_t{16},
+        "hex viewer aligns its viewport to a sixteen-byte row"
+    );
     hex_scroll_viewer.scroll_lines(-1, 8);
     check_equal(
         hex_scroll_viewer.offset(),
-        std::uint64_t{8},
+        std::uint64_t{0},
         "hex viewer scrolls backward by sixteen bytes"
     );
     const auto repeat_search_path =
@@ -2312,9 +2317,10 @@ void test_viewer_editor() {
     editor.goto_line(2);
     check_equal(
         editor.column(),
-        std::size_t{0},
-        "goto aligns UTF-8 cursor"
+        std::size_t{2},
+        "goto retains the preferred display column on UTF-8 text"
     );
+    editor.home();
     editor.erase();
     check_equal(
         editor.lines()[1],

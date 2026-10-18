@@ -37,12 +37,13 @@ def reverse_sgr(reverse, sequence):
 
 class TerminalSession:
     def __init__(self, binary, tmux, root, arguments, width=100, height=30,
-                 record_exit=False):
+                 record_exit=False, record_stderr=False):
         self.root = Path(root).resolve()
         self.root.mkdir(parents=True, exist_ok=True)
         self.socket = "terminal.sock"
         self.exit_file = self.root / "exit.status"
         self.record_exit = record_exit
+        self.stderr_file = self.root / "stderr.txt"
         self.tmux = tmux
         self.width = width
         environment = {
@@ -63,6 +64,8 @@ class TerminalSession:
         command = ["env", *(f"{key}={value}" for key, value in environment.items()),
                    str(Path(binary).resolve()), *map(str, arguments)]
         command = shlex.join(command)
+        if record_stderr:
+            command += " 2> " + shlex.quote(str(self.stderr_file))
         if record_exit:
             self.exit_file.unlink(missing_ok=True)
             command = (

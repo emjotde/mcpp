@@ -4,6 +4,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace mcpp {
@@ -25,10 +26,14 @@ struct EditorSearchOptions {
 struct EditorSearchMatch {
     std::size_t begin{0};
     std::size_t end{0};
+    std::vector<std::pair<std::size_t, std::size_t>> captures{};
 };
 
 class EditorSearch {
 public:
+    [[nodiscard]] static bool filename_matches(
+        std::string_view name, std::string_view pattern, bool case_sensitive
+    );
     [[nodiscard]] static std::optional<EditorSearchMatch> find(
         std::string_view text,
         std::string_view pattern,

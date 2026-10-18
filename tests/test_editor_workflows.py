@@ -399,7 +399,7 @@ def fresh_context_workflow(binary, tmux, root):
         close_file(terminal)
         expect_search(terminal, "alpha", mode=1, sensitive=True, in_selection=True, whole=True)
         menu(terminal, 0, "Open file")
-        prompt(terminal, root / "missing.txt")
+        prompt(terminal, root)
         terminal.wait_for("Editor error")
         terminal.step("Enter")
         expect_search(terminal, "alpha", mode=1, sensitive=True, in_selection=True, whole=True)

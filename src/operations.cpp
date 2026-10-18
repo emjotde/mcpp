@@ -1,6 +1,7 @@
 #include "mcpp/operations.hpp"
 #include "mcpp/local_provider.hpp"
 
+#include <algorithm>
 #include <cerrno>
 #include <cstring>
 #include <filesystem>
@@ -32,6 +33,15 @@ void emit_completed_progress(
         emit_progress(callback, progress);
     } catch (const SkipCurrent&) {
         // A skip after publication cannot undo the completed entry.
+    }
+}
+
+void preserve_time(
+    Provider& destination_provider, const std::string& destination,
+    const Entry& source
+) {
+    if (auto* local = dynamic_cast<LocalProvider*>(&destination_provider)) {
+        local->set_modified(destination, source.modified);
     }
 }
 
@@ -267,17 +277,25 @@ void accumulate_entry(
     Provider& provider,
     const Entry& entry,
     const Cancellation& cancellation,
-    TransferProgress& result
+    TransferProgress& result,
+    const bool tolerate_errors = false
 ) {
     cancellation.throw_if_requested();
     if (entry.kind == EntryKind::directory) {
-        for (const auto& child :
-             provider.list(
-                 entry.path,
-                 {.show_hidden = true},
-                 cancellation
-             )) {
-            accumulate_entry(provider, child, cancellation, result);
+        std::vector<Entry> children;
+        try {
+            children = provider.list(entry.path, {.show_hidden = true}, cancellation);
+        } catch (const OperationCancelled&) {
+            throw;
+        } catch (const std::exception&) {
+            if (!tolerate_errors) {
+                throw;
+            }
+            // Counting is an estimate; the real traversal will invoke the error resolver.
+            return;
+        }
+        for (const auto& child : children) {
+            accumulate_entry(provider, child, cancellation, result, tolerate_errors);
         }
         return;
     }
@@ -289,7 +307,8 @@ void accumulate_removal(
     Provider& provider,
     const Entry& entry,
     const Cancellation& cancellation,
-    TransferProgress& result
+    TransferProgress& result,
+    const bool tolerate_errors = false
 ) {
     cancellation.throw_if_requested();
     ++result.files_total;
@@ -297,17 +316,24 @@ void accumulate_removal(
         result.bytes_total += entry.size;
         return;
     }
-    for (const auto& child :
-         provider.list(
-             entry.path,
-             {.show_hidden = true},
-             cancellation
-         )) {
+    std::vector<Entry> children;
+    try {
+        children = provider.list(entry.path, {.show_hidden = true}, cancellation);
+    } catch (const OperationCancelled&) {
+        throw;
+    } catch (const std::exception&) {
+        if (!tolerate_errors) {
+            throw;
+        }
+        return;
+    }
+    for (const auto& child : children) {
         accumulate_removal(
             provider,
             child,
             cancellation,
-            result
+            result,
+            tolerate_errors
         );
     }
 }
@@ -347,8 +373,10 @@ bool should_overwrite(
 
 class DescriptorBuffer final : public std::streambuf {
 public:
-    explicit DescriptorBuffer(const int descriptor)
-        : descriptor_(descriptor) {}
+    explicit DescriptorBuffer(
+        const int descriptor,
+        std::function<void()> checkpoint = {}
+    ) : descriptor_(descriptor), checkpoint_(std::move(checkpoint)) {}
 
 protected:
     std::streamsize xsputn(
@@ -357,6 +385,9 @@ protected:
     ) override {
         std::streamsize offset = 0;
         while (offset < count) {
+            if (checkpoint_) {
+                checkpoint_();
+            }
             const auto result = ::write(
                 descriptor_,
                 data + offset,
@@ -385,6 +416,7 @@ protected:
 
 private:
     int descriptor_;
+    std::function<void()> checkpoint_;
 };
 
 class TemporaryTransferFile final {
@@ -458,11 +490,12 @@ private:
 TransferProgress OperationEngine::measure(
     Provider& provider,
     const std::vector<Entry>& entries,
-    const Cancellation& cancellation
+    const Cancellation& cancellation,
+    const bool tolerate_errors
 ) {
     TransferProgress result;
     for (const auto& entry : entries) {
-        accumulate_entry(provider, entry, cancellation, result);
+        accumulate_entry(provider, entry, cancellation, result, tolerate_errors);
     }
     return result;
 }
@@ -476,14 +509,29 @@ bool OperationEngine::copy_entry(
     const Cancellation& cancellation,
     TransferProgress& state,
     const ProgressCallback& progress,
-    std::string& skip_reason
+    std::string& skip_reason,
+    const bool overwrite_current,
+    std::vector<Entry> ancestors,
+    std::shared_ptr<LinkCache> links
 ) {
+    if (!links) {
+        links = std::make_shared<LinkCache>();
+    }
     const auto before = state;
+    const bool existed_before = destination_provider.exists(destination);
+    bool allow_current = overwrite_current;
+    auto current_source = source;
+    bool refresh_source = false;
     for (;;) {
         try {
+            if (refresh_source) {
+                current_source = source_provider.stat(source.path, cancellation);
+                refresh_source = false;
+            }
             return copy_entry_once(
-                source_provider, source, destination_provider, destination,
-                options, cancellation, state, progress, skip_reason
+                source_provider, current_source, destination_provider, destination,
+                options, cancellation, state, progress, skip_reason,
+                allow_current, ancestors, links
             );
         } catch (const OperationCancelled&) {
             throw;
@@ -498,6 +546,14 @@ bool OperationEngine::copy_entry(
                     cancellation.throw_if_requested();
                     state = before;
                     skip_reason.clear();
+                    refresh_source = true;
+                    if (!existed_before &&
+                        (source.kind == EntryKind::directory ||
+                         (!options.preserve_symlinks && source.target_is_directory)) &&
+                        destination_provider.exists(destination) &&
+                        destination_provider.stat(destination, cancellation).kind == EntryKind::directory) {
+                        allow_current = true;
+                    }
                     continue;
                 case OperationErrorDecision::skip:
                     skip_reason = error.what();
@@ -518,14 +574,17 @@ bool OperationEngine::copy_entry_once(
     const Cancellation& cancellation,
     TransferProgress& state,
     const ProgressCallback& progress,
-    std::string& skip_reason
+    std::string& skip_reason,
+    const bool overwrite_current,
+    std::vector<Entry> ancestors,
+    const std::shared_ptr<LinkCache>& links
 ) {
     cancellation.throw_if_requested();
     const auto destination_path = std::string(destination);
-    if (source_provider.id() == destination_provider.id() &&
-        source_provider.normalize(source.path) ==
-            destination_provider.normalize(destination_path)) {
-        skip_reason = "source and destination are the same";
+    if (same_move_file(
+            source_provider, source.path, destination_provider, destination_path
+        )) {
+        skip_reason = "source and destination are the same file";
         return false;
     }
     if (source.kind == EntryKind::directory &&
@@ -542,7 +601,9 @@ bool OperationEngine::copy_entry_once(
     const bool destination_exists =
         destination_provider.exists(destination_path);
     const bool overwrite =
-        destination_exists
+        destination_exists && overwrite_current
+            ? true
+            : destination_exists
             ? should_overwrite(
                   source_provider,
                   source,
@@ -563,10 +624,50 @@ bool OperationEngine::copy_entry_once(
         source_provider, source.path, destination_provider, destination_path
     );
 
+    auto effective_source = source;
+    if (source.kind == EntryKind::symlink && !options.preserve_symlinks) {
+        effective_source = source_provider.stat_follow(source.path, cancellation);
+        if (same_move_file(source_provider, effective_source.path,
+                           destination_provider, destination_path)) {
+            skip_reason = "source and destination are the same file";
+            return false;
+        }
+    }
+    if (effective_source.kind != EntryKind::directory) {
+        state.bytes_total = std::max(state.bytes_total, state.bytes_done + effective_source.size);
+        state.files_total = std::max(state.files_total, state.files_done + 1U);
+    }
+    auto* local_source = dynamic_cast<LocalProvider*>(&source_provider);
+    auto* local_destination = dynamic_cast<LocalProvider*>(&destination_provider);
+    const auto link_key = source_provider.id() + "|" + source.revision;
+    const bool track_links =
+        local_source != nullptr && local_destination != nullptr &&
+        options.preserve_symlinks && source.kind == EntryKind::file &&
+        (links->contains(link_key) || local_source->hardlink_count(source.path) > 1U);
+    if (track_links) {
+        const auto cached = links->find(link_key);
+        if (cached != links->end() && destination_provider.exists(cached->second.first) &&
+            destination_provider.stat(cached->second.first, cancellation).revision == cached->second.second) {
+            local_destination->copy_hardlink(cached->second.first, destination_path, overwrite, cancellation);
+            cached->second.second = destination_provider.stat(cached->second.first, cancellation).revision;
+            state.bytes_done += effective_source.size;
+            ++state.files_done;
+            emit_completed_progress(progress, state);
+            return true;
+        }
+    }
+    const auto remember_link = [&] {
+        if (track_links) {
+            (*links)[link_key] = {
+                destination_path, destination_provider.stat(destination_path, cancellation).revision
+            };
+        }
+    };
+
     if (&source_provider == &destination_provider &&
         options.preserve_permissions &&
         options.preserve_symlinks &&
-        (source.kind != EntryKind::directory || !options.error) &&
+        source.kind != EntryKind::directory &&
         has_capability(
             source_provider.capabilities(),
             ProviderCapability::direct_copy
@@ -588,6 +689,8 @@ bool OperationEngine::copy_entry_once(
             }
         );
         if (copied_all) {
+            preserve_time(destination_provider, destination_path, source);
+            remember_link();
             TransferProgress completed;
             accumulate_entry(
                 source_provider,
@@ -604,14 +707,18 @@ bool OperationEngine::copy_entry_once(
         return copied_all;
     }
 
-    auto effective_source = source;
-    if (source.kind == EntryKind::symlink &&
-        !options.preserve_symlinks) {
-        effective_source =
-            source_provider.stat_follow(source.path, cancellation);
-    }
-
     if (effective_source.kind == EntryKind::directory) {
+        if (std::ranges::any_of(ancestors, [&](const Entry& ancestor) {
+                return same_move_file(
+                    source_provider, effective_source.path,
+                    source_provider, ancestor.path
+                );
+            })) {
+            throw std::runtime_error(
+                "cannot copy cyclic symbolic link: " + source.path
+            );
+        }
+        ancestors.push_back(effective_source);
         validate_directory_target(
             source_provider,
             effective_source.path,
@@ -642,7 +749,10 @@ bool OperationEngine::copy_entry_once(
                     cancellation,
                     state,
                     progress,
-                    skip_reason
+                    skip_reason,
+                    false,
+                    ancestors,
+                    links
                 ) && copied_all;
             } catch (const SkipCurrent&) {
                 copied_all = false;
@@ -663,6 +773,9 @@ bool OperationEngine::copy_entry_once(
                 effective_source.permissions
             );
         }
+        if (copied_all) {
+            preserve_time(destination_provider, destination_path, effective_source);
+        }
         return copied_all;
     }
 
@@ -680,8 +793,12 @@ bool OperationEngine::copy_entry_once(
         );
     } else {
         TemporaryTransferFile temporary;
-        DescriptorBuffer buffer(temporary.descriptor());
+        DescriptorBuffer buffer(temporary.descriptor(), [&] {
+            cancellation.throw_if_requested();
+            emit_progress(progress, state);
+        });
         std::ostream output(&buffer);
+        output.exceptions(std::ios::badbit | std::ios::failbit);
         source_provider.read(
             source.path,
             0,
@@ -697,15 +814,24 @@ bool OperationEngine::copy_entry_once(
         }
         temporary.close_output();
         std::ifstream input(temporary.path(), std::ios::binary);
-        destination_provider.write(
-            destination_path,
-            input,
-            effective_source.size,
-            overwrite,
-            std::nullopt,
-            cancellation,
-            {}
-        );
+        const auto callback = [&](const TransferProgress& value) {
+            auto overall = state;
+            overall.bytes_done += value.bytes_done;
+            overall.current_path = source.path;
+            emit_progress(progress, overall);
+        };
+        if (local_destination != nullptr && options.preserve_permissions &&
+            effective_source.permissions != std::filesystem::perms::unknown) {
+            local_destination->write_with_permissions(
+                destination_path, input, effective_source.size, overwrite,
+                cancellation, callback, effective_source.permissions
+            );
+        } else {
+            destination_provider.write(
+                destination_path, input, effective_source.size, overwrite,
+                std::nullopt, cancellation, callback
+            );
+        }
     }
 
     if (effective_source.kind != EntryKind::symlink &&
@@ -721,6 +847,8 @@ bool OperationEngine::copy_entry_once(
             effective_source.permissions
         );
     }
+    preserve_time(destination_provider, destination_path, effective_source);
+    remember_link();
     state.bytes_done += effective_source.size;
     ++state.files_done;
     emit_completed_progress(progress, state);
@@ -737,7 +865,8 @@ void OperationEngine::copy(
     const ProgressCallback& progress,
     OperationResult* result
 ) const {
-    auto state = measure(source_provider, sources, cancellation);
+    auto state = measure(source_provider, sources, cancellation, static_cast<bool>(options.error));
+    auto links = std::make_shared<LinkCache>();
     for (const auto& source : sources) {
         try {
             std::string skip_reason;
@@ -753,7 +882,10 @@ void OperationEngine::copy(
                 cancellation,
                 state,
                 progress,
-                skip_reason
+                skip_reason,
+                false,
+                {},
+                links
             );
             if (copied) {
                 record_completed(result, source);
@@ -795,7 +927,7 @@ void OperationEngine::copy_exact(
         );
         return;
     }
-    auto state = measure(source_provider, {source}, cancellation);
+    auto state = measure(source_provider, {source}, cancellation, static_cast<bool>(options.error));
     try {
         std::string skip_reason;
         if (copy_entry(
@@ -833,7 +965,7 @@ void OperationEngine::move(
             source_provider.capabilities(),
             ProviderCapability::rename
         )) {
-        auto state = measure(source_provider, sources, cancellation);
+        auto state = measure(source_provider, sources, cancellation, static_cast<bool>(options.error));
         for (const auto& source : sources) {
             cancellation.throw_if_requested();
             state.current_path = source.path;
@@ -916,7 +1048,8 @@ void OperationEngine::move(
                         cancellation
                     ),
                     cancellation,
-                    completed
+                    completed,
+                    true
                 );
                 state.bytes_done += completed.bytes_total;
                 state.files_done += completed.files_total;
@@ -935,7 +1068,7 @@ void OperationEngine::move(
                     destination_provider,
                     destination,
                     {
-                        .overwrite = overwrite,
+                        .overwrite = options.overwrite,
                         .preserve_permissions =
                             options.preserve_permissions,
                         .preserve_symlinks =
@@ -946,7 +1079,8 @@ void OperationEngine::move(
                     cancellation,
                     state,
                     progress,
-                    skip_reason
+                    skip_reason,
+                    overwrite
                 );
                 if (copied) {
                     if (remove_with_retry(
@@ -976,7 +1110,7 @@ void OperationEngine::move(
         }
         return;
     }
-    auto state = measure(source_provider, sources, cancellation);
+    auto state = measure(source_provider, sources, cancellation, static_cast<bool>(options.error));
     for (const auto& source : sources) {
         try {
             const auto destination = destination_provider.join(
@@ -1042,7 +1176,7 @@ void OperationEngine::remove(
 ) const {
     TransferProgress state;
     for (const auto& entry : entries) {
-        accumulate_removal(provider, entry, cancellation, state);
+        accumulate_removal(provider, entry, cancellation, state, static_cast<bool>(error));
     }
     for (const auto& entry : entries) {
         cancellation.throw_if_requested();
@@ -1144,7 +1278,7 @@ void OperationEngine::move_exact(
                 throw OperationCancelled{};
         }
     }
-    auto state = measure(source_provider, {source}, cancellation);
+    auto state = measure(source_provider, {source}, cancellation, static_cast<bool>(options.error));
     state.current_path = source.path;
     try {
         emit_progress(progress, state);
@@ -1210,7 +1344,7 @@ void OperationEngine::move_exact(
             destination_provider,
             destination,
             {
-                .overwrite = overwrite,
+                .overwrite = options.overwrite,
                 .preserve_permissions = options.preserve_permissions,
                 .preserve_symlinks = options.preserve_symlinks,
                 .collision = options.collision,
@@ -1219,7 +1353,8 @@ void OperationEngine::move_exact(
             cancellation,
             state,
             progress,
-            skip_reason
+            skip_reason,
+            overwrite
         );
     } catch (const SkipCurrent&) {
         record_skipped(result, source, "user requested skip");

@@ -14,12 +14,77 @@
 #include <pwd.h>
 #include <sstream>
 #include <stdexcept>
+#include <system_error>
 #include <sys/syscall.h>
 #include <sys/stat.h>
+#include <sys/xattr.h>
 #include <unistd.h>
 
 namespace mcpp {
 namespace {
+
+struct OutputMetadata {
+    struct stat status{};
+    std::vector<std::pair<std::string, std::vector<char>>> attributes;
+};
+
+std::optional<OutputMetadata> output_metadata(const std::filesystem::path& path) {
+    OutputMetadata result;
+    if (::lstat(path.c_str(), &result.status) != 0) {
+        if (errno == ENOENT || errno == ENOTDIR) {
+            return std::nullopt;
+        }
+        throw std::system_error(errno, std::generic_category(), "inspect output metadata");
+    }
+    if (!S_ISREG(result.status.st_mode)) {
+        return std::nullopt;
+    }
+    const auto count = listxattr(path.c_str(), nullptr, 0);
+    if (count < 0) {
+        if (errno == ENOTSUP || errno == EOPNOTSUPP) {
+            return result;
+        }
+        throw std::system_error(errno, std::generic_category(), "read output attribute list");
+    }
+    std::vector<char> names(static_cast<std::size_t>(count));
+    if (count > 0 && listxattr(path.c_str(), names.data(), names.size()) != count) {
+        throw std::runtime_error("output attributes changed while saving: " + path.string());
+    }
+    for (std::size_t offset = 0; offset < names.size();) {
+        const std::string name(names.data() + offset);
+        offset += name.size() + 1U;
+        if (!name.starts_with("user.") && name != "system.posix_acl_access") {
+            continue;
+        }
+        const auto size = getxattr(path.c_str(), name.c_str(), nullptr, 0);
+        if (size < 0) {
+            throw std::system_error(errno, std::generic_category(), "read output attribute");
+        }
+        std::vector<char> value(static_cast<std::size_t>(size));
+        if (getxattr(path.c_str(), name.c_str(), value.data(), value.size()) != size) {
+            throw std::runtime_error("output attribute changed while saving: " + name);
+        }
+        result.attributes.emplace_back(name, std::move(value));
+    }
+    return result;
+}
+
+mode_t creation_mode() {
+    std::ifstream status("/proc/self/status");
+    std::string line;
+    while (std::getline(status, line)) {
+        if (line.starts_with("Umask:")) {
+            std::istringstream input(line.substr(6));
+            unsigned int mask = 0;
+            input >> std::oct >> mask;
+            if (input && mask <= 0777U) {
+                return static_cast<mode_t>(0666U & ~mask);
+            }
+            break;
+        }
+    }
+    throw std::runtime_error("cannot read the process umask from /proc/self/status");
+}
 
 bool path_is_within(
     const std::filesystem::path& root,
@@ -52,6 +117,16 @@ bool lstat_if_present(
         path,
         std::error_code(failure, std::generic_category())
     );
+}
+
+std::string revision_for(const struct stat& status) {
+    return std::to_string(status.st_dev) + ":" +
+           std::to_string(status.st_ino) + ":" +
+           std::to_string(status.st_mtim.tv_sec) + ":" +
+           std::to_string(status.st_mtim.tv_nsec) + ":" +
+           std::to_string(status.st_size) + ":" +
+           std::to_string(status.st_ctim.tv_sec) + ":" +
+           std::to_string(status.st_ctim.tv_nsec);
 }
 
 std::string lowercase(std::string value) {
@@ -459,12 +534,7 @@ Entry LocalProvider::make_entry(
                 std::chrono::seconds(native_status.st_mtim.tv_sec) +
                 std::chrono::nanoseconds(native_status.st_mtim.tv_nsec)
             };
-        result.revision =
-            std::to_string(native_status.st_dev) + ":" +
-            std::to_string(native_status.st_ino) + ":" +
-            std::to_string(native_status.st_mtim.tv_sec) + ":" +
-            std::to_string(native_status.st_mtim.tv_nsec) + ":" +
-            std::to_string(native_status.st_size);
+        result.revision = revision_for(native_status);
     }
     return result;
 }
@@ -670,7 +740,33 @@ void LocalProvider::write(
     const Cancellation& cancellation,
     const ProgressCallback& progress
 ) {
+    write_impl(path, input, length, overwrite, expected_revision, cancellation, progress, std::nullopt);
+}
+
+void LocalProvider::write_with_permissions(
+    const std::string_view path, std::istream& input,
+    const std::optional<std::uint64_t> length, const bool overwrite,
+    const Cancellation& cancellation, const ProgressCallback& progress,
+    const std::filesystem::perms permissions
+) {
+    if (permissions == std::filesystem::perms::unknown) {
+        throw std::invalid_argument("copy permissions are unknown");
+    }
+    write_impl(path, input, length, overwrite, std::nullopt, cancellation, progress, permissions);
+}
+
+void LocalProvider::write_impl(
+    const std::string_view path, std::istream& input,
+    const std::optional<std::uint64_t> length, const bool overwrite,
+    const std::optional<std::string> expected_revision,
+    const Cancellation& cancellation, const ProgressCallback& progress,
+    const std::optional<std::filesystem::perms> permissions
+) {
     const auto destination = resolve(path);
+    const auto metadata = output_metadata(destination);
+    const auto destination_permissions =
+        permissions ? static_cast<mode_t>(static_cast<unsigned int>(*permissions) & 07777U)
+                    : metadata ? metadata->status.st_mode & 07777U : creation_mode();
     if (!overwrite && exists(destination.string())) {
         throw std::runtime_error(
             "destination exists: " + destination.string()
@@ -698,31 +794,30 @@ void LocalProvider::write(
         );
     }
     const std::filesystem::path temporary(temporary_buffer.data());
-    auto destination_permissions = std::filesystem::perms::owner_read |
-                                   std::filesystem::perms::owner_write;
-    if (exists(destination.string())) {
-        destination_permissions =
-            std::filesystem::symlink_status(destination).permissions();
-    }
-    if (fchmod(
-            descriptor,
-            static_cast<mode_t>(
-                static_cast<unsigned int>(destination_permissions) &
-                07777U
-            )
-        ) != 0) {
-        const auto failure = errno;
-        static_cast<void>(close(descriptor));
-        std::error_code ignored;
-        std::filesystem::remove(temporary, ignored);
-        throw std::runtime_error(
-            "cannot set temporary output permissions: " +
-            std::string(std::strerror(failure))
-        );
-    }
     std::array<char, 64U * 1024U> buffer{};
     std::uint64_t written = 0;
     try {
+        if (metadata &&
+            (metadata->status.st_uid != geteuid() || metadata->status.st_gid != getegid()) &&
+            fchown(descriptor, metadata->status.st_uid, metadata->status.st_gid) != 0) {
+            throw std::system_error(errno, std::generic_category(), "preserve output ownership");
+        }
+        if (metadata && fremovexattr(descriptor, "system.posix_acl_access") != 0 &&
+            errno != ENODATA && errno != ENOTSUP && errno != EOPNOTSUPP) {
+            throw std::system_error(errno, std::generic_category(), "clear inherited output ACL");
+        }
+        if (metadata) {
+            for (const auto& [name, value] : metadata->attributes) {
+                if (fsetxattr(descriptor, name.c_str(), value.data(), value.size(), 0) != 0) {
+                    throw std::system_error(
+                        errno, std::generic_category(), "preserve output attribute " + name
+                    );
+                }
+            }
+        }
+        if (fchmod(descriptor, static_cast<mode_t>(destination_permissions)) != 0) {
+            throw std::system_error(errno, std::generic_category(), "set temporary output permissions");
+        }
         while (input) {
             cancellation.throw_if_requested();
             input.read(
@@ -788,6 +883,15 @@ void LocalProvider::write(
         }
         descriptor = -1;
         cancellation.throw_if_requested();
+        if (progress) {
+            progress({
+                .bytes_done = written,
+                .bytes_total = length.value_or(0),
+                .files_done = 0,
+                .files_total = 1,
+                .current_path = destination.string(),
+            });
+        }
         if (overwrite) {
             if (expected_revision) {
                 const auto current = stat(
@@ -798,6 +902,15 @@ void LocalProvider::write(
                     throw std::runtime_error(
                         "destination changed while saving: " +
                         destination.string()
+                    );
+                }
+            }
+            if (metadata) {
+                struct stat current{};
+                if (!lstat_if_present(destination, current) ||
+                    revision_for(current) != revision_for(metadata->status)) {
+                    throw std::runtime_error(
+                        "destination metadata changed while saving: " + destination.string()
                     );
                 }
             }
@@ -827,6 +940,101 @@ void LocalProvider::write(
     }
 }
 
+std::uintmax_t LocalProvider::hardlink_count(const std::string_view path) const {
+    return std::filesystem::hard_link_count(resolve_follow(path));
+}
+
+void LocalProvider::ensure_writable(const std::string_view path) const {
+    const auto target = resolve_follow(path);
+    if (faccessat(AT_FDCWD, target.c_str(), W_OK, AT_EACCESS) != 0) {
+        throw std::system_error(
+            errno, std::generic_category(), "file is not writable: " + target.string()
+        );
+    }
+}
+
+void LocalProvider::set_modified(
+    const std::string_view path,
+    const std::chrono::system_clock::time_point modified
+) {
+    const auto target = resolve(path);
+    const auto seconds = std::chrono::floor<std::chrono::seconds>(modified.time_since_epoch());
+    const auto nanos = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        modified.time_since_epoch() - seconds
+    );
+    timespec times[2]{};
+    times[0].tv_nsec = UTIME_OMIT;
+    times[1].tv_sec = static_cast<time_t>(seconds.count());
+    times[1].tv_nsec = static_cast<long>(nanos.count());
+    if (utimensat(AT_FDCWD, target.c_str(), times, AT_SYMLINK_NOFOLLOW) != 0) {
+        throw std::system_error(errno, std::generic_category(), "preserve modification time");
+    }
+}
+
+void LocalProvider::write_in_place(
+    const std::string_view path,
+    std::istream& input,
+    const std::uint64_t length,
+    const std::optional<std::string>& expected_revision,
+    const Cancellation& cancellation
+) {
+    const auto target = resolve_follow(path);
+    ensure_writable(path);
+    cancellation.throw_if_requested();
+    if (expected_revision && stat(target.string(), cancellation).revision != *expected_revision) {
+        throw std::runtime_error("destination changed since it was opened: " + target.string());
+    }
+    const int descriptor = open(target.c_str(), O_WRONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+    if (descriptor < 0) {
+        throw std::system_error(errno, std::generic_category(), "open linked file for writing");
+    }
+    try {
+        struct stat current{};
+        if (fstat(descriptor, &current) != 0 || !S_ISREG(current.st_mode)) {
+            throw std::runtime_error("linked save requires a regular file");
+        }
+        if (expected_revision && revision_for(current) != *expected_revision) {
+            throw std::runtime_error("destination changed while opening linked save: " + target.string());
+        }
+        std::array<char, 64U * 1024U> data{};
+        std::uint64_t written = 0;
+        while (written < length) {
+            cancellation.throw_if_requested();
+            const auto count = static_cast<std::streamsize>(
+                std::min<std::uint64_t>(data.size(), length - written)
+            );
+            input.read(data.data(), count);
+            if (input.gcount() != count) {
+                throw std::runtime_error("linked save input ended unexpectedly");
+            }
+            std::streamsize offset = 0;
+            while (offset < count) {
+                const auto result = pwrite(
+                    descriptor, data.data() + offset, static_cast<std::size_t>(count - offset),
+                    static_cast<off_t>(written + static_cast<std::uint64_t>(offset))
+                );
+                if (result < 0 && errno == EINTR) {
+                    continue;
+                }
+                if (result <= 0) {
+                    throw std::system_error(errno, std::generic_category(), "write linked file");
+                }
+                offset += result;
+            }
+            written += static_cast<std::uint64_t>(count);
+        }
+        if (ftruncate(descriptor, static_cast<off_t>(length)) != 0 || fsync(descriptor) != 0) {
+            throw std::system_error(errno, std::generic_category(), "commit linked save");
+        }
+    } catch (...) {
+        close(descriptor);
+        throw;
+    }
+    if (close(descriptor) != 0) {
+        throw std::system_error(errno, std::generic_category(), "close linked save");
+    }
+}
+
 void LocalProvider::create_directory(const std::string_view path) {
     std::error_code error;
     if (!std::filesystem::create_directories(resolve(path), error) &&
@@ -835,6 +1043,49 @@ void LocalProvider::create_directory(const std::string_view path) {
             "cannot create directory: " + error.message()
         );
     }
+}
+
+void LocalProvider::copy_hardlink(
+    const std::string_view source, const std::string_view destination,
+    const bool overwrite, const Cancellation& cancellation
+) {
+    const auto from = resolve(source);
+    const auto to = resolve(destination);
+    cancellation.throw_if_requested();
+    if (same_file(from.string(), *this, to.string())) {
+        return;
+    }
+    struct stat original{};
+    if (!lstat_if_present(from, original) || !S_ISREG(original.st_mode)) {
+        throw std::runtime_error("copied hardlink source is not a regular file");
+    }
+    std::filesystem::create_directories(to.parent_path());
+    auto pattern = (to.parent_path() / ".mcpp-hardlink-XXXXXX").string();
+    if (mkdtemp(pattern.data()) == nullptr) {
+        throw std::system_error(errno, std::generic_category(), "stage copied hardlink");
+    }
+    const std::filesystem::path directory(pattern);
+    const auto temporary = directory / "link";
+    try {
+        std::filesystem::create_hard_link(from, temporary);
+        struct stat staged{};
+        if (!lstat_if_present(temporary, staged) ||
+            staged.st_dev != original.st_dev || staged.st_ino != original.st_ino) {
+            throw std::runtime_error("copied hardlink source changed during publication");
+        }
+        cancellation.throw_if_requested();
+        if (overwrite) {
+            std::filesystem::rename(temporary, to);
+        } else if (!rename_no_replace(temporary, to)) {
+            throw std::runtime_error("destination exists: " + to.string());
+        }
+    } catch (...) {
+        std::error_code ignored;
+        std::filesystem::remove(temporary, ignored);
+        std::filesystem::remove(directory, ignored);
+        throw;
+    }
+    std::filesystem::remove(directory);
 }
 
 void LocalProvider::remove(
@@ -1049,14 +1300,14 @@ bool LocalProvider::copy_direct(
     try {
         DescriptorInputBuffer source_buffer(source_descriptor);
         std::istream input(&source_buffer);
-        write(
+        write_with_permissions(
             destination_path.string(),
             input,
             source_entry.size,
             overwrite,
-            std::nullopt,
             cancellation,
-            progress
+            progress,
+            source_entry.permissions
         );
     } catch (...) {
         close(source_descriptor);

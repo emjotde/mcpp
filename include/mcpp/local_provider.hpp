@@ -32,6 +32,23 @@ public:
         const LocalProvider& destination_provider,
         std::string_view destination
     ) const;
+    [[nodiscard]] std::uintmax_t hardlink_count(std::string_view path) const;
+    void ensure_writable(std::string_view path) const;
+    void set_modified(
+        std::string_view path,
+        std::chrono::system_clock::time_point modified
+    );
+    void write_in_place(
+        std::string_view path,
+        std::istream& input,
+        std::uint64_t length,
+        const std::optional<std::string>& expected_revision,
+        const Cancellation& cancellation
+    );
+    void copy_hardlink(
+        std::string_view source, std::string_view destination,
+        bool overwrite, const Cancellation& cancellation
+    );
     [[nodiscard]] std::vector<Entry> list(
         std::string_view path,
         const ListRequest& request,
@@ -65,6 +82,12 @@ public:
         const Cancellation& cancellation,
         const ProgressCallback& progress
     ) override;
+    void write_with_permissions(
+        std::string_view path, std::istream& input,
+        std::optional<std::uint64_t> length, bool overwrite,
+        const Cancellation& cancellation, const ProgressCallback& progress,
+        std::filesystem::perms permissions
+    );
     void create_directory(std::string_view path) override;
     void remove(
         std::string_view path,
@@ -105,6 +128,13 @@ public:
     ) override;
 
 private:
+    void write_impl(
+        std::string_view path, std::istream& input,
+        std::optional<std::uint64_t> length, bool overwrite,
+        std::optional<std::string> expected_revision,
+        const Cancellation& cancellation, const ProgressCallback& progress,
+        std::optional<std::filesystem::perms> permissions
+    );
     [[nodiscard]] std::filesystem::path resolve(
         std::string_view path
     ) const;

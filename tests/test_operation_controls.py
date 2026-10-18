@@ -17,12 +17,19 @@ def run(binary, tmux):
     try:
         for case in (
             "collision", "all", "none", "older", "retry", "ignore",
-            "move-retry", "delete-retry",
+            "move-retry", "delete-retry", "older-directory",
         ):
             left, right = root / case / "left", root / case / "right"
             left.mkdir(parents=True)
             right.mkdir()
             (left / "a.txt").write_bytes(b"NEW A\n")
+            if case == "older-directory":
+                (left / "tree").mkdir()
+                (right / "tree").mkdir()
+                (left / "tree/a.txt").write_bytes(b"OLDER SOURCE\n")
+                (right / "tree/a.txt").write_bytes(b"NEWER TARGET\n")
+                os.utime(left / "tree/a.txt", (1000, 1000))
+                os.utime(right / "tree/a.txt", (2000, 2000))
             multiple = case in ("collision", "all", "none", "older", "ignore")
             if multiple:
                 (left / "b.txt").write_bytes(b"NEW B\n")
@@ -51,14 +58,21 @@ def run(binary, tmux):
                     session.press("Down")
                     if multiple:
                         session.press("C-a")
-                    key = {"move-retry": "F6", "delete-retry": "F8"}.get(case, "F5")
+                    key = {"move-retry": "F6", "delete-retry": "F8",
+                           "older-directory": "F6"}.get(case, "F5")
                     session.press(key)
                     session.wait_for(
                         "Delete 1 selected item(s)?" if case == "delete-retry"
                         else "Source mask:"
                     )
                     session.press("Enter")
-                    if case == "collision":
+                    if case == "older-directory":
+                        session.wait_for("Destination exists")
+                        session.type("o")
+                        session.wait_for("Move incomplete: 1 skipped")
+                        session.wait_file(left / "tree/a.txt", b"OLDER SOURCE\n")
+                        session.wait_file(right / "tree/a.txt", b"NEWER TARGET\n")
+                    elif case == "collision":
                         session.wait_for("Destination exists")
                         session.wait_for("Source: " + str(left / "a.txt"))
                         session.type("n")
@@ -121,7 +135,7 @@ def run(binary, tmux):
                 left.chmod(0o700)
                 right.chmod(0o700)
                 for path in left.iterdir():
-                    path.chmod(0o600)
+                    path.chmod(0o700 if path.is_dir() else 0o600)
         passed = True
     finally:
         if passed:

@@ -21,6 +21,8 @@ struct EditorPosition {
     auto operator<=>(const EditorPosition&) const = default;
 };
 
+enum class EditorLineEnding { unchanged, lf, crlf, cr };
+
 class EditorModel {
 public:
     void open(
@@ -73,7 +75,8 @@ public:
     void insert(std::string_view text);
     void paste(std::string_view text);
     void newline(bool auto_indent = false);
-    void backspace();
+    void tab(std::size_t indent_width, bool fill_spaces = false);
+    void backspace(std::size_t indent_width = 0);
     void erase();
     void delete_block_or_line();
     void delete_line();
@@ -100,9 +103,26 @@ public:
         bool force,
         const Cancellation& cancellation = {}
     );
+    [[nodiscard]] std::uintmax_t hardlink_count() const;
+    void save_preserving_links(
+        bool force = false,
+        const Cancellation& cancellation = {}
+    );
     void save_as(
         std::string path,
         bool force,
+        const Cancellation& cancellation = {}
+    );
+    void save_as(
+        std::string path,
+        bool force,
+        EditorLineEnding ending,
+        const Cancellation& cancellation = {}
+    );
+    void save_as_preserving_links(
+        std::string path,
+        bool force,
+        EditorLineEnding ending,
         const Cancellation& cancellation = {}
     );
     [[nodiscard]] bool find(
@@ -155,8 +175,11 @@ public:
     );
 
 private:
+    void save_as_impl(
+        std::string path, bool force, EditorLineEnding ending,
+        bool preserve_links, const Cancellation& cancellation
+    );
     struct Snapshot {
-        std::vector<std::string> lines;
         std::size_t row{0};
         std::size_t column{0};
         std::optional<EditorPosition> selection_begin;
@@ -165,6 +188,16 @@ private:
         bool column_selection{false};
         std::optional<std::size_t> column_selection_width;
         std::size_t byte_size{0};
+    };
+    struct UndoRecord {
+        Snapshot before;
+        Snapshot after;
+        std::size_t offset{0};
+        std::string removed;
+        std::string inserted;
+        [[nodiscard]] std::size_t bytes() const noexcept {
+            return removed.size() + inserted.size();
+        }
     };
 
     [[nodiscard]] std::string content() const;
@@ -191,7 +224,10 @@ private:
         bool include_selection_end = false
     );
     void erase_text(EditorPosition begin, EditorPosition end);
+    void edit_text(EditorPosition begin, EditorPosition end, std::string_view replacement);
     void record_undo();
+    void finalize_undo();
+    [[nodiscard]] std::optional<EditorSearchMatch> selected_match() const;
     [[nodiscard]] Snapshot snapshot() const;
     void trim_undo();
     void restore(Snapshot snapshot);
@@ -215,8 +251,15 @@ private:
     bool new_file_{false};
     std::size_t tab_width_{8};
     std::string clipboard_;
-    std::vector<Snapshot> undo_;
-    std::vector<Snapshot> redo_;
+    std::vector<UndoRecord> undo_;
+    std::vector<UndoRecord> redo_;
+    std::optional<Snapshot> pending_undo_;
+    std::string pending_content_;
+    std::optional<EditorSearchMatch> search_match_;
+    std::string search_match_pattern_;
+    EditorSearchOptions search_match_options_;
+    std::uint64_t search_match_change_id_{0};
+    std::optional<std::size_t> search_resume_;
     std::size_t undo_bytes_{0};
     std::size_t redo_bytes_{0};
 };

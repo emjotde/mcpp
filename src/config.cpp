@@ -1,7 +1,9 @@
 #include "mcpp/config.hpp"
 
+#include <algorithm>
 #include <charconv>
 #include <cerrno>
+#include <cctype>
 #include <cstring>
 #include <cstdlib>
 #include <fstream>
@@ -17,8 +19,19 @@
 namespace mcpp {
 namespace {
 
-bool parse_bool(const std::string& value) {
-    return value == "true" || value == "1" || value == "yes";
+bool parse_bool(const std::string& value, const std::string& key) {
+    auto normalized = value;
+    std::transform(normalized.begin(), normalized.end(), normalized.begin(),
+                   [](const unsigned char character) {
+                       return static_cast<char>(std::tolower(character));
+                   });
+    if (normalized == "true" || normalized == "1" || normalized == "yes") {
+        return true;
+    }
+    if (normalized == "false" || normalized == "0" || normalized == "no") {
+        return false;
+    }
+    throw std::runtime_error("invalid boolean setting: " + key + "=" + value);
 }
 
 std::size_t parse_width(
@@ -110,6 +123,11 @@ Config Config::load(const std::filesystem::path& path) {
     Config result;
     std::ifstream input(path);
     if (!input) {
+        std::error_code error;
+        const bool present = std::filesystem::exists(path, error);
+        if (error || present) {
+            throw std::runtime_error("cannot read configuration: " + path.string());
+        }
         return result;
     }
     std::string line;
@@ -124,23 +142,23 @@ Config Config::load(const std::filesystem::path& path) {
         const auto key = line.substr(0, equals);
         const auto value = line.substr(equals + 1U);
         if (key == "show_hidden") {
-            result.show_hidden = parse_bool(value);
+            result.show_hidden = parse_bool(value, key);
         } else if (key == "confirm_delete") {
-            result.confirm_delete = parse_bool(value);
+            result.confirm_delete = parse_bool(value, key);
         } else if (key == "confirm_overwrite") {
-            result.confirm_overwrite = parse_bool(value);
+            result.confirm_overwrite = parse_bool(value, key);
         } else if (key == "directories_first") {
-            result.directories_first = parse_bool(value);
+            result.directories_first = parse_bool(value, key);
         } else if (key == "sort") {
             result.sort = parse_sort(value);
         } else if (key == "sort_descending") {
-            result.sort_descending = parse_bool(value);
+            result.sort_descending = parse_bool(value, key);
         } else if (key == "theme") {
             result.theme = decode_value(value);
         } else if (key == "editor_syntax") {
-            result.editor_syntax = parse_bool(value);
+            result.editor_syntax = parse_bool(value, key);
         } else if (key == "editor_line_numbers") {
-            result.editor_line_numbers = parse_bool(value);
+            result.editor_line_numbers = parse_bool(value, key);
         } else if (key == "editor_tab_width") {
             result.editor_tab_width = parse_width(
                 value,
@@ -152,14 +170,17 @@ Config Config::load(const std::filesystem::path& path) {
                 result.editor_indent_width
             );
         } else if (key == "editor_auto_indent") {
-            result.editor_auto_indent = parse_bool(value);
+            result.editor_auto_indent = parse_bool(value, key);
         } else if (key == "editor_show_whitespace") {
-            result.editor_show_whitespace = parse_bool(value);
+            result.editor_show_whitespace = parse_bool(value, key);
         } else if (key == "bookmark") {
             result.bookmarks.push_back(decode_value(value));
         } else if (key == "editor_history") {
             result.editor_history.push_back(decode_value(value));
         }
+    }
+    if (input.bad()) {
+        throw std::runtime_error("failed while reading configuration: " + path.string());
     }
     return result;
 }

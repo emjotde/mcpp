@@ -3,6 +3,8 @@
 #include "mcpp/provider.hpp"
 
 #include <functional>
+#include <map>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -105,10 +107,12 @@ public:
     ) const;
 
 private:
+    using LinkCache = std::map<std::string, std::pair<std::string, std::string>>;
     static TransferProgress measure(
         Provider& provider,
         const std::vector<Entry>& entries,
-        const Cancellation& cancellation
+        const Cancellation& cancellation,
+        bool tolerate_errors = false
     );
 
     static bool copy_entry(
@@ -120,7 +124,10 @@ private:
         const Cancellation& cancellation,
         TransferProgress& state,
         const ProgressCallback& progress,
-        std::string& skip_reason
+        std::string& skip_reason,
+        bool overwrite_current = false,
+        std::vector<Entry> ancestors = {},
+        std::shared_ptr<LinkCache> links = {}
     );
     static bool copy_entry_once(
         Provider& source_provider,
@@ -131,7 +138,10 @@ private:
         const Cancellation& cancellation,
         TransferProgress& state,
         const ProgressCallback& progress,
-        std::string& skip_reason
+        std::string& skip_reason,
+        bool overwrite_current,
+        std::vector<Entry> ancestors,
+        const std::shared_ptr<LinkCache>& links
     );
 };
 

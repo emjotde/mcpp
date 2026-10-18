@@ -7,6 +7,8 @@
 
 namespace mcpp {
 
+using SearchErrorCallback = std::function<void(const std::string&, const std::string&)>;
+
 struct SearchOptions {
     std::string name_pattern{"*"};
     std::string content;
@@ -22,7 +24,8 @@ public:
         std::string_view root,
         const SearchOptions& options,
         const Cancellation& cancellation,
-        const ProgressCallback& progress = {}
+        const ProgressCallback& progress = {},
+        const SearchErrorCallback& error = {}
     ) const;
 };
 

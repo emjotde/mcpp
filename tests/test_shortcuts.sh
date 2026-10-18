@@ -4,7 +4,8 @@ set -euo pipefail
 binary="$1"
 script_command="$2"
 timeout_command="$3"
-temporary="$(mktemp -d /tmp/mcpp-shortcut-test.XXXXXX)"
+temporary="$PWD/mcpp-shortcut-test-$BASHPID"
+mkdir -m 700 -- "$temporary"
 trap 'rm -rf -- "$temporary"' EXIT
 mkdir -p "$temporary/left" "$temporary/right"
 for ((index = 1; index <= 40; ++index)); do
@@ -68,6 +69,8 @@ printf '\033' >&3
 sleep 0.4
 printf '\030d' >&3
 sleep 0.4
+printf '\r' >&3
+sleep 0.4
 printf '\034' >&3
 sleep 0.4
 printf '\033' >&3
@@ -122,6 +125,9 @@ if ((status != 0)); then
     exit 1
 fi
 
+sed -E 's/\x1b\[[0-?]*[ -/]*[@-~]//g' \
+    "$temporary/output" >"$temporary/output-clean"
+
 for expected in \
     'Quick view: a.txt' \
     'Quick view: b.txt' \
@@ -142,13 +148,13 @@ for expected in \
     'Unselect group' \
     'Delete 2 selected item(s)?' \
     'Delete 1 selected item(s)?'; do
-    if ! grep -aFq "$expected" "$temporary/output"; then
+    if ! grep -aFq "$expected" "$temporary/output-clean"; then
         printf 'shortcut did not open: %s\n' "$expected" >&2
         exit 1
     fi
 done
 
-if grep -aFq 'Quick view: c.txt' "$temporary/output"; then
+if grep -aFq 'Quick view: c.txt' "$temporary/output-clean"; then
     printf 'F9 opened the panel menu for the inactive pane\n' >&2
     exit 1
 fi

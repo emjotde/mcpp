@@ -15,6 +15,8 @@ public:
     void refresh(const Cancellation& cancellation = {});
     void move_cursor(int amount);
     void page_cursor(int amount);
+    void set_viewport_rows(std::size_t rows);
+    [[nodiscard]] std::size_t first_row() const noexcept;
     bool enter(const Cancellation& cancellation = {});
     bool up(const Cancellation& cancellation = {});
     bool history_back(const Cancellation& cancellation = {});
@@ -66,12 +68,15 @@ private:
         const Cancellation& cancellation
     );
     void restore_child_cursor(std::string_view child_path);
+    void keep_cursor_visible();
 
     ProviderPtr provider_;
     std::string path_;
     std::vector<Entry> entries_;
     std::set<std::string, std::less<>> selected_;
     std::size_t cursor_{0};
+    std::size_t first_row_{0};
+    std::size_t viewport_rows_{1};
     bool show_hidden_{false};
     bool directories_first_{true};
     std::string filter_;

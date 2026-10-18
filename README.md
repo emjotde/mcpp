@@ -27,6 +27,8 @@ Azure Blob Storage through azcpp. SSH/SFTP work is currently paused.
   relative destinations use the active pane and a trailing slash requests a directory
 - Skipped sources are reported as incomplete and keep their selection marks
 - Atomic no-clobber writes and symlink/root confinement
+- Source-cycle rejection, preserved copy modification times and copied hardlink groups
+- Creation permissions follow the process umask when permissions are not preserved
 - Mode, owner/group, file information, free-space display, and links
 - Directory comparison plus fixed-width Quick view and live Info panels
 - Local command line, history, and a disposable interactive child shell
@@ -38,6 +40,11 @@ Azure Blob Storage through azcpp. SSH/SFTP work is currently paused.
 - Persistent linear/column blocks and atomic cross-session editor clipboard
 - Persistent editor history and switchable multi-buffer editing
 - Clickable editor menus and mouse-drag linear/Alt-drag column blocks
+- Clickable function-key bars, consistent modal controls and pointer-editable command text
+- Direct View/Edit from Find results with the result position retained on return
+- Stable listing viewports and filename-preserving headers for long paths
+- Staged viewer hex/ASCII edits with explicit save/discard decisions
+- UTF-8-aware character search, greedy wildcard captures and regex replacement escapes
 
 The implementation is behaviorally familiar but does not use Midnight
 Commander source code, resources, strings, tests, or artwork. A shallow MC
@@ -110,6 +117,7 @@ The current parity gaps against GNU Midnight Commander are documented in
 | `*` | Invert files, including directory symlinks; leave real-directory marks unchanged |
 | `Ctrl-S` / `Alt-S` | Incremental panel search |
 | `Ctrl-X Q` | Toggle quick view |
+| Tree click / double-click | Select a directory / open it in the opposite pane |
 | Tree `Enter` | Open selected directory and expand its branch |
 | Tree `Space` / `+` / `-` | Toggle, expand, or collapse branch |
 | Tree `F2` | Rescan the selected branch without losing selection |
@@ -125,7 +133,8 @@ The current parity gaps against GNU Midnight Commander are documented in
 Simple prompts use `Tab` / `Shift-Tab` to move between the input, OK and
 Cancel. Input Enter accepts; focused buttons accept Enter or Space, and can
 also be clicked. Escape cancels. File / View file... prompts for a filename;
-relative filenames are resolved against the active pane.
+relative filenames are resolved against the active pane. Prefilled defaults
+are selected for replacement; recalled history and command drafts stay editable.
 
 Text inputs support `Left`/`Right`, `Home`/`End`, `Ctrl-Left`/`Ctrl-Right`,
 Shift movement for selection, and Delete/Backspace at the cursor. `Ctrl-K`
@@ -135,7 +144,8 @@ the commander's `Ctrl-U` pane-swap shortcut is unchanged.
 
 Use `Alt-Tab` (or Escape followed by Tab) to complete a dialog path.
 Repeated `Alt-Tab` cycles ambiguous matches. This completes filesystem paths,
-not shell variables or command names.
+not shell variables or command names. Editor file dialogs resolve and complete
+relative paths against the edited file's directory.
 
 Left / Right / Panelize by name... performs local recursive filename matching.
 External-command panelization is not implemented: its Command menu entry is
@@ -146,6 +156,18 @@ disabled, and `Ctrl-X !` reports that it is unavailable.
 Each editor buffer keeps its own search query, options, selection scope, cursor,
 viewport, mark, and undo history. Moving a block keeps its destination marked. Rectangular
 copies preserve real spaces without filling virtual source cells.
+
+Atomic editor saves retain user attributes, access ACLs and ownership where
+permitted. A linked file offers an explicit detach/preserve-links/cancel choice.
+Preserving links writes the existing inode and is not atomic; cancellation and
+write errors are reported rather than represented as a completed atomic save.
+Read-only files are not silently replaced. Save As supports confirmed replacement
+and unchanged/LF/CRLF/CR line endings.
+
+Undo stores edit differences rather than a full document for every keystroke, so
+large documents retain useful history within the memory budget. Persistent marks
+survive ordinary range edits and Undo. Regex replacement supports zero-width
+anchors, capture expansion, escapes and case transformations.
 
 Scrolling keeps the view steady until the cursor reaches an edge. PageUp/Down
 move the view and cursor together, and the final page stays filled through EOF.
@@ -163,7 +185,7 @@ Click the editor header or press `F9` to open its menus, then click a category
 or action. Drag with the left mouse button to mark text; hold `Alt` while
 starting a drag to mark columns. Shift-click extends from the current cursor.
 
-File > Close or `Esc` closes the active buffer. `F10` or File > Quit checks every
+File > Close closes the active buffer. `Esc`, `F10` and File > Quit check every
 dirty buffer, including inactive buffers. Cancel keeps all buffers open, and
 discard decisions take effect only when quitting completes. A failed save leaves
 the buffers open.

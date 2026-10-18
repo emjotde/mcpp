@@ -3,6 +3,7 @@
 #include "mcpp/provider.hpp"
 
 #include <cstdint>
+#include <map>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -28,6 +29,18 @@ public:
     );
     void scroll_columns(int amount);
     void toggle_hex();
+    void goto_offset(std::uint64_t offset);
+    void toggle_hex_editing();
+    [[nodiscard]] bool hex_editing() const noexcept;
+    [[nodiscard]] bool hex_ascii() const noexcept;
+    void toggle_hex_navigation();
+    [[nodiscard]] std::uint64_t hex_cursor() const noexcept;
+    void move_hex_cursor(long long delta);
+    void edit_hex_digit(char digit);
+    void edit_ascii_byte(char byte);
+    [[nodiscard]] bool dirty() const noexcept;
+    void save_changes(const Cancellation& cancellation = {});
+    void discard_changes();
     void set_wrap(bool value);
     [[nodiscard]] bool wrap() const noexcept;
     [[nodiscard]] bool hex() const noexcept;
@@ -42,10 +55,12 @@ public:
         std::size_t height,
         const Cancellation& cancellation = {}
     );
+    [[nodiscard]] bool search_can_wrap() const noexcept;
     [[nodiscard]] std::optional<std::uint64_t> find(
         std::string_view needle,
         bool case_sensitive,
-        const Cancellation& cancellation = {}
+        const Cancellation& cancellation = {},
+        bool wrap = true
     );
 
 private:
@@ -70,6 +85,7 @@ private:
         std::size_t size,
         const Cancellation& cancellation
     );
+    void set_byte(std::uint64_t offset, unsigned char value);
 
     ProviderPtr provider_;
     std::string path_;
@@ -86,6 +102,14 @@ private:
     std::string last_search_;
     bool last_search_case_sensitive_{false};
     std::uint64_t next_search_offset_{0};
+    std::uint64_t search_begin_{0};
+    bool hex_editing_{false};
+    bool hex_ascii_{false};
+    std::uint64_t hex_cursor_{0};
+    bool hex_low_nibble_{false};
+    std::size_t hex_view_rows_{1};
+    std::map<std::uint64_t, unsigned char> edits_;
+    std::string revision_;
 };
 
 }  // namespace mcpp

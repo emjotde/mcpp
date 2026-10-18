@@ -6,7 +6,39 @@ This is a functional review of the supported Linux local-filesystem workflows,
 not a claim that mcpp is a complete MC clone. Archive, SSH/SFTP, Azure, and
 spelling support remain deferred.
 
-## Source audit of the current implementation
+## Audit fix delivery
+
+All 41 recorded A/B/C/H/U findings below are fixed, including the earlier
+file-safety findings as well as the last UI report. The eight broader capability
+groups remain a separate feature backlog; the explicitly paused providers and
+spelling remain paused.
+The source excerpts and line numbers in the audit sections describe the old
+`14b7a82` baseline, not the corrected code.
+
+Core fixes now have bounded normal regressions for directory merge policy,
+source-cycle rejection, copied timestamps/hardlink sets/permissions, pre-publication
+Skip, invalid confirmation settings, persistent marks, scoped/zero-width/UTF-8
+search and replacement, linked saves, access ACLs/user attributes, read-only
+protection, line endings, directional/content comparison, partial Find errors,
+staged hex save, and useful undo depth on a 16 MiB document.
+
+Controller and usability changes are integrated and covered by 19 new terminal
+audit cases, including the filesystem outcomes and Cancel/error paths.
+
+| Findings | Delivered changes |
+|---|---|
+| A01-A16 | Safe copy traversal and metadata, explicit linked saves, responsive transfer controls, directional comparison modes, matching/search, commander cd/exit, editor keys and save/create workflows, viewer controls, partial-error handling and whole-editor Quit. |
+| B01-B11 | Per-file merge decisions, stable marked permission targets, retained save metadata, persistent marks, scoped/zero-width replacement and captures, read-only protection, same-inode copies, word movement and delta-based undo. |
+| C01-C10 | Clickable keybars and modal controls, replaceable defaults, command caret/dragging, viewer wheel, Find View/Edit return context, identifiable long filenames, stable viewports, auxiliary-list navigation and short-terminal forms. |
+| H01-H03 | Invalid confirmation settings fail explicitly, automatic configuration-save errors reach stderr/nonzero exit, and character search/replacement respects UTF-8. |
+| U01 | Tree single-click selection, double-click opening and wheel navigation; this is a deliberate usability improvement over the reference behavior. |
+
+The complete normal container suite passed all 19 CTest entries. The Release
+binary also passed the core audit regressions and all 19 new terminal audit
+cases. The older audit descriptions remain below as historical evidence, not
+current functionality claims.
+
+## Historical source audit (`14b7a82`)
 
 The source comparison uses mcpp code at `14b7a82` and MC reference commit
 `b2706063b0e3abe9b7a6b7edef0a63e512dfb28c` (2026-10-16; its NEWS identifies
@@ -15,7 +47,7 @@ of that reference commit. Reference-version changes must therefore not be
 inferred from the older binary alone.
 
 MC paths below are relative to `reference/mc/`; mcpp paths are relative to
-this repository. This is an audit, not a claim that the findings are fixed.
+this repository. These sections record the findings before the fix batch above.
 Uncommitted, unbuilt shell work is not counted as an implemented feature.
 MC implementation and resources were inspected, not copied into mcpp.
 
@@ -50,11 +82,13 @@ workflow. Source-only findings are distinguished from reproduced outcomes.
 | A15 | P2 | Initial copy/delete measurement errors bypass the new Retry/Skip controller. Find aborts the entire traversal on an unreadable directory instead of continuing with accessible results. | `src/filemanager/file.c` has per-file error decisions; `src/filemanager/find.c:1250-1318` continues seeking an accessible directory. | `src/operations.cpp:266-314,738-740,1042-1047`; `src/search.cpp:138-148` and `src/app.cpp:1758-1848`. Source-confirmed. |
 | A16 | P2 | Escape closes only the active editor buffer, whereas MC maps Escape and F10 to Quit. With multiple buffers the two keys therefore have different scope in mcpp. | `misc/mc.default.keymap` editor Quit binding; `src/editor/editwidget.c:444-455`. | `handle_editor()` in `src/app.cpp` calls different close/quit functions. This is documented mcpp behavior, but not an established user-approved MC deviation. |
 
-### Missing local capabilities
+### Baseline local capability inventory
 
 These are capability gaps, not evidence that already implemented operations fail.
-They remain open work rather than being treated as acceptable merely because an
-entry is disabled.
+Some overlapping items, including copied hardlink groups, compare methods and
+viewer hex editing, were subsequently fixed with the numbered findings.
+The remaining gaps are described under Current local functionality below;
+a disabled entry is not treated as a completed feature.
 
 | Area | Missing or partial behavior | Source anchors |
 |---|---|---|
@@ -329,10 +363,10 @@ live Info, Tree, pane swapping, hotlist, and filename-search panelization.
 Tree opens at the chosen pane's cwd. Enter opens the selected directory in
 the opposite listing and expands it. Right expands/moves to a child; Left
 selects the parent. Space toggles, `+` expands, and `-` collapses. A single
-click focuses the Tree pane; a double-click selects and opens a node.
-Explicit collapse controls and Enter expansion are requested mcpp behavior,
-not an assertion that all
-MC Tree modes use the same controls.
+click focuses the Tree pane and selects the node; a double-click opens it.
+The wheel moves the selection. Explicit collapse controls, Enter expansion,
+and Tree pointer improvements are deliberate mcpp behavior, not an assertion
+that all MC Tree modes use the same controls.
 
 Unavailable listing formats, multi-column layouts, split/resizing controls,
 directory-size calculation, codepage selection, full help, key learning, and
@@ -342,6 +376,9 @@ Dialog text inputs support cursor/word editing, Shift selection, mouse positioni
 and dragging, kill/yank, and session history. Filename/directory and operation
 destination inputs provide path completion with ambiguous-match cycling.
 Editor search/replacement and numeric options use the same editing controls.
+Prefilled defaults are selected for replacement without changing the editing
+behavior of history and command drafts. Search/Replace buttons stay visible
+on short terminals while their option body scrolls.
 Persistent input histories and shell-variable/command-name completion remain
 gaps. Editor menus support mouse category/action selection.
 
@@ -364,27 +401,33 @@ an incomplete result. `Ctrl-X j` opens recent job results and active-job
 pause/resume, show-progress and abort controls.
 
 This is still not MC's full operation controller. Only one operation can run
-at once, job history is session-local, and initial traversal/measurement errors
-still abort the operation. Recursive-delete choices, append/reget, and resuming
-a partially copied file remain gaps; Retry restarts the failed file.
-ACLs, xattrs, sparse layout, hard-link sets, and all failure/rollback
-combinations were not established by this review.
+at once and job history is session-local. Initial measurement is an estimate;
+unreadable entries reach the actual operation's Retry/Skip controller rather
+than bypassing it. Recursive-delete choices, append/reget, and resuming a
+partially copied file remain gaps; Retry restarts the failed file.
+Copied modification times and hardlink groups are retained. Creation modes
+respect umask when Preserve permissions is off. Broader copy-metadata options,
+sparse layout, and every failure/rollback combination are not claimed complete.
 
 Find and filename panelization are asynchronous and cancellable. They are
-not an external-command panelizer. Saved external panelize commands,
-advanced Find options/context, thorough byte comparison, and diff/merge
+not an external-command panelizer. Find retains accessible results and reports
+unreadable paths; result View/Edit returns to the same list position. Directory
+comparison offers Quick, Size only and Thorough, with directional marks.
+Saved external panelize commands, advanced Find options/context and diff/merge
 remain unavailable.
 
 ### Viewer
 
 The viewer has its own full-screen header/keybar, bounded range reads,
-text/hex display, wrap, horizontal scroll, Home/End, search, and repeat search.
-Goto, raw/nroff, format, bookmarks, hex editing/save, next/previous file,
-codepages, and screen selection remain unavailable.
+text/hex display, wrap, horizontal scroll, Home/End, mouse wheel, decimal/hex
+byte-offset Go to, forward literal/hex search, and repeat search.
+Hex/ASCII edits are staged until Save,
+with explicit save/discard/cancel decisions. Raw/nroff, format, bookmarks,
+backward/regex search, next/previous file, codepages, and screen selection
+remain unavailable.
 
-Known differences: repeat search wraps automatically instead of asking to
-continue from the beginning; standalone `--view` returns to panels on F3
-instead of exiting like `mcview`; hex-to-text offset alignment differs.
+Repeat search asks before wrapping. Standalone `--view` Quit exits rather
+than returning to panels. Hex view uses aligned 16-byte rows.
 In the tested far-right unwrapped search, neither program automatically
 revealed the match. That is not counted as a mcpp-only defect.
 
@@ -395,14 +438,18 @@ history, linear/rectangular blocks, persistent clipboard, overwrite,
 undo/redo, preferred display columns, horizontal scrolling, and
 normal/regex/wildcard/hex search with replacement options.
 
-Atomic saves reject external changes and preserve a regular-file symlink
-when writing its target. New buffers, save-as, dirty-close decisions, and
-independent buffer undo/save are supported. Files larger than 16 MiB remain
-rejected rather than using MC's large-file confirmation workflow.
+Atomic saves reject external changes, preserve user attributes/access ACLs and
+ownership where permitted, and retain a regular-file symlink when writing its
+target. Linked files offer detach/preserve-links/cancel; preserving links is an
+explicit in-place, non-atomic write. Read-only files are not silently replaced.
+New pathname editing, confirmed Save As replacement and unchanged/LF/CRLF/CR
+line endings are supported. Delta-based undo retains useful history for large
+documents. Files larger than 16 MiB remain rejected rather than using MC's
+large-file confirmation workflow.
 
-F10 and File > Quit check inactive dirty buffers as well as the current one.
-Cancel retains every buffer, including after an earlier No decision. File >
-Close and Escape still close only the current buffer.
+Escape, F10 and File > Quit check inactive dirty buffers as well as the current
+one. Cancel retains every buffer, including after an earlier No decision.
+File > Close closes only the current buffer.
 
 Mouse dragging supports linear blocks and Alt-drag column blocks.
 
@@ -436,6 +483,8 @@ remain gaps.
 subshell toggle. Use `exit` to return. A child `cd` does not change the pane
 cwd, and a later shell starts at the pane directory rather than resuming the
 previous shell. Terminal restoration working does not close this gap.
+The commander command line separately handles literal `cd`, quoted paths,
+`cd -` and `exit` within mcpp.
 
 Configuration persists panel paths and common preferences, editor options,
 history, and hotlist. Full per-pane preferences, skins, localization,
@@ -447,21 +496,16 @@ review.
 
 ## Coverage limits
 
-### Final verification
+### Audit-fix verification
 
 | Build | Functional checks |
 |---|---|
-| Debug | 12/12 CTest entries passed; all 15 standalone operation cases passed |
-| Release | 12/12 CTest entries passed; all 15 standalone operation cases passed |
-| ASan + UBSan | 11/12 passed together; the remaining Tree workflow passed its bounded targeted rerun |
+| Debug | 19/19 CTest entries passed, including guarded core audit regressions and the 19-case terminal audit suite |
+| Release | Core audit regressions and all 19 terminal audit cases passed |
 
-Guarded filesystem models and the dedicated editor regressions also passed
-with fatal sanitizer diagnostics enabled. All destructive/error-injection
-checks used disposable containers without host mounts.
-
-Extended sanitizer background-race automation did not complete reliably and
-is not counted as passing. This review stopped further stress-test tuning;
-the Debug/Release operation results above are the verified functional result.
+Both normal builds use strict warnings. All destructive/error-injection checks
+used non-root disposable containers without host mounts. No sanitizers or
+optional profiling were run for this fix batch.
 
 The committed model and terminal regressions reproduce concrete failures,
 not every MC action or filesystem condition. They do not establish behavior

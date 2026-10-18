@@ -1,4 +1,5 @@
 #include "mcpp/search.hpp"
+#include "mcpp/editor_search.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -8,56 +9,12 @@
 namespace mcpp {
 namespace {
 
-std::string lowercase(std::string value) {
-    std::transform(
-        value.begin(),
-        value.end(),
-        value.begin(),
-        [](const unsigned char character) {
-            return static_cast<char>(std::tolower(character));
-        }
-    );
-    return value;
-}
-
 bool wildcard_match(
     const std::string_view pattern,
     const std::string_view value,
     const bool case_sensitive
 ) {
-    std::size_t pattern_index = 0;
-    std::size_t value_index = 0;
-    std::size_t star = std::string_view::npos;
-    std::size_t retry = 0;
-    const auto equal = [&](const char left, const char right) {
-        if (case_sensitive) {
-            return left == right;
-        }
-        return std::tolower(static_cast<unsigned char>(left)) ==
-               std::tolower(static_cast<unsigned char>(right));
-    };
-    while (value_index < value.size()) {
-        if (pattern_index < pattern.size() &&
-            (pattern[pattern_index] == '?' ||
-             equal(pattern[pattern_index], value[value_index]))) {
-            ++pattern_index;
-            ++value_index;
-        } else if (pattern_index < pattern.size() &&
-                   pattern[pattern_index] == '*') {
-            star = pattern_index++;
-            retry = value_index;
-        } else if (star != std::string_view::npos) {
-            pattern_index = star + 1U;
-            value_index = ++retry;
-        } else {
-            return false;
-        }
-    }
-    while (pattern_index < pattern.size() &&
-           pattern[pattern_index] == '*') {
-        ++pattern_index;
-    }
-    return pattern_index == pattern.size();
+    return EditorSearch::filename_matches(value, pattern, case_sensitive);
 }
 
 bool content_matches(
@@ -70,10 +27,7 @@ bool content_matches(
         return true;
     }
     constexpr std::uint64_t chunk_size = 256U * 1024U;
-    const auto needle =
-        options.case_sensitive
-            ? options.content
-            : lowercase(options.content);
+    const auto& needle = options.content;
     std::string overlap;
     for (std::uint64_t offset = 0; offset < entry.size;
          offset += chunk_size) {
@@ -87,16 +41,23 @@ bool content_matches(
             cancellation
         );
         auto chunk = overlap + std::move(output).str();
-        const auto searchable =
-            options.case_sensitive ? chunk : lowercase(std::move(chunk));
-        if (searchable.find(needle) != std::string::npos) {
+        if (EditorSearch::find(
+                chunk, needle, 0, 0, chunk.size(),
+                {.mode = EditorSearchMode::normal, .case_sensitive = options.case_sensitive},
+                false, false
+            )) {
             return true;
         }
         const auto keep = std::min(
-            needle.empty() ? 0U : needle.size() - 1U,
-            searchable.size()
+            needle.size() > chunk.size() / 4U ? chunk.size() : needle.size() * 4U + 4U,
+            chunk.size()
         );
-        overlap = searchable.substr(searchable.size() - keep);
+        auto begin = chunk.size() - keep;
+        while (begin > 0U &&
+               (static_cast<unsigned char>(chunk[begin]) & 0xC0U) == 0x80U) {
+            --begin;
+        }
+        overlap = chunk.substr(begin);
     }
     return false;
 }
@@ -108,8 +69,10 @@ std::vector<Entry> SearchEngine::search(
     const std::string_view root,
     const SearchOptions& options,
     const Cancellation& cancellation,
-    const ProgressCallback& progress
+    const ProgressCallback& progress,
+    const SearchErrorCallback& error
 ) const {
+    static_cast<void>(EditorSearch::filename_matches("", options.name_pattern, options.case_sensitive));
     std::vector<Entry> result;
     TransferProgress state;
     const auto normalized_root = provider.normalize(root);
@@ -128,11 +91,18 @@ std::vector<Entry> SearchEngine::search(
         cancellation.throw_if_requested();
         auto path = std::move(pending.back());
         pending.pop_back();
-        auto entries = provider.list(
-            path,
-            {.show_hidden = options.include_hidden},
-            cancellation
-        );
+        std::vector<Entry> entries;
+        try {
+            entries = provider.list(path, {.show_hidden = options.include_hidden}, cancellation);
+        } catch (const OperationCancelled&) {
+            throw;
+        } catch (const std::exception& failure) {
+            if (!error) {
+                throw;
+            }
+            error(path, failure.what());
+            continue;
+        }
         std::vector<std::string> children;
         for (const auto& entry : entries) {
             cancellation.throw_if_requested();
@@ -141,18 +111,29 @@ std::vector<Entry> SearchEngine::search(
             if (progress) {
                 progress(state);
             }
+            bool matches_content = options.content.empty();
+            if (!matches_content && entry.kind != EntryKind::directory) {
+                try {
+                    const auto source = entry.kind == EntryKind::symlink
+                                            ? provider.stat_follow(entry.path, cancellation)
+                                            : entry;
+                    matches_content = source.kind == EntryKind::file &&
+                                      content_matches(provider, source, options, cancellation);
+                } catch (const OperationCancelled&) {
+                    throw;
+                } catch (const std::exception& failure) {
+                    if (!error) {
+                        throw;
+                    }
+                    error(entry.path, failure.what());
+                }
+            }
             if (wildcard_match(
                     options.name_pattern,
                     entry.name,
                     options.case_sensitive
                 ) &&
-                (entry.kind != EntryKind::file ||
-                 content_matches(
-                     provider,
-                     entry,
-                     options,
-                     cancellation
-                 ))) {
+                matches_content) {
                 result.push_back(entry);
             }
             if (options.recursive &&
