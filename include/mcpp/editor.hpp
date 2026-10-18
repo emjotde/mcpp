@@ -75,6 +75,7 @@ public:
     void newline(bool auto_indent = false);
     void backspace();
     void erase();
+    void delete_block_or_line();
     void delete_line();
     void delete_to_end();
     [[nodiscard]] bool copy_selection();

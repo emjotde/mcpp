@@ -243,13 +243,13 @@ def expect_search(terminal, needle, mode=0, sensitive=False, in_selection=False,
 def prompt(terminal, value):
     observe(terminal, value_prompt_state, lambda state: True, "Value prompt opens")
     terminal.press("C-u")
-    empty = observe(terminal, value_prompt_state, lambda state: state["value"] == "",
-                    "Ctrl-U clears the Value input")
+    observe(terminal, value_prompt_state, lambda state: state["value"] == "",
+            "Ctrl-U clears the Value input")
     value = str(value)
     terminal.type(value)
     observe(terminal, value_prompt_state,
-            lambda state: state["value"] == value[:empty["width"]],
-            "Value input displays the typed path")
+            lambda state: bool(state["value"]) and value.endswith(state["value"]),
+            "Value input displays the typed path at the caret")
     terminal.press("Enter")
     terminal.wait_for("Value:", present=False)
 

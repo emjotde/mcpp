@@ -144,8 +144,16 @@ disabled, and `Ctrl-X !` reports that it is unavailable.
 ## Editor buffers
 
 Each editor buffer keeps its own search query, options, selection scope, cursor,
-mark, and undo history. Moving a block keeps its destination marked. Rectangular
+viewport, mark, and undo history. Moving a block keeps its destination marked. Rectangular
 copies preserve real spaces without filling virtual source cells.
+
+Scrolling keeps the view steady until the cursor reaches an edge. PageUp/Down
+move the view and cursor together, and the final page stays filled through EOF.
+`Ctrl-Home`/`Ctrl-End` go to the first/last line while retaining the preferred
+column; `Ctrl-PageUp`/`Ctrl-PageDown` go to the top/bottom visible line.
+`Ctrl-Up`/`Ctrl-Down` scroll one line; the mouse wheel scrolls two.
+`F8` deletes the marked block, or the whole current line if no block is marked.
+Delete still removes one character, and `Ctrl-U` undoes either deletion.
 
 Click the editor header or press `F9` to open its menus, then click a category
 or action. Drag with the left mouse button to mark text; hold `Alt` while

@@ -190,6 +190,16 @@ Close and Escape still close only the current buffer.
 
 Mouse dragging supports linear blocks and Alt-drag column blocks.
 
+The editor follow-up compared actual `mcedit` screens for EOF with and without a
+final newline, paging, arrows, mouse wheel, horizontal scrolling, document/window
+jumps, and F8. The view now stays steady rather than recentering on every move,
+fills the final page, and retains per-buffer scroll positions. Document jumps
+retain the preferred column, including through short lines. F8 deletes the whole
+unmarked line; an empty mark is cleared without deleting text. The character
+readout distinguishes a newline from EOF.
+
+F2 still saves directly rather than showing MC's save-confirmation dialog.
+
 Missing features include movable/resizable editor windows,
 block-to-file actions, lock interaction, backup/recovery modes,
 macros, spell checking, literal insertion, completion, all-charsets search,

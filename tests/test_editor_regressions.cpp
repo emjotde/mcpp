@@ -49,9 +49,7 @@ mcpp::EditorModel load(
 }
 
 void erase_block(mcpp::EditorModel& editor) {
-    if (!editor.delete_selection()) {
-        editor.erase();
-    }
+    editor.delete_block_or_line();
 }
 
 void test_linear_move(const std::filesystem::path& root) {
@@ -224,6 +222,44 @@ void test_unicode_nul(const std::filesystem::path& root) {
           "invalid UTF-8 bytes retain exact identity during normal search");
 }
 
+void test_delete_line_and_empty_mark(const std::filesystem::path& root) {
+    const auto path = root / "delete-actions";
+    constexpr auto original = "first line\nsecond line\nthird line\n";
+    auto editor = load(path, original);
+    editor.set_position({1, 2});
+    editor.delete_block_or_line();
+    check(editor.row() == 1 && editor.column() == 0, "F8 moves to the start of the next line");
+    editor.save(false);
+    check(read_file(path) == "first line\nthird line\n", "unmarked F8 deletes the whole current line");
+    check(editor.undo(), "undo F8 line deletion");
+    editor.save(false);
+    check(read_file(path) == original, "one undo restores the deleted line exactly");
+    editor.set_position({0, 0});
+    editor.toggle_mark();
+    editor.delete_block_or_line();
+    check(!editor.marking() && !editor.dirty(), "F8 clears an empty mark without deleting text");
+    editor.move(0, 2);
+    editor.delete_block_or_line();
+    editor.save(false);
+    check(read_file(path) == "second line\nthird line\n", "F8 after an empty mark deletes the line");
+    editor.goto_line(editor.lines().size());
+    editor.delete_block_or_line();
+    check(!editor.dirty(), "F8 at the empty EOF line is a no-op");
+}
+
+void test_jump_preferred_column(const std::filesystem::path& root) {
+    auto editor = load(root / "jump-column", "\talpha\nx\n\tbeta\n");
+    editor.set_position({0, 2});
+    editor.goto_line(2);
+    check(editor.column() == 1, "jump clamps the cursor to a short line");
+    editor.goto_line(3);
+    check(editor.column() == 2, "jump restores the preferred display column after a short line");
+    editor.goto_line(4);
+    check(editor.column() == 0, "jump to the empty EOF line");
+    editor.goto_line(1);
+    check(editor.column() == 2, "jump back from EOF retains the preferred display column");
+}
+
 }  // namespace
 
 int main(const int argc, char** argv) {
@@ -244,6 +280,8 @@ int main(const int argc, char** argv) {
         {"E4 real spaces", test_real_spaces_copy},
         {"E3 Unicode offsets", test_unicode_offsets},
         {"E3 embedded NUL", test_unicode_nul},
+        {"F8 line and empty mark", test_delete_line_and_empty_mark},
+        {"Document jump preferred column", test_jump_preferred_column},
     };
     int failures = 0;
     for (const auto& [name, test] : tests) {

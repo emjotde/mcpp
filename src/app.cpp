@@ -57,6 +57,8 @@ struct EditorSearchState {
 
 struct EditorBuffer : EditorModel {
     EditorSearchState search;
+    std::size_t first_row{0};
+    std::size_t first_column{0};
 };
 
 enum class Mode {
@@ -763,8 +765,8 @@ struct App::Impl {
     std::string syntax_path;
     std::vector<std::vector<SyntaxSpan>> syntax_spans;
     std::vector<ftxui::Box> editor_line_boxes;
+    std::size_t editor_rendered_first_row{0};
     std::vector<std::size_t> editor_line_first_columns;
-    std::size_t editor_first_row{0};
     bool editor_mouse_dragging{false};
     bool editor_mouse_marking{false};
     bool editor_mouse_column{false};
@@ -981,6 +983,53 @@ struct App::Impl {
             1U,
             editor_visible_rows() - 1U
         );
+    }
+
+    void update_editor_view() {
+        if (!editor.open()) {
+            return;
+        }
+        const auto visible = editor_visible_rows();
+        const auto maximum =
+            editor.lines().size() > visible ? editor.lines().size() - visible : 0U;
+        editor.first_row = std::min(editor.first_row, maximum);
+        if (editor.row() < editor.first_row) {
+            editor.first_row = editor.row();
+        } else if (editor.row() - editor.first_row >= visible) {
+            editor.first_row = editor.row() - visible + 1U;
+        }
+        const auto width = static_cast<std::size_t>(std::max(
+            1, ftxui::Terminal::Size().dimx - (editor_line_numbers ? 6 : 0)
+        ));
+        const auto column = editor_display_width(
+            editor.lines()[editor.row()], editor.column(), editor.tab_width()
+        );
+        if (column < editor.first_column) {
+            editor.first_column = column;
+        } else if (column - editor.first_column >= width) {
+            editor.first_column = column - width + 1U;
+        }
+    }
+
+    void scroll_editor(const int rows) {
+        const auto visible = editor_visible_rows();
+        const auto maximum =
+            editor.lines().size() > visible ? editor.lines().size() - visible : 0U;
+        if (rows < 0) {
+            editor.first_row -= std::min(
+                editor.first_row, static_cast<std::size_t>(-rows)
+            );
+        } else {
+            editor.first_row = std::min(
+                maximum, editor.first_row + static_cast<std::size_t>(rows)
+            );
+        }
+        editor.page(rows);
+    }
+
+    void center_editor() {
+        const auto half = editor_visible_rows() / 2U;
+        editor.first_row = editor.row() > half ? editor.row() - half : 0U;
     }
 
     void refresh(const bool notify_tree = false) {
@@ -3058,6 +3107,7 @@ struct App::Impl {
                         );
                     }
                     editor.goto_line(line);
+                    center_editor();
                     status = "Line " + std::to_string(line);
                     break;
                 }
@@ -3796,6 +3846,7 @@ struct App::Impl {
 
     ftxui::Element render_editor() {
         using namespace ftxui;
+        update_editor_view();
         const auto terminal_size = Terminal::Size();
         const auto visible_rows = editor_visible_rows();
         const auto& lines = editor.lines();
@@ -3814,10 +3865,7 @@ struct App::Impl {
         } else if (!editor_syntax && !syntax_spans.empty()) {
             syntax_spans.clear();
         }
-        const auto first =
-            editor.row() > visible_rows / 2U
-                ? editor.row() - visible_rows / 2U
-                : 0U;
+        const auto first = editor.first_row;
         const auto end = std::min(lines.size(), first + visible_rows);
         const auto& current_line = lines[editor.row()];
         const auto cursor_width = editor_display_width(
@@ -3832,11 +3880,8 @@ struct App::Impl {
                     (editor_line_numbers ? 6 : 0)
             )
         );
-        const auto first_column =
-            cursor_width >= content_width
-                ? cursor_width - content_width + 1U
-                : 0U;
-        editor_first_row = first;
+        const auto first_column = editor.first_column;
+        editor_rendered_first_row = first;
         editor_line_boxes.clear();
         editor_line_boxes.resize(end - first);
         editor_line_first_columns.clear();
@@ -3893,8 +3938,11 @@ struct App::Impl {
                 std::move(item) | reflect(editor_menu_category_boxes[index])
             );
         }
+        const bool at_eof = editor.cursor_offset() == editor.byte_size();
         const auto character =
-            utf8_codepoint(current_line, editor.column());
+            editor.column() == current_line.size() && !at_eof
+                ? 10U
+                : utf8_codepoint(current_line, editor.column());
         std::ostringstream editor_status;
         editor_status
             << " L:[" << editor.row() + 1U
@@ -3902,11 +3950,16 @@ struct App::Impl {
             << "/" << editor.lines().size() << "]"
             << " *(" << editor.selection_size()
             << "/" << editor.cursor_offset()
-            << "/" << editor.byte_size() << "b)"
-            << " " << std::setfill('0') << std::setw(4)
-            << character
-            << " U+" << std::uppercase << std::hex
-            << std::setw(4) << character << std::dec;
+            << "/" << editor.byte_size() << "b)";
+        if (at_eof) {
+            editor_status << " <EOF>";
+        } else {
+            editor_status
+                << " " << std::setfill('0') << std::setw(4)
+                << character
+                << " U+" << std::uppercase << std::hex
+                << std::setw(4) << character << std::dec;
+        }
         const auto block_flag =
             editor.selection().has_value()
                ? editor.column_selection() ? 'C' : 'B'
@@ -4171,7 +4224,7 @@ struct App::Impl {
                    text("F4        Replace next match"),
                    text("F5/F6     Copy/move marked block"),
                    text("F7        Search"),
-                   text("F8        Delete block or character"),
+                   text("F8        Delete marked block or current line"),
                    text("F9        Pull-down menu"),
                    text("F10       Quit editor (all buffers)"),
                    text("F12       Save as"),
@@ -6631,6 +6684,8 @@ struct App::Impl {
     }
 
     void reset_editor_view_state() {
+        editor_line_boxes.clear();
+        editor_line_first_columns.clear();
         editor_mouse_dragging = false;
         editor_mouse_marking = false;
         editor_shift_marking = false;
@@ -6838,6 +6893,8 @@ struct App::Impl {
                     "Search",
                     "Search string not found"
                 );
+            } else {
+                center_editor();
             }
         } catch (const std::exception& error) {
             show_editor_error(error);
@@ -6934,9 +6991,7 @@ struct App::Impl {
                                  : "No movable block";
                     break;
                 case 9:
-                    if (!editor.delete_selection()) {
-                        editor.erase();
-                    }
+                    editor.delete_block_or_line();
                     status = "Deleted";
                     break;
                 case 10:
@@ -6950,11 +7005,9 @@ struct App::Impl {
                     break;
                 case 13:
                     editor.goto_line(1);
-                    editor.home();
                     break;
                 case 14:
                     editor.goto_line(editor.lines().size());
-                    editor.end();
                     break;
                 default:
                     break;
@@ -7687,6 +7740,7 @@ struct App::Impl {
                 );
                 return true;
             }
+            center_editor();
             commit_editor_search(
                 editor_dialog_query,
                 editor_dialog_options,
@@ -7757,6 +7811,7 @@ struct App::Impl {
                     " replacement(s)"
                 );
             }
+            center_editor();
             return true;
         }
         if (editor_replace_choice == 2U) {
@@ -7814,6 +7869,7 @@ struct App::Impl {
                 " replacement(s)"
             );
         }
+        center_editor();
         return true;
     }
 
@@ -7833,7 +7889,9 @@ struct App::Impl {
         if (!clamp && !box.Contain(mouse.x, mouse.y)) {
             return std::nullopt;
         }
-        const auto row = editor_first_row + index;
+        const auto row = std::min(
+            editor.lines().size() - 1U, editor_rendered_first_row + index
+        );
         const auto cell = static_cast<std::size_t>(std::max(
             0, mouse.x - box.x_min - (editor_line_numbers ? 6 : 0)
         ));
@@ -7852,11 +7910,11 @@ struct App::Impl {
             auto mouse_event = event;
             const auto& mouse = mouse_event.mouse();
             if (mouse.button == ftxui::Mouse::WheelUp) {
-                editor.move(-3, 0);
+                scroll_editor(-2);
                 return true;
             }
             if (mouse.button == ftxui::Mouse::WheelDown) {
-                editor.move(3, 0);
+                scroll_editor(2);
                 return true;
             }
             if (editor_mouse_dragging &&
@@ -8025,7 +8083,7 @@ struct App::Impl {
                        ftxui::Event::Special("\x1B[1;2F")) {
                 editor.end();
             } else {
-                editor.page(
+                scroll_editor(
                     event == ftxui::Event::Special("\x1B[5;2~")
                         ? -static_cast<int>(editor_page_rows())
                         : static_cast<int>(editor_page_rows())
@@ -8086,9 +8144,7 @@ struct App::Impl {
             return true;
         }
         if (event == ftxui::Event::F8) {
-            if (!editor.delete_selection()) {
-                editor.erase();
-            }
+            editor.delete_block_or_line();
             return true;
         }
         if (event == ftxui::Event::F9) {
@@ -8202,12 +8258,26 @@ struct App::Impl {
         }
         if (event == ftxui::Event::Special("\x1B[1;5H")) {
             editor.goto_line(1);
-            editor.home();
             return true;
         }
         if (event == ftxui::Event::Special("\x1B[1;5F")) {
             editor.goto_line(editor.lines().size());
-            editor.end();
+            return true;
+        }
+        if (event == ftxui::Event::Special("\x1B[5;5~")) {
+            editor.goto_line(editor.first_row + 1U);
+            return true;
+        }
+        if (event == ftxui::Event::Special("\x1B[6;5~")) {
+            editor.goto_line(editor.first_row + editor_visible_rows());
+            return true;
+        }
+        if (event == ftxui::Event::Special("\x1B[1;5A")) {
+            scroll_editor(-1);
+            return true;
+        }
+        if (event == ftxui::Event::Special("\x1B[1;5B")) {
+            scroll_editor(1);
             return true;
         }
         if (event == ftxui::Event::ArrowUp) {
@@ -8223,11 +8293,11 @@ struct App::Impl {
         } else if (event == ftxui::Event::End) {
             editor.end();
         } else if (event == ftxui::Event::PageUp) {
-            editor.page(
+            scroll_editor(
                 -static_cast<int>(editor_page_rows())
             );
         } else if (event == ftxui::Event::PageDown) {
-            editor.page(
+            scroll_editor(
                 static_cast<int>(editor_page_rows())
             );
         } else if (event == ftxui::Event::Tab) {
@@ -10053,7 +10123,9 @@ int App::run() {
     component = ftxui::CatchEvent(
         std::move(component),
         [&](const ftxui::Event& event) {
-            return impl_->handle(event);
+            const auto handled = impl_->handle(event);
+            impl_->update_editor_view();
+            return handled;
         }
     );
     terminal.Loop(std::move(component));

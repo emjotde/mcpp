@@ -594,20 +594,17 @@ void EditorModel::goto_line(const std::size_t line) {
     if (lines_.empty()) {
         return;
     }
+    if (!preferred_display_column_) {
+        preferred_display_column_ =
+            display_column(lines_[row_], column_, tab_width_);
+    }
     row_ = std::min(
         line == 0U ? 0U : line - 1U,
         lines_.size() - 1U
     );
-    column_ = std::min(column_, lines_[row_].size());
-    while (column_ > 0U &&
-           column_ < lines_[row_].size() &&
-           continuation(
-               static_cast<unsigned char>(lines_[row_][column_])
-           )) {
-        --column_;
-    }
-    preferred_display_column_ =
-        display_column(lines_[row_], column_, tab_width_);
+    column_ = byte_column(
+        lines_[row_], *preferred_display_column_, tab_width_
+    );
     update_mark();
 }
 
@@ -1117,6 +1114,15 @@ void EditorModel::erase() {
         {.row = row_, .column = column_},
         {.row = row_ + 1U, .column = 0U}
     );
+}
+
+void EditorModel::delete_block_or_line() {
+    if (selection_begin_) {
+        static_cast<void>(delete_selection());
+        clear_selection();
+    } else {
+        delete_line();
+    }
 }
 
 void EditorModel::delete_line() {
