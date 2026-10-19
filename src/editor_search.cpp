@@ -570,6 +570,31 @@ std::vector<EditorSearchMatch> matches(
 
 }  // namespace
 
+std::string EditorSearch::fold_case(const std::string_view text) {
+    const auto folded = fold_utf8(text);
+    std::string result;
+    for (const auto character : folded.characters) {
+        if (character > 0x10ffffU) {
+            result += static_cast<char>(character - 0x110000U);
+        } else if (character < 0x80U) {
+            result += static_cast<char>(character);
+        } else if (character < 0x800U) {
+            result += static_cast<char>(0xc0U | (character >> 6U));
+            result += static_cast<char>(0x80U | (character & 63U));
+        } else if (character < 0x10000U) {
+            result += static_cast<char>(0xe0U | (character >> 12U));
+            result += static_cast<char>(0x80U | ((character >> 6U) & 63U));
+            result += static_cast<char>(0x80U | (character & 63U));
+        } else {
+            result += static_cast<char>(0xf0U | (character >> 18U));
+            result += static_cast<char>(0x80U | ((character >> 12U) & 63U));
+            result += static_cast<char>(0x80U | ((character >> 6U) & 63U));
+            result += static_cast<char>(0x80U | (character & 63U));
+        }
+    }
+    return result;
+}
+
 bool EditorSearch::filename_matches(
     const std::string_view name,
     const std::string_view pattern,

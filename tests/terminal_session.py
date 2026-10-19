@@ -13,7 +13,7 @@ class ApplicationExitError(AssertionError):
     pass
 
 
-def reverse_sgr(reverse, sequence):
+def style_sgr(active, sequence, enabled, disabled):
     parameters = sequence[2:-1].split(";")
     index = 0
     while index < len(parameters):
@@ -28,11 +28,15 @@ def reverse_sgr(reverse, sequence):
                 if ":" not in mode:
                     index += {"2": 3, "5": 1}.get(mode, 0)
             continue
-        if code == 0 or code == 27:
-            reverse = False
-        elif code == 7:
-            reverse = True
-    return reverse
+        if code in (0, disabled):
+            active = False
+        elif code == enabled:
+            active = True
+    return active
+
+
+def reverse_sgr(reverse, sequence):
+    return style_sgr(reverse, sequence, 7, 27)
 
 
 class TerminalSession:
@@ -141,19 +145,25 @@ class TerminalSession:
     def styled_rows(self, ansi=None):
         rows = []
         reverse = False
+        bold = False
         for line in (self.text(ansi=True) if ansi is None else ansi).splitlines():
             plain = ""
             spans = []
+            bold_spans = []
             for token in SGR.split(line):
                 if token.startswith("\x1b["):
                     reverse = reverse_sgr(reverse, token)
+                    bold = style_sgr(bold, token, 1, 22)
                     continue
                 start = len(plain)
                 plain += token
                 if reverse and token:
                     spans.append((start, len(plain)))
+                if bold and token:
+                    bold_spans.append((start, len(plain)))
             rows.append({
                 "text": plain, "spans": spans,
+                "bold_spans": bold_spans,
                 "focused": "".join(plain[start:end] for start, end in spans).strip(),
             })
         return rows
@@ -162,15 +172,17 @@ class TerminalSession:
         return [row["focused"] for row in self.styled_rows() if row["focused"]]
 
     def editor_state(self):
-        header = self.text().splitlines()[0]
-        match = re.search(
+        expression = re.compile(
             r"\[([A-Z-]{4})\]\s+L:\[(\d+) C:(\d+)/(\d+)\]"
-            r"\s+\*\((\d+)/(\d+)/(\d+)b\)", header
+            r"\s+\*\((\d+)/(\d+)/(\d+)b\)"
         )
+        lines = self.text().splitlines()
+        match = next((found for line in lines if (found := expression.search(line))), None)
         if not match:
-            raise AssertionError(f"Editor header not reached: {header}")
+            raise AssertionError(f"Editor header not reached: {lines[0] if lines else ''}")
         flags, row, column, lines, selection, offset, size = match.groups()
         return {
+            "flags": flags,
             "row": int(row), "column": int(column), "lines": int(lines),
             "selection": int(selection), "offset": int(offset), "bytes": int(size),
             "mark": flags[0], "dirty": flags[1] == "M",

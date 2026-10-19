@@ -3,9 +3,12 @@
 #include "mcpp/compare.hpp"
 #include "mcpp/editor_clipboard.hpp"
 #include "mcpp/local_provider.hpp"
+#include "mcpp/local_tools.hpp"
 #include "mcpp/location.hpp"
+#include "mcpp/listing.hpp"
 #include "mcpp/search.hpp"
 #include "mcpp/syntax.hpp"
+#include "mcpp/terminal_input.hpp"
 #include "mcpp/user_menu.hpp"
 
 #include <algorithm>
@@ -22,28 +25,37 @@
 #include <functional>
 #include <fnmatch.h>
 #include <iomanip>
+#include <fstream>
 #include <iostream>
 #include <iterator>
+#include <linux/fs.h>
 #include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <sstream>
 #include <span>
+#include <set>
 #include <stdexcept>
 #include <sys/wait.h>
+#include <sys/stat.h>
 #include <thread>
 #include <unordered_map>
 #include <utility>
 #include <unistd.h>
+#include <pwd.h>
+#include <grp.h>
+#include <termios.h>
 
 #include <ftxui/component/app.hpp>
 #include <ftxui/component/component.hpp>
 #include <ftxui/component/event.hpp>
 #include <ftxui/dom/elements.hpp>
+#include <ftxui/dom/node.hpp>
 #include <ftxui/screen/box.hpp>
 #include <ftxui/screen/string.hpp>
 #include <ftxui/screen/terminal.hpp>
+#include <ftxui/screen/screen.hpp>
 
 namespace mcpp {
 namespace {
@@ -60,6 +72,17 @@ struct EditorBuffer : EditorModel {
     EditorSearchState search;
     std::size_t first_row{0};
     std::size_t first_column{0};
+    bool fullscreen{true};
+    int window_x{0};
+    int window_y{0};
+    int window_width{80};
+    int window_height{24};
+    bool window_geometry_saved{false};
+};
+
+struct EditorLocation {
+    std::string path;
+    EditorPosition position;
 };
 
 enum class Mode {
@@ -67,6 +90,7 @@ enum class Mode {
     viewer,
     viewer_message,
     viewer_close_dialog,
+    viewer_link_dialog,
     viewer_wrap_dialog,
     editor,
     editor_menu,
@@ -76,6 +100,8 @@ enum class Mode {
     editor_replace_dialog,
     editor_replace_confirm,
     editor_save_dialog,
+    editor_save_mode_dialog,
+    editor_newline_warning,
     editor_close_dialog,
     editor_link_dialog,
     editor_overwrite_dialog,
@@ -83,6 +109,25 @@ enum class Mode {
     editor_history,
     editor_buffer_list,
     prompt,
+    listing_dialog,
+    sort_dialog,
+    confirmation_dialog,
+    layout_dialog,
+    panel_options_dialog,
+    appearance_dialog,
+    display_bits_dialog,
+    configure_dialog,
+    external_panelize_dialog,
+    chattr_dialog,
+    advanced_chown_dialog,
+    native_input,
+    native_key_query,
+    native_message,
+    native_query,
+    local_list,
+    local_command,
+    learn_key,
+    learn_keys_dialog,
     help,
     user_menu,
     pulldown,
@@ -162,38 +207,42 @@ enum class PromptAction {
     panelize_search,
 };
 
-std::string format_size(const std::uint64_t size) {
+std::string format_size(const std::uint64_t size, const bool si = false) {
     static constexpr std::array<const char*, 5> suffixes{
         "B", "KiB", "MiB", "GiB", "TiB"
     };
+    static constexpr std::array<const char*, 5> decimal_suffixes{"B", "kB", "MB", "GB", "TB"};
+    const auto& units = si ? decimal_suffixes : suffixes;
+    const auto base = si ? 1000.0 : 1024.0;
     auto value = static_cast<double>(size);
     std::size_t suffix = 0;
-    while (value >= 1024.0 && suffix + 1U < suffixes.size()) {
-        value /= 1024.0;
+    while (value >= base && suffix + 1U < units.size()) {
+        value /= base;
         ++suffix;
     }
     std::ostringstream output;
     if (suffix == 0U) {
-        output << size << ' ' << suffixes[suffix];
+        output << size << ' ' << units[suffix];
     } else {
         output << std::fixed << std::setprecision(1)
-               << value << ' ' << suffixes[suffix];
+               << value << ' ' << units[suffix];
     }
     return output.str();
 }
 
-std::string format_panel_size(const std::uint64_t size) {
+std::string format_panel_size(const std::uint64_t size, const bool si = false) {
     const auto decimal = std::to_string(size);
-    if (decimal.size() <= 8U) {
+    if (decimal.size() <= 7U) {
         return decimal;
     }
     static constexpr std::array<char, 6> suffixes{
         'B', 'K', 'M', 'G', 'T', 'P'
     };
     auto value = static_cast<double>(size);
+    const auto base = si ? 1000.0 : 1024.0;
     std::size_t suffix = 0;
-    while (value >= 1024.0 && suffix + 1U < suffixes.size()) {
-        value /= 1024.0;
+    while (value >= base && suffix + 1U < suffixes.size()) {
+        value /= base;
         ++suffix;
     }
     std::ostringstream output;
@@ -689,6 +738,55 @@ std::string decode_hex_query(const std::string_view query) {
     return bytes;
 }
 
+std::string encode_hex_bytes(const std::string_view value) {
+    constexpr char hex[] = "0123456789ABCDEF";
+    std::string result;
+    result.reserve(value.size() * 2U);
+    for (const auto character : value) {
+        const auto byte = static_cast<unsigned char>(character);
+        result += hex[byte >> 4U];
+        result += hex[byte & 15U];
+    }
+    return result;
+}
+
+ftxui::Event named_event(const std::string& name) {
+    using namespace ftxui;
+    static const std::array<Event, 12> functions{
+        Event::F1, Event::F2, Event::F3, Event::F4, Event::F5, Event::F6,
+        Event::F7, Event::F8, Event::F9, Event::F10, Event::F11, Event::F12
+    };
+    if (name.starts_with("F")) {
+        unsigned int number = 0;
+        const auto parsed = std::from_chars(name.data() + 1, name.data() + name.size(), number);
+        if (parsed.ec == std::errc{} && parsed.ptr == name.data() + name.size() &&
+            number >= 1U && number <= functions.size()) return functions[number - 1U];
+        static const std::array<std::string_view, 8> extended{
+            "\x1B[25~", "\x1B[26~", "\x1B[28~", "\x1B[29~",
+            "\x1B[31~", "\x1B[32~", "\x1B[33~", "\x1B[34~"
+        };
+        if (parsed.ec == std::errc{} && parsed.ptr == name.data() + name.size() &&
+            number >= 13U && number <= 20U) return Event::Special(extended[number - 13U]);
+    }
+    static const std::vector<std::pair<std::string, Event>> navigation{
+        {"Up", Event::ArrowUp}, {"Down", Event::ArrowDown}, {"Left", Event::ArrowLeft},
+        {"Right", Event::ArrowRight}, {"Home", Event::Home}, {"End", Event::End},
+        {"PageUp", Event::PageUp}, {"PageDown", Event::PageDown}, {"Tab", Event::Tab},
+        {"Enter", Event::Return}, {"Insert", Event::Insert}, {"Delete", Event::Delete},
+        {"Backspace", Event::Backspace}, {"Escape", Event::Escape},
+        {"Completion", Event::Special("\x1B\t")}, {"BackTab", Event::TabReverse},
+        {"Keypad /", Event::Character('/')}, {"Keypad *", Event::Character('*')},
+        {"Keypad -", Event::Character('-')}, {"Keypad +", Event::Character('+')}
+    };
+    for (const auto& [label, event] : navigation) if (label == name) return event;
+    throw std::runtime_error("unknown learned key action: " + name);
+}
+
+struct MacroKey {
+    bool character;
+    std::string input;
+};
+
 ButtonInput handle_button_input(
     const ftxui::Event& event,
     std::size_t& choice,
@@ -753,6 +851,49 @@ ftxui::Element dialog_button(
     return element | ftxui::reflect(box);
 }
 
+ftxui::Element native_button(
+    const std::string& label, const bool primary, const bool focused, ftxui::Box& box
+) {
+    auto element = ftxui::text(primary ? "[< " + label + " >]" : "[ " + label + " ]");
+    if (focused) element = element | ftxui::inverted | ftxui::focus;
+    return element | ftxui::reflect(box);
+}
+
+ftxui::Element native_window(const std::string& title, ftxui::Element body, const int width) {
+    using namespace ftxui;
+    const auto border_width = std::min(width, std::max(1, Terminal::Size().dimx - 2));
+    auto framed = dbox({
+        std::move(body) | borderStyled(LIGHT),
+        vbox({hbox({filler(), text(" " + title + " ") | bold, filler()}), filler()}),
+    }) | size(WIDTH, EQUAL, border_width);
+    return vbox({
+        text(" "),
+        hbox({text(" "), std::move(framed), text(" ")}),
+        text(" "),
+    }) | size(WIDTH, EQUAL, border_width + 2);
+}
+
+class DialogShadow final : public ftxui::Node {
+public:
+    explicit DialogShadow(ftxui::Element child) : Node({std::move(child)}) {}
+    void SetBox(ftxui::Box box) override {
+        Node::SetBox(box);
+        children_.front()->SetBox(box);
+    }
+    void Render(ftxui::Screen& screen) override {
+        for (int row = box_.y_min + 1; row <= box_.y_max + 1; ++row) {
+            for (int column = box_.x_min + 2; column <= box_.x_max + 2; ++column) {
+                auto& cell = screen.CellAt(column, row);
+                cell.character = " ";
+                cell.foreground_color = ftxui::Color::Grey11;
+                cell.background_color = ftxui::Color::Grey11;
+                cell.automerge = false;
+            }
+        }
+        Node::Render(screen);
+    }
+};
+
 std::string type_prefix(const Entry& entry) {
     switch (entry.kind) {
         case EntryKind::directory:
@@ -801,6 +942,11 @@ const std::array<std::string, 5> top_menu_names{
     "  Left     ", "File     ", "Command     ", "Options     ", "Right "
 };
 constexpr std::array<std::size_t, 5> top_menu_mnemonics{2, 0, 0, 0, 0};
+const std::array<std::string, 7> editor_menu_names{
+    "File     ", "Edit     ", "Search     ", "Command     ",
+    "Format     ", "Window     ", "Options"
+};
+constexpr std::array<std::size_t, 7> editor_menu_mnemonics{0, 0, 0, 0, 3, 0, 0};
 
 ftxui::Element render_viewer_text(
     const std::string& row,
@@ -855,14 +1001,17 @@ ftxui::Element gray_selected(
 
 ftxui::Element gray_entry(
     ftxui::Element element,
-    const Entry& entry
+    const Entry& entry,
+    const bool type_colors = false
 ) {
     using namespace ftxui;
     if (entry.kind == EntryKind::directory) {
-        return std::move(element) | color(Color::Grey100);
+        return std::move(element) |
+               color(type_colors ? Color::RGB(95, 160, 255) : Color::Grey100);
     }
     if (entry.kind == EntryKind::symlink) {
-        return std::move(element) | color(Color::Grey66);
+        return std::move(element) |
+               color(type_colors ? Color::RGB(95, 215, 215) : Color::Grey66);
     }
     if (entry.kind == EntryKind::other) {
         return std::move(element) | color(Color::Grey46);
@@ -877,7 +1026,8 @@ ftxui::Element gray_entry(
             )
         ) != std::filesystem::perms::none;
     return executable
-               ? std::move(element) | color(Color::Grey100) | underlined
+               ? std::move(element) |
+                     color(type_colors ? Color::RGB(95, 215, 135) : Color::Grey100) | underlined
                : std::move(element) | color(Color::Grey85);
 }
 
@@ -929,7 +1079,21 @@ std::string permission_text(const Entry& entry) {
 struct MenuRow {
     std::string label;
     int action{-1};
+    char mnemonic{0};
 };
+
+ftxui::Element menu_row_label(const MenuRow& row) {
+    std::size_t index = std::string::npos;
+    if (row.mnemonic != 0) {
+        for (std::size_t offset = 0; offset < row.label.size(); ++offset) {
+            if (std::tolower(static_cast<unsigned char>(row.label[offset])) == row.mnemonic) {
+                index = offset;
+                break;
+            }
+        }
+    }
+    return ftxui::hbox({ftxui::text(" "), mnemonic_label(row.label, index)});
+}
 
 struct TreeNode {
     std::string path;
@@ -1008,6 +1172,154 @@ struct App::Impl {
     TextInputState mask_input;
     TextInputState command_input;
     std::string input_clipboard;
+    std::size_t listing_choice{0};
+    std::size_t listing_focus{0};
+    std::string listing_brief_value;
+    std::string listing_user_value;
+    bool listing_user_mini{false};
+    std::array<std::string, 4> listing_status_values;
+    TextInputState listing_brief_input;
+    TextInputState listing_user_input;
+    TextInputState listing_status_input;
+    std::array<ftxui::Box, 10> listing_boxes{};
+    ftxui::Box listing_viewport;
+    std::string listing_error;
+    std::size_t sort_choice{1};
+    std::size_t sort_focus{0};
+    bool sort_executable_first{false};
+    bool sort_case_sensitive{true};
+    bool sort_reverse{false};
+    std::array<ftxui::Box, 14> sort_boxes{};
+    ftxui::Box sort_viewport;
+    std::array<bool, 6> confirmation_values{};
+    std::size_t confirmation_focus{0};
+    std::array<ftxui::Box, 8> confirmation_boxes{};
+    bool layout_horizontal{false};
+    bool layout_equal{true};
+    int layout_left_size{0};
+    int layout_top_size{0};
+    std::array<bool, 6> layout_visible{};
+    std::size_t layout_focus{0};
+    std::array<ftxui::Box, 13> layout_boxes{};
+    std::array<bool, 16> panel_option_values{};
+    std::size_t panel_option_search{2};
+    std::size_t panel_option_focus{0};
+    std::array<ftxui::Box, 21> panel_option_boxes{};
+    bool fast_reload_warning_shown{false};
+    std::vector<gid_t> effective_groups;
+    std::string terminal_title;
+    bool terminal_title_pushed{false};
+    std::string appearance_skin;
+    std::string appearance_original_skin;
+    bool appearance_shadows{true};
+    bool appearance_original_shadows{true};
+    std::size_t appearance_focus{0};
+    std::array<ftxui::Box, 4> appearance_boxes{};
+    std::size_t display_bits_focus{0};
+    std::array<ftxui::Box, 3> display_bits_boxes{};
+    std::array<bool, 18> configure_values{};
+    std::size_t configure_pause{1};
+    std::string configure_timeout;
+    TextInputState configure_timeout_input;
+    std::size_t configure_focus{0};
+    std::array<ftxui::Box, 24> configure_boxes{};
+    std::string configure_error;
+    bool escape_waiting{false};
+    std::size_t panelize_cursor{0};
+    std::size_t panelize_focus{0};
+    std::string panelize_command;
+    std::string panelize_error;
+    TextInputState panelize_input;
+    std::vector<ftxui::Box> panelize_rows;
+    ftxui::Box panelize_viewport;
+    ftxui::Box panelize_command_box;
+    std::array<ftxui::Box, 4> panelize_buttons{};
+    std::vector<Entry> attribute_entries;
+    std::size_t attribute_index{0};
+    unsigned int attribute_original{0};
+    unsigned int attribute_value{0};
+    std::size_t attribute_focus{0};
+    std::array<ftxui::Box, 14> attribute_boxes{};
+    std::vector<ftxui::Box> attribute_buttons;
+    ftxui::Box attribute_viewport;
+    std::string attribute_error;
+    std::vector<Entry> ownership_entries;
+    std::size_t ownership_index{0};
+    std::size_t ownership_focus{0};
+    std::size_t ownership_bit{0};
+    std::array<char, 11> ownership_flags{};
+    std::string ownership_user;
+    std::string ownership_group;
+    std::array<ftxui::Box, 5> ownership_boxes{};
+    std::vector<ftxui::Box> ownership_buttons;
+    std::string ownership_error;
+    std::string native_input_title;
+    std::string native_input_label;
+    std::string native_input_value;
+    std::string native_input_error;
+    std::string native_input_directory;
+    TextInputState native_input_state;
+    std::size_t native_input_focus{0};
+    std::array<ftxui::Box, 3> native_input_boxes{};
+    Mode native_input_return{Mode::panels};
+    std::function<void(const std::string&)> native_input_apply;
+    std::string key_query_title;
+    std::string key_query_label;
+    bool key_query_cancel{true};
+    Mode key_query_return{Mode::editor};
+    std::function<void(const ftxui::Event&)> key_query_apply;
+    ftxui::Box key_query_cancel_box;
+    std::string native_message_title;
+    std::string native_message_text;
+    Mode native_message_return{Mode::panels};
+    ftxui::Box native_message_button;
+    std::string native_query_title;
+    std::string native_query_text;
+    std::vector<std::string> native_query_labels;
+    std::vector<ftxui::Box> native_query_boxes;
+    std::size_t native_query_choice{0};
+    Mode native_query_return{Mode::panels};
+    std::function<void(std::size_t)> native_query_apply;
+    std::string local_list_title;
+    std::vector<std::string> local_list_items;
+    std::vector<ftxui::Box> local_list_boxes;
+    ftxui::Box local_list_box;
+    std::size_t local_list_cursor{0};
+    std::function<void(std::size_t)> local_list_activate;
+    Mode local_list_return{Mode::panels};
+    bool local_list_native{false};
+    std::string local_list_hotkeys;
+    bool local_list_completion{false};
+    std::vector<std::string> completion_choices;
+    std::string completion_filter;
+    int local_history_kind{0};
+    std::vector<std::pair<bool, std::string>> local_history_files;
+    std::optional<std::string> local_directory;
+    std::vector<std::string> local_directory_choices;
+    std::jthread local_command_thread;
+    Cancellation local_command_cancellation;
+    bool local_command_running{false};
+    Mode local_command_return{Mode::panels};
+    std::string local_command_title;
+    ftxui::Box local_command_cancel_box;
+    std::shared_ptr<TemporaryFile> viewer_temporary_file;
+    std::string viewer_display_name;
+    Mode user_menu_return{Mode::panels};
+    Mode learn_key_return{Mode::panels};
+    std::string learn_key_action;
+    std::size_t learn_key_focus{0};
+    std::array<bool, 38> learn_key_detected{};
+    std::array<ftxui::Box, 40> learn_key_boxes{};
+    ftxui::Box learn_keys_viewport;
+    std::map<std::string, std::string> learn_keys_draft;
+    bool macro_recording{false};
+    bool macro_replaying{false};
+    std::vector<MacroKey> macro_keys;
+    std::vector<MacroKey> macro_playback;
+    std::size_t macro_play_index{0};
+    std::size_t macro_repeats{0};
+    std::vector<EditorLocation> declaration_history;
+    std::size_t declaration_cursor{0};
     std::array<ftxui::Box, 7> operation_dialog_boxes{};
     ftxui::Box operation_dialog_viewport;
     std::string status{"Ready"};
@@ -1015,6 +1327,7 @@ struct App::Impl {
     OperationEngine operations;
     Cancellation operation_cancellation;
     TransferProgress progress;
+    int operation_source_side{0};
     ViewerModel viewer;
     std::string viewer_search_needle;
     std::string viewer_search_pattern;
@@ -1024,6 +1337,7 @@ struct App::Impl {
     ftxui::Box message_button_box;
     Mode viewer_return_mode{Mode::panels};
     bool exit_after_viewer{false};
+    bool viewer_save_closes{false};
     std::size_t viewer_choice{0};
     std::array<ftxui::Box, 3> viewer_choice_boxes{};
     std::array<ftxui::Box, 2> viewer_wrap_boxes{};
@@ -1052,7 +1366,15 @@ struct App::Impl {
     };
     std::string syntax_path;
     std::vector<std::vector<SyntaxSpan>> syntax_spans;
+    std::vector<std::pair<std::string, std::string>> syntax_rules;
+    std::vector<std::pair<std::string, std::string>> extension_rules;
+    std::vector<std::pair<std::string, ftxui::Color>> highlight_rules;
     std::vector<ftxui::Box> editor_line_boxes;
+    ftxui::Box editor_header_box;
+    int editor_window_action{0};
+    std::array<int, 4> editor_window_previous{};
+    bool editor_window_mouse_drag{false};
+    int editor_window_mouse_offset{0};
     std::size_t editor_rendered_first_row{0};
     std::vector<std::size_t> editor_line_first_columns;
     bool editor_mouse_dragging{false};
@@ -1083,6 +1405,16 @@ struct App::Impl {
     std::array<ftxui::Box, 7> editor_menu_category_boxes{};
     std::vector<ftxui::Box> editor_menu_item_boxes;
     std::size_t editor_save_choice{0};
+    std::size_t save_mode_choice{1};
+    std::size_t save_mode_focus{0};
+    std::string save_mode_extension;
+    TextInputState save_mode_extension_input;
+    bool save_mode_check_newline{false};
+    std::array<ftxui::Box, 7> save_mode_boxes{};
+    std::size_t newline_warning_choice{0};
+    std::array<ftxui::Box, 2> newline_warning_boxes{};
+    bool newline_warning_accepted{false};
+    bool newline_warning_preserve_links{false};
     std::array<ftxui::Box, 2> editor_save_boxes{};
     std::size_t editor_close_choice{0};
     std::array<ftxui::Box, 3> editor_close_boxes{};
@@ -1117,6 +1449,7 @@ struct App::Impl {
     std::chrono::steady_clock::time_point operation_started{};
     std::mutex operation_mutex;
     std::string command_line;
+    bool command_prompt_override{false};
     bool command_mode{false};
     bool panel_ctrl_x{false};
     bool panel_search_mode{false};
@@ -1133,13 +1466,13 @@ struct App::Impl {
     std::string search_warning;
     std::size_t search_cursor{0};
     std::vector<ftxui::Box> search_result_boxes;
+    ftxui::Box search_panelize_box;
     ftxui::Box search_list_box;
     std::size_t bookmark_cursor{0};
     std::vector<ftxui::Box> bookmark_boxes;
     ftxui::Box bookmark_list_box;
     std::array<ftxui::Box, 10> function_key_boxes{};
     std::array<bool, 10> function_key_enabled{};
-    bool detailed_view{true};
     std::optional<int> quick_view_panel;
     bool quick_view_focused{false};
     std::optional<int> information_panel;
@@ -1235,12 +1568,58 @@ struct App::Impl {
           left(left_location.provider, left_location.path),
           right(right_location.provider, right_location.path) {
         user_menu = load_user_menu(default_user_menu_path());
+        const auto group_count = getgroups(0, nullptr);
+        if (group_count < 0) throw std::system_error(errno, std::generic_category(), "read user groups");
+        effective_groups.resize(static_cast<std::size_t>(group_count));
+        if (group_count > 0 && getgroups(group_count, effective_groups.data()) < 0) {
+            throw std::system_error(errno, std::generic_category(), "read user groups");
+        }
+        for (const auto& [key, action] : config.learned_keys) {
+            static_cast<void>(decode_hex_query(key));
+            static_cast<void>(named_event(action));
+        }
+        command_history = config.command_history;
+        command_input.history = command_history;
+        try {
+            reload_local_rules();
+        } catch (const std::exception& error) {
+            set_error(error);
+        }
         left.set_show_hidden(config.show_hidden);
         right.set_show_hidden(config.show_hidden);
         left.set_directories_first(config.directories_first);
         right.set_directories_first(config.directories_first);
-        left.set_sort(config.sort, config.sort_descending);
-        right.set_sort(config.sort, config.sort_descending);
+        left.set_sort_options(config.panel_sort[0].value_or(config.sort),
+                              config.panel_descending[0].value_or(config.sort_descending),
+                              config.panel_case_sensitive[0].value_or(true),
+                              config.panel_executable_first[0].value_or(false));
+        right.set_sort_options(config.panel_sort[1].value_or(config.sort),
+                               config.panel_descending[1].value_or(config.sort_descending),
+                               config.panel_case_sensitive[1].value_or(true),
+                               config.panel_executable_first[1].value_or(false));
+        left.set_reverse_files_only(config.reverse_files_only);
+        right.set_reverse_files_only(config.reverse_files_only);
+        left.set_show_hidden(config.panel_hidden[0].value_or(config.show_hidden));
+        right.set_show_hidden(config.panel_hidden[1].value_or(config.show_hidden));
+        left.set_directories_first(config.panel_directories_first[0].value_or(config.directories_first));
+        right.set_directories_first(config.panel_directories_first[1].value_or(config.directories_first));
+        left.set_show_backups(config.show_backups);
+        right.set_show_backups(config.show_backups);
+        left.set_fast_reload(config.fast_reload);
+        right.set_fast_reload(config.fast_reload);
+        left.set_navigation(config.scroll_pages, config.scroll_center);
+        right.set_navigation(config.scroll_pages, config.scroll_center);
+        left.set_shell_patterns(config.shell_patterns);
+        right.set_shell_patterns(config.shell_patterns);
+        left.set_follow_links(config.cd_follows_links);
+        right.set_follow_links(config.cd_follows_links);
+        set_terminal_input_delay(config.single_escape ? static_cast<std::uint64_t>(config.escape_timeout) : 50000U);
+        if (auto* provider = dynamic_cast<LocalProvider*>(local.get())) provider->set_preallocate(config.preallocate_space);
+        for (std::size_t index = 0; index < 2U; ++index) {
+            if (config.panel_listing[index] == ListingFormat::custom) {
+                static_cast<void>(parse_listing_format(config.panel_columns[index]));
+            }
+        }
         editor_syntax = config.editor_syntax;
         editor_line_numbers = config.editor_line_numbers;
         editor.set_tab_width(config.editor_tab_width);
@@ -1258,15 +1637,54 @@ struct App::Impl {
         return active_index == 0 ? right : left;
     }
 
-    static std::size_t panel_visible_rows() {
-        return static_cast<std::size_t>(
-            std::max(3, ftxui::Terminal::Size().dimy - 9)
+    bool command_prompt_shown() const { return config.command_prompt || command_prompt_override; }
+
+    int file_manager_body_height() const {
+        const auto reserved = static_cast<int>(config.menubar_visible) +
+                              static_cast<int>(command_prompt_shown()) +
+                              static_cast<int>(config.keybar_visible) +
+                              static_cast<int>(config.hintbar_visible);
+        return std::max(1, ftxui::Terminal::Size().dimy - reserved);
+    }
+
+    int split_top_height() const {
+        const auto height = file_manager_body_height();
+        const auto minimum = std::min(6, std::max(1, height / 2));
+        const auto wanted = config.equal_split || config.panel_top_size == 0
+                                ? height / 2 : config.panel_top_size;
+        return std::clamp(wanted, minimum, std::max(minimum, height - minimum));
+    }
+
+    std::size_t panel_visible_rows(const int index = -1) const {
+        auto height = file_manager_body_height();
+        const auto physical = index < 0 ? active_index : index;
+        if (config.layout_horizontal) {
+            height = physical == 0 ? split_top_height() : height - split_top_height();
+        }
+        const bool auxiliary = (tree_panel && *tree_panel == physical) ||
+                               (quick_view_panel && *quick_view_panel == physical) ||
+                               (information_panel && *information_panel == physical);
+        return static_cast<std::size_t>(std::max(1, height - (config.show_mini_status || auxiliary ? 5 : 3)));
+    }
+
+    int split_left_width() const {
+        const auto width = std::max(2, ftxui::Terminal::Size().dimx);
+        return std::clamp(
+            config.equal_split || config.panel_left_size == 0 ? width / 2 : config.panel_left_size,
+            1, width - 1
         );
     }
 
-    static int panel_width(const int index) {
+    bool listing_full_width(const int index) const {
+        if ((tree_panel && *tree_panel == index) || (quick_view_panel && *quick_view_panel == index) ||
+            (information_panel && *information_panel == index)) return false;
+        return pane_listing_spec(index == 0 ? left : right).full_width;
+    }
+
+    int panel_width(const int index) const {
         const auto width = std::max(2, ftxui::Terminal::Size().dimx);
-        const auto left_width = width / 2;
+        if (config.layout_horizontal || listing_full_width(index)) return width;
+        const auto left_width = split_left_width();
         return index == 0
                    ? left_width
                    : width - left_width;
@@ -1279,7 +1697,7 @@ struct App::Impl {
                                : panel_width(1 - active_index);
         return {
             static_cast<std::size_t>(std::max(1, width - 2)),
-            panel_visible_rows() + 2U,
+            panel_visible_rows(quick_view_panel ? *quick_view_panel : 1 - active_index) + 2U,
         };
     }
 
@@ -1292,13 +1710,29 @@ struct App::Impl {
         };
     }
 
-    static std::size_t editor_visible_rows() {
+    std::array<int, 4> editor_window_bounds() const {
+        const auto terminal_size = ftxui::Terminal::Size();
+        const auto columns = std::max(1, terminal_size.dimx);
+        const auto rows = std::max(1, terminal_size.dimy);
+        const auto width = editor.fullscreen ? columns : std::clamp(editor.window_width, 1, columns);
+        const auto height = editor.fullscreen ? rows : std::clamp(editor.window_height, 1, std::max(1, rows - 2));
+        return {editor.fullscreen ? 0 : std::clamp(editor.window_x, 0, columns - width),
+                editor.fullscreen ? 0 : std::clamp(editor.window_y, 1, std::max(1, rows - height - 1)), width, height};
+    }
+
+    std::pair<int, int> editor_dimensions() const {
+        const auto bounds = editor_window_bounds();
+        return {std::max(1, bounds[2] - (editor.fullscreen ? 0 : 2)),
+                std::max(1, bounds[3] - (editor.fullscreen ? 0 : 2))};
+    }
+
+    std::size_t editor_visible_rows() const {
         return static_cast<std::size_t>(
-            std::max(1, ftxui::Terminal::Size().dimy - 2)
+            std::max(1, editor_dimensions().second - (editor.fullscreen ? 2 : 0))
         );
     }
 
-    static std::size_t editor_page_rows() {
+    std::size_t editor_page_rows() const {
         return std::max<std::size_t>(
             1U,
             editor_visible_rows() - 1U
@@ -1308,10 +1742,11 @@ struct App::Impl {
     ftxui::Element render_function_key(
         const std::size_t index,
         const std::string& label,
-        const bool enabled = true
+        const bool enabled = true,
+        const int width = 0
     ) {
         using namespace ftxui;
-        const auto available = std::max(10, Terminal::Size().dimx - 1);
+        const auto available = std::max(10, (width == 0 ? Terminal::Size().dimx : width) - 1);
         const auto key_width =
             available / 10 +
             (static_cast<int>(index) < available % 10 ? 1 : 0);
@@ -1430,7 +1865,7 @@ struct App::Impl {
             editor.first_row = editor.row() - visible + 1U;
         }
         const auto width = static_cast<std::size_t>(std::max(
-            1, ftxui::Terminal::Size().dimx - (editor_line_numbers ? 6 : 0)
+            1, editor_dimensions().first - (editor_line_numbers ? 6 : 0)
         ));
         const auto column = editor_display_width(
             editor.lines()[editor.row()], editor.column(), editor.tab_width()
@@ -1440,6 +1875,944 @@ struct App::Impl {
         } else if (column - editor.first_column >= width) {
             editor.first_column = column - width + 1U;
         }
+    }
+
+    std::string editor_relative_path(const std::string& path) const {
+        return local->join(local->parent(editor.path()), path);
+    }
+
+    std::string read_local_text(const std::string& path) const {
+        EditorModel input;
+        input.open(local, path);
+        return input.text();
+    }
+
+    void write_local_text(
+        const std::string& path, const std::string& value,
+        const bool replace, const std::size_t linked_choice
+    ) {
+        std::istringstream input(value);
+        write_local_stream(path, input, value.size(), replace, linked_choice);
+    }
+
+    void write_local_stream(
+        const std::string& path, std::istream& input, const std::uint64_t length,
+        const bool replace, const std::size_t linked_choice,
+        const Cancellation& cancellation = {}
+    ) {
+        cancellation.throw_if_requested();
+        auto storage = path;
+        std::optional<std::string> expected;
+        const bool exists = local->exists(path);
+        if (exists) {
+            if (!replace) throw std::runtime_error("destination exists; choose Replace explicitly");
+            const auto entry = local->stat_follow(path, {});
+            if (entry.kind != EntryKind::file) throw std::runtime_error("destination is not a regular file");
+            storage = entry.path;
+            const auto* provider = dynamic_cast<const LocalProvider*>(local.get());
+            if (provider == nullptr) throw std::runtime_error("local file writer is unavailable");
+            provider->ensure_writable(storage);
+            if (provider->hardlink_count(storage) > 1U && linked_choice == 0U) {
+                throw std::runtime_error("linked destination: choose Detach or Preserve links");
+            }
+            expected = entry.revision;
+        }
+        if (exists && linked_choice == 2U) {
+            auto* provider = dynamic_cast<LocalProvider*>(local.get());
+            if (provider == nullptr) throw std::runtime_error("linked file writer is unavailable");
+            provider->write_in_place(storage, input, length, expected, cancellation);
+        } else if (!exists) {
+            auto* provider = dynamic_cast<LocalProvider*>(local.get());
+            if (provider == nullptr) throw std::runtime_error("local file writer is unavailable");
+            provider->write_with_permissions(storage, input, length, false, cancellation, {},
+                std::filesystem::perms::owner_read | std::filesystem::perms::owner_write);
+        } else {
+            local->write(storage, input, length, replace, expected, cancellation, {});
+        }
+    }
+
+    void show_insert_file() {
+        show_native_input("Insert file", "Enter file name:", editor_clipboard_path().string(),
+            [this](const std::string& file) {
+            if (file.empty()) throw std::runtime_error("file name is empty");
+            const EditorPosition before{editor.row(), editor.column()};
+            const auto path = editor_relative_path(file);
+            if (local->normalize(path) == local->normalize(editor_clipboard_path().string())) {
+                bool column = false;
+                const auto value = load_editor_clipboard(editor_clipboard_path(), &column);
+                if (column) editor.paste_column(value);
+                else editor.paste(value);
+            } else editor.paste_bytes(read_local_text(path));
+            if (!config.editor_cursor_after_inserted_block) editor.set_position(before);
+            status = "File inserted";
+        }, Mode::editor, local->parent(editor.path()));
+    }
+
+    void show_save_block() {
+        if (!editor.selected_text()) {
+            show_editor_message("Save block", "No marked block to save");
+            return;
+        }
+        show_native_input("Save block", "Enter file name:", editor_clipboard_path().string(),
+            [this](const std::string& file) {
+            if (file.empty()) throw std::runtime_error("file name is empty");
+            const auto value = editor.selected_bytes();
+            if (!value) throw std::runtime_error("the marked block is no longer available");
+            const auto path = editor_relative_path(file);
+            if (local->normalize(path) == local->normalize(editor_clipboard_path().string())) {
+                const auto text = editor.selected_text();
+                if (!text) throw std::runtime_error("the marked block is no longer available");
+                save_editor_clipboard(editor_clipboard_path(), *text, editor.column_selection());
+                status = "Marked block saved";
+                return;
+            }
+            const bool exists = local->exists(path);
+            const auto expected = exists ? std::optional<std::string>{local->stat_follow(path, {}).revision}
+                                         : std::nullopt;
+            const auto save_block = [this, path, value, exists, expected](const std::size_t policy) {
+                if (expected && local->stat_follow(path, {}).revision != *expected) {
+                    throw std::runtime_error("block destination changed while awaiting confirmation");
+                }
+                write_local_text(path, *value, exists, policy);
+                status = "Marked block saved";
+            };
+            const auto continue_save = [this, path, save_block, exists](const std::size_t accepted) {
+                if (accepted != 0U) return;
+                if (exists && std::filesystem::hard_link_count(path) > 1U) {
+                    show_native_query("File has multiple hardlinks",
+                        display_text(path) + "\nDetach replaces this name atomically. Preserve links writes in place.",
+                        {"Detach", "Preserve links", "Cancel"},
+                        [save_block](const std::size_t choice) {
+                            if (choice < 2U) save_block(choice == 0U ? 1U : 2U);
+                        }, Mode::editor);
+                } else save_block(0);
+            };
+            if (exists && config.confirm_overwrite) {
+                show_native_query("File exists", "Overwrite " + display_text(path) + "?",
+                                  {"Overwrite", "Cancel"}, continue_save, Mode::editor);
+            } else continue_save(0);
+        }, Mode::editor, local->parent(editor.path()));
+    }
+
+    void open_user_menu(
+        const Mode return_mode, const std::filesystem::path& menu_path = default_user_menu_path()
+    ) {
+        user_menu = load_user_menu(menu_path);
+        user_menu_return = return_mode;
+        mode = Mode::user_menu;
+    }
+
+    void show_editor_encoding() {
+        show_codepage_chooser(editor.encoding(), Mode::editor, [this](const std::string& codepage) {
+            editor.set_encoding(codepage);
+            reset_editor_view_state();
+            status = "Editor codepage changed";
+        });
+    }
+
+    void show_editor_save_mode() {
+        save_mode_choice = editor.save_mode() == EditorSaveMode::in_place ? 0U
+                         : editor.save_mode() == EditorSaveMode::atomic ? 1U : 2U;
+        save_mode_focus = 0;
+        save_mode_extension = config.editor_backup_extension;
+        save_mode_extension_input.reset(save_mode_extension, true);
+        save_mode_check_newline = config.editor_check_newline;
+        mode = Mode::editor_save_mode_dialog;
+    }
+
+    ftxui::Element render_editor_save_mode() {
+        using namespace ftxui;
+        static const std::array<std::string, 3> labels{
+            "Quick save", "Safe save", "Do backups with following extension:"
+        };
+        Elements rows;
+        for (std::size_t index = 0; index < labels.size(); ++index) {
+            auto row = hbox({text(" "), text(save_mode_choice == index ? "(*) " : "( ) "),
+                             mnemonic_label(labels[index], 0)}) | reflect(save_mode_boxes[index]);
+            if (save_mode_focus == 0U && save_mode_choice == index) row = row | inverted | focus;
+            rows.push_back(std::move(row));
+        }
+        auto extension = render_input(save_mode_extension, save_mode_extension_input, save_mode_focus == 1U, "");
+        if (save_mode_choice != 2U) extension = extension | dim | color(Color::Grey50);
+        rows.push_back(hbox({text(" "), std::move(extension) | reflect(save_mode_boxes[3]), text(" ")}));
+        rows.push_back(separator());
+        auto check = hbox({text(save_mode_check_newline ? " [x] " : " [ ] "),
+                           mnemonic_label("Check POSIX new line", 6)}) | reflect(save_mode_boxes[4]);
+        if (save_mode_focus == 2U) check = check | inverted | focus;
+        rows.push_back(std::move(check));
+        return native_window("Edit Save Mode", vbox({
+            vbox(std::move(rows)),
+            separator(),
+            hbox({native_button("OK", true, save_mode_focus == 3U, save_mode_boxes[5]),
+                  text(" "), native_button("Cancel", false, save_mode_focus == 4U, save_mode_boxes[6])}) | center,
+        }), 44);
+    }
+
+    bool handle_editor_save_mode(const ftxui::Event& event) {
+        using namespace ftxui;
+        if (modal_cancel(event)) { mode = Mode::editor; return true; }
+        if (event.is_mouse()) {
+            auto copy = event;
+            const auto& mouse = copy.mouse();
+            if (save_mode_extension_input.dragging) return input_mouse(save_mode_extension, save_mode_extension_input, mouse);
+            if (mouse.button != Mouse::Left || mouse.motion != Mouse::Pressed) return true;
+            for (std::size_t index = 0; index < save_mode_boxes.size(); ++index) {
+                if (!save_mode_boxes[index].Contain(mouse.x, mouse.y)) continue;
+                if (index < 3U) { save_mode_choice = index; save_mode_focus = 0; }
+                else if (index == 3U && save_mode_choice == 2U) {
+                    save_mode_focus = 1;
+                    input_mouse(save_mode_extension, save_mode_extension_input, mouse);
+                } else if (index == 4U) { save_mode_focus = 2; save_mode_check_newline = !save_mode_check_newline; }
+                else if (index == 5U) apply_editor_save_mode();
+                else if (index == 6U) mode = Mode::editor;
+                return true;
+            }
+            return true;
+        }
+        if (event == Event::Tab || event == Event::TabReverse) {
+            do {
+                save_mode_focus = event == Event::Tab ? (save_mode_focus + 1U) % 5U : (save_mode_focus + 4U) % 5U;
+            } while (save_mode_focus == 1U && save_mode_choice != 2U);
+        } else if (save_mode_focus == 0U && (event == Event::ArrowUp || event == Event::ArrowDown)) {
+            save_mode_choice = event == Event::ArrowDown ? (save_mode_choice + 1U) % 3U : (save_mode_choice + 2U) % 3U;
+        } else if (event == Event::Return || (event == Event::Character(' ') && save_mode_focus >= 3U)) {
+            if (save_mode_focus == 4U) mode = Mode::editor;
+            else apply_editor_save_mode();
+        } else if (save_mode_focus == 1U) {
+            return edit_input(save_mode_extension, save_mode_extension_input, event);
+        } else if (save_mode_focus == 2U && event == Event::Character(' ')) {
+            save_mode_check_newline = !save_mode_check_newline;
+        } else if (event.is_character() && event.character().size() == 1U) {
+            const auto key = static_cast<char>(std::tolower(static_cast<unsigned char>(event.character()[0])));
+            if (key == 'q') { save_mode_choice = 0; save_mode_focus = 0; }
+            else if (key == 's') { save_mode_choice = 1; save_mode_focus = 0; }
+            else if (key == 'd') { save_mode_choice = 2; save_mode_focus = 0; }
+            else if (key == 'p') { save_mode_check_newline = !save_mode_check_newline; save_mode_focus = 2; }
+        }
+        return true;
+    }
+
+    void apply_editor_save_mode() {
+        const auto selected = save_mode_choice == 0U ? EditorSaveMode::in_place
+                            : save_mode_choice == 1U ? EditorSaveMode::atomic : EditorSaveMode::backup;
+        editor.set_backup_extension(save_mode_extension);
+        editor.set_save_mode(selected);
+        for (auto& buffer : editor_buffers) {
+            buffer.set_backup_extension(save_mode_extension);
+            buffer.set_save_mode(selected);
+        }
+        config.editor_backup_extension = save_mode_extension;
+        config.editor_check_newline = save_mode_check_newline;
+        config.editor_save_mode = selected == EditorSaveMode::atomic ? "atomic"
+                                : selected == EditorSaveMode::in_place ? "in-place" : "backup";
+        mode = Mode::editor;
+        status = "Save mode changed";
+    }
+
+    ftxui::Element render_newline_warning() {
+        using namespace ftxui;
+        return native_window("Warning", vbox({
+            text(" The file you are saving does not end with a newline. "),
+            separator(),
+            hbox({native_button("Continue", true, newline_warning_choice == 0U, newline_warning_boxes[0]),
+                  text(" "), native_button("Cancel", false, newline_warning_choice == 1U, newline_warning_boxes[1])}) | center,
+        }), 57);
+    }
+
+    bool handle_newline_warning(const ftxui::Event& event) {
+        const auto input = handle_button_input(event, newline_warning_choice, newline_warning_boxes, "oc");
+        if (input == ButtonInput::cancel || (input == ButtonInput::activate && newline_warning_choice == 1U)) {
+            editor_quit_requested = false;
+            mode = editor_save_purpose == EditorSavePurpose::save_as ? Mode::prompt : Mode::editor;
+            editor_save_buffer = nullptr;
+        } else if (input == ButtonInput::activate) {
+            newline_warning_accepted = true;
+            complete_editor_buffer_save(newline_warning_preserve_links);
+        }
+        return input != ButtonInput::ignored;
+    }
+
+    void show_editor_window(const int action) {
+        if (action == 5) {
+            editor_window_action = 0;
+            if (editor.fullscreen && !editor.window_geometry_saved) {
+                const auto dimensions = ftxui::Terminal::Size();
+                editor.window_x = 0;
+                editor.window_y = 1;
+                editor.window_width = dimensions.dimx;
+                editor.window_height = std::max(1, dimensions.dimy - 2);
+                editor.window_geometry_saved = true;
+            }
+            editor.fullscreen = !editor.fullscreen;
+            update_editor_view();
+            return;
+        }
+        if (editor.fullscreen) return;
+        editor_window_previous = editor_window_bounds();
+        editor.window_x = editor_window_previous[0];
+        editor.window_y = editor_window_previous[1];
+        editor.window_width = editor_window_previous[2];
+        editor.window_height = editor_window_previous[3];
+        editor_window_action = action;
+        editor_window_mouse_drag = false;
+    }
+
+    bool handle_editor_window(const ftxui::Event& event) {
+        using namespace ftxui;
+        const auto dimensions = Terminal::Size();
+        const auto bounds = editor_window_bounds();
+        editor.window_x = bounds[0]; editor.window_y = bounds[1];
+        editor.window_width = bounds[2]; editor.window_height = bounds[3];
+        const auto maximum_width = std::max(1, dimensions.dimx - editor.window_x);
+        const auto maximum_height = std::max(1, dimensions.dimy - editor.window_y - 1);
+        if (modal_cancel(event) || event == Event::CtrlC) {
+            editor.window_x = editor_window_previous[0];
+            editor.window_y = editor_window_previous[1];
+            editor.window_width = editor_window_previous[2];
+            editor.window_height = editor_window_previous[3];
+            editor_window_action = 0;
+            editor_window_mouse_drag = false;
+        } else if (event == Event::Return) {
+            editor_window_action = 0;
+            editor_window_mouse_drag = false;
+        } else if (event == Event::ArrowLeft || event == Event::ArrowRight ||
+                   event == Event::ArrowUp || event == Event::ArrowDown) {
+            const auto dx = event == Event::ArrowLeft ? -1 : event == Event::ArrowRight ? 1 : 0;
+            const auto dy = event == Event::ArrowUp ? -1 : event == Event::ArrowDown ? 1 : 0;
+            if (editor_window_action == 3) {
+                editor.window_x = std::clamp(editor.window_x + dx, 0, std::max(0, dimensions.dimx - editor.window_width));
+                editor.window_y = std::clamp(editor.window_y + dy, 1, std::max(1, dimensions.dimy - editor.window_height - 1));
+            } else {
+                editor.window_width = std::clamp(editor.window_width + dx, std::min(12, maximum_width), maximum_width);
+                editor.window_height = std::clamp(editor.window_height + dy, std::min(4, maximum_height), maximum_height);
+            }
+        } else if (event.is_mouse()) {
+            auto copy = event;
+            const auto& mouse = copy.mouse();
+            if (mouse.button == Mouse::Left && mouse.motion == Mouse::Pressed) {
+                editor_window_mouse_drag = true;
+                editor_window_mouse_offset = mouse.x - editor.window_x;
+            } else if (editor_window_mouse_drag && mouse.motion == Mouse::Moved) {
+                if (editor_window_action == 3) {
+                    editor.window_x = std::clamp(mouse.x - editor_window_mouse_offset, 0,
+                                                std::max(0, dimensions.dimx - editor.window_width));
+                    editor.window_y = std::clamp(mouse.y, 1, std::max(1, dimensions.dimy - editor.window_height - 1));
+                } else {
+                    editor.window_width = std::clamp(mouse.x - editor.window_x + 1, std::min(12, maximum_width), maximum_width);
+                    editor.window_height = std::clamp(mouse.y - editor.window_y + 1, std::min(4, maximum_height), maximum_height);
+                }
+            } else if (editor_window_mouse_drag && mouse.motion == Mouse::Released) {
+                editor_window_mouse_drag = false;
+                editor_window_action = 0;
+            }
+        }
+        editor.window_geometry_saved = true;
+        update_editor_view();
+        return true;
+    }
+
+    void reload_local_rules() {
+        const auto directory = default_config_path().parent_path();
+        auto syntax = read_local_rules(directory / "syntax");
+        auto extensions = read_local_rules(directory / "extensions");
+        auto highlighting = read_local_rules(directory / "highlighting");
+        for (const auto& [pattern, language] : syntax) {
+            static_cast<void>(pattern);
+            if (std::ranges::find(SyntaxHighlighter::languages(), language) == SyntaxHighlighter::languages().end()) {
+                throw std::runtime_error("unknown syntax language in rules: " + language);
+            }
+        }
+        std::vector<std::pair<std::string, ftxui::Color>> colors;
+        for (const auto& [pattern, value] : highlighting) {
+            std::istringstream components(value);
+            std::array<int, 3> values{};
+            std::string component;
+            for (auto& number : values) {
+                if (!std::getline(components, component, ',')) throw std::runtime_error("highlight color needs red,green,blue");
+                std::istringstream input(component);
+                if (!(input >> number) || number < 0 || number > 255) throw std::runtime_error("highlight color values must be 0 through 255");
+                input >> std::ws;
+                if (!input.eof()) throw std::runtime_error("invalid highlight color");
+            }
+            if (std::getline(components, component, ',')) throw std::runtime_error("highlight color has too many values");
+            colors.emplace_back(pattern, ftxui::Color::RGB(
+                static_cast<std::uint8_t>(values[0]), static_cast<std::uint8_t>(values[1]),
+                static_cast<std::uint8_t>(values[2])));
+        }
+        syntax_rules = std::move(syntax);
+        extension_rules = std::move(extensions);
+        highlight_rules = std::move(colors);
+        syntax_spans.clear();
+        syntax_path.clear();
+    }
+
+    std::string effective_syntax_language() const {
+        if (config.editor_syntax_language != "auto") return config.editor_syntax_language;
+        const auto name = std::filesystem::path(editor.path()).filename().string();
+        for (const auto& [pattern, language] : syntax_rules) {
+            if (EditorSearch::filename_matches(name, pattern, true)) return language;
+        }
+        return "auto";
+    }
+
+    void show_syntax_settings() {
+        static const std::vector<std::pair<std::string, std::string>> syntaxes{
+            {"C/C++ Program", "cpp"}, {"Rust Program", "rust"}, {"GoLang Program", "go"},
+            {"JavaScript Program", "javascript"}, {"Python Program", "python"},
+            {"Shell Script", "shell"}, {"JSON File", "json"}, {"Markdown", "markdown"},
+            {"INI-based File", "config"}
+        };
+        std::vector<std::string> names{"< Auto >", "< Reload Current Syntax >"};
+        for (const auto& [name, language] : syntaxes) {
+            static_cast<void>(language);
+            names.push_back(name);
+        }
+        show_local_list("Choose syntax highlighting", std::move(names),
+            [this](const std::size_t selected) {
+                if (selected == 0U) config.editor_syntax_language = "auto";
+                else if (selected == 1U) reload_local_rules();
+                else config.editor_syntax_language = syntaxes.at(selected - 2U).second;
+                syntax_spans.clear();
+                syntax_path.clear();
+            }, Mode::editor);
+        local_list_native = true;
+        for (std::size_t index = 0; index < syntaxes.size(); ++index) {
+            if (syntaxes[index].second == config.editor_syntax_language) local_list_cursor = index + 2U;
+        }
+    }
+
+    void activate_file_association() {
+        const auto* entry = active().current();
+        if (entry == nullptr || !can_open_file(*entry)) return;
+        reload_local_rules();
+        std::string command;
+        for (const auto& [pattern, action] : extension_rules) {
+            if (EditorSearch::filename_matches(entry->name, pattern, true)) {
+                command = expand_user_menu_command(action, entry->path, active().path(), passive().path());
+                break;
+            }
+        }
+        if (command.empty()) {
+            const auto executable = entry->permissions &
+                (std::filesystem::perms::owner_exec | std::filesystem::perms::group_exec |
+                 std::filesystem::perms::others_exec);
+            if (executable == std::filesystem::perms::none) {
+                status = "No file association; use F3 to view or F4 to edit";
+                return;
+            }
+            command = expand_user_menu_command("%f", entry->path, active().path(), passive().path());
+        }
+        const auto directory = active().path();
+        const auto execute = [this, directory, command](const std::size_t selected) {
+            if (selected != 0U) return;
+            const auto result = run_process(command, false, directory);
+            if (result != 0) throw std::runtime_error("association command exited " + std::to_string(result));
+            status = "File association completed";
+        };
+        if (config.confirm_execute) {
+            show_native_query("Execute", "Execute " + display_text(entry->name) + "?",
+                              {"Yes", "No"}, execute);
+        } else execute(0);
+    }
+
+    EditorLocation editor_location() const {
+        return {editor.path(), {editor.row(), editor.column()}};
+    }
+
+    void open_editor_location(const EditorLocation& location) {
+        open_editor_buffer(local, location.path, false, true);
+        editor.set_position(location.position);
+        center_editor();
+        mode = Mode::editor;
+    }
+
+    void follow_declaration(const Declaration& target) {
+        const auto origin = editor_location();
+        open_editor_location({target.path, {target.line - 1U, 0}});
+        if (declaration_history.empty()) {
+            declaration_history.push_back(origin);
+        } else {
+            declaration_history[declaration_cursor] = origin;
+            declaration_history.erase(declaration_history.begin() +
+                                          static_cast<std::ptrdiff_t>(declaration_cursor + 1U),
+                                      declaration_history.end());
+        }
+        declaration_history.push_back(editor_location());
+        declaration_cursor = declaration_history.size() - 1U;
+        status = "Declaration: " + target.path + ":" + std::to_string(target.line);
+    }
+
+    void move_declaration_history(const bool forward) {
+        if (declaration_history.empty() || (!forward && declaration_cursor == 0U) ||
+            (forward && declaration_cursor + 1U >= declaration_history.size())) {
+            show_editor_message("Declarations", forward ? "No forward declaration position"
+                                                       : "No previous declaration position");
+            return;
+        }
+        declaration_history[declaration_cursor] = editor_location();
+        const auto next = forward ? declaration_cursor + 1U : declaration_cursor - 1U;
+        open_editor_location(declaration_history[next]);
+        declaration_cursor = next;
+    }
+
+    void show_find_declaration() {
+        const auto& line = editor.lines()[editor.row()];
+        auto begin = std::min(editor.column(), line.size());
+        const auto identifier = [](const unsigned char byte) {
+            return byte >= 128U || byte == '_' || std::isalnum(byte) != 0;
+        };
+        while (begin > 0U && identifier(static_cast<unsigned char>(line[begin - 1U]))) --begin;
+        auto end = std::min(editor.column(), line.size());
+        while (end < line.size() && identifier(static_cast<unsigned char>(line[end]))) ++end;
+        const auto word = line.substr(begin, end - begin);
+        if (word.empty()) throw std::runtime_error("there is no identifier at the cursor");
+        const auto file = editor.path();
+        auto targets = std::make_shared<std::vector<Declaration>>();
+        start_local_task("Finding declaration: " + word,
+            [file, word, targets](const Cancellation& cancellation) {
+                *targets = find_declarations(file, word, cancellation);
+                return CommandOutput{};
+            }, [this, targets](CommandOutput) {
+                if (targets->size() == 1U) {
+                    follow_declaration(targets->front());
+                } else {
+                    std::vector<std::string> choices;
+                    for (const auto& target : *targets) {
+                        choices.push_back(target.path + ":" + std::to_string(target.line));
+                    }
+                    show_local_list("Declaration targets", std::move(choices),
+                        [this, targets](const std::size_t index) { follow_declaration(targets->at(index)); },
+                        Mode::editor);
+                }
+            }, Mode::editor);
+    }
+
+    static bool recordable_editor_key(const ftxui::Event& event) {
+        using namespace ftxui;
+        if (event.is_character() && !event.input().empty()) return true;
+        static const std::vector<Event> keys{
+            Event::ArrowLeft, Event::ArrowRight, Event::ArrowUp, Event::ArrowDown,
+            Event::ArrowLeftCtrl, Event::ArrowRightCtrl, Event::ArrowUpCtrl, Event::ArrowDownCtrl,
+            Event::Home, Event::End, Event::PageUp, Event::PageDown,
+            Event::Return, Event::Tab, Event::Insert, Event::Delete, Event::Backspace,
+            Event::F3, Event::F5, Event::F6, Event::F8, Event::CtrlU, Event::AltR,
+            Event::CtrlK, Event::CtrlY, Event::CtrlA, Event::CtrlE,
+            Event::Special("\x1B[25~"), Event::Special("\x1B[1;5H"), Event::Special("\x1B[1;5F"),
+            Event::Special("\x1B[2;5~"), Event::Special("\x1B[3;2~"), Event::Special("\x1B[2;2~")
+        };
+        return std::ranges::find(keys, event) != keys.end() ||
+               (event.input().starts_with("\x1B[1;") && !event.input().empty() &&
+                std::string_view("ABCDHF").find(event.input().back()) != std::string_view::npos);
+    }
+
+    static std::string encode_macro(const std::vector<MacroKey>& keys) {
+        std::string result;
+        for (const auto& key : keys) {
+            result += key.character ? 'c' : 's';
+            result += encode_hex_bytes(key.input);
+            result += ';';
+        }
+        return result;
+    }
+
+    static std::vector<MacroKey> decode_macro(const std::string& text) {
+        std::vector<MacroKey> result;
+        std::size_t begin = 0;
+        while (begin < text.size()) {
+            const auto end = text.find(';', begin);
+            if (end == std::string::npos || end <= begin + 1U ||
+                (text[begin] != 'c' && text[begin] != 's')) {
+                throw std::runtime_error("invalid recorded macro");
+            }
+            MacroKey key{text[begin] == 'c',
+                         decode_hex_query(std::string_view(text).substr(begin + 1U, end - begin - 1U))};
+            const auto event = key.character ? ftxui::Event::Character(key.input)
+                                            : ftxui::Event::Special(key.input);
+            if (!recordable_editor_key(event)) throw std::runtime_error("macro contains a non-editing key");
+            result.push_back(std::move(key));
+            begin = end + 1U;
+        }
+        if (result.empty()) throw std::runtime_error("macro contains no editing keys");
+        return result;
+    }
+
+    void toggle_macro_recording() {
+        if (macro_recording) {
+            macro_recording = false;
+            show_key_query("Save macro", "Press the macro's new hotkey:", true,
+                [this](const ftxui::Event& event) {
+                    if (event == ftxui::Event::CtrlR) throw std::runtime_error("macro recording hotkey is reserved");
+                    const auto hotkey = encode_hex_bytes(event.input());
+                    if (macro_keys.empty()) config.editor_macros.erase(hotkey);
+                    else config.editor_macros[hotkey] = encode_macro(macro_keys);
+                    status = "Macro saved";
+                });
+            return;
+        }
+        macro_keys.clear();
+        macro_recording = true;
+        status = "Recording macro";
+    }
+
+    void show_delete_macro() {
+        show_key_query("Delete macro", "Press macro hotkey:", true, [this](const ftxui::Event& event) {
+            if (config.editor_macros.erase(encode_hex_bytes(event.input())) == 0U) {
+                show_editor_message("Delete macro", "Macro not deleted");
+            } else status = "Macro deleted";
+        });
+    }
+
+    void step_macro() {
+        if (!macro_replaying) return;
+        try {
+            for (int count = 0; count < 32 && macro_replaying; ++count) {
+                const auto key = macro_playback.at(macro_play_index);
+                handle_editor(key.character ? ftxui::Event::Character(key.input)
+                                            : ftxui::Event::Special(key.input));
+                if (mode != Mode::editor) {
+                    macro_replaying = false;
+                    return;
+                }
+                if (++macro_play_index == macro_playback.size()) {
+                    macro_play_index = 0;
+                    if (--macro_repeats == 0U) {
+                        macro_replaying = false;
+                        status = "Macro completed";
+                    }
+                }
+            }
+            if (macro_replaying) post_ui([this] { step_macro(); });
+        } catch (const std::exception& error) {
+            macro_replaying = false;
+            show_editor_error(error);
+        }
+    }
+
+    void show_repeat_actions() {
+        if (!macro_recording) {
+            macro_keys.clear();
+            macro_recording = true;
+            status = "Recording commands to repeat";
+            return;
+        }
+        macro_recording = false;
+        show_native_input("Repeat last commands", "Repeat times:", "", [this](const std::string& value) {
+            if (value.empty() || value.front() == '-') throw std::runtime_error("repeat count must be nonnegative");
+            std::size_t parsed = 0;
+            const auto count = std::stoull(value, &parsed, 0);
+            if (parsed != value.size() || count > std::numeric_limits<std::size_t>::max()) {
+                throw std::runtime_error("invalid repeat count");
+            }
+            start_macro(macro_keys, static_cast<std::size_t>(count));
+        }, Mode::editor);
+    }
+
+    void start_macro(std::vector<MacroKey> keys, const std::size_t repeats) {
+        if (keys.empty() || repeats == 0U) {
+            status = "No commands to repeat";
+            return;
+        }
+        macro_playback = std::move(keys);
+        macro_recording = false;
+        macro_repeats = repeats;
+        macro_play_index = 0;
+        macro_replaying = true;
+        post_ui([this] { step_macro(); });
+    }
+
+    void show_learn_keys(const Mode return_mode) {
+        learn_key_return = return_mode;
+        learn_key_focus = 39;
+        learn_key_detected.fill(false);
+        learn_keys_draft = config.learned_keys;
+        mode = Mode::learn_keys_dialog;
+    }
+
+    static const std::vector<std::pair<std::string, std::string>>& learnable_keys() {
+        static const auto result = [] {
+            std::vector<std::pair<std::string, std::string>> keys{{"Escape", "Escape"}};
+            for (int index = 1; index <= 20; ++index) {
+                keys.emplace_back("Function key " + std::to_string(index), "F" + std::to_string(index));
+            }
+            for (const auto& key : std::vector<std::pair<std::string, std::string>>{
+                {"Completion/M-tab", "Completion"}, {"BackTab/S-tab", "BackTab"},
+                {"Backspace", "Backspace"}, {"Up arrow", "Up"}, {"Down arrow", "Down"},
+                {"Left arrow", "Left"}, {"Right arrow", "Right"}, {"Insert", "Insert"},
+                {"Delete", "Delete"}, {"Home", "Home"}, {"End key", "End"},
+                {"Page Up", "PageUp"}, {"Page Down", "PageDown"},
+                {"/ on keypad", "Keypad /"}, {"* on keypad", "Keypad *"},
+                {"- on keypad", "Keypad -"}, {"+ on keypad", "Keypad +"}
+            }) keys.push_back(key);
+            return keys;
+        }();
+        return result;
+    }
+
+    void teach_key(const std::size_t index) {
+        learn_key_focus = index;
+        learn_key_action = learnable_keys().at(index).second;
+        mode = Mode::learn_key;
+    }
+
+    ftxui::Element render_learn_keys() {
+        using namespace ftxui;
+        Elements rows;
+        const auto& keys = learnable_keys();
+        for (std::size_t row = 0; row < 13U; ++row) {
+            Elements columns{text(" ")};
+            for (std::size_t column = 0; column < 3U; ++column) {
+                const auto index = column * 13U + row;
+                Element cell = text("");
+                if (index < keys.size()) {
+                    cell = text("[" + fit_listing_text(keys[index].first, 16, ListingAlignment::left) + "]") |
+                           reflect(learn_key_boxes[index]);
+                    if (learn_key_focus == index) cell = cell | inverted | focus;
+                    cell = hbox({std::move(cell), text(learn_key_detected[index] ? " OK" : "   "), filler()});
+                }
+                columns.push_back(std::move(cell) | size(WIDTH, EQUAL, 23));
+            }
+            rows.push_back(hbox(std::move(columns)));
+        }
+        return native_window("Learn keys", vbox({
+            vbox(std::move(rows)) | yframe |
+                size(HEIGHT, LESS_THAN, std::max(1, Terminal::Size().dimy - 10)) | reflect(learn_keys_viewport),
+            separator(),
+            text(" Press each listed key. Working keys are marked OK."),
+            text(" Press Space on a missing key, or click it, to define it."),
+            text(" Use Tab to move between buttons."),
+            separator(),
+            hbox({native_button("Save", true, learn_key_focus == 38U, learn_key_boxes[38]), text(" "),
+                  native_button("Cancel", false, learn_key_focus == 39U, learn_key_boxes[39])}) | center,
+        }), 76);
+    }
+
+    bool handle_learn_keys(const ftxui::Event& event) {
+        using namespace ftxui;
+        if (event.is_mouse()) {
+            auto copy = event;
+            const auto& mouse = copy.mouse();
+            if (mouse.button != Mouse::Left || mouse.motion != Mouse::Pressed) return true;
+            for (std::size_t index = 0; index < learn_key_boxes.size(); ++index) {
+                if (index < 38U && !learn_keys_viewport.Contain(mouse.x, mouse.y)) continue;
+                if (!learn_key_boxes[index].Contain(mouse.x, mouse.y)) continue;
+                learn_key_focus = index;
+                if (index < 38U) teach_key(index);
+                else return handle_learn_keys(Event::Return);
+                return true;
+            }
+            return true;
+        }
+        auto translated = event;
+        if (const auto binding = learn_keys_draft.find(encode_hex_bytes(event.input()));
+            binding != learn_keys_draft.end()) translated = named_event(binding->second);
+        const auto& keys = learnable_keys();
+        for (std::size_t index = 0; index < keys.size(); ++index) {
+            if (!learn_key_detected[index] && translated == named_event(keys[index].second)) {
+                learn_key_detected[index] = true;
+                learn_key_focus = index;
+                return true;
+            }
+        }
+        if (event == Event::Escape || event == Event::AltC) {
+            mode = learn_key_return;
+        } else if (event == Event::AltS || (event == Event::Return && learn_key_focus == 38U)) {
+            config.learned_keys = learn_keys_draft;
+            mode = learn_key_return;
+        } else if ((event == Event::Return || event == Event::Character(' ')) && learn_key_focus == 39U) {
+            mode = learn_key_return;
+        } else if ((event == Event::Return || event == Event::Character(' ')) && learn_key_focus < 38U) {
+            teach_key(learn_key_focus);
+        } else if (event == Event::Tab || event == Event::Character('j') || event == Event::ArrowDown) {
+            learn_key_focus = (learn_key_focus + 1U) % 40U;
+        } else if (event == Event::TabReverse || event == Event::Character('k') || event == Event::ArrowUp) {
+            learn_key_focus = (learn_key_focus + 39U) % 40U;
+        } else if (event == Event::ArrowRight || event == Event::Character('l')) {
+            learn_key_focus = learn_key_focus < 26U ? std::min<std::size_t>(37U, learn_key_focus + 13U)
+                                                  : learn_key_focus % 13U;
+        } else if (event == Event::ArrowLeft || event == Event::Character('h')) {
+            learn_key_focus = learn_key_focus >= 13U && learn_key_focus < 38U ? learn_key_focus - 13U
+                                                                          : std::min<std::size_t>(37U, learn_key_focus + 26U);
+        }
+        return true;
+    }
+
+    ftxui::Element render_learn_key() {
+        using namespace ftxui;
+        const auto label = learnable_keys().at(learn_key_focus).first;
+        return native_window("Teach me a key", vbox({
+            text(" Press " + label + " and wait."),
+            text(" Press it again in Learn keys to verify the OK marker."),
+            text(" A single Escape cancels teaching."),
+        }), 65);
+    }
+
+    bool handle_learn_key(const ftxui::Event& event) {
+        if (event == ftxui::Event::Escape) {
+            mode = Mode::learn_keys_dialog;
+        } else if (!event.input().empty() && !event.is_mouse() &&
+                   !event.is_cursor_position() && !event.is_cursor_shape() &&
+                   !event.IsTerminalNameVersion() && !event.IsTerminalEmulator() &&
+                   !event.IsTerminalCapabilities()) {
+            const auto& input = event.input();
+            const bool printable = input.size() == 1U &&
+                                   static_cast<unsigned char>(input[0]) >= 32U &&
+                                   static_cast<unsigned char>(input[0]) <= 126U;
+            if (printable || event == ftxui::Event::Return || event == ftxui::Event::Tab) {
+                show_native_message("Warning", "Cannot accept this key.", Mode::learn_keys_dialog);
+            } else {
+                learn_keys_draft[encode_hex_bytes(input)] = learn_key_action;
+                mode = Mode::learn_keys_dialog;
+            }
+        }
+        return true;
+    }
+
+    void show_literal_insert() {
+        show_key_query("Insert literal", "Press any key:", false, [this](const ftxui::Event& event) {
+            if (event == ftxui::Event::Special("\x1B[32;5u")) editor.paste(std::string(1, '\0'));
+            else if (event.is_character() || event.input().size() == 1U) editor.paste(event.input());
+        });
+    }
+
+    void show_date_insert() {
+        const auto now = std::time(nullptr);
+        std::tm local_time{};
+        if (localtime_r(&now, &local_time) == nullptr) throw std::runtime_error("cannot read local time");
+        std::array<char, 4096> value{};
+        const auto length = std::strftime(value.data(), value.size(), "%c", &local_time);
+        if (length == 0U) throw std::runtime_error("cannot format local time");
+        editor.paste(std::string_view(value.data(), length));
+    }
+
+    void show_paste_output() {
+        show_native_input("Paste output of external command", "Enter shell command(s):", "",
+            [this](const std::string& command) {
+            if (command.empty()) throw std::runtime_error("command is empty");
+            const auto path = editor.path();
+            const auto change = editor.change_id();
+            const EditorPosition position{editor.row(), editor.column()};
+            const auto directory = local->parent(path);
+            start_local_task("Capturing command output",
+                [command, directory](const Cancellation& cancellation) {
+                    return capture_shell(command, directory, cancellation, 16U * 1024U * 1024U);
+                }, [this, path, change, position](CommandOutput result) {
+                    require_command_success(result);
+                    if (editor.path() != path || editor.change_id() != change) {
+                        throw std::runtime_error("buffer changed while the command was running");
+                    }
+                    editor.set_position(position);
+                    editor.paste(result.output);
+                    if (!config.editor_cursor_after_inserted_block) editor.set_position(position);
+                    status = result.output.empty() ? "Command produced no output" : "Command output inserted";
+                    show_command_warnings(result.error);
+                }, Mode::editor);
+        }, Mode::editor);
+    }
+
+    void show_editor_transform(const int action) {
+        if (action == 3) {
+            if (!editor.selection()) {
+                show_editor_message("Error", "You must first highlight a block of text");
+                return;
+            }
+            show_native_input("Run sort", "Enter sort options (see sort(1) manpage) separated by whitespace:", "",
+                [this](const std::string& options) {
+                    const auto words = plain_command_words("sort " + options);
+                    if (!words) throw std::invalid_argument("sort options must be plain arguments, not shell operators");
+                    run_editor_transform(*words, "", false);
+                }, Mode::editor);
+        } else if (action == 2) {
+            run_editor_transform({"fmt", "-w", std::to_string(config.editor_wrap_length)}, "", true);
+        } else {
+            const auto* data = std::getenv("XDG_DATA_HOME");
+            const auto* home = std::getenv("HOME");
+            if ((data == nullptr || *data == '\0') && (home == nullptr || *home == '\0')) {
+                throw std::runtime_error("XDG_DATA_HOME and HOME are unavailable for external formatter configuration");
+            }
+            const auto directory = data != nullptr && *data != '\0' ? std::filesystem::path(data)
+                                   : std::filesystem::path(home) / ".local/share";
+            const auto path = directory / "mcpp/mcedit/macros.d/macro.0.sh";
+            if (!local->exists(path.string())) {
+                throw std::runtime_error("external formatter menu is not configured: " + path.string());
+            }
+            const auto entries = load_user_menu(path);
+            if (entries.empty()) throw std::runtime_error("external formatter menu has no command");
+            const auto command = expand_user_menu_command(entries.front().command, editor.path(),
+                                                          local->parent(editor.path()), active().path());
+            run_editor_transform({}, command, false);
+        }
+    }
+
+    void run_editor_transform(std::vector<std::string> arguments, std::string command, const bool paragraph) {
+        const auto selected = editor.selected_text();
+        std::pair<EditorPosition, EditorPosition> range;
+        std::string source = selected.value_or("");
+        if (paragraph && !selected) {
+            const auto blank = [](const std::string& line) {
+                return std::ranges::all_of(line, [](const unsigned char byte) { return std::isspace(byte) != 0; });
+            };
+            auto first = editor.row(), last = first;
+            if (blank(editor.lines()[first])) return;
+            while (first > 0U && !blank(editor.lines()[first - 1U])) --first;
+            while (last + 1U < editor.lines().size() && !blank(editor.lines()[last + 1U])) ++last;
+            range = {{first, 0}, last + 1U < editor.lines().size() ? EditorPosition{last + 1U, 0}
+                                                                : EditorPosition{last, editor.lines()[last].size()}};
+            source = editor.text_range(range.first, range.second);
+        }
+        const bool crlf = source.find("\r\n") != std::string::npos;
+        if (editor.line_separator() == '\r') std::replace(source.begin(), source.end(), '\r', '\n');
+        auto input = std::make_shared<TemporaryFile>(source);
+        const auto file = editor.path();
+        const auto change = editor.change_id();
+        const auto directory = local->parent(file);
+        if (command.empty()) arguments.insert(arguments.end(), {"--", input->path().string()});
+        else command += " < " + expand_user_menu_command("%f", input->path().string(), directory, directory);
+        start_local_task("Transforming editor text",
+            [input, arguments, command, directory](const Cancellation& cancellation) {
+                return command.empty() ? capture_command(arguments, directory, cancellation, 16U * 1024U * 1024U)
+                                       : capture_shell(command, directory, cancellation, 16U * 1024U * 1024U);
+            }, [this, input, file, change, range, selected, crlf, paragraph](CommandOutput result) {
+                require_command_success(result);
+                if (editor.path() != file || editor.change_id() != change) {
+                    throw std::runtime_error("buffer changed while transforming text");
+                }
+                if (paragraph && crlf) {
+                    std::string converted;
+                    for (std::size_t index = 0; index < result.output.size(); ++index) {
+                        if (result.output[index] == '\n' && (index == 0U || result.output[index - 1U] != '\r')) converted += '\r';
+                        converted += result.output[index];
+                    }
+                    result.output = std::move(converted);
+                }
+                if (selected) editor.replace_block(result.output);
+                else if (paragraph) editor.replace_text(range.first, range.second, result.output);
+                else editor.paste(result.output);
+                status = "Text transformed; Undo restores the original";
+                show_command_warnings(result.error);
+            }, Mode::editor);
+    }
+
+    void editor_bookmark_action(const int action) {
+        if (action == 3) editor.toggle_bookmark();
+        else if (action == 6) editor.clear_bookmarks();
+        else if (!editor.jump_bookmark(action == 4 ? 1 : -1)) {
+            show_editor_message("Bookmarks", "No bookmarks in this buffer");
+            return;
+        }
+        remember_editor_position(editor);
+        update_editor_view();
+    }
+
+    void open_config_editor(const std::filesystem::path& path, const std::string& starter = {}) {
+        const bool exists = local->exists(path.string());
+        if (std::filesystem::create_directories(path.parent_path()) &&
+            chmod(path.parent_path().c_str(), 0700) != 0) {
+            throw std::system_error(errno, std::generic_category(), "protect configuration directory");
+        }
+        if (mode != Mode::editor && mode != Mode::editor_menu) editor_return_mode = Mode::panels;
+        open_editor_buffer(local, path.string(), !exists);
+        if (!exists && !starter.empty()) editor.set_text(starter);
+        mode = Mode::editor;
     }
 
     void scroll_editor(const int rows) {
@@ -1463,9 +2836,11 @@ struct App::Impl {
         editor.first_row = editor.row() > half ? editor.row() - half : 0U;
     }
 
-    void refresh(const bool notify_tree = false) {
-        left.refresh();
-        right.refresh();
+    void refresh(const bool notify_tree = false, const bool force = false) {
+        left.clear_directory_sizes();
+        right.clear_directory_sizes();
+        left.refresh({}, force);
+        right.refresh({}, force);
         quick_viewer.close();
         quick_view_path.clear();
         if (tree_panel) {
@@ -2076,7 +3451,7 @@ struct App::Impl {
         tree_operation_destination_provider = active().provider();
         tree_operation_source_index = panel_index;
         if (remove_operation) {
-            dialog_focus = 0;
+            dialog_focus = config.safe_delete ? 1U : 0U;
             mode = Mode::delete_dialog;
             return true;
         }
@@ -2114,7 +3489,17 @@ struct App::Impl {
     }
 
     void swap_panels() {
-        std::swap(left, right);
+        if (!config.simple_swap && !quick_view_panel && !information_panel && !tree_panel) {
+            left.swap_contents(right);
+        } else {
+            std::swap(left, right);
+            std::swap(config.panel_listing[0], config.panel_listing[1]);
+            std::swap(config.panel_columns[0], config.panel_columns[1]);
+            std::swap(config.panel_brief_columns[0], config.panel_brief_columns[1]);
+            std::swap(config.panel_user_mini_status[0], config.panel_user_mini_status[1]);
+            std::swap(config.panel_status_formats[0], config.panel_status_formats[1]);
+            std::swap(config.panel_encoding[0], config.panel_encoding[1]);
+        }
         std::swap(pane_ids[0], pane_ids[1]);
         active_index = 1 - active_index;
         if (quick_view_panel) {
@@ -2141,10 +3526,25 @@ struct App::Impl {
     }
 
     void store_panel_options_in_config() {
+        config.command_history = command_history;
         config.show_hidden = left.show_hidden();
         config.directories_first = left.directories_first();
         config.sort = left.sort_field();
         config.sort_descending = left.descending();
+        for (std::size_t index = 0; index < 2U; ++index) {
+            const auto& pane = index == 0U ? left : right;
+            const auto id = index;
+            config.panel_sort[id] = pane.sort_field();
+            config.panel_descending[id] = pane.descending();
+            config.panel_hidden[id] = pane.show_hidden();
+            config.panel_directories_first[id] = pane.directories_first();
+            config.panel_case_sensitive[id] = pane.sort_case_sensitive();
+            config.panel_executable_first[id] = pane.executable_first();
+        }
+        if (config.auto_save_panels_setup) {
+            config.saved_left_path = left.path();
+            config.saved_right_path = right.path();
+        }
     }
 
     void store_editor_options_in_config() {
@@ -2155,10 +3555,2336 @@ struct App::Impl {
         config.editor_auto_indent = editor_auto_indent;
         config.editor_show_whitespace = editor_show_whitespace;
         config.editor_history = editor_history;
+        remember_editor_position(editor);
+        for (const auto& buffer : editor_buffers) remember_editor_position(buffer);
+    }
+
+    void remember_editor_position(const EditorBuffer& buffer) {
+        if (!buffer.open()) return;
+        config.editor_positions[buffer.path()] = {
+            buffer.row(), buffer.column(), {buffer.bookmarks().begin(), buffer.bookmarks().end()}
+        };
+    }
+
+    void show_local_list(
+        std::string title, std::vector<std::string> items,
+        std::function<void(std::size_t)> activate,
+        const Mode return_mode = Mode::panels
+    ) {
+        local_list_title = std::move(title);
+        local_list_items = std::move(items);
+        local_list_cursor = 0;
+        local_list_activate = std::move(activate);
+        local_list_return = return_mode;
+        local_list_native = false;
+        local_list_hotkeys.clear();
+        local_list_completion = false;
+        local_history_kind = 0;
+        local_directory.reset();
+        mode = Mode::local_list;
+    }
+
+    ftxui::Element render_local_list() {
+        using namespace ftxui;
+        Elements rows;
+        local_list_boxes.assign(local_list_items.size(), {});
+        for (std::size_t index = 0; index < local_list_items.size(); ++index) {
+            auto row = text(middle_truncate(display_text(local_list_items[index]),
+                static_cast<std::size_t>(std::max(1, std::min(90, Terminal::Size().dimx - 4)))));
+            if (index == local_list_cursor) row = row | inverted | focus;
+            rows.push_back(std::move(row) | reflect(local_list_boxes[index]));
+        }
+        if (rows.empty()) rows.push_back(text("<empty>") | dim);
+        if (local_list_native) {
+            return native_window(local_list_title,
+                vbox(std::move(rows)) | yframe |
+                    size(HEIGHT, LESS_THAN, std::max(1, Terminal::Size().dimy - 6)) |
+                    reflect(local_list_box),
+                std::min(44, std::max(1, Terminal::Size().dimx - 2)));
+        }
+        return gray_dialog(vbox({
+            text(local_list_title) | bold | center,
+            separator(),
+            vbox(std::move(rows)) | yframe |
+                size(HEIGHT, LESS_THAN, std::max(1, Terminal::Size().dimy - 6)) |
+                reflect(local_list_box),
+            separator(),
+            text(local_directory
+                     ? "Left: parent  Right: open  Enter: choose  Esc: cancel"
+                     : "Enter/double-click: select   Esc: cancel"),
+        }) | borderStyled(LIGHT) | size(WIDTH, LESS_THAN, std::min(94, Terminal::Size().dimx)));
+    }
+
+    bool handle_local_list(const ftxui::Event& event) {
+        if (local_list_completion && (event.is_character() || event == ftxui::Event::Backspace)) {
+            auto prefix = completion_filter;
+            if (event == ftxui::Event::Backspace) erase_last_utf8(prefix);
+            else prefix += event.character();
+            std::vector<std::string> filtered;
+            for (const auto& candidate : completion_choices) {
+                if (candidate.starts_with(prefix)) filtered.push_back(candidate);
+            }
+            if (!filtered.empty()) {
+                completion_filter = std::move(prefix);
+                local_list_items = std::move(filtered);
+                local_list_cursor = 0;
+            }
+            return true;
+        }
+        if (!local_list_hotkeys.empty() && event.is_character() && event.character().size() == 1U) {
+            const auto selected = local_list_hotkeys.find(event.character()[0]);
+            if (selected != std::string::npos && selected < local_list_items.size()) {
+                local_list_cursor = selected;
+                return handle_local_list(ftxui::Event::Return);
+            }
+        }
+        if (local_history_kind != 0 &&
+            (event == ftxui::Event::Delete || event == ftxui::Event::Character('d'))) {
+            delete_history_item();
+            return true;
+        }
+        if (local_history_kind != 0 &&
+            (event == ftxui::Event::Special("\x1B[3;2~") || event == ftxui::Event::Character('D'))) {
+            if (config.confirm_history_cleanup) {
+                show_native_query("History cleanup", "Do you want clean this history?", {"Yes", "No"},
+                    [this](const std::size_t selected) { if (selected == 0U) clear_history_items(); },
+                    Mode::local_list);
+            } else clear_history_items();
+            return true;
+        }
+        if (local_directory &&
+            (event == ftxui::Event::ArrowLeft || event == ftxui::Event::Backspace)) {
+            show_directory_chooser(local->parent(*local_directory));
+            return true;
+        }
+        if (local_directory && event == ftxui::Event::ArrowRight &&
+            local_list_cursor < local_directory_choices.size()) {
+            show_directory_chooser(local_directory_choices[local_list_cursor]);
+            return true;
+        }
+        const auto input = handle_list_input(
+            event, local_list_cursor, local_list_items.size(), local_list_boxes, local_list_box
+        );
+        if (input == ButtonInput::cancel) {
+            mode = local_list_return;
+        } else if (input == ButtonInput::activate && local_list_cursor < local_list_items.size()) {
+            const auto activate = local_list_activate;
+            const auto selected = local_list_cursor;
+            mode = local_list_return;
+            try {
+                activate(selected);
+            } catch (const std::exception& error) {
+                if (local_list_return == Mode::editor) show_editor_error(error);
+                else set_error(error);
+            }
+        }
+        return input != ButtonInput::ignored;
+    }
+
+    void show_directory_chooser(const std::string& directory) {
+        const auto path = local->normalize(directory);
+        std::vector<std::string> paths{path};
+        std::vector<std::string> labels{"[Current] " + path};
+        for (const auto& entry : local->list(path, {.show_hidden=active().show_hidden()}, {})) {
+            if (entry.kind == EntryKind::directory || entry.target_is_directory) {
+                paths.push_back(entry.path);
+                labels.push_back("  + " + entry.name);
+            }
+        }
+        show_local_list("Directory tree: " + display_text(path), std::move(labels),
+            [this, paths](const std::size_t index) {
+                active().change_directory(paths.at(index));
+                status = "Directory changed";
+            });
+        local_directory = path;
+        local_directory_choices = std::move(paths);
+    }
+
+    void show_directory_sizes() {
+        const bool marked_directories = std::ranges::any_of(active().entries(), [this](const Entry& entry) {
+            return entry.kind == EntryKind::directory && entry.revision != "mcpp:parent" && active().is_selected(entry);
+        });
+        std::vector<std::string> directories;
+        for (const auto& entry : active().entries()) {
+            if (entry.kind == EntryKind::directory && entry.revision != "mcpp:parent" &&
+                (!marked_directories || active().is_selected(entry))) directories.push_back(entry.path);
+        }
+        if (directories.empty()) {
+            status = "No directories to scan";
+            mode = Mode::panels;
+            return;
+        }
+        const auto panel = active_index;
+        auto sizes = std::make_shared<std::map<std::string, std::uint64_t>>();
+        start_local_task("Directory scanning",
+                [directories, sizes](const Cancellation& cancellation) {
+                    for (const auto& directory : directories) {
+                        std::uint64_t total = 0;
+                        for (const auto& entry : std::filesystem::recursive_directory_iterator(directory)) {
+                            cancellation.throw_if_requested();
+                            if (!entry.is_symlink() && entry.is_regular_file()) {
+                                const auto size = entry.file_size();
+                                if (size > std::numeric_limits<std::uint64_t>::max() - total) {
+                                    throw std::runtime_error("directory size overflow");
+                                }
+                                total += size;
+                            }
+                        }
+                        (*sizes)[directory] = total;
+                    }
+                    return CommandOutput{};
+                },
+                [this, panel, sizes](CommandOutput) {
+                    (panel == 0 ? left : right).set_directory_sizes(*sizes);
+                    status = "Directory sizes calculated";
+                });
+    }
+
+    void show_command_history() {
+        auto history = command_history;
+        std::reverse(history.begin(), history.end());
+        show_local_list("History", history, [this](const std::size_t index) {
+            command_line = local_list_items.at(index);
+            command_prompt_override = !config.command_prompt;
+            command_input.reset(command_line);
+            command_mode = true;
+        });
+        local_list_native = true;
+        local_history_kind = 1;
+    }
+
+    void show_file_history() {
+        std::vector<std::string> labels;
+        std::vector<std::pair<bool, std::string>> files;
+        for (const auto& path : editor_history) {
+            labels.push_back("[Edit] " + path);
+            files.emplace_back(true, path);
+        }
+        for (const auto& path : config.viewer_history) {
+            labels.push_back("[View] " + path);
+            files.emplace_back(false, path);
+        }
+        show_local_list("History", std::move(labels),
+            [this](const std::size_t index) {
+                const auto& [edit, path] = local_history_files.at(index);
+                if (edit) {
+                    open_editor_buffer(local, path, false, true);
+                    mode = Mode::editor;
+                } else {
+                    load_viewer(local, path);
+                    viewer_return_mode = Mode::panels;
+                    mode = Mode::viewer;
+                }
+            });
+        local_history_files = std::move(files);
+        local_list_native = true;
+        local_history_kind = 2;
+    }
+
+    void delete_history_item() {
+        if (local_list_cursor >= local_list_items.size()) return;
+        if (local_history_kind == 1) {
+            const auto& value = local_list_items[local_list_cursor];
+            const auto found = std::find(command_history.rbegin(), command_history.rend(), value);
+            if (found != command_history.rend()) command_history.erase(std::next(found).base());
+            command_input.history = command_history;
+            command_input.history_index = command_history.size();
+        } else {
+            const auto& [edit, path] = local_history_files.at(local_list_cursor);
+            if (edit) std::erase(editor_history, path);
+            else std::erase(config.viewer_history, path);
+            local_history_files.erase(local_history_files.begin() + static_cast<std::ptrdiff_t>(local_list_cursor));
+        }
+        local_list_items.erase(local_list_items.begin() + static_cast<std::ptrdiff_t>(local_list_cursor));
+        if (local_list_cursor >= local_list_items.size() && local_list_cursor > 0U) --local_list_cursor;
+    }
+
+    void clear_history_items() {
+        if (local_history_kind == 1) {
+            command_history.clear();
+            command_input.history.clear();
+            command_input.history_index = 0;
+        } else {
+            editor_history.clear();
+            config.viewer_history.clear();
+            local_history_files.clear();
+        }
+        local_list_items.clear();
+        local_list_cursor = 0;
+    }
+
+    void show_screens(const Mode return_mode) {
+        std::vector<std::string> labels{"File manager"};
+        std::vector<std::function<void()>> activate{[this] {
+            exit_after_viewer = false;
+            exit_after_editor = false;
+            mode = Mode::panels;
+        }};
+        const auto viewer_slot = viewer.open() ? std::optional<std::size_t>{1U} : std::nullopt;
+        if (viewer.open()) {
+            labels.push_back("[View] " + viewer.path());
+            activate.push_back([this] { mode = Mode::viewer; });
+        }
+        if (editor.open()) {
+            labels.push_back(std::string(editor.dirty() ? "[Edit*] " : "[Edit] ") + editor.path());
+            activate.push_back([this] {
+                editor_session_base = 0;
+                editor_return_mode = Mode::panels;
+                exit_after_editor = false;
+                mode = Mode::editor;
+            });
+        }
+        for (std::size_t index = 0; index < editor_buffers.size(); ++index) {
+            labels.push_back(std::string(editor_buffers[index].dirty() ? "[Edit*] " : "[Edit] ") +
+                             editor_buffers[index].path());
+            activate.push_back([this, index] {
+                std::swap(editor, editor_buffers.at(index));
+                reset_editor_view_state();
+                editor_session_base = 0;
+                editor_return_mode = Mode::panels;
+                exit_after_editor = false;
+                mode = Mode::editor;
+            });
+        }
+        show_local_list("Screen list", std::move(labels),
+            [this, return_mode, activate, viewer_slot](const std::size_t index) {
+                if (return_mode == Mode::viewer && viewer.dirty() &&
+                    (!viewer_slot || index != *viewer_slot)) {
+                    viewer_message_title = "Unsaved viewer";
+                    viewer_message = "Save or discard the staged hex edits before leaving this viewer.";
+                    mode = Mode::viewer_message;
+                    return;
+                }
+                activate.at(index)();
+            }, return_mode);
+    }
+
+    void cleanup_viewer_temporary() {
+        viewer_temporary_file.reset();
+        viewer_display_name.clear();
+    }
+
+    void load_viewer(const ProviderPtr& provider, const std::string& path) {
+        if (viewer.dirty()) throw std::runtime_error("save or discard the current viewer edits first");
+        if (viewer_temporary_file && provider == local &&
+            local->normalize(path) == local->normalize(viewer_temporary_file->path().string())) return;
+        viewer.open(provider, path);
+        cleanup_viewer_temporary();
+        std::erase(config.viewer_history, path);
+        config.viewer_history.insert(config.viewer_history.begin(), path);
+        if (config.viewer_history.size() > 20U) config.viewer_history.resize(20U);
+    }
+
+    void view_file(const ProviderPtr& provider, const std::string& path, const Mode return_mode) {
+        if (config.use_internal_view) {
+            load_viewer(provider, path);
+            viewer_search_needle.clear();
+            viewer_return_mode = return_mode;
+            mode = Mode::viewer;
+            return;
+        }
+        const auto* pager = std::getenv("PAGER");
+        const auto command = std::string(pager != nullptr && *pager != '\0' ? pager : "less") + " " +
+            expand_user_menu_command("%f", path, provider->parent(path), passive().path());
+        const auto result = run_process(command, false, provider->parent(path));
+        mode = return_mode;
+        if (result != 0) throw std::runtime_error("external viewer exited " + std::to_string(result));
+        std::erase(config.viewer_history, path);
+        config.viewer_history.insert(config.viewer_history.begin(), path);
+        if (config.viewer_history.size() > 20U) config.viewer_history.resize(20U);
+        status = "Viewer closed";
+    }
+
+    void edit_file(
+        const ProviderPtr& provider, const std::string& path, const Mode return_mode,
+        const bool require_existing = true
+    ) {
+        if (config.use_internal_edit) {
+            const auto retained = editor_buffers.size() + (editor.open() ? 1U : 0U);
+            open_editor_buffer(provider, path, false, require_existing);
+            editor_session_base = return_mode == Mode::search_results ? retained : 0U;
+            editor_return_mode = return_mode;
+            mode = Mode::editor;
+            return;
+        }
+        const auto* external = std::getenv("EDITOR");
+        const auto command = std::string(external != nullptr && *external != '\0' ? external : "vi") + " " +
+            expand_user_menu_command("%f", path, provider->parent(path), passive().path());
+        const auto result = run_process(command, false, provider->parent(path));
+        mode = return_mode;
+        if (result != 0) throw std::runtime_error("external editor exited " + std::to_string(result));
+        remember_editor_path(path);
+        status = "Editor closed";
+    }
+
+    void request_main_edit(const Entry* entry) {
+        if (!config.ask_new_filename) {
+            if (entry != nullptr && can_open_file(*entry)) edit_file(active().provider(), entry->path, Mode::panels);
+            return;
+        }
+        const auto provider = active().provider();
+        const auto directory = active().navigation_path();
+        const auto value = entry != nullptr && can_open_file(*entry) ? entry->path : std::string{};
+        show_native_input("Edit file", "Enter file name:", value,
+            [this, provider, directory](const std::string& name) {
+                if (name.empty()) throw std::invalid_argument("file name is empty");
+                edit_file(provider, provider->join(directory, name), Mode::panels, false);
+            }, Mode::panels, directory);
+    }
+
+    std::string mkdir_default() const {
+        const auto* entry = active_index == 0 ? left.current() : right.current();
+        return config.mkdir_autoname && entry != nullptr && entry->revision != "mcpp:parent"
+                   ? entry->name : std::string{};
+    }
+
+    const std::string& viewer_title() const {
+        return viewer_display_name.empty() ? viewer.path() : viewer_display_name;
+    }
+
+    void open_output_viewer(const std::string& label, const std::string& value) {
+        if (viewer.dirty()) throw std::runtime_error("save or discard the current viewer edits first");
+        auto temporary = std::make_shared<TemporaryFile>(value);
+        viewer.open(local, temporary->path().string());
+        cleanup_viewer_temporary();
+        viewer_temporary_file = std::move(temporary);
+        viewer_display_name = label;
+        viewer_return_mode = Mode::panels;
+        viewer_search_needle.clear();
+        mode = Mode::viewer;
+    }
+
+    static void require_command_success(const CommandOutput& result, const bool difference_ok = false) {
+        if (result.status != 0 && !(difference_ok && result.status == 1)) {
+            throw std::runtime_error("command exited " + std::to_string(result.status) +
+                                     (result.error.empty() ? "" : ": " + result.error));
+        }
+    }
+
+    void show_command_warnings(const std::string& warning) {
+        if (warning.empty()) return;
+        if (mode == Mode::viewer) {
+            viewer_message_title = "Command diagnostics";
+            viewer_message = warning;
+            mode = Mode::viewer_message;
+        } else if (mode == Mode::editor) {
+            show_editor_message("Command diagnostics", warning);
+        } else {
+            status = "Command warning: " + warning;
+        }
+    }
+
+    void show_filtered_view() {
+        const auto* entry = active().current();
+        const auto directory = active().path();
+        const auto initial = !command_line.empty() ? command_line : entry == nullptr ? std::string{}
+            : expand_user_menu_command("%f", entry->path, directory, passive().path());
+        show_native_input("Filtered view", "Filter command and arguments:", initial,
+            [this, directory](const std::string& command) {
+            if (command.empty()) throw std::runtime_error("filter command is empty");
+            start_local_task("Filtered view",
+                [command, directory](const Cancellation& cancellation) {
+                    return capture_shell(command, directory, cancellation);
+                }, [this, command](CommandOutput result) {
+                    require_command_success(result);
+                    open_output_viewer("Filtered: " + command, result.output);
+                    show_command_warnings(result.error);
+                });
+        });
+    }
+
+    void show_file_comparison() {
+        const auto* first = left.current();
+        const auto* second = right.current();
+        if (first == nullptr || second == nullptr || !can_open_file(*first) || !can_open_file(*second)) {
+            throw std::runtime_error("select a regular file in each pane");
+        }
+        const auto first_path = first->path;
+        const auto second_path = second->path;
+            start_local_task("Comparing files",
+                [first_path, second_path](const Cancellation& cancellation) {
+                    return capture_command({"diff", "-u", "--", first_path, second_path},
+                                           std::filesystem::path(first_path).parent_path(), cancellation);
+                }, [this, first_path, second_path](CommandOutput result) {
+                    require_command_success(result, true);
+                    if (result.status == 0) {
+                        status = "Files are identical";
+                    } else {
+                        open_output_viewer("Diff: " + first_path + " <> " + second_path, result.output);
+                    }
+                    show_command_warnings(result.error);
+                });
+    }
+
+    void show_external_panelize() {
+        panelize_cursor = 0;
+        panelize_focus = 0;
+        panelize_command.clear();
+        panelize_error.clear();
+        panelize_input.reset("", true);
+        mode = Mode::external_panelize_dialog;
+    }
+
+    ftxui::Element render_external_panelize() {
+        using namespace ftxui;
+        Elements rows;
+        panelize_rows.assign(config.panelize_commands.size() + 1U, {});
+        for (std::size_t index = 0; index < panelize_rows.size(); ++index) {
+            const auto label = index == 0U ? std::string("Other command") : config.panelize_commands[index - 1U].first;
+            auto row = text(" " + middle_truncate(display_text(label),
+                static_cast<std::size_t>(std::max(1, Terminal::Size().dimx - 16)))) |
+                reflect(panelize_rows[index]);
+            if (panelize_cursor == index) {
+                row = row | inverted;
+                if (panelize_focus == 0U) row = row | focus;
+            }
+            rows.push_back(std::move(row));
+        }
+        while (rows.size() < 10U) rows.push_back(text(""));
+        const auto list_height = std::max(1, std::min(10, Terminal::Size().dimy - 12));
+        auto list = vbox(std::move(rows)) | yframe | size(HEIGHT, EQUAL, list_height) | reflect(panelize_viewport);
+        Elements content{
+            hbox({text(" "), std::move(list) | borderStyled(LIGHT) | flex, text(" ")}),
+            text(" Command"),
+            hbox({text(" "), render_input(panelize_command, panelize_input, panelize_focus == 1U, "") |
+                  reflect(panelize_command_box), text(" ")})
+        };
+        if (!panelize_error.empty()) content.push_back(text(" " + display_text(panelize_error)));
+        content.push_back(separator());
+        content.push_back(hbox({
+            native_button("Panelize", true, panelize_focus == 2U, panelize_buttons[0]), text(" "),
+            native_button("Remove", false, panelize_focus == 3U, panelize_buttons[1]), text(" "),
+            native_button("Add new", false, panelize_focus == 4U, panelize_buttons[2]), text(" "),
+            native_button("Cancel", false, panelize_focus == 5U, panelize_buttons[3])
+        }) | center);
+        return native_window("External panelize", vbox(std::move(content)), std::max(1, Terminal::Size().dimx - 8));
+    }
+
+    void activate_panelize_button(const std::size_t button) {
+        if (button == 3U) { mode = Mode::panels; return; }
+        if (button == 1U) {
+            if (panelize_cursor == 0U) { panelize_error = "Other command cannot be removed"; return; }
+            config.panelize_commands.erase(config.panelize_commands.begin() + static_cast<std::ptrdiff_t>(panelize_cursor - 1U));
+            mode = Mode::panels;
+            status = "Panelize command removed";
+            return;
+        }
+        if (panelize_command.empty()) { panelize_error = "Enter a command first"; return; }
+        if (button == 2U) {
+            const auto command = panelize_command;
+            show_native_input("Add to external panelize", "Enter command label:", "",
+                [this, command](const std::string& label) {
+                    if (label.empty()) throw std::invalid_argument("command label is empty");
+                    const auto found = std::ranges::find(config.panelize_commands, label,
+                        &std::pair<std::string, std::string>::first);
+                    if (found != config.panelize_commands.end()) found->second = command;
+                    else config.panelize_commands.emplace_back(label, command);
+                    status = "Panelize command saved";
+                });
+            return;
+        }
+        run_external_panelize(panelize_command);
+    }
+
+    bool handle_external_panelize(const ftxui::Event& event) {
+        using namespace ftxui;
+        if (modal_cancel(event)) { mode = Mode::panels; return true; }
+        const auto selected_profile = [&] {
+            panelize_command = panelize_cursor == 0U ? std::string{} : config.panelize_commands.at(panelize_cursor - 1U).second;
+            panelize_input.reset(panelize_command, true);
+        };
+        if (event.is_mouse()) {
+            auto copy = event;
+            const auto& mouse = copy.mouse();
+            if (panelize_input.dragging) return input_mouse(panelize_command, panelize_input, mouse);
+            if (mouse.button == Mouse::Left && mouse.motion == Mouse::Pressed) {
+                if (panelize_command_box.Contain(mouse.x, mouse.y)) {
+                    panelize_focus = 1;
+                    return input_mouse(panelize_command, panelize_input, mouse);
+                }
+                for (std::size_t index = 0; index < panelize_buttons.size(); ++index) {
+                    if (panelize_buttons[index].Contain(mouse.x, mouse.y)) {
+                        panelize_focus = index + 2U;
+                        activate_panelize_button(index);
+                        return true;
+                    }
+                }
+            }
+            const auto result = handle_list_input(event, panelize_cursor, panelize_rows.size(), panelize_rows, panelize_viewport);
+            if (result == ButtonInput::changed || result == ButtonInput::activate) {
+                panelize_focus = 0;
+                selected_profile();
+                if (result == ButtonInput::activate) activate_panelize_button(0);
+            }
+            return true;
+        }
+        if (event == Event::Tab || event == Event::TabReverse) {
+            panelize_focus = event == Event::Tab ? (panelize_focus + 1U) % 6U : (panelize_focus + 5U) % 6U;
+        } else if (event == Event::Return || (event == Event::Character(' ') && panelize_focus >= 2U)) {
+            activate_panelize_button(panelize_focus < 2U ? 0U : panelize_focus - 2U);
+        } else if (panelize_focus == 1U) {
+            return edit_input(panelize_command, panelize_input, event);
+        } else if (panelize_focus == 0U) {
+            const auto result = handle_list_input(event, panelize_cursor, panelize_rows.size(), panelize_rows, panelize_viewport);
+            if (result == ButtonInput::changed) selected_profile();
+            else if (event == Event::Character('l') || event == Event::AltL) activate_panelize_button(0);
+            else if (event == Event::Character('r') || event == Event::AltR) activate_panelize_button(1);
+            else if (event == Event::Character('a') || event == Event::AltA) activate_panelize_button(2);
+            else if (event == Event::Character('c') || event == Event::AltC) activate_panelize_button(3);
+        }
+        return true;
+    }
+
+    void run_external_panelize(const std::string& command) {
+        const auto directory = active().path();
+        const auto panel = active_index;
+            start_local_task("External panelization",
+                [command, directory](const Cancellation& cancellation) {
+                    return capture_shell(command, directory, cancellation);
+                }, [this, directory, panel](CommandOutput result) {
+                    require_command_success(result);
+                    const auto separator = result.output.find('\0') != std::string::npos ? '\0' : '\n';
+                    std::vector<Entry> entries;
+                    std::set<std::string> seen;
+                    std::size_t begin = 0;
+                    while (begin < result.output.size()) {
+                        const auto end = result.output.find(separator, begin);
+                        const auto line = result.output.substr(begin, end == std::string::npos
+                                                                         ? std::string::npos : end - begin);
+                        begin = end == std::string::npos ? result.output.size() : end + 1U;
+                        if (line.empty()) continue;
+                        const auto path = local->join(directory, line);
+                        if (!seen.insert(path).second) continue;
+                        auto entry = local->stat(path, {});
+                        entry.name = line;
+                        entries.push_back(std::move(entry));
+                    }
+                    (panel == 0 ? left : right).set_panelized(std::move(entries));
+                    status = "External panelization complete";
+                    show_command_warnings(result.error);
+                });
+    }
+
+    void show_edit_symlink() {
+        const auto* selected = active().current();
+        if (selected == nullptr || selected->kind != EntryKind::symlink ||
+            selected->revision == "mcpp:parent") {
+            throw std::runtime_error("select a symlink to edit");
+        }
+        const auto entry = *selected;
+        show_native_input("Edit symlink", "Symlink '" + display_text(entry.name) + "' points to:", entry.target,
+            [this, entry](const std::string& target) {
+            if (target == entry.target) return;
+            auto* provider = dynamic_cast<LocalProvider*>(local.get());
+            if (provider == nullptr) throw std::runtime_error("symlink editing requires the local provider");
+            provider->replace_symlink(entry.path, target, entry.revision);
+            refresh(false, true);
+            status = "Symlink updated";
+        }, Mode::panels, active().navigation_path());
+    }
+
+    std::vector<Entry> real_selection() {
+        auto entries = active().selected_entries();
+        std::erase_if(entries, [](const Entry& entry) { return entry.revision == "mcpp:parent"; });
+        if (entries.empty()) throw std::runtime_error("select a real file or directory first");
+        return entries;
+    }
+
+    std::vector<Entry> unique_metadata_selection() {
+        auto entries = real_selection();
+        const auto* provider = dynamic_cast<const LocalProvider*>(local.get());
+        if (provider == nullptr) throw std::runtime_error("metadata editing requires the local provider");
+        std::vector<Entry> unique;
+        for (auto& entry : entries) {
+            const bool alias = entry.kind == EntryKind::file && std::ranges::any_of(unique, [&](const Entry& existing) {
+                return existing.kind == EntryKind::file &&
+                       provider->same_file(entry.path, *provider, existing.path);
+            });
+            if (!alias) unique.push_back(std::move(entry));
+        }
+        return unique;
+    }
+
+    void show_advanced_chown() {
+        ownership_entries = unique_metadata_selection();
+        ownership_index = 0;
+        ownership_buttons.assign(ownership_entries.size() > 1U ? 4U : 2U, {});
+        load_ownership_entry();
+        mode = Mode::advanced_chown_dialog;
+    }
+
+    void load_ownership_entry() {
+        auto& entry = ownership_entries.at(ownership_index);
+        const auto name = entry.name;
+        entry = local->stat(entry.path, {});
+        entry.name = name;
+        ownership_user = entry.owner;
+        ownership_group = entry.group;
+        ownership_flags.fill('=');
+        ownership_focus = 0;
+        ownership_bit = 0;
+        ownership_error.clear();
+    }
+
+    unsigned int ownership_mode(const Entry& entry) const {
+        auto mode_value = static_cast<unsigned int>(entry.permissions) & 07777U;
+        for (std::size_t bit = 0; bit < 9U; ++bit) {
+            const auto mask = 1U << (8U - static_cast<unsigned int>(bit));
+            if (ownership_flags[bit] == '+') mode_value |= mask;
+            else if (ownership_flags[bit] == '-') mode_value &= ~mask;
+        }
+        return mode_value;
+    }
+
+    ftxui::Element render_advanced_chown() {
+        using namespace ftxui;
+        const auto& entry = ownership_entries.at(ownership_index);
+        const auto permissions = ownership_mode(entry);
+        Elements values{text("      ")};
+        constexpr std::string_view letters{"rwx"};
+        for (std::size_t group = 0; group < 3U; ++group) {
+            Elements button{text("[")};
+            for (std::size_t bit = 0; bit < 3U; ++bit) {
+                const auto absolute = group * 3U + bit;
+                auto character = text(std::string(1, (permissions & (1U << (8U - static_cast<unsigned int>(absolute)))) != 0U
+                                                       ? letters[bit] : '-'));
+                if (ownership_focus == group && ownership_bit == absolute) character = character | underlined | bold;
+                button.push_back(std::move(character));
+            }
+            button.push_back(text("]"));
+            auto field = hbox(std::move(button)) | reflect(ownership_boxes[group]);
+            if (ownership_focus == group) field = field | inverted | focus;
+            values.push_back(std::move(field));
+            values.push_back(text(group == 2U ? "     " : "   "));
+        }
+        auto user = text("[" + middle_truncate(display_text(ownership_user), 15) + "]") | reflect(ownership_boxes[3]);
+        auto group = text("[" + middle_truncate(display_text(ownership_group), 15) + "]") | reflect(ownership_boxes[4]);
+        if (ownership_focus == 3U) user = user | inverted | focus;
+        if (ownership_focus == 4U) group = group | inverted | focus;
+        values.push_back(std::move(user) | size(WIDTH, EQUAL, 18));
+        values.push_back(std::move(group) | size(WIDTH, EQUAL, 18));
+        std::string flags = " Flag  " + std::string(ownership_flags.data(), 3) + "     " +
+            std::string(ownership_flags.data() + 3, 3) + "     " +
+            std::string(ownership_flags.data() + 6, 3) + "       " +
+            std::string(15, ownership_flags[9]) + "   " + std::string(15, ownership_flags[10]);
+        std::ostringstream octal;
+        octal << " Permissions (octal): " << std::oct << ((entry.mode & ~07777U) | permissions);
+        const std::vector<std::string> labels = ownership_entries.size() > 1U
+            ? std::vector<std::string>{"Set all","Skip","Set","Cancel"} : std::vector<std::string>{"Set","Cancel"};
+        Elements buttons;
+        for (std::size_t index = 0; index < labels.size(); ++index) {
+            if (index != 0U) buttons.push_back(text(" "));
+            buttons.push_back(native_button(labels[index], labels[index] == "Set", ownership_focus == index + 5U,
+                                           ownership_buttons[index]));
+        }
+        return native_window("Chown advanced command", vbox({
+            hbox({text(" " + display_text(entry.name)), filler(),
+                  text("(" + std::to_string(ownership_index + 1U) + "/" + std::to_string(ownership_entries.size()) + ")  ")}),
+            separator(),
+            text("      owner   group   other     owner             group"),
+            hbox(std::move(values)), text(flags), text(octal.str()), separator(),
+            hbox(std::move(buttons)) | center
+        }), 72);
+    }
+
+    void choose_account(const bool user) {
+        struct Enumeration {
+            bool user;
+            ~Enumeration() { if (user) endpwent(); else endgrent(); }
+        } enumeration{user};
+        std::vector<std::string> names;
+        if (user) {
+            setpwent();
+            for (;;) {
+                errno = 0;
+                const auto* account = getpwent();
+                if (account == nullptr) break;
+                names.emplace_back(account->pw_name);
+            }
+        } else {
+            setgrent();
+            for (;;) {
+                errno = 0;
+                const auto* account = getgrent();
+                if (account == nullptr) break;
+                names.emplace_back(account->gr_name);
+            }
+        }
+        if (errno != 0 && errno != ENOENT) throw std::system_error(errno, std::generic_category(), "read accounts");
+        std::ranges::sort(names);
+        const auto current = user ? ownership_user : ownership_group;
+        show_local_list(user ? "Owner" : "Group", names, [this, names, user](const std::size_t selected) {
+            (user ? ownership_user : ownership_group) = names.at(selected);
+            ownership_flags[user ? 9U : 10U] = '+';
+        }, Mode::advanced_chown_dialog);
+        local_list_native = true;
+        const auto found = std::ranges::find(names, current);
+        local_list_cursor = found == names.end() ? 0U : static_cast<std::size_t>(found - names.begin());
+    }
+
+    void apply_advanced_chown(const std::size_t button) try {
+        const auto action = ownership_entries.size() > 1U ? button : button + 2U;
+        if (action == 3U) { mode = Mode::panels; return; }
+        const auto last = action == 0U ? ownership_entries.size() : ownership_index + 1U;
+        if (action != 1U) {
+            for (auto index = ownership_index; index < last; ++index) {
+                const auto& entry = ownership_entries[index];
+                if (local->stat(entry.path, {}).revision != entry.revision) {
+                    throw std::runtime_error("selected path changed: " + entry.path);
+                }
+            }
+            for (auto index = ownership_index; index < last; ++index) {
+                const auto& entry = ownership_entries[index];
+                const auto owner = ownership_flags[9] == '+' && ownership_user != entry.owner
+                                     ? std::optional<std::string>{ownership_user} : std::nullopt;
+                const auto group = ownership_flags[10] == '+' && ownership_group != entry.group
+                                     ? std::optional<std::string>{ownership_group} : std::nullopt;
+                if (owner || group) local->set_owner(entry.path, owner, group);
+                const auto permissions = ownership_mode(entry);
+                if (permissions != (static_cast<unsigned int>(entry.permissions) & 07777U)) {
+                    local->set_permissions(entry.path, static_cast<std::filesystem::perms>(permissions));
+                }
+            }
+        }
+        ownership_index = last;
+        if (ownership_index < ownership_entries.size()) load_ownership_entry();
+        else { mode = Mode::panels; refresh(false, true); status = "Owner/permission request completed"; }
+    } catch (const std::exception& error) {
+        ownership_error = error.what();
+        show_native_message("Error", ownership_error, Mode::advanced_chown_dialog);
+    }
+
+    bool handle_advanced_chown(const ftxui::Event& event) {
+        using namespace ftxui;
+        if (modal_cancel(event)) { mode = Mode::panels; return true; }
+        if (event.is_mouse()) {
+            auto copy = event;
+            const auto& mouse = copy.mouse();
+            if (mouse.button != Mouse::Left || mouse.motion != Mouse::Pressed) return true;
+            for (std::size_t index = 0; index < ownership_boxes.size(); ++index) {
+                if (!ownership_boxes[index].Contain(mouse.x, mouse.y)) continue;
+                ownership_focus = index;
+                if (index < 3U) ownership_bit = index * 3U + static_cast<std::size_t>(std::clamp(mouse.x - ownership_boxes[index].x_min - 1, 0, 2));
+                else choose_account(index == 3U);
+                return true;
+            }
+            for (std::size_t index = 0; index < ownership_buttons.size(); ++index) {
+                if (ownership_buttons[index].Contain(mouse.x, mouse.y)) { apply_advanced_chown(index); return true; }
+            }
+            return true;
+        }
+        const auto count = 5U + ownership_buttons.size();
+        if (event == Event::Tab || event == Event::TabReverse) {
+            ownership_focus = event == Event::Tab ? (ownership_focus + 1U) % count : (ownership_focus + count - 1U) % count;
+            if (ownership_focus < 3U) ownership_bit = ownership_focus * 3U;
+        } else if (ownership_focus < 3U && (event == Event::ArrowLeft || event == Event::ArrowRight)) {
+            ownership_bit = event == Event::ArrowRight ? (ownership_bit + 1U) % 9U : (ownership_bit + 8U) % 9U;
+            ownership_focus = ownership_bit / 3U;
+        } else if (ownership_focus < 3U && event.is_character() && event.character().size() == 1U) {
+            const auto key = event.character()[0];
+            if (key == '+' || key == '-' || key == '=') ownership_flags[ownership_bit] = key;
+            else {
+                if (const auto selected = std::string_view("rwx").find(key); selected != std::string_view::npos) {
+                    ownership_bit = ownership_focus * 3U + selected;
+                } else if (key != ' ') return true;
+                const auto bit = 1U << (8U - static_cast<unsigned int>(ownership_bit));
+                ownership_flags[ownership_bit] = (ownership_mode(ownership_entries[ownership_index]) & bit) != 0U ? '-' : '+';
+            }
+        } else if (event == Event::Return || event == Event::Character(' ')) {
+            if (ownership_focus == 3U || ownership_focus == 4U) choose_account(ownership_focus == 3U);
+            else if (ownership_focus >= 5U) apply_advanced_chown(ownership_focus - 5U);
+        }
+        return true;
+    }
+
+    struct FileAttribute {
+        std::string_view label;
+        char letter;
+        unsigned int bit;
+        std::size_t slot;
+    };
+
+    static const std::array<FileAttribute, 14>& file_attributes() {
+        static const std::array<FileAttribute, 14> attributes{{
+            {"Secure deletion",'s',FS_SECRM_FL,0}, {"Undelete",'u',FS_UNRM_FL,1},
+            {"Synchronous updates",'S',FS_SYNC_FL,2}, {"Synchronous directory updates",'D',FS_DIRSYNC_FL,3},
+            {"Immutable",'i',FS_IMMUTABLE_FL,4}, {"Append only",'a',FS_APPEND_FL,5},
+            {"No dump",'d',FS_NODUMP_FL,6}, {"No update atime",'A',FS_NOATIME_FL,7},
+            {"Compress",'c',FS_COMPR_FL,8}, {"No tail merging",'t',FS_NOTAIL_FL,11},
+            {"Top of directory hierarchies",'T',FS_TOPDIR_FL,12}, {"Inode uses extents",'e',FS_EXTENT_FL,17},
+            {"Casefolded file",'F',FS_CASEFOLD_FL,23}, {"Project hierarchy",'P',FS_PROJINHERIT_FL,22}
+        }};
+        return attributes;
+    }
+
+    void load_attribute_entry() {
+        auto& entry = attribute_entries.at(attribute_index);
+        const auto name = entry.name;
+        entry = local->stat(entry.path, {});
+        entry.name = name;
+        attribute_original = local_file_flags(entry.path);
+        attribute_value = attribute_original;
+        attribute_focus = 0;
+        attribute_error.clear();
+    }
+
+    void show_file_attributes() {
+        attribute_entries = unique_metadata_selection();
+        attribute_index = 0;
+        load_attribute_entry();
+        attribute_buttons.assign(attribute_entries.size() > 1U ? 6U : 2U, {});
+        mode = Mode::chattr_dialog;
+    }
+
+    ftxui::Element render_file_attributes() {
+        using namespace ftxui;
+        const auto& attributes = file_attributes();
+        std::string letters(25, '-');
+        Elements rows;
+        for (std::size_t index = 0; index < attributes.size(); ++index) {
+            const auto& attribute = attributes[index];
+            const bool checked = (attribute_value & attribute.bit) != 0U;
+            if (checked) letters[attribute.slot] = attribute.letter;
+            auto row = text(std::string(checked ? " [x] (" : " [ ] (") + attribute.letter + ") " +
+                            std::string(attribute.label)) | reflect(attribute_boxes[index]);
+            if (attribute_focus == index) row = row | inverted | focus;
+            rows.push_back(std::move(row));
+        }
+        const bool many = attribute_entries.size() > 1U;
+        const std::vector<std::string> labels = many
+            ? std::vector<std::string>{"Set all","Marked all","Set marked","Clear marked","Set","Cancel"}
+            : std::vector<std::string>{"Set","Cancel"};
+        attribute_buttons.assign(labels.size(), {});
+        Elements buttons;
+        for (std::size_t index = 0; index < labels.size(); ++index) {
+            if (index != 0U) buttons.push_back(text(" "));
+            buttons.push_back(native_button(labels[index], labels[index] == "Set",
+                attribute_focus == attributes.size() + index, attribute_buttons[index]));
+        }
+        Elements content{
+            text(" " + display_text(attribute_entries.at(attribute_index).name)) | center,
+            text(letters) | center,
+            separator(),
+            vbox(std::move(rows)) | yframe |
+                size(HEIGHT, LESS_THAN, std::max(1, Terminal::Size().dimy - 9)) | reflect(attribute_viewport)
+        };
+        if (!attribute_error.empty()) content.push_back(text(display_text(attribute_error)));
+        content.push_back(separator());
+        content.push_back(hbox(std::move(buttons)) | center);
+        return native_window("Chattr command", vbox(std::move(content)),
+                             many ? std::min(84, Terminal::Size().dimx - 2) : 43);
+    }
+
+    void apply_file_attributes(const std::size_t button) try {
+        const bool many = attribute_entries.size() > 1U;
+        const auto action = many ? button : button + 4U;
+        if (action == 5U) { mode = Mode::panels; return; }
+        unsigned int known = 0;
+        for (const auto& attribute : file_attributes()) known |= attribute.bit;
+        const auto changed = attribute_original ^ attribute_value;
+        const auto last = action == 4U ? attribute_index + 1U : attribute_entries.size();
+        for (auto index = attribute_index; index < last; ++index) {
+            const auto& entry = attribute_entries[index];
+            if (local->stat(entry.path, {}).revision != entry.revision) {
+                throw std::runtime_error("selected path changed: " + entry.path);
+            }
+        }
+        for (auto index = attribute_index; index < last; ++index) {
+            const auto& entry = attribute_entries[index];
+            const auto original = local_file_flags(entry.path);
+            const auto mask = action == 0U ? known : changed;
+            const auto updated = action == 2U ? original | mask
+                               : action == 3U ? original & ~mask
+                               : (original & ~mask) | (attribute_value & mask);
+            if (updated != original) set_local_file_flags(entry.path, updated);
+        }
+        attribute_index = last;
+        if (attribute_index < attribute_entries.size()) load_attribute_entry();
+        else {
+            mode = Mode::panels;
+            refresh(false, true);
+            status = "File attributes changed";
+        }
+    } catch (const std::exception& error) {
+        attribute_error = error.what();
+    }
+
+    bool handle_file_attributes(const ftxui::Event& event) {
+        using namespace ftxui;
+        if (modal_cancel(event)) { mode = Mode::panels; return true; }
+        const auto count = file_attributes().size() + attribute_buttons.size();
+        if (event.is_mouse()) {
+            auto copy = event;
+            const auto& mouse = copy.mouse();
+            if (mouse.button != Mouse::Left || mouse.motion != Mouse::Pressed) return true;
+            for (std::size_t index = 0; index < attribute_boxes.size(); ++index) {
+                if (attribute_viewport.Contain(mouse.x, mouse.y) && attribute_boxes[index].Contain(mouse.x, mouse.y)) {
+                    attribute_focus = index;
+                    attribute_value ^= file_attributes()[index].bit;
+                    return true;
+                }
+            }
+            for (std::size_t index = 0; index < attribute_buttons.size(); ++index) {
+                if (attribute_buttons[index].Contain(mouse.x, mouse.y)) { apply_file_attributes(index); return true; }
+            }
+            return true;
+        }
+        if (event == Event::Tab || event == Event::ArrowDown) attribute_focus = (attribute_focus + 1U) % count;
+        else if (event == Event::TabReverse || event == Event::ArrowUp) attribute_focus = (attribute_focus + count - 1U) % count;
+        else if (event == Event::Character(' ') && attribute_focus < 14U) attribute_value ^= file_attributes()[attribute_focus].bit;
+        else if (event == Event::Return || event == Event::Character(' ')) {
+            apply_file_attributes(attribute_focus < 14U ? attribute_buttons.size() - 2U : attribute_focus - 14U);
+        }
+        return true;
+    }
+
+    void report_local_command_error(const std::string& message) {
+        mode = local_command_return;
+        if (local_command_return == Mode::editor) {
+            show_editor_message("Local command", message);
+        } else if (local_command_return == Mode::viewer) {
+            viewer_message_title = "Local command";
+            viewer_message = message;
+            mode = Mode::viewer_message;
+        } else {
+            status = "Error: " + message;
+        }
+    }
+
+    void start_local_task(
+        std::string title,
+        std::function<CommandOutput(const Cancellation&)> task,
+        std::function<void(CommandOutput)> complete,
+        const Mode return_mode = Mode::panels
+    ) {
+        if (local_command_running || operation_running.load(std::memory_order_acquire) ||
+            traversal_running.load(std::memory_order_acquire)) {
+            throw std::runtime_error("another operation is still running");
+        }
+        if (local_command_thread.joinable()) local_command_thread.join();
+        local_command_title = std::move(title);
+        local_command_return = return_mode;
+        local_command_cancellation = Cancellation{};
+        const auto cancellation = local_command_cancellation;
+        local_command_running = true;
+        mode = Mode::local_command;
+        try {
+        local_command_thread = std::jthread(
+            [this, cancellation, task = std::move(task), complete = std::move(complete)] {
+                try {
+                    auto result = task(cancellation);
+                    post_ui([this, complete, result = std::move(result)]() mutable {
+                        local_command_running = false;
+                        mode = local_command_return;
+                        try {
+                            complete(std::move(result));
+                        } catch (const std::exception& error) {
+                            report_local_command_error(error.what());
+                        }
+                    });
+                } catch (const OperationCancelled&) {
+                    post_ui([this] {
+                        local_command_running = false;
+                        mode = local_command_return;
+                        status = local_command_title + " cancelled";
+                    });
+                } catch (const std::exception& error) {
+                    const auto message = std::string(error.what());
+                    post_ui([this, message] {
+                        local_command_running = false;
+                        report_local_command_error(message);
+                    });
+                }
+            }
+        );
+        } catch (...) {
+            local_command_running = false;
+            mode = return_mode;
+            throw;
+        }
+    }
+
+    ftxui::Element render_local_command() {
+        using namespace ftxui;
+        return gray_dialog(vbox({
+            text(display_text(local_command_title)) | bold | center,
+            separator(),
+            text(local_command_cancellation.requested() ? "Cancelling..." : "Running..."),
+            separator(),
+            dialog_button("Cancel", true, local_command_cancel_box) | center,
+        }) | borderStyled(LIGHT) | size(WIDTH, LESS_THAN, std::min(72, Terminal::Size().dimx)));
+    }
+
+    bool handle_local_command(const ftxui::Event& event) {
+        if (event == ftxui::Event::CtrlC) {
+            local_command_cancellation.request();
+            return true;
+        }
+        std::size_t selected = 0;
+        const auto input = handle_button_input(event, selected,
+            std::span<const ftxui::Box>(&local_command_cancel_box, 1U));
+        if (input == ButtonInput::cancel || input == ButtonInput::activate) {
+            local_command_cancellation.request();
+        }
+        return true;
+    }
+
+    std::size_t panel_config_index(const Pane& pane) const {
+        return &pane == &left ? 0U : 1U;
+    }
+
+    bool panel_search_case_sensitive() const {
+        return config.quick_search_mode == 1U ||
+               (config.quick_search_mode == 2U && (active_index == 0 ? left : right).sort_case_sensitive());
+    }
+
+    std::string format_size(const std::uint64_t value) const {
+        return ::mcpp::format_size(value, config.use_si_units);
+    }
+
+    ftxui::Element gray_menu(ftxui::Element element) const {
+        if (config.theme != "default") return ::mcpp::gray_menu(std::move(element));
+        return std::move(element) | ftxui::color(ftxui::Color::Grey0) |
+               ftxui::bgcolor(ftxui::Color::RGB(0, 160, 160));
+    }
+
+    ftxui::Element gray_selected(ftxui::Element element, const bool marked, const bool active) const {
+        if (config.theme != "default") return ::mcpp::gray_selected(std::move(element), marked, active);
+        return std::move(element) | ftxui::color(marked ? ftxui::Color(ftxui::Color::Yellow)
+                                                       : ftxui::Color(ftxui::Color::Grey0)) |
+               ftxui::bgcolor(active ? ftxui::Color::RGB(0, 160, 160) : ftxui::Color::RGB(0, 100, 160));
+    }
+
+    ftxui::Element with_dialog_shadow(ftxui::Element element) const {
+        return config.shadows ? std::make_shared<DialogShadow>(std::move(element)) : element;
+    }
+
+    std::string display_filename(const Pane& pane, const std::string_view value) const {
+        const auto& encoding = config.panel_encoding[panel_config_index(pane)];
+        if (encoding.empty() || encoding == "UTF-8") return display_text(value);
+        std::string converted;
+        constexpr char hex[] = "0123456789ABCDEF";
+        for (const auto character : value) {
+            const auto byte = static_cast<unsigned char>(character);
+            if (byte < 128U) {
+                converted += character;
+            } else {
+                try {
+                    converted += convert_encoding(std::string(1, character), encoding, "UTF-8");
+                } catch (const std::system_error& error) {
+                    if (error.code().value() != EILSEQ && error.code().value() != EINVAL) throw;
+                    converted += "\\x";
+                    converted += hex[byte >> 4U];
+                    converted += hex[byte & 15U];
+                }
+            }
+        }
+        return display_text(converted);
+    }
+
+    std::size_t panel_page_rows(const Pane& pane) const {
+        return panel_visible_rows(&pane == &left ? 0 : 1) * pane_listing_spec(pane).columns;
+    }
+
+    ListingSpec pane_listing_spec(const Pane& pane) const {
+        const auto id = panel_config_index(pane);
+        return parse_listing_format(listing_format(config.panel_listing[id],
+                                    config.panel_brief_columns[id], config.panel_columns[id]));
+    }
+
+    ftxui::Element render_panel_pair(ftxui::Elements panes) const {
+        if (config.layout_horizontal) return ftxui::vbox(std::move(panes));
+        if (!listing_full_width(0) && !listing_full_width(1)) return ftxui::hbox(std::move(panes));
+        auto focused = active_index;
+        if (tree_panel && tree_panel_focused) focused = *tree_panel;
+        if (quick_view_panel && quick_view_focused) focused = *quick_view_panel;
+        if (information_panel && information_panel_focused) focused = *information_panel;
+        const auto positioned = [&](const int index) {
+            const auto x = index == 0 || listing_full_width(index) ? 0 : split_left_width();
+            return ftxui::hbox({
+                ftxui::filler() | ftxui::size(ftxui::WIDTH, ftxui::EQUAL, x),
+                panes[static_cast<std::size_t>(index)], ftxui::filler()
+            });
+        };
+        return ftxui::dbox({positioned(1 - focused), positioned(focused)});
+    }
+
+    void show_listing_options() {
+        const auto id = panel_config_index(active());
+        listing_choice = static_cast<std::size_t>(config.panel_listing[id]);
+        listing_focus = 0;
+        listing_brief_value = std::to_string(config.panel_brief_columns[id]);
+        listing_user_value = config.panel_columns[id];
+        listing_user_mini = config.panel_user_mini_status[id];
+        listing_status_values = config.panel_status_formats[id];
+        listing_brief_input.reset(listing_brief_value, true);
+        listing_user_input.reset(listing_user_value, true);
+        listing_status_input.reset(listing_status_values[listing_choice], true);
+        listing_error.clear();
+        mode = Mode::listing_dialog;
+    }
+
+    void show_native_input(
+        std::string title, std::string label, std::string value,
+        std::function<void(const std::string&)> apply, const Mode return_mode = Mode::panels,
+        std::string directory = {}
+    ) {
+        native_input_title = std::move(title);
+        native_input_label = std::move(label);
+        native_input_value = std::move(value);
+        native_input_state.reset(native_input_value, true);
+        native_input_error.clear();
+        native_input_directory = std::move(directory);
+        native_input_focus = 0;
+        native_input_return = return_mode;
+        native_input_apply = std::move(apply);
+        mode = Mode::native_input;
+    }
+
+    ftxui::Element render_native_input() {
+        using namespace ftxui;
+        Elements rows{
+            text(" " + native_input_label),
+            hbox({text(" "), render_input(native_input_value, native_input_state,
+                                          native_input_focus == 0U, "") |
+                              reflect(native_input_boxes[0]), text(" ")})
+        };
+        if (!native_input_error.empty()) rows.push_back(text(" " + display_text(native_input_error)));
+        const auto width = std::max({Terminal::Size().dimx / 2 - 2,
+                                    string_width(native_input_title) + 2,
+                                    string_width(native_input_label) + 4});
+        return native_window(native_input_title, vbox({
+            vbox(std::move(rows)),
+            separator(),
+            hbox({native_button("OK", true, native_input_focus == 1U, native_input_boxes[1]),
+                  text(" "), native_button("Cancel", false, native_input_focus == 2U, native_input_boxes[2])}) | center,
+        }), std::min(width, std::max(1, Terminal::Size().dimx - 2)));
+    }
+
+    bool handle_native_input(const ftxui::Event& event) {
+        using namespace ftxui;
+        if (event == Event::Special("\x1B\t") && native_input_focus == 0U &&
+            !native_input_directory.empty()) {
+            try {
+                complete_path(native_input_value, native_input_state, native_input_directory);
+                native_input_error = native_input_state.message;
+            } catch (const std::exception& error) {
+                native_input_error = error.what();
+            }
+            return true;
+        }
+        if (modal_cancel(event)) { mode = native_input_return; return true; }
+        if (event.is_mouse()) {
+            auto copy = event;
+            const auto& mouse = copy.mouse();
+            if (native_input_state.dragging) return input_mouse(native_input_value, native_input_state, mouse);
+            if (mouse.button != Mouse::Left || mouse.motion != Mouse::Pressed) return true;
+            for (std::size_t index = 0; index < native_input_boxes.size(); ++index) {
+                if (!native_input_boxes[index].Contain(mouse.x, mouse.y)) continue;
+                native_input_focus = index;
+                if (index == 0U) return input_mouse(native_input_value, native_input_state, mouse);
+                return handle_native_input(Event::Return);
+            }
+            return true;
+        }
+        if (event == Event::Tab || event == Event::TabReverse) {
+            native_input_focus = event == Event::Tab ? (native_input_focus + 1U) % 3U
+                                                     : (native_input_focus + 2U) % 3U;
+            return true;
+        }
+        if (event == Event::Return || (event == Event::Character(' ') && native_input_focus != 0U)) {
+            if (native_input_focus == 2U) { mode = native_input_return; return true; }
+            const auto apply = native_input_apply;
+            const auto value = native_input_value;
+            const auto return_mode = native_input_return;
+            try {
+                mode = return_mode;
+                apply(value);
+            } catch (const std::exception& error) {
+                native_input_error = error.what();
+                mode = Mode::native_input;
+            }
+            return true;
+        }
+        return native_input_focus == 0U ? edit_input(native_input_value, native_input_state, event) : true;
+    }
+
+    void show_key_query(
+        std::string title, std::string label, const bool cancel,
+        std::function<void(const ftxui::Event&)> apply, const Mode return_mode = Mode::editor
+    ) {
+        key_query_title = std::move(title);
+        key_query_label = std::move(label);
+        key_query_cancel = cancel;
+        key_query_apply = std::move(apply);
+        key_query_return = return_mode;
+        mode = Mode::native_key_query;
+    }
+
+    ftxui::Element render_key_query() {
+        using namespace ftxui;
+        Elements rows{hbox({text(" " + key_query_label + " "), text(" ") | focusCursorBarBlinking})};
+        if (key_query_cancel) {
+            rows.push_back(separator());
+            rows.push_back(native_button("Cancel", false, false, key_query_cancel_box) | center);
+        }
+        const auto width = std::max(string_width(key_query_title) + 4, string_width(key_query_label) + 7);
+        return native_window(key_query_title, vbox(std::move(rows)), width);
+    }
+
+    bool handle_key_query(const ftxui::Event& event) {
+        if (key_query_cancel && event == ftxui::Event::Escape) {
+            mode = key_query_return;
+            return true;
+        }
+        if (event.is_mouse()) {
+            auto copy = event;
+            if (key_query_cancel && copy.mouse().button == ftxui::Mouse::Left &&
+                copy.mouse().motion == ftxui::Mouse::Pressed &&
+                key_query_cancel_box.Contain(copy.mouse().x, copy.mouse().y)) mode = key_query_return;
+            return true;
+        }
+        if (event.input().empty() || event.is_cursor_position() || event.is_cursor_shape() ||
+            event.IsTerminalNameVersion() || event.IsTerminalEmulator() || event.IsTerminalCapabilities()) return true;
+        const auto apply = key_query_apply;
+        mode = key_query_return;
+        apply(event);
+        return true;
+    }
+
+    void show_native_message(
+        std::string title, std::string message, const Mode return_mode = Mode::panels
+    ) {
+        native_message_title = std::move(title);
+        native_message_text = std::move(message);
+        native_message_return = return_mode;
+        mode = Mode::native_message;
+    }
+
+    ftxui::Element render_native_message() {
+        using namespace ftxui;
+        return native_window(native_message_title, vbox({
+            paragraph(display_text(native_message_text)),
+            separator(),
+            native_button("OK", true, true, native_message_button) | center,
+        }), std::min(68, std::max(1, Terminal::Size().dimx - 2)));
+    }
+
+    bool handle_native_message(const ftxui::Event& event) {
+        std::size_t focus = 0;
+        const auto result = handle_button_input(event, focus,
+            std::span<const ftxui::Box>(&native_message_button, 1U));
+        if (result == ButtonInput::cancel || result == ButtonInput::activate) mode = native_message_return;
+        return true;
+    }
+
+    void show_native_query(
+        std::string title, std::string message, std::vector<std::string> buttons,
+        std::function<void(std::size_t)> apply, const Mode return_mode = Mode::panels
+    ) {
+        native_query_title = std::move(title);
+        native_query_text = std::move(message);
+        native_query_labels = std::move(buttons);
+        native_query_boxes.assign(native_query_labels.size(), {});
+        native_query_choice = 0;
+        native_query_return = return_mode;
+        native_query_apply = std::move(apply);
+        mode = Mode::native_query;
+    }
+
+    ftxui::Element render_native_query() {
+        using namespace ftxui;
+        Elements paragraphs, buttons;
+        std::istringstream input(native_query_text);
+        std::string line;
+        while (std::getline(input, line)) paragraphs.push_back(paragraph(display_text(line)));
+        for (std::size_t index = 0; index < native_query_labels.size(); ++index) {
+            if (index != 0U) buttons.push_back(text(" "));
+            buttons.push_back(native_button(native_query_labels[index], index == 0U,
+                native_query_choice == index, native_query_boxes[index]));
+        }
+        return native_window(native_query_title, vbox({
+            vbox(std::move(paragraphs)), separator(), hbox(std::move(buttons)) | center
+        }), std::min(68, std::max(1, Terminal::Size().dimx - 2)));
+    }
+
+    bool handle_native_query(const ftxui::Event& event) {
+        std::string hotkeys;
+        for (const auto& label : native_query_labels) {
+            hotkeys += label.empty() ? '\0' : static_cast<char>(std::tolower(static_cast<unsigned char>(label.front())));
+        }
+        const auto input = handle_button_input(event, native_query_choice, native_query_boxes, hotkeys);
+        if (input == ButtonInput::cancel) {
+            mode = native_query_return;
+        } else if (input == ButtonInput::activate) {
+            const auto apply = native_query_apply;
+            const auto selected = native_query_choice;
+            mode = native_query_return;
+            apply(selected);
+        }
+        return input != ButtonInput::ignored;
+    }
+
+    static const std::array<SortField, 9>& native_sort_fields() {
+        static const std::array<SortField, 9> fields{
+            SortField::unsorted, SortField::name, SortField::version, SortField::extension,
+            SortField::size, SortField::modified, SortField::accessed, SortField::changed, SortField::inode
+        };
+        return fields;
+    }
+
+    void show_sort_options() {
+        const auto& fields = native_sort_fields();
+        sort_choice = static_cast<std::size_t>(std::ranges::find(fields, active().sort_field()) - fields.begin());
+        sort_focus = 0;
+        sort_executable_first = active().executable_first();
+        sort_case_sensitive = active().sort_case_sensitive();
+        sort_reverse = active().descending();
+        mode = Mode::sort_dialog;
+    }
+
+    ftxui::Element render_listing_dialog() {
+        using namespace ftxui;
+        static const std::array<std::string, 4> labels{
+            "Full file list", "Brief file list:", "Long file list", "User defined:"
+        };
+        Elements rows;
+        for (std::size_t index = 0; index < labels.size(); ++index) {
+            auto label = hbox({text(listing_choice == index ? "(*) " : "( ) "),
+                               mnemonic_label(labels[index], 0)});
+            if (listing_focus == 0U && listing_choice == index) label = label | inverted | focus;
+            label = label | reflect(listing_boxes[index]);
+            if (index == 1U) {
+                auto columns = render_input(listing_brief_value, listing_brief_input,
+                                            listing_focus == 1U, "");
+                if (listing_choice != 1U) columns = columns | dim | color(Color::Grey50);
+                rows.push_back(hbox({
+                    text(" "), label | size(WIDTH, EQUAL, 21),
+                    columns | size(WIDTH, EQUAL, 13) | reflect(listing_boxes[4]),
+                    text("columns")
+                }));
+            } else {
+                rows.push_back(hbox({text(" "), std::move(label)}));
+            }
+        }
+        auto user = render_input(listing_user_value, listing_user_input, listing_focus == 2U, "");
+        if (listing_choice != 3U) user = user | dim | color(Color::Grey50);
+        rows.push_back(hbox({text(" "), std::move(user) | reflect(listing_boxes[5]), text(" ")}));
+        rows.push_back(separator());
+        auto mini = hbox({text(listing_user_mini ? "[x] " : "[ ] "),
+                          mnemonic_label("User mini status", 5)});
+        if (listing_focus == 3U) mini = mini | inverted | focus;
+        rows.push_back(hbox({text(" "), std::move(mini) | reflect(listing_boxes[6])}));
+        auto mini_input = render_input(listing_status_values[listing_choice], listing_status_input,
+                                       listing_focus == 4U, "");
+        if (!listing_user_mini) mini_input = mini_input | dim | color(Color::Grey50);
+        rows.push_back(hbox({text(" "), std::move(mini_input) | reflect(listing_boxes[7]), text(" ")}));
+        if (!listing_error.empty()) rows.push_back(text(display_text(listing_error)) | bold);
+        return native_window("Listing format", vbox({
+            vbox(std::move(rows)) | yframe |
+                size(HEIGHT, LESS_THAN, std::max(1, Terminal::Size().dimy - 6)) |
+                reflect(listing_viewport),
+            separator(),
+            hbox({
+                native_button("OK", true, listing_focus == 5U, listing_boxes[8]),
+                text(" "),
+                native_button("Cancel", false, listing_focus == 6U, listing_boxes[9])
+            }) | center,
+        }), std::min(46, Terminal::Size().dimx));
+    }
+
+    bool handle_listing_dialog(const ftxui::Event& event) {
+        using namespace ftxui;
+        const auto enabled = [&](const std::size_t focus) {
+            return (focus != 1U || listing_choice == 1U) && (focus != 2U || listing_choice == 3U) &&
+                   (focus != 4U || listing_user_mini);
+        };
+        const auto select_mode = [&](const std::size_t index) {
+            listing_choice = index;
+            listing_status_input.reset(listing_status_values[index], true);
+        };
+        const auto move_focus = [&](const bool next) {
+            do {
+                listing_focus = next ? (listing_focus + 1U) % 7U : (listing_focus + 6U) % 7U;
+            } while (!enabled(listing_focus));
+        };
+        if (modal_cancel(event)) {
+            mode = Mode::panels;
+            return true;
+        }
+        bool accept = false;
+        if (event.is_mouse()) {
+            auto copy = event;
+            const auto& mouse = copy.mouse();
+            if (listing_focus == 1U && listing_brief_input.dragging) {
+                return input_mouse(listing_brief_value, listing_brief_input, mouse);
+            }
+            if (listing_focus == 2U && listing_user_input.dragging) {
+                return input_mouse(listing_user_value, listing_user_input, mouse);
+            }
+            if (listing_focus == 4U && listing_status_input.dragging) {
+                return input_mouse(listing_status_values[listing_choice], listing_status_input, mouse);
+            }
+            if (mouse.button != Mouse::Left || mouse.motion != Mouse::Pressed) return true;
+            for (std::size_t index = 0; index < listing_boxes.size(); ++index) {
+                if (index < 8U && !listing_viewport.Contain(mouse.x, mouse.y)) continue;
+                if (!listing_boxes[index].Contain(mouse.x, mouse.y)) continue;
+                if (index < 4U) {
+                    listing_focus = 0;
+                    select_mode(index);
+                } else if (index == 4U && listing_choice == 1U) {
+                    listing_focus = 1;
+                    input_mouse(listing_brief_value, listing_brief_input, mouse);
+                } else if (index == 5U && listing_choice == 3U) {
+                    listing_focus = 2;
+                    input_mouse(listing_user_value, listing_user_input, mouse);
+                }
+                else if (index == 6U) {
+                    listing_user_mini = !listing_user_mini;
+                    listing_focus = 3;
+                } else if (index == 7U && listing_user_mini) {
+                    listing_focus = 4;
+                    input_mouse(listing_status_values[listing_choice], listing_status_input, mouse);
+                }
+                else if (index == 8U) accept = true;
+                else if (index == 9U) mode = Mode::panels;
+                return accept ? apply_listing_dialog() : true;
+            }
+            return true;
+        }
+        if (event == Event::Tab || event == Event::TabReverse) {
+            move_focus(event == Event::Tab);
+            return true;
+        }
+        if (listing_focus == 0U && (event == Event::ArrowUp || event == Event::ArrowDown)) {
+            select_mode(event == Event::ArrowDown ? (listing_choice + 1U) % 4U
+                                                 : (listing_choice + 3U) % 4U);
+            return true;
+        }
+        if (event == Event::Return || (event == Event::Character(' ') && listing_focus >= 5U)) {
+            if (listing_focus == 6U) mode = Mode::panels;
+            else apply_listing_dialog();
+            return true;
+        }
+        if (listing_focus == 1U || listing_focus == 2U || listing_focus == 4U) {
+            return edit_input(listing_focus == 1U ? listing_brief_value
+                               : listing_focus == 2U ? listing_user_value
+                                                    : listing_status_values[listing_choice],
+                              listing_focus == 1U ? listing_brief_input
+                               : listing_focus == 2U ? listing_user_input : listing_status_input, event);
+        }
+        if (listing_focus == 3U && event == Event::Character(' ')) {
+            listing_user_mini = !listing_user_mini;
+            return true;
+        }
+        if (event.is_character() && event.character().size() == 1U) {
+            const auto key = static_cast<char>(std::tolower(static_cast<unsigned char>(event.character()[0])));
+            const auto index = std::string_view("fblu").find(key);
+            if (index != std::string_view::npos) {
+                select_mode(index);
+                listing_focus = 0;
+            } else if (key == 'm') {
+                listing_user_mini = !listing_user_mini;
+                listing_focus = 3;
+            }
+        }
+        return true;
+    }
+
+    bool apply_listing_dialog() {
+        try {
+            const auto id = panel_config_index(active());
+            auto columns = config.panel_brief_columns[id];
+            if (listing_choice == 1U) {
+                const auto parsed = std::from_chars(listing_brief_value.data(),
+                    listing_brief_value.data() + listing_brief_value.size(), columns);
+                if (parsed.ec != std::errc{} || parsed.ptr != listing_brief_value.data() + listing_brief_value.size() ||
+                    columns < 1U || columns > 9U) throw std::runtime_error("Brief columns must be 1 through 9");
+            }
+            if (listing_choice == 3U) static_cast<void>(parse_listing_format(listing_user_value));
+            if (listing_user_mini) static_cast<void>(parse_listing_format(listing_status_values[listing_choice]));
+            config.panel_listing[id] = static_cast<ListingFormat>(listing_choice);
+            config.panel_brief_columns[id] = columns;
+            config.panel_columns[id] = listing_user_value;
+            config.panel_user_mini_status[id] = listing_user_mini;
+            config.panel_status_formats[id] = listing_status_values;
+            mode = Mode::panels;
+            status = "Listing format changed";
+        } catch (const std::exception& error) {
+            listing_error = error.what();
+        }
+        return true;
+    }
+
+    ftxui::Element render_sort_dialog() {
+        using namespace ftxui;
+        static const std::array<std::string, 9> names{
+            "Unsorted", "Name", "Version", "Extension", "Size", "Modify time", "Access time", "Change time", "Inode"
+        };
+        static constexpr std::array<std::size_t, 9> mnemonics{0, 0, 0, 1, 0, 0, 0, 1, 0};
+        Elements rows;
+        for (std::size_t index = 0; index < names.size(); ++index) {
+            auto radio = hbox({text(sort_choice == index ? "(*) " : "( ) "),
+                               mnemonic_label(names[index], mnemonics[index])}) |
+                         size(WIDTH, EQUAL, 21) | reflect(sort_boxes[index]);
+            if (sort_focus == 0U && sort_choice == index) radio = radio | inverted | focus;
+            Element checkbox = text("");
+            if (index < 3U) {
+                const bool checked = index == 0U ? sort_executable_first : index == 1U ? sort_case_sensitive : sort_reverse;
+                const std::string label = index == 0U ? "Executable first" : index == 1U ? "Case sensitive" : "Reverse";
+                checkbox = hbox({text(checked ? "[x] " : "[ ] "),
+                                  mnemonic_label(label, index == 0U ? 11U : index == 1U ? 3U : 0U)}) |
+                           reflect(sort_boxes[9U + index]);
+                if (sort_focus == index + 1U) checkbox = checkbox | inverted | focus;
+            }
+            rows.push_back(hbox({text(" "), std::move(radio), std::move(checkbox)}));
+        }
+        return native_window("Sort order", vbox({
+            vbox(std::move(rows)) | yframe |
+                size(HEIGHT, LESS_THAN, std::max(1, Terminal::Size().dimy - 6)) | reflect(sort_viewport),
+            separator(),
+            hbox({native_button("OK", true, sort_focus == 4U, sort_boxes[12]), text(" "),
+                  native_button("Cancel", false, sort_focus == 5U, sort_boxes[13])}) | center,
+        }), std::min(45, Terminal::Size().dimx));
+    }
+
+    bool handle_sort_dialog(const ftxui::Event& event) {
+        using namespace ftxui;
+        const auto toggle = [&](const std::size_t index) {
+            if (index == 1U) sort_executable_first = !sort_executable_first;
+            else if (index == 2U) sort_case_sensitive = !sort_case_sensitive;
+            else sort_reverse = !sort_reverse;
+        };
+        if (modal_cancel(event)) { mode = Mode::panels; return true; }
+        if (event.is_mouse()) {
+            auto copy = event;
+            const auto& mouse = copy.mouse();
+            if (mouse.button != Mouse::Left || mouse.motion != Mouse::Pressed) return true;
+            for (std::size_t index = 0; index < sort_boxes.size(); ++index) {
+                if (index < 12U && !sort_viewport.Contain(mouse.x, mouse.y)) continue;
+                if (!sort_boxes[index].Contain(mouse.x, mouse.y)) continue;
+                if (index < 9U) { sort_choice = index; sort_focus = 0; }
+                else if (index < 12U) { sort_focus = index - 8U; toggle(sort_focus); }
+                else if (index == 12U) apply_sort_dialog();
+                else mode = Mode::panels;
+                return true;
+            }
+            return true;
+        }
+        if (event == Event::Tab || event == Event::TabReverse) {
+            sort_focus = event == Event::Tab ? (sort_focus + 1U) % 6U : (sort_focus + 5U) % 6U;
+        } else if (sort_focus == 0U && (event == Event::ArrowUp || event == Event::ArrowDown)) {
+            sort_choice = event == Event::ArrowDown ? (sort_choice + 1U) % 9U : (sort_choice + 8U) % 9U;
+        } else if (event == Event::Return || (event == Event::Character(' ') && sort_focus >= 4U)) {
+            if (sort_focus == 5U) mode = Mode::panels;
+            else apply_sort_dialog();
+        } else if (sort_focus >= 1U && sort_focus <= 3U && event == Event::Character(' ')) {
+            toggle(sort_focus);
+        } else if (event.is_character() && event.character().size() == 1U) {
+            const auto key = static_cast<char>(std::tolower(static_cast<unsigned char>(event.character()[0])));
+            static const std::string keys = "unvxsmahi";
+            if (const auto selected = keys.find(key); selected != std::string::npos) { sort_choice = selected; sort_focus = 0; }
+            else if (key == 'f') toggle(1);
+            else if (key == 'e') toggle(2);
+            else if (key == 'r') toggle(3);
+        }
+        return true;
+    }
+
+    void apply_sort_dialog() {
+        active().set_sort_options(native_sort_fields()[sort_choice], sort_reverse,
+                                  sort_case_sensitive, sort_executable_first);
+        store_panel_options_in_config();
+        mode = Mode::panels;
+        status = "Sort order changed";
+    }
+
+    void show_filename_encoding() {
+        const auto id = panel_config_index(active());
+        show_codepage_chooser(config.panel_encoding[id], Mode::panels, [this, id](const std::string& codepage) {
+            config.panel_encoding[id] = codepage;
+            status = "Filename display encoding changed; paths were not renamed";
+        });
+    }
+
+    void show_codepage_chooser(
+        const std::string& current, const Mode return_mode,
+        std::function<void(const std::string&)> apply
+    ) {
+        std::vector<std::string> names{"-  < No translation >"};
+        std::vector<std::string> values{""};
+        std::string hotkeys{"-"};
+        const auto& pages = supported_codepages();
+        for (std::size_t index = 0; index < pages.size(); ++index) {
+            const auto hotkey = static_cast<char>(index < 10U ? '0' + index : 'a' + index - 10U);
+            hotkeys += hotkey;
+            names.push_back(std::string(1, hotkey) + "  " + pages[index].name);
+            values.push_back(pages[index].id);
+        }
+        show_local_list("Choose codepage", std::move(names),
+            [values, apply](const std::size_t selected) { apply(values.at(selected)); }, return_mode);
+        local_list_native = true;
+        local_list_hotkeys = std::move(hotkeys);
+        const auto found = std::ranges::find(values, current);
+        local_list_cursor = found == values.end() ? 0U : static_cast<std::size_t>(found - values.begin());
+    }
+
+    void show_settings(const int action) {
+        if (action == 20) {
+            configure_values = {config.verbose_operation, config.compute_totals, config.classic_progressbar,
+                config.mkdir_autoname, config.preallocate_space, config.single_escape,
+                config.use_internal_edit, config.use_internal_view, config.ask_new_filename,
+                config.auto_menus, config.drop_menus, config.shell_patterns, config.completion_show_all,
+                config.rotating_dash, config.cd_follows_links, config.safe_delete,
+                config.safe_overwrite, config.auto_save_setup};
+            configure_pause = config.pause_after_run;
+            configure_timeout = std::to_string(config.escape_timeout);
+            configure_timeout_input.reset(configure_timeout, true);
+            configure_focus = 0;
+            configure_error.clear();
+            mode = Mode::configure_dialog;
+        } else if (action == 21) {
+            layout_horizontal = config.layout_horizontal;
+            layout_equal = config.equal_split;
+            layout_left_size = split_left_width();
+            layout_top_size = split_top_height();
+            layout_visible = {config.menubar_visible, config.command_prompt, config.keybar_visible,
+                              config.hintbar_visible, config.xterm_title, config.show_free_space};
+            layout_focus = 0;
+            mode = Mode::layout_dialog;
+        } else if (action == 22) {
+            panel_option_values = {config.show_mini_status, config.use_si_units, !config.directories_first,
+                config.show_backups, config.show_hidden, config.fast_reload, config.mark_moves_down,
+                config.reverse_files_only, config.simple_swap, config.auto_save_panels_setup,
+                config.navigate_with_arrows, config.scroll_pages, config.scroll_center,
+                config.mouse_page_scrolling, config.highlight_file_types, config.highlight_permissions};
+            panel_option_search = config.quick_search_mode;
+            panel_option_focus = 0;
+            mode = Mode::panel_options_dialog;
+        } else if (action == 23) {
+            confirmation_values = {config.confirm_delete, config.confirm_overwrite,
+                config.confirm_execute, config.confirm_exit, config.confirm_hotlist_delete,
+                config.confirm_history_cleanup};
+            confirmation_focus = 0;
+            mode = Mode::confirmation_dialog;
+        } else if (action == 24) {
+            appearance_original_skin = config.theme;
+            appearance_original_shadows = config.shadows;
+            appearance_skin = config.theme == "default" ? "< Default >" : "gray";
+            appearance_shadows = config.shadows;
+            appearance_focus = 0;
+            mode = Mode::appearance_dialog;
+        } else if (action == 25) {
+            display_bits_focus = 0;
+            mode = Mode::display_bits_dialog;
+        } else {
+            throw std::runtime_error("unknown settings action");
+        }
+    }
+
+    ftxui::Element render_configure_dialog() {
+        using namespace ftxui;
+        static const std::array<std::string, 18> names{
+            "Verbose operation", "Compute totals", "Classic progressbar", "Mkdir autoname", "Preallocate space",
+            "Single press", "Use internal edit", "Use internal view", "Ask new file name", "Auto menus",
+            "Drop down menus", "Shell patterns", "Complete: show all", "Rotating dash",
+            "Cd follows links", "Safe delete", "Safe overwrite", "Auto save setup"
+        };
+        static constexpr std::array<std::size_t, 18> keys{0,12,11,4,0,1,16,16,1,6,0,1,2,10,14,2,99,1};
+        const auto check = [&](const std::size_t index) {
+            auto row = hbox({text(configure_values[index] ? " [x] " : " [ ] "), mnemonic_label(names[index], keys[index])}) |
+                       reflect(configure_boxes[index]);
+            if (configure_focus == index) row = row | inverted | focus;
+            return row;
+        };
+        Elements file_options, other_options, pause;
+        for (std::size_t index = 0; index < 5U; ++index) file_options.push_back(check(index));
+        for (std::size_t index = 6; index < 18U; ++index) other_options.push_back(check(index));
+        other_options.push_back(text(""));
+        other_options.push_back(text(""));
+        auto timeout = render_input(configure_timeout, configure_timeout_input, configure_focus == 18U, " Timeout: ") |
+                       reflect(configure_boxes[18]);
+        if (!configure_values[5]) timeout = timeout | dim | color(Color::Grey50);
+        static const std::array<std::string, 3> pause_labels{"Never", "On dumb terminals", "Always"};
+        static constexpr std::array<std::size_t, 3> pause_keys{0,6,4};
+        for (std::size_t index = 0; index < 3U; ++index) {
+            auto row = hbox({text(configure_pause == index ? " (*) " : " ( ) "),
+                             mnemonic_label(pause_labels[index], pause_keys[index])}) |
+                       reflect(configure_boxes[19U + index]);
+            if (configure_focus == 19U && configure_pause == index) row = row | inverted | focus;
+            pause.push_back(std::move(row));
+        }
+        Elements content{
+            hbox({text(" "), vbox({
+                window(text(" File operations "), vbox(std::move(file_options)), LIGHT),
+                window(text(" Esc key mode "), vbox({check(5), timeout}), LIGHT),
+                window(text(" Pause after run "), vbox(std::move(pause)), LIGHT),
+            }) | size(WIDTH, EQUAL, 27), text(" "),
+            window(text(" Other options "), vbox(std::move(other_options)), LIGHT) | size(WIDTH, EQUAL, 27),
+            text(" ")})
+        };
+        if (!configure_error.empty()) content.push_back(text(" " + display_text(configure_error)));
+        content.push_back(separator());
+        content.push_back(hbox({
+            native_button("OK", true, configure_focus == 20U, configure_boxes[22]), text(" "),
+            native_button("Cancel", false, configure_focus == 21U, configure_boxes[23])
+        }) | center);
+        return native_window("Configure options", vbox(std::move(content)), 59);
+    }
+
+    void apply_configure_dialog() try {
+        int timeout = 0;
+        const auto parsed = std::from_chars(configure_timeout.data(), configure_timeout.data() + configure_timeout.size(), timeout);
+        if (parsed.ec != std::errc{} || parsed.ptr != configure_timeout.data() + configure_timeout.size() || timeout < 0) {
+            configure_error = "Timeout must be a nonnegative number of microseconds";
+            return;
+        }
+        if (!configure_values[11]) {
+            try {
+                for (const auto* pane : {&left, &right}) {
+                    if (!pane->filter().empty()) {
+                        static_cast<void>(EditorSearch::find("", pane->filter(), 0, 0, 0,
+                            {.mode=EditorSearchMode::regular_expression, .case_sensitive=true}, false, false));
+                    }
+                }
+            } catch (const std::exception& error) {
+                configure_error = error.what();
+                return;
+            }
+        }
+        const auto& values = configure_values;
+        config.verbose_operation = values[0]; config.compute_totals = values[1];
+        config.classic_progressbar = values[2]; config.mkdir_autoname = values[3];
+        config.preallocate_space = values[4]; config.single_escape = values[5];
+        config.use_internal_edit = values[6]; config.use_internal_view = values[7];
+        config.ask_new_filename = values[8]; config.auto_menus = values[9];
+        config.drop_menus = values[10]; config.shell_patterns = values[11];
+        config.completion_show_all = values[12]; config.rotating_dash = values[13];
+        config.cd_follows_links = values[14]; config.safe_delete = values[15];
+        config.safe_overwrite = values[16]; config.auto_save_setup = values[17];
+        config.escape_timeout = timeout;
+        config.pause_after_run = configure_pause;
+        set_terminal_input_delay(config.single_escape ? static_cast<std::uint64_t>(timeout) : 50000U);
+        escape_waiting = false;
+        if (auto* provider = dynamic_cast<LocalProvider*>(local.get())) provider->set_preallocate(config.preallocate_space);
+        for (auto* pane : {&left, &right}) {
+            pane->set_shell_patterns(config.shell_patterns);
+            pane->set_follow_links(config.cd_follows_links);
+        }
+        mode = Mode::panels;
+        status = "Configuration changed";
+    } catch (const std::exception& error) {
+        configure_error = error.what();
+        mode = Mode::configure_dialog;
+    }
+
+    bool handle_configure_dialog(const ftxui::Event& event) {
+        using namespace ftxui;
+        if (modal_cancel(event)) { mode = Mode::panels; return true; }
+        if (event.is_mouse()) {
+            auto copy = event;
+            const auto& mouse = copy.mouse();
+            if (configure_timeout_input.dragging) return input_mouse(configure_timeout, configure_timeout_input, mouse);
+            if (mouse.button != Mouse::Left || mouse.motion != Mouse::Pressed) return true;
+            for (std::size_t index = 0; index < configure_boxes.size(); ++index) {
+                if (!configure_boxes[index].Contain(mouse.x, mouse.y)) continue;
+                if (index < 18U) { configure_focus = index; configure_values[index] = !configure_values[index]; }
+                else if (index == 18U && configure_values[5]) {
+                    configure_focus = 18;
+                    input_mouse(configure_timeout, configure_timeout_input, mouse);
+                } else if (index >= 19U && index < 22U) { configure_focus = 19; configure_pause = index - 19U; }
+                else if (index == 22U) apply_configure_dialog();
+                else if (index == 23U) mode = Mode::panels;
+                return true;
+            }
+            return true;
+        }
+        static constexpr std::array<std::size_t, 22> order{
+            0,1,2,3,4,5,18,19,6,7,8,9,10,11,12,13,14,15,16,17,20,21
+        };
+        if (event == Event::Tab || event == Event::TabReverse) {
+            auto index = static_cast<std::size_t>(std::ranges::find(order, configure_focus) - order.begin());
+            do {
+                index = event == Event::Tab ? (index + 1U) % order.size() : (index + order.size() - 1U) % order.size();
+                configure_focus = order[index];
+            } while (configure_focus == 18U && !configure_values[5]);
+        } else if (configure_focus == 19U && (event == Event::ArrowUp || event == Event::ArrowDown)) {
+            configure_pause = event == Event::ArrowDown ? (configure_pause + 1U) % 3U : (configure_pause + 2U) % 3U;
+        } else if (event == Event::Return || (event == Event::Character(' ') && configure_focus >= 20U)) {
+            if (configure_focus == 21U) mode = Mode::panels;
+            else apply_configure_dialog();
+        } else if (configure_focus == 18U) {
+            return edit_input(configure_timeout, configure_timeout_input, event);
+        } else if (configure_focus < 18U && event == Event::Character(' ')) {
+            configure_values[configure_focus] = !configure_values[configure_focus];
+        } else if (configure_focus == 19U && event == Event::Character(' ')) {
+            return true;
+        } else if (event.is_character() && event.character().size() == 1U) {
+            const auto key = static_cast<char>(std::tolower(static_cast<unsigned char>(event.character()[0])));
+            if (const auto index = std::string_view("vlgrpitwsedhmakf u").find(key); index != std::string_view::npos && index < 18U) {
+                configure_values[index] = !configure_values[index];
+                configure_focus = index;
+            } else if (const auto pause_index = std::string_view("nby").find(key); pause_index != std::string_view::npos) {
+                configure_pause = pause_index;
+                configure_focus = 19;
+            }
+        }
+        return true;
+    }
+
+    ftxui::Element render_appearance() {
+        using namespace ftxui;
+        auto skin = text("[ " + fit_listing_text(appearance_skin, 25, ListingAlignment::left) + " ]") |
+                    reflect(appearance_boxes[0]);
+        if (appearance_focus == 0U) skin = skin | inverted | focus;
+        auto shadows = hbox({text(appearance_shadows ? " [x] " : " [ ] "), mnemonic_label("Shadows", 0)}) |
+                       reflect(appearance_boxes[1]);
+        if (appearance_focus == 1U) shadows = shadows | inverted | focus;
+        return native_window("Appearance", vbox({
+            hbox({text(" Skin:"), filler(), std::move(skin), text(" ")}),
+            separator(), std::move(shadows), separator(),
+            hbox({native_button("OK", true, appearance_focus == 2U, appearance_boxes[2]), text(" "),
+                  native_button("Cancel", false, appearance_focus == 3U, appearance_boxes[3])}) | center,
+        }), 53);
+    }
+
+    void choose_skin() {
+        show_local_list("Skins", {"< Default >", "gray"}, [this](const std::size_t selected) {
+            appearance_skin = selected == 0U ? "< Default >" : "gray";
+            config.theme = selected == 0U ? "default" : "grayscale";
+        }, Mode::appearance_dialog);
+        local_list_native = true;
+        local_list_cursor = appearance_skin == "gray" ? 1U : 0U;
+    }
+
+    bool handle_appearance(const ftxui::Event& event) {
+        using namespace ftxui;
+        if (modal_cancel(event)) {
+            config.theme = appearance_original_skin;
+            config.shadows = appearance_original_shadows;
+            mode = Mode::panels;
+            return true;
+        }
+        if (event.is_mouse()) {
+            auto copy = event;
+            const auto& mouse = copy.mouse();
+            if (mouse.button != Mouse::Left || mouse.motion != Mouse::Pressed) return true;
+            for (std::size_t index = 0; index < appearance_boxes.size(); ++index) {
+                if (!appearance_boxes[index].Contain(mouse.x, mouse.y)) continue;
+                appearance_focus = index;
+                return handle_appearance(Event::Character(' '));
+            }
+            return true;
+        }
+        if (event == Event::Tab || event == Event::ArrowDown) appearance_focus = (appearance_focus + 1U) % 4U;
+        else if (event == Event::TabReverse || event == Event::ArrowUp) appearance_focus = (appearance_focus + 3U) % 4U;
+        else if (event == Event::Character(' ') || event == Event::Return) {
+            if (appearance_focus == 0U) choose_skin();
+            else if (appearance_focus == 1U && event == Event::Character(' ')) {
+                appearance_shadows = !appearance_shadows;
+                config.shadows = appearance_shadows;
+            } else if (appearance_focus == 3U) return handle_appearance(Event::Escape);
+            else {
+                config.shadows = appearance_shadows;
+                mode = Mode::panels;
+                status = "Appearance changed";
+            }
+        } else if (event == Event::Character('s') || event == Event::Character('S')) {
+            appearance_shadows = !appearance_shadows;
+            config.shadows = appearance_shadows;
+            appearance_focus = 1;
+        }
+        return true;
+    }
+
+    ftxui::Element render_display_bits() {
+        using namespace ftxui;
+        auto codepage = text("[ UTF-8 ]") | reflect(display_bits_boxes[0]);
+        if (display_bits_focus == 0U) codepage = codepage | inverted | focus;
+        return native_window("Display bits", vbox({
+            hbox({text(" Input / display codepage: "), std::move(codepage), filler()}),
+            separator(),
+            hbox({text(" [x] "), mnemonic_label("Full 8 bits input", 1)}) | dim | color(Color::Grey50),
+            separator(),
+            hbox({native_button("OK", true, display_bits_focus == 1U, display_bits_boxes[1]), text(" "),
+                  native_button("Cancel", false, display_bits_focus == 2U, display_bits_boxes[2])}) | center,
+        }), 55);
+    }
+
+    bool handle_display_bits(const ftxui::Event& event) {
+        using namespace ftxui;
+        if (modal_cancel(event)) { mode = Mode::panels; return true; }
+        if (event.is_mouse()) {
+            auto copy = event;
+            const auto& mouse = copy.mouse();
+            if (mouse.button != Mouse::Left || mouse.motion != Mouse::Pressed) return true;
+            for (std::size_t index = 0; index < display_bits_boxes.size(); ++index) {
+                if (!display_bits_boxes[index].Contain(mouse.x, mouse.y)) continue;
+                display_bits_focus = index;
+                return handle_display_bits(Event::Return);
+            }
+            return true;
+        }
+        if (event == Event::Tab || event == Event::ArrowDown) display_bits_focus = (display_bits_focus + 1U) % 3U;
+        else if (event == Event::TabReverse || event == Event::ArrowUp) display_bits_focus = (display_bits_focus + 2U) % 3U;
+        else if (event == Event::Return || event == Event::Character(' ')) {
+            if (display_bits_focus == 0U) {
+                show_local_list("Choose codepage", {"UTF-8"}, [](const std::size_t) {}, Mode::display_bits_dialog);
+                local_list_native = true;
+            } else mode = Mode::panels;
+        }
+        return true;
+    }
+
+    ftxui::Element render_panel_options() {
+        using namespace ftxui;
+        static const std::array<std::string, 16> names{
+            "Show mini-status", "Use SI size units", "Mix all files", "Show backup files",
+            "Show hidden files", "Fast dir reload", "Mark moves down", "Reverse files only",
+            "Simple swap", "Auto save panels setup", "Lynx-like motion", "Page scrolling",
+            "Center scrolling", "Mouse page scrolling", "File types", "Permissions"
+        };
+        static constexpr std::array<std::size_t, 16> hotkeys{7, 9, 2, 5, 5, 0, 2, 2, 8, 1, 1, 2, 7, 0, 5, 0};
+        const auto check = [&](const std::size_t index) {
+            auto row = hbox({text(panel_option_values[index] ? " [x] " : " [ ] "),
+                             mnemonic_label(names[index], hotkeys[index])}) | reflect(panel_option_boxes[index]);
+            if (panel_option_focus == index) row = row | inverted | focus;
+            return row;
+        };
+        Elements main, navigation, highlight, search;
+        for (std::size_t index = 0; index < 10U; ++index) main.push_back(check(index));
+        for (int index = 0; index < 3; ++index) main.push_back(text(""));
+        for (std::size_t index = 10U; index < 14U; ++index) navigation.push_back(check(index));
+        highlight.push_back(check(14));
+        highlight.push_back(check(15));
+        static const std::array<std::string, 3> search_names{
+            "Case insensitive", "Case sensitive", "Use panel sort mode"
+        };
+        static constexpr std::array<std::size_t, 3> search_hotkeys{5, 3, 17};
+        for (std::size_t index = 0; index < 3U; ++index) {
+            auto row = hbox({text(panel_option_search == index ? " (*) " : " ( ) "),
+                             mnemonic_label(search_names[index], search_hotkeys[index])}) |
+                       reflect(panel_option_boxes[16U + index]);
+            if (panel_option_focus == 16U && panel_option_search == index) row = row | inverted | focus;
+            search.push_back(std::move(row));
+        }
+        return native_window("Panel options", vbox({
+            hbox({text(" "),
+                window(text(" Main options "), vbox(std::move(main)), LIGHT) | size(WIDTH, EQUAL, 30),
+                text(" "),
+                vbox({
+                    window(text(" Navigation "), vbox(std::move(navigation)), LIGHT),
+                    window(text(" File highlight "), vbox(std::move(highlight)), LIGHT),
+                    window(text(" Quick search "), vbox(std::move(search)), LIGHT),
+                }) | size(WIDTH, EQUAL, 30), text(" ")}),
+            separator(),
+            hbox({native_button("OK", true, panel_option_focus == 17U, panel_option_boxes[19]), text(" "),
+                  native_button("Cancel", false, panel_option_focus == 18U, panel_option_boxes[20])}) | center,
+        }), 65);
+    }
+
+    void apply_panel_options() try {
+        const auto& values = panel_option_values;
+        const bool warn_fast_reload = !config.fast_reload && values[5];
+        config.show_mini_status = values[0]; config.use_si_units = values[1];
+        config.directories_first = !values[2]; config.show_backups = values[3];
+        config.show_hidden = values[4]; config.fast_reload = values[5];
+        config.mark_moves_down = values[6]; config.reverse_files_only = values[7];
+        config.simple_swap = values[8]; config.auto_save_panels_setup = values[9];
+        config.navigate_with_arrows = values[10]; config.scroll_pages = values[11];
+        config.scroll_center = values[12]; config.mouse_page_scrolling = values[13];
+        config.highlight_file_types = values[14]; config.highlight_permissions = values[15];
+        config.quick_search_mode = panel_option_search;
+        for (auto* pane : {&left, &right}) {
+            pane->set_show_hidden(config.show_hidden);
+            pane->set_show_backups(config.show_backups);
+            pane->set_directories_first(config.directories_first);
+            pane->set_reverse_files_only(config.reverse_files_only);
+            pane->set_fast_reload(config.fast_reload);
+            pane->set_navigation(config.scroll_pages, config.scroll_center);
+        }
+        store_panel_options_in_config();
+        mode = Mode::panels;
+        status = "Panel options changed";
+        if (warn_fast_reload && !fast_reload_warning_shown) {
+            fast_reload_warning_shown = true;
+            show_native_message("Information",
+                "Fast directory reload can miss changes to existing files. Use Rescan or Ctrl-R when a full reload is needed.");
+        }
+    } catch (const std::exception& error) {
+        mode = Mode::panels;
+        set_error(error);
+    }
+
+    bool handle_panel_options(const ftxui::Event& event) {
+        using namespace ftxui;
+        if (modal_cancel(event)) { mode = Mode::panels; return true; }
+        if (event.is_mouse()) {
+            auto copy = event;
+            const auto& mouse = copy.mouse();
+            if (mouse.button != Mouse::Left || mouse.motion != Mouse::Pressed) return true;
+            for (std::size_t index = 0; index < panel_option_boxes.size(); ++index) {
+                if (!panel_option_boxes[index].Contain(mouse.x, mouse.y)) continue;
+                if (index < 16U) { panel_option_focus = index; panel_option_values[index] = !panel_option_values[index]; }
+                else if (index < 19U) { panel_option_focus = 16; panel_option_search = index - 16U; }
+                else if (index == 19U) apply_panel_options();
+                else mode = Mode::panels;
+                return true;
+            }
+            return true;
+        }
+        if (event == Event::Tab) panel_option_focus = (panel_option_focus + 1U) % 19U;
+        else if (event == Event::TabReverse) panel_option_focus = (panel_option_focus + 18U) % 19U;
+        else if (panel_option_focus == 16U && (event == Event::ArrowUp || event == Event::ArrowDown)) {
+            panel_option_search = event == Event::ArrowDown ? (panel_option_search + 1U) % 3U : (panel_option_search + 2U) % 3U;
+        } else if (event == Event::ArrowUp || event == Event::ArrowDown) {
+            panel_option_focus = event == Event::ArrowDown ? (panel_option_focus + 1U) % 19U : (panel_option_focus + 18U) % 19U;
+        } else if (event == Event::Character(' ') && panel_option_focus < 16U) {
+            panel_option_values[panel_option_focus] = !panel_option_values[panel_option_focus];
+        } else if (event == Event::Character(' ') && panel_option_focus == 16U) {
+            return true;
+        } else if (event == Event::Return || event == Event::Character(' ')) {
+            if (panel_option_focus == 18U) mode = Mode::panels;
+            else apply_panel_options();
+        } else if (event.is_character() && event.character().size() == 1U) {
+            const auto key = static_cast<char>(std::tolower(static_cast<unsigned char>(event.character()[0])));
+            if (const auto index = std::string_view("nzxbhfrvwuygsmtp").find(key); index != std::string_view::npos) {
+                panel_option_values[index] = !panel_option_values[index];
+                panel_option_focus = index;
+            } else if (const auto radio_index = std::string_view("ied").find(key); radio_index != std::string_view::npos) {
+                panel_option_search = radio_index;
+                panel_option_focus = 16;
+            }
+        }
+        return true;
+    }
+
+    ftxui::Element render_layout_dialog() {
+        using namespace ftxui;
+        const auto check = [&](const std::string& label, const std::size_t mnemonic,
+                               const bool value, const std::size_t focus_index, const std::size_t box) {
+            auto row = hbox({text(value ? " [x] " : " [ ] "), mnemonic_label(label, mnemonic)}) |
+                       reflect(layout_boxes[box]);
+            if (layout_focus == focus_index) row = row | inverted | focus;
+            return row;
+        };
+        const auto radio = [&](const std::string& label, const bool horizontal, const std::size_t box) {
+            auto row = hbox({text(layout_horizontal == horizontal ? " (*) " : " ( ) "), mnemonic_label(label, 0)}) |
+                       reflect(layout_boxes[box]);
+            if (layout_focus == 0U && layout_horizontal == horizontal) row = row | inverted | focus;
+            return row;
+        };
+        const auto total = layout_horizontal
+            ? std::max(1, ftxui::Terminal::Size().dimy - static_cast<int>(layout_visible[0]) -
+                          static_cast<int>(layout_visible[1]) - static_cast<int>(layout_visible[2]) -
+                          static_cast<int>(layout_visible[3]))
+            : ftxui::Terminal::Size().dimx;
+        const auto split_size = layout_equal ? total / 2 : layout_horizontal ? layout_top_size : layout_left_size;
+        const auto count = [](const int value) {
+            std::ostringstream output;
+            output << std::setw(3) << std::setfill('0') << value;
+            return output.str();
+        };
+        auto decrease = text("[<]") | reflect(layout_boxes[3]);
+        auto increase = text("[>]") | reflect(layout_boxes[4]);
+        if (layout_equal) {
+            decrease = decrease | dim | color(Color::Grey50);
+            increase = increase | dim | color(Color::Grey50);
+        } else {
+            if (layout_focus == 2U) decrease = decrease | inverted | focus;
+            if (layout_focus == 3U) increase = increase | inverted | focus;
+        }
+        auto split = window(text(" Panel split "), vbox({
+            radio("Vertical", false, 0), radio("Horizontal", true, 1),
+            check("Equal split", 0, layout_equal, 1, 2),
+            hbox({text(" " + count(split_size)), decrease, text(" = "), increase, text(count(total - split_size))}),
+        }), LIGHT) | size(WIDTH, EQUAL, 26);
+        auto console = window(text(" Console output "),
+            text(" Output lines:[+]00[-]") | dim | color(Color::Grey50), LIGHT) | size(WIDTH, EQUAL, 26);
+        static const std::array<std::string, 6> labels{
+            "Menubar visible", "Command prompt", "Keybar visible", "Hintbar visible",
+            "XTerm window title", "Show free space"
+        };
+        static constexpr std::array<std::size_t, 6> mnemonic{0, 8, 0, 1, 0, 0};
+        Elements options;
+        for (std::size_t index = 0; index < labels.size(); ++index) {
+            options.push_back(check(labels[index], mnemonic[index], layout_visible[index], index + 4U, index + 5U));
+        }
+        options.push_back(text(""));
+        return native_window("Layout", vbox({
+            hbox({text(" "), vbox({split, console}), text(" "),
+                  window(text(" Other options "), vbox(std::move(options)), LIGHT) | size(WIDTH, EQUAL, 26),
+                  text(" ")}),
+            separator(),
+            hbox({native_button("OK", true, layout_focus == 10U, layout_boxes[11]), text(" "),
+                  native_button("Cancel", false, layout_focus == 11U, layout_boxes[12])}) | center,
+        }), 57);
+    }
+
+    void adjust_layout_split(const int amount) {
+        if (layout_equal) return;
+        const auto total = layout_horizontal
+            ? std::max(1, ftxui::Terminal::Size().dimy - static_cast<int>(layout_visible[0]) -
+                          static_cast<int>(layout_visible[1]) - static_cast<int>(layout_visible[2]) -
+                          static_cast<int>(layout_visible[3]))
+            : ftxui::Terminal::Size().dimx;
+        auto& split = layout_horizontal ? layout_top_size : layout_left_size;
+        const auto minimum = std::min(layout_horizontal ? 6 : 12, std::max(1, total / 2));
+        split = std::clamp(split + amount, minimum, std::max(minimum, total - minimum));
+    }
+
+    void apply_layout() {
+        config.layout_horizontal = layout_horizontal;
+        config.equal_split = layout_equal;
+        config.panel_left_size = layout_left_size;
+        config.panel_top_size = layout_top_size;
+        config.menubar_visible = layout_visible[0];
+        config.command_prompt = layout_visible[1];
+        config.keybar_visible = layout_visible[2];
+        config.hintbar_visible = layout_visible[3];
+        config.xterm_title = layout_visible[4];
+        config.show_free_space = layout_visible[5];
+        if (!config.command_prompt) {
+            command_prompt_override = false;
+            command_mode = false;
+            command_line.clear();
+            command_input.reset(command_line);
+        }
+        mode = Mode::panels;
+        status = "Layout changed";
+    }
+
+    bool handle_layout_dialog(const ftxui::Event& event) {
+        using namespace ftxui;
+        if (modal_cancel(event)) { mode = Mode::panels; return true; }
+        const auto equal_changed = [&] {
+            layout_equal = !layout_equal;
+            if (layout_equal) {
+                layout_left_size = Terminal::Size().dimx / 2;
+                layout_top_size = file_manager_body_height() / 2;
+            }
+        };
+        if (event.is_mouse()) {
+            auto copy = event;
+            const auto& mouse = copy.mouse();
+            if (mouse.button != Mouse::Left || mouse.motion != Mouse::Pressed) return true;
+            for (std::size_t index = 0; index < layout_boxes.size(); ++index) {
+                if (!layout_boxes[index].Contain(mouse.x, mouse.y)) continue;
+                if (index < 2U) { layout_focus = 0; layout_horizontal = index == 1U; }
+                else if (index == 2U) { layout_focus = 1; equal_changed(); }
+                else if (index < 5U) {
+                    if (!layout_equal) { layout_focus = index - 1U; adjust_layout_split(index == 3U ? -1 : 1); }
+                } else if (index < 11U) {
+                    layout_focus = index - 1U;
+                    layout_visible[index - 5U] = !layout_visible[index - 5U];
+                } else if (index == 11U) apply_layout();
+                else mode = Mode::panels;
+                return true;
+            }
+            return true;
+        }
+        if (event == Event::Tab || event == Event::TabReverse) {
+            do {
+                layout_focus = event == Event::Tab ? (layout_focus + 1U) % 12U : (layout_focus + 11U) % 12U;
+            } while (layout_equal && (layout_focus == 2U || layout_focus == 3U));
+        } else if (layout_focus == 0U && (event == Event::ArrowUp || event == Event::ArrowDown)) {
+            layout_horizontal = !layout_horizontal;
+        } else if (event == Event::Return || event == Event::Character(' ')) {
+            if (layout_focus == 11U) mode = Mode::panels;
+            else if (layout_focus == 2U || layout_focus == 3U) adjust_layout_split(layout_focus == 2U ? -1 : 1);
+            else if (event == Event::Return || layout_focus == 10U) apply_layout();
+            else if (layout_focus == 1U) equal_changed();
+            else if (layout_focus >= 4U && layout_focus <= 9U) layout_visible[layout_focus - 4U] = !layout_visible[layout_focus - 4U];
+        } else if (event.is_character() && event.character().size() == 1U) {
+            const auto key = static_cast<char>(std::tolower(static_cast<unsigned char>(event.character()[0])));
+            if (key == 'v') { layout_horizontal = false; layout_focus = 0; }
+            else if (key == 'h') { layout_horizontal = true; layout_focus = 0; }
+            else if (key == 'e') { equal_changed(); layout_focus = 1; }
+            else if (const auto index = std::string_view("mpkixs").find(key); index != std::string_view::npos) {
+                layout_visible[index] = !layout_visible[index];
+                layout_focus = index + 4U;
+            }
+        }
+        return true;
+    }
+
+    ftxui::Element render_confirmation_dialog() {
+        using namespace ftxui;
+        static const std::array<std::string, 6> labels{
+            "Delete", "Overwrite", "Execute", "Exit", "Directory hotlist delete", "History cleanup"
+        };
+        static constexpr std::array<std::size_t, 6> mnemonics{0, 1, 0, 1, 2, 0};
+        Elements rows;
+        for (std::size_t index = 0; index < labels.size(); ++index) {
+            auto row = hbox({text(confirmation_values[index] ? " [x] " : " [ ] "),
+                             mnemonic_label(labels[index], mnemonics[index])}) |
+                       reflect(confirmation_boxes[index]);
+            if (confirmation_focus == index) row = row | inverted | focus;
+            rows.push_back(std::move(row));
+        }
+        return native_window("Confirmation", vbox({
+            vbox(std::move(rows)), separator(),
+            hbox({native_button("OK", true, confirmation_focus == 6U, confirmation_boxes[6]), text(" "),
+                  native_button("Cancel", false, confirmation_focus == 7U, confirmation_boxes[7])}) | center,
+        }), 44);
+    }
+
+    bool handle_confirmation_dialog(const ftxui::Event& event) {
+        using namespace ftxui;
+        if (modal_cancel(event)) { mode = Mode::panels; return true; }
+        if (event.is_mouse()) {
+            auto copy = event;
+            const auto& mouse = copy.mouse();
+            if (mouse.button != Mouse::Left || mouse.motion != Mouse::Pressed) return true;
+            for (std::size_t index = 0; index < confirmation_boxes.size(); ++index) {
+                if (!confirmation_boxes[index].Contain(mouse.x, mouse.y)) continue;
+                confirmation_focus = index;
+                if (index < 6U) confirmation_values[index] = !confirmation_values[index];
+                else return handle_confirmation_dialog(Event::Return);
+                return true;
+            }
+            return true;
+        }
+        if (event == Event::Tab || event == Event::ArrowDown) {
+            confirmation_focus = (confirmation_focus + 1U) % 8U;
+        } else if (event == Event::TabReverse || event == Event::ArrowUp) {
+            confirmation_focus = (confirmation_focus + 7U) % 8U;
+        } else if (event == Event::Character(' ') && confirmation_focus < 6U) {
+            confirmation_values[confirmation_focus] = !confirmation_values[confirmation_focus];
+        } else if (event == Event::Return || event == Event::Character(' ')) {
+            if (confirmation_focus != 7U) {
+                config.confirm_delete = confirmation_values[0];
+                config.confirm_overwrite = confirmation_values[1];
+                config.confirm_execute = confirmation_values[2];
+                config.confirm_exit = confirmation_values[3];
+                config.confirm_hotlist_delete = confirmation_values[4];
+                config.confirm_history_cleanup = confirmation_values[5];
+            }
+            mode = Mode::panels;
+        } else if (event.is_character() && event.character().size() == 1U) {
+            const auto key = static_cast<char>(std::tolower(static_cast<unsigned char>(event.character()[0])));
+            if (const auto index = std::string_view("dvexrh").find(key); index != std::string_view::npos) {
+                confirmation_values[index] = !confirmation_values[index];
+                confirmation_focus = index;
+            }
+        }
+        return true;
+    }
+
+    void request_app_exit() {
+        if (config.confirm_exit) {
+            show_native_query("Quit", "Do you really want to quit?", {"Yes", "No"},
+                [this](const std::size_t selected) { if (selected == 0U) exit_terminal(); });
+        } else exit_terminal();
     }
 
     void set_error(const std::exception& error) {
         status = std::string("Error: ") + error.what();
+        if (!config.hintbar_visible && terminal != nullptr &&
+            (mode == Mode::panels || mode == Mode::pulldown)) {
+            const auto message = std::string(error.what());
+            post_ui([this, message] { show_native_message("Error", message); });
+        }
     }
 
     void post_ui(std::function<void()> task) {
@@ -2369,7 +6095,7 @@ struct App::Impl {
             operation_prompt_source = std::move(source);
             operation_prompt_destination = std::move(destination);
             operation_prompt_error = std::move(error);
-            dialog_focus = 0;
+            dialog_focus = operation_prompt_destination && config.safe_overwrite ? 1U : 0U;
             mode = operation_prompt_destination
                        ? Mode::conflict_dialog
                        : Mode::operation_error_dialog;
@@ -2799,6 +6525,28 @@ struct App::Impl {
         return false;
     }
 
+    void show_completions(std::string& value, TextInputState& input) {
+        const auto return_mode = mode;
+        auto* destination = &value;
+        auto* state = &input;
+        const auto choices = input.completions;
+        show_local_list("Completion", choices,
+            [this, destination, state](const std::size_t selected) {
+                const auto completion = local_list_items.at(selected);
+                const auto suffix = completion.ends_with('/') && state->completion_suffix.starts_with('/')
+                                        ? state->completion_suffix.substr(1U) : state->completion_suffix;
+                *destination = state->completion_prefix + completion + suffix;
+                state->cursor = state->completion_prefix.size() + completion.size();
+                state->anchor.reset();
+                state->completed_value = *destination;
+                state->message.clear();
+            }, return_mode);
+        local_list_native = true;
+        local_list_completion = true;
+        completion_choices = choices;
+        completion_filter.clear();
+    }
+
     void complete_path(
         std::string& value,
         TextInputState& input,
@@ -2815,9 +6563,7 @@ struct App::Impl {
             input.completed_value = value;
         };
         if (!input.completions.empty() && value == input.completed_value) {
-            input.completion_index =
-                (input.completion_index + 1U) % input.completions.size();
-            apply(input.completions[input.completion_index]);
+            show_completions(value, input);
             return;
         }
         input.cursor = std::min(input.cursor, value.size());
@@ -2893,6 +6639,9 @@ struct App::Impl {
         input.completion_index = matches.size() - 1U;
         input.message =
             std::to_string(matches.size()) + " paths; Alt-Tab cycles matches";
+        if (config.completion_show_all) {
+            show_completions(value, input);
+        }
     }
 
     void cancel_prompt() {
@@ -2984,7 +6733,7 @@ struct App::Impl {
         if (active().selected_entries().empty()) {
             throw std::runtime_error("no source selected");
         }
-        dialog_focus = 0;
+        dialog_focus = config.safe_delete ? 1U : 0U;
         mode = Mode::delete_dialog;
     }
 
@@ -3026,6 +6775,7 @@ struct App::Impl {
                 ? tree_operation_source_index
                 : active_index
         ];
+        operation_source_side = tree_operation_source ? tree_operation_source_index : active_index;
         const auto policy = std::make_shared<OperationPolicy>();
         const OperationOptions options{
             .overwrite = overwrite,
@@ -3064,13 +6814,14 @@ struct App::Impl {
                     }
                 },
             .error = error_handler(policy),
+            .compute_totals = config.compute_totals,
         };
         clear_tree_operation_context();
         operation_running.store(true, std::memory_order_release);
         operation_started = std::chrono::steady_clock::now();
         operation_paused.store(false, std::memory_order_release);
         operation_skip.store(false, std::memory_order_release);
-        mode = Mode::operation_progress;
+        mode = config.verbose_operation ? Mode::operation_progress : Mode::panels;
         operation_label = move_operation ? "Move" : "Copy";
         start_job(destination);
         status = move_operation ? "Starting move" : "Starting copy";
@@ -3281,6 +7032,7 @@ struct App::Impl {
                 ? tree_operation_source_index
                 : active_index
         ];
+        operation_source_side = tree_operation_source ? tree_operation_source_index : active_index;
         clear_tree_operation_context();
         operation_cancellation = Cancellation{};
         progress = {};
@@ -3288,14 +7040,15 @@ struct App::Impl {
         operation_started = std::chrono::steady_clock::now();
         operation_paused.store(false, std::memory_order_release);
         operation_skip.store(false, std::memory_order_release);
-        mode = Mode::operation_progress;
+        mode = config.verbose_operation ? Mode::operation_progress : Mode::panels;
         operation_label = "Delete";
         start_job({});
         const auto resolve_error = error_handler(std::make_shared<OperationPolicy>());
+        const auto compute_totals = config.compute_totals;
         status = "Starting delete";
         try {
             operation_thread = std::jthread(
-            [this, provider, entries, source_id, resolve_error] {
+            [this, provider, entries, source_id, resolve_error, compute_totals] {
                 OperationResult result;
                 try {
                     operations.remove(
@@ -3333,7 +7086,8 @@ struct App::Impl {
                             });
                         },
                         &result,
-                        resolve_error
+                        resolve_error,
+                        compute_totals
                     );
                     post_ui([
                         this,
@@ -3396,7 +7150,8 @@ struct App::Impl {
 
     int run_process(
         const std::string& command,
-        const bool interactive
+        const bool interactive,
+        const std::string& directory = {}
     ) {
         if (operation_running.load(std::memory_order_acquire)) {
             throw std::runtime_error(
@@ -3418,7 +7173,7 @@ struct App::Impl {
                 throw std::runtime_error("failed to fork shell");
             }
             if (child == 0) {
-                if (chdir(active().path().c_str()) != 0) {
+                if (chdir((directory.empty() ? active().path() : directory).c_str()) != 0) {
                     _exit(126);
                 }
                 const auto* shell = std::getenv("SHELL");
@@ -3445,7 +7200,41 @@ struct App::Impl {
                     );
                 }
             }
+            const auto* term = std::getenv("TERM");
+            const bool dumb_terminal = term != nullptr &&
+                (std::string_view(term) == "dumb" || std::string_view(term) == "linux");
+            if (!interactive && (config.pause_after_run == 2U ||
+                (config.pause_after_run == 1U && dumb_terminal))) {
+                struct termios original{};
+                if (tcgetattr(STDIN_FILENO, &original) != 0) {
+                    throw std::system_error(errno, std::generic_category(), "read terminal settings");
+                }
+                auto one_key = original;
+                one_key.c_lflag &= static_cast<tcflag_t>(~(ICANON | ECHO));
+                one_key.c_cc[VMIN] = 1;
+                one_key.c_cc[VTIME] = 0;
+                if (tcsetattr(STDIN_FILENO, TCSANOW, &one_key) != 0) {
+                    throw std::system_error(errno, std::generic_category(), "set pause input mode");
+                }
+                try {
+                    std::cout << "\nPress any key to continue..." << std::flush;
+                    char key = 0;
+                    ssize_t count = 0;
+                    do { count = read(STDIN_FILENO, &key, 1); } while (count < 0 && errno == EINTR);
+                    if (count != 1) throw std::runtime_error("cannot read pause key");
+                    std::cout << '\n' << std::flush;
+                } catch (...) {
+                    if (tcsetattr(STDIN_FILENO, TCSANOW, &original) != 0) {
+                        std::cerr << "mcpp: cannot restore terminal settings after pause\n";
+                    }
+                    throw;
+                }
+                if (tcsetattr(STDIN_FILENO, TCSANOW, &original) != 0) {
+                    throw std::system_error(errno, std::generic_category(), "restore terminal settings");
+                }
+            }
         })();
+        terminal_title.clear();
         refresh();
         if (WIFEXITED(child_status)) {
             return WEXITSTATUS(child_status);
@@ -3456,6 +7245,7 @@ struct App::Impl {
     }
 
     void execute_command() {
+        command_prompt_override = false;
         if (command_line.empty()) {
             command_mode = false;
             return;
@@ -3497,7 +7287,7 @@ struct App::Impl {
                 }
                 const auto old_path = active().path();
                 active().change_directory(active().provider()->join(
-                    old_path, destination
+                    active().navigation_path(), destination
                 ));
                 previous = old_path;
                 status = "Directory changed: " + active().path();
@@ -3529,13 +7319,10 @@ struct App::Impl {
                             "not a regular file: " + path
                         );
                     }
-                    viewer.open(provider, path);
-                    viewer_search_needle.clear();
-                    viewer_return_mode = Mode::panels;
                     prompt_action = PromptAction::none;
                     prompt_value.clear();
                     prompt_error.clear();
-                    mode = Mode::viewer;
+                    view_file(provider, path, Mode::panels);
                     return;
                 }
                 case PromptAction::rename: {
@@ -3730,7 +7517,7 @@ struct App::Impl {
                 }
                 case PromptAction::quick_cd: {
                     auto destination = (
-                        std::filesystem::path(active().path()) / prompt_value
+                        std::filesystem::path(active().navigation_path()) / prompt_value
                     ).lexically_normal();
                     // Keep a trailing separator from resolving a logical symlink leaf.
                     if (destination.filename().empty()) {
@@ -3821,6 +7608,103 @@ struct App::Impl {
         prompt_value.clear();
     }
 
+    std::string listing_value(const Pane& pane, const Entry& entry, const std::string& field) const {
+        if (field == "type") return type_prefix(entry);
+        if (field == "name" || field == "version" || field == "extension" || field == "unsorted") {
+            return display_filename(pane, entry.name);
+        }
+        if (field == "size" || field == "bsize") {
+            if (entry.revision == "mcpp:parent") return "UP--DIR";
+            return field == "size" ? format_panel_size(entry.size, config.use_si_units) : format_size(entry.size);
+        }
+        if (field == "perm") return permission_text(entry);
+        if (field == "mode") {
+            std::ostringstream value;
+            value << std::oct << std::setfill('0') << std::setw(6) << entry.mode;
+            return value.str();
+        }
+        if (field == "mtime") return format_panel_time(entry.modified);
+        if (field == "atime") return format_panel_time(entry.accessed);
+        if (field == "ctime") return format_panel_time(entry.changed);
+        if (field == "inode") return std::to_string(entry.inode);
+        if (field == "nlink") return std::to_string(entry.links);
+        if (field == "nuid") return std::to_string(entry.uid);
+        if (field == "ngid") return std::to_string(entry.gid);
+        if (field == "owner") return display_text(entry.owner);
+        if (field == "group") return display_text(entry.group);
+        if (field == "mark") return pane.is_selected(entry) ? "*" : " ";
+        if (field == "space") return " ";
+        if (field == "dot") return ".";
+        throw std::runtime_error("unsupported display field: " + field);
+    }
+
+    static std::string fit_listing_text(
+        const std::string& value, const int width, const ListingAlignment alignment
+    ) {
+        if (width <= 0) return {};
+        auto fitted = middle_truncate(value, static_cast<std::size_t>(width));
+        const auto padding = static_cast<std::size_t>(std::max(0, width - ftxui::string_width(fitted)));
+        const auto before = alignment == ListingAlignment::right ? padding
+                          : alignment == ListingAlignment::center ? padding / 2U : 0U;
+        return std::string(before, ' ') + fitted + std::string(padding - before, ' ');
+    }
+
+    ftxui::Element render_listing_fields(
+        const Pane& pane, const Entry* entry, const ListingSpec& spec, const int width,
+        const bool header = false
+    ) const {
+        using namespace ftxui;
+        const auto widths = listing_field_widths(spec, width);
+        Elements fields;
+        for (std::size_t index = 0; index < spec.fields.size(); ++index) {
+            if (widths[index] == 0) continue;
+            const auto& field = spec.fields[index];
+            if (field.name == "|") {
+                fields.push_back(separator() | size(WIDTH, EQUAL, widths[index]));
+            } else {
+                const auto value = header ? field.title
+                                 : entry == nullptr ? std::string{} : listing_value(pane, *entry, field.name);
+                const auto fitted = fit_listing_text(value, widths[index],
+                    header ? ListingAlignment::center : field.alignment);
+                if (!header && entry != nullptr && config.highlight_permissions &&
+                    (field.name == "perm" || field.name == "mode")) {
+                    const auto group = entry->uid == geteuid() ? 0
+                                     : entry->gid == getegid() ||
+                                       std::ranges::find(effective_groups, entry->gid) != effective_groups.end() ? 1 : 2;
+                    const auto start = field.name == "perm" ? group * 3 + 1 : widths[index] + group - 3;
+                    const auto end = start + (field.name == "perm" ? 3 : 1);
+                    Elements permission;
+                    for (std::size_t character = 0; character < fitted.size(); ++character) {
+                        auto cell = text(fitted.substr(character, 1));
+                        if (static_cast<int>(character) >= start && static_cast<int>(character) < end) {
+                            cell = cell | bold | underlined;
+                        }
+                        permission.push_back(std::move(cell));
+                    }
+                    fields.push_back(hbox(std::move(permission)));
+                } else fields.push_back(text(fitted));
+            }
+        }
+        return hbox(std::move(fields)) | size(WIDTH, EQUAL, std::max(0, width));
+    }
+
+    std::string listing_status(const Pane& pane, const Entry& entry, const int width) const {
+        if (entry.revision == "mcpp:parent") return "UP--DIR";
+        const auto id = panel_config_index(pane);
+        const auto format = config.panel_listing[id];
+        const auto spec = parse_listing_format(config.panel_user_mini_status[id]
+            ? config.panel_status_formats[id][static_cast<std::size_t>(format)]
+            : mini_status_format(format, config.panel_columns[id]));
+        const auto widths = listing_field_widths(spec, width);
+        std::string result;
+        for (std::size_t index = 0; index < spec.fields.size(); ++index) {
+            const auto& field = spec.fields[index];
+            result += fit_listing_text(field.name == "|" ? "|" : listing_value(pane, entry, field.name),
+                                       widths[index], field.alignment);
+        }
+        return result;
+    }
+
     ftxui::Element render_pane(
         Pane& pane,
         const bool focused,
@@ -3830,88 +7714,66 @@ struct App::Impl {
     ) {
         using namespace ftxui;
         const auto inner_width = std::max(1, panel_width_value - 2);
-        const bool show_details =
-            detailed_view && inner_width >= 28;
-        const auto name_width = std::max(1, inner_width - 22);
-        const auto visible_rows = panel_visible_rows();
-        pane.set_viewport_rows(visible_rows);
+        const auto spec = pane_listing_spec(pane);
+        const auto visible_rows = panel_visible_rows(&pane == &left ? 0 : 1);
+        const auto slots = visible_rows * spec.columns;
+        pane.set_viewport_rows(slots);
         Elements rows;
+        Elements headers;
         const auto& entries = pane.entries();
         rows.reserve(visible_rows);
         entry_boxes.clear();
         entry_boxes.resize(entries.size());
-        const auto end = std::min(entries.size(), pane.first_row() + visible_rows);
-        for (std::size_t index = pane.first_row(); index < end; ++index) {
+        const auto end = std::min(entries.size(), pane.first_row() + slots);
+        const auto decorate = [&](const std::size_t index, Element row) {
             const auto& entry = entries[index];
-            auto name = type_prefix(entry) + display_text(entry.name);
-            auto row =
-                show_details
-                    ? hbox({
-                          text(
-                              truncate_text(
-                                  (
-                                      pane.is_selected(entry)
-                                          ? "*"
-                                          : " "
-                                  ) + name,
-                                  static_cast<std::size_t>(name_width)
-                              )
-                          ) | size(WIDTH, EQUAL, name_width),
-                          separator(),
-                          text(
-                              entry.revision == "mcpp:parent"
-                                  ? "UP--DIR"
-                                  : format_panel_size(entry.size)
-                          ) | size(WIDTH, EQUAL, 8),
-                          separator(),
-                          text(format_panel_time(entry.modified)) |
-                              size(WIDTH, EQUAL, 12),
-                      })
-                    : hbox({
-                          text(pane.is_selected(entry) ? "*" : " "),
-                          text(name) | flex,
-                      });
             if (index == pane.cursor()) {
-                row = gray_selected(
-                    std::move(row),
-                    pane.is_selected(entry),
-                    focused
-                );
+                row = gray_selected(std::move(row), pane.is_selected(entry), focused);
             } else {
-                row = gray_entry(std::move(row), entry);
-                if (pane.is_selected(entry)) {
-                    row = row | bold;
+                row = config.highlight_file_types ? gray_entry(std::move(row), entry, config.theme == "type-colors")
+                                                  : std::move(row) | color(Color::Grey85);
+                if (config.highlight_file_types && config.theme == "type-colors") {
+                    for (const auto& [pattern, foreground] : highlight_rules) {
+                        if (EditorSearch::filename_matches(entry.name, pattern, true)) {
+                            row = row | color(foreground);
+                            break;
+                        }
+                    }
                 }
+                if (pane.is_selected(entry)) row = row | bold | color(Color::Grey100);
             }
-            rows.push_back(
-                std::move(row) | reflect(entry_boxes[index])
-            );
+            return std::move(row) | reflect(entry_boxes[index]);
+        };
+        const auto column_width = [&](const std::size_t column) {
+            const auto content = std::max(0, inner_width - static_cast<int>(spec.columns - 1U));
+            return content / static_cast<int>(spec.columns) +
+                   (column + 1U == spec.columns ? content % static_cast<int>(spec.columns) : 0);
+        };
+        const auto field_width = std::max(0, (panel_width_value - 1) / static_cast<int>(spec.columns) - 1);
+        for (std::size_t column = 0; column < spec.columns; ++column) {
+            if (column != 0U) headers.push_back(separator());
+            headers.push_back(hbox({
+                render_listing_fields(pane, nullptr, spec, field_width, true), filler()
+            }) | size(WIDTH, EQUAL, column_width(column)));
         }
-        while (rows.size() < visible_rows) {
-            rows.push_back(
-                show_details
-                    ? hbox({
-                          text("") | size(WIDTH, EQUAL, name_width),
-                          separator(),
-                          text("") | size(WIDTH, EQUAL, 8),
-                          separator(),
-                          text("") | size(WIDTH, EQUAL, 12),
-                      })
-                    : text("")
-            );
+        for (std::size_t row = 0; row < visible_rows; ++row) {
+            Elements cells;
+            for (std::size_t column = 0; column < spec.columns; ++column) {
+                if (column != 0U) cells.push_back(separator());
+                const auto index = pane.first_row() + row + column * visible_rows;
+                auto line = render_listing_fields(pane, index < end ? &entries[index] : nullptr,
+                                                   spec, field_width);
+                if (index < end) line = decorate(index, std::move(line));
+                cells.push_back(hbox({std::move(line), filler()}) |
+                                size(WIDTH, EQUAL, column_width(column)));
+            }
+            rows.push_back(hbox(std::move(cells)));
         }
         const auto* current = pane.current();
         auto info =
             current == nullptr
                 ? std::string{}
-                : inner_width < 50
-                      ? display_text(current->name) + "  " +
-                            format_size(current->size)
-                      : permission_text(*current) + " " +
-                            display_text(current->name) + "  " +
-                            format_size(current->size) +
-                            "  " + current->owner + ":" +
-                            current->group;
+                : listing_status(pane, *current, inner_width);
         if (pane.marked_count() > 0U) {
             info =
                 std::to_string(pane.marked_count()) +
@@ -3931,10 +7793,12 @@ struct App::Impl {
                 format_size(disk.available) + " / " +
                 format_size(disk.capacity) + " (" +
                 std::to_string(percent) + "%)";
-        } catch (...) {
+        } catch (const std::exception&) {
+            available = "Space unavailable";
         }
+        if (!config.show_free_space) available.clear();
         auto title = text(" " + path_label(
-            display_text(pane.path()) +
+            display_filename(pane, pane.path()) +
                 (pane.panelized() ? " [panelized]" : ""),
             static_cast<std::size_t>(
                 std::max(1, panel_width_value - 8)
@@ -3945,47 +7809,24 @@ struct App::Impl {
         } else {
             title = title | color(Color::Grey58);
         }
-        auto header =
-            show_details
-                ? hbox({
-                      text(" Name") |
-                          size(WIDTH, EQUAL, name_width),
-                      separator(),
-                      text(" Size") |
-                          size(WIDTH, EQUAL, 8),
-                      separator(),
-                      text("Modify time") |
-                          size(WIDTH, EQUAL, 12),
-                  })
-                : text(" Name");
-        header = header | color(Color::Grey93) | bold;
-        const auto minimum_info_width = std::min(
-            static_cast<int>(info.size()),
-            std::max(12, inner_width / 2)
-        );
-        if (static_cast<int>(available.size()) +
-                minimum_info_width + 1 >
-            inner_width) {
-            available.clear();
+        Elements panel_rows{hbox(std::move(headers)) | color(Color::Grey93) | bold,
+                            vbox(std::move(rows)) | flex};
+        if (config.show_mini_status) {
+            panel_rows.push_back(separator());
+            panel_rows.push_back(text(middle_truncate(info, static_cast<std::size_t>(inner_width))) |
+                                 size(WIDTH, EQUAL, inner_width));
         }
-        const auto available_width =
-            static_cast<int>(available.size());
-        const auto info_width =
-            std::max(0, inner_width - available_width - 1);
-        auto content = vbox({
-                   header,
-                   vbox(std::move(rows)) | flex,
-                   separator(),
-                   hbox({
-                       text(truncate_text(
-                           info,
-                           static_cast<std::size_t>(info_width)
-                       )) | size(WIDTH, EQUAL, info_width),
-                       filler(),
-                       text(available) | color(Color::Grey50),
-                   }),
-               });
-        return window(title, content, LIGHT) |
+        auto content = vbox(std::move(panel_rows));
+        auto framed = window(title, content, LIGHT);
+        if (!available.empty() && panel_width_value > 8) {
+            available = middle_truncate(available, static_cast<std::size_t>(panel_width_value - 6));
+            framed = dbox({framed, vbox({
+                filler(),
+                hbox({filler(), text(" " + available + " ") | color(Color::Grey50),
+                      filler() | size(WIDTH, EQUAL, 1)}),
+            })});
+        }
+        return framed |
                size(WIDTH, EQUAL, panel_width_value) |
                yflex |
                reflect(pane_box);
@@ -4092,7 +7933,7 @@ struct App::Impl {
             percentage << std::setw(3) << percent << "%";
             header = hbox({
                 text(path_label(
-                    display_text(viewer.path()),
+                    display_text(viewer_title()),
                     screen_width - 34U
                 )) |
                     size(
@@ -4109,7 +7950,7 @@ struct App::Impl {
             percentage << std::setw(3) << percent << "%";
             header = hbox({
                 text(path_label(
-                    display_text(viewer.path()),
+                    display_text(viewer_title()),
                     screen_width > 5U ? screen_width - 5U : 1U
                 )) |
                     flex,
@@ -4239,6 +8080,13 @@ struct App::Impl {
             selected_begin = selected->first;
             selected_end = selected->second;
         }
+        auto match_begin = line.size();
+        auto match_end = std::size_t{0};
+        if (const auto match = editor.search_selection();
+            match && index >= match->first.row && index <= match->second.row) {
+            match_begin = index == match->first.row ? match->first.column : 0U;
+            match_end = index == match->second.row ? match->second.column : line.size();
+        }
         auto trailing_whitespace = line.size();
         while (trailing_whitespace > 0U &&
                (
@@ -4281,6 +8129,8 @@ struct App::Impl {
                 visible_begin,
                 visible_end
             ),
+            std::clamp(match_begin, visible_begin, visible_end),
+            std::clamp(match_end, visible_begin, visible_end),
         };
         if (index == editor.row() &&
             editor.column() >= visible_begin &&
@@ -4367,6 +8217,7 @@ struct App::Impl {
                 begin == editor.column();
             const bool selected =
                 begin >= selected_begin && begin < selected_end;
+            const bool matched = begin >= match_begin && begin < match_end;
             if (cursor && line[begin] == '\t') {
                 segments.push_back(
                     focusCursorBlock(
@@ -4383,7 +8234,10 @@ struct App::Impl {
                 );
                 if (displayed.size() > 1U) {
                     auto remainder = text(displayed.substr(1U));
-                    if (selected) {
+                    if (matched) {
+                        remainder = remainder | color(Color::Grey0) |
+                                    bgcolor(Color::Grey62) | bold;
+                    } else if (selected) {
                         remainder = remainder |
                                     color(Color::Grey0) |
                                     bgcolor(Color::Grey85);
@@ -4401,6 +8255,8 @@ struct App::Impl {
                     bgcolor(Color::Grey85) |
                     bold
                 );
+            } else if (matched) {
+                segment = segment | color(Color::Grey0) | bgcolor(Color::Grey62) | bold;
             } else if (selected) {
                 segment = segment |
                           color(Color::Grey0) |
@@ -4487,6 +8343,7 @@ struct App::Impl {
             segments.push_back(text(""));
         }
         auto content = hbox(std::move(segments));
+        if (editor.bookmarks().contains(index)) content = content | underlined;
         if (!editor_line_numbers) {
             return content;
         }
@@ -4501,21 +8358,27 @@ struct App::Impl {
     ftxui::Element render_editor() {
         using namespace ftxui;
         update_editor_view();
-        const auto terminal_size = Terminal::Size();
+        auto terminal_size = Terminal::Size();
+        const auto dimensions = editor_dimensions();
+        terminal_size.dimx = dimensions.first;
+        terminal_size.dimy = dimensions.second;
         const auto visible_rows = editor_visible_rows();
         const auto& lines = editor.lines();
+        const auto syntax_language = effective_syntax_language();
+        const auto syntax_identity = editor.path() + "\n" + syntax_language;
         if (editor_syntax &&
             (
                 syntax_change_id != editor.change_id() ||
-                syntax_path != editor.path() ||
+                syntax_path != syntax_identity ||
                 syntax_spans.size() != lines.size()
             )) {
             syntax_spans = syntax_highlighter.highlight(
                 editor.path(),
-                lines
+                lines,
+                syntax_language
             );
             syntax_change_id = editor.change_id();
-            syntax_path = editor.path();
+            syntax_path = syntax_identity;
         } else if (!editor_syntax && !syntax_spans.empty()) {
             syntax_spans.clear();
         }
@@ -4555,20 +8418,13 @@ struct App::Impl {
             );
         }
 
-        static const std::array<std::string, 7> menu_names{
-            "File     ", "Edit     ", "Search     ", "Command     ",
-            "Format     ", "Window     ", "Options"
-        };
-        static constexpr std::array<std::size_t, 7> mnemonic_indices{
-            0, 0, 0, 0, 3, 0, 0
-        };
         Elements menu;
-        for (std::size_t index = 0; index < menu_names.size(); ++index) {
+        for (std::size_t index = 0; index < editor_menu_names.size(); ++index) {
             auto item = mnemonic_label(
-                menu_names[index],
-                mnemonic_indices[index]
+                editor_menu_names[index],
+                editor_menu_mnemonics[index]
             );
-            if (index == editor_menu_category) {
+            if (mode == Mode::editor_menu && index == editor_menu_category) {
                 item = item |
                        color(Color::Grey100) |
                        bgcolor(Color::Grey23) |
@@ -4581,16 +8437,16 @@ struct App::Impl {
         const bool at_eof = editor.cursor_offset() == editor.byte_size();
         const auto character =
             editor.column() == current_line.size() && !at_eof
-                ? 10U
+                ? static_cast<unsigned int>(editor.line_separator())
                 : utf8_codepoint(current_line, editor.column());
         std::ostringstream editor_status;
         editor_status
             << " L:[" << editor.row() + 1U
             << " C:" << cursor_width + 1U
             << "/" << editor.lines().size() << "]"
-            << " *(" << editor.selection_size()
-            << "/" << editor.cursor_offset()
-            << "/" << editor.byte_size() << "b)";
+            << " *("             << editor.storage_selection_size()
+            << "/" << editor.storage_cursor_offset()
+            << "/" << editor.storage_byte_size() << "b)";
         if (at_eof) {
             editor_status << " <EOF>";
         } else {
@@ -4609,7 +8465,9 @@ struct App::Impl {
             '[',
             block_flag,
             editor.dirty() ? 'M' : '-',
-            '-',
+            (macro_recording ||
+             (mode == Mode::native_key_query && key_query_title == "Save macro") ||
+             (mode == Mode::native_input && native_input_title == "Repeat last commands")) ? 'R' : '-',
             editor.overwrite() ? 'O' : '-',
             ']',
             ' ',
@@ -4626,17 +8484,17 @@ struct App::Impl {
             1, terminal_size.dimx -
                    static_cast<int>(editor_flags.size() + position_status.size())
         ));
-        auto header =
-            mode == Mode::editor_menu
-                ? hbox(std::move(menu))
-                : hbox({
+        auto status_header = hbox({
                       text(path_label(
                           display_text(editor.path()), filename_width
                       )) | bold | flex,
                       text(editor_flags),
                       text(position_status),
                   });
-        header = gray_menu(std::move(header));
+        status_header = gray_menu(std::move(status_header)) | xframe |
+                        size(WIDTH, EQUAL, terminal_size.dimx);
+        auto menubar = gray_menu(hbox(std::move(menu))) | reflect(editor_header_box);
+        auto header = mode == Mode::editor_menu ? menubar : status_header | reflect(editor_header_box);
         const auto key = [this](
                              const std::string& number,
                              const std::string& label
@@ -4646,10 +8504,7 @@ struct App::Impl {
                 label, mode == Mode::editor
             );
         };
-        return vbox({
-            header,
-            vbox(std::move(elements)) | flex,
-            hbox({
+        auto keybar = hbox({
                 text(" "),
                 key("1", "Help"),
                 key("2", "Save"),
@@ -4661,7 +8516,23 @@ struct App::Impl {
                 key("8", "Delete"),
                 key("9", "PullDn"),
                 key("10", "Quit"),
-            }),
+            });
+        auto body = vbox(std::move(elements)) | flex;
+        if (editor.fullscreen) return vbox({header, std::move(body), keybar});
+        const auto bounds = editor_window_bounds();
+        auto framed = dbox({
+            std::move(body) | borderStyled(LIGHT),
+            vbox({hbox({filler() | size(WIDTH, EQUAL, 1), status_header,
+                         filler() | size(WIDTH, EQUAL, 1)}), filler()}),
+        }) | size(WIDTH, EQUAL, bounds[2]) | size(HEIGHT, EQUAL, bounds[3]);
+        return vbox({
+            menubar,
+            vbox({
+                filler() | size(HEIGHT, EQUAL, std::max(0, bounds[1] - 1)),
+                hbox({filler() | size(WIDTH, EQUAL, bounds[0]), std::move(framed), filler()}),
+                filler(),
+            }) | flex,
+            keybar,
         });
     }
 
@@ -4671,107 +8542,107 @@ struct App::Impl {
     >& editor_menu_items() {
         static const std::array<std::vector<MenuRow>, 7> menus{{
             {
-                {"Open file...", 0},
-                {"New  C-n", 1},
-                {"Close", 2},
-                {"History...  M-E", 5},
+                {"Open file...", 0, 'o'},
+                {"New              C-n", 1, 'n'},
+                {"Close", 2, 'c'},
+                {"History...       M-E", 5, 'h'},
                 {"", -2},
-                {"Save  F2", 3},
-                {"Save as...  F12", 4},
+                {"Save             F2", 3, 's'},
+                {"Save as...       F12", 4, 'a'},
                 {"", -2},
-                {"Insert file...  F15", -1},
-                {"Copy to file...  C-f", -1},
+                {"Insert file...   F15", 7, 'i'},
+                {"Copy to file...  C-f", 8, 'y'},
                 {"", -2},
-                {"User menu...  F11", -1},
+                {"User menu...     F11", 9, 'u'},
                 {"", -2},
-                {"About...", -1},
+                {"About...", 10, 'b'},
                 {"", -2},
-                {"Quit  F10", 6},
+                {"Quit             F10", 6, 'q'},
             },
             {
-                {"Undo  C-u", 0},
-                {"Redo  M-r", 1},
+                {"Undo                 C-u", 0, 'u'},
+                {"Redo                 M-r", 1, 'r'},
                 {"", -2},
-                {"Toggle insert/overwrite  Ins", 2},
+                {"Toggle ins/overw     Ins", 2, 't'},
                 {"", -2},
-                {"Mark  F3", 3},
-                {"Mark columns  F13", 4},
-                {"Mark all", 5},
-                {"Unmark", 6},
+                {"Toggle mark          F3", 3, 'g'},
+                {"Mark columns         F13", 4, 'm'},
+                {"Mark all", 5, 'a'},
+                {"Unmark", 6, 'k'},
                 {"", -2},
-                {"Copy  F5", 7},
-                {"Move  F6", 8},
-                {"Delete  F8", 9},
+                {"Copy                 F5", 7, 'y'},
+                {"Move                 F6", 8, 'v'},
+                {"Delete               F8", 9, 'd'},
                 {"", -2},
-                {"Copy to clipfile  C-Ins", 10},
-                {"Cut to clipfile  S-Del", 11},
-                {"Paste from clipfile  S-Ins", 12},
+                {"Copy to clipfile     C-Ins", 10, 'p'},
+                {"Cut to clipfile      S-Del", 11, 'c'},
+                {"Paste from clipfile  S-Ins", 12, 's'},
                 {"", -2},
-                {"Beginning  C-Home", 13},
-                {"End  C-End", 14},
+                {"Beginning            C-Home", 13, 'b'},
+                {"End                  C-End", 14, 'e'},
             },
             {
-                {"Search...  F7", 0},
-                {"Search again  F17", 1},
-                {"Replace...  F4", 2},
+                {"Search...        F7", 0, 's'},
+                {"Search again     F17", 1, 'a'},
+                {"Replace...       F4", 2, 'r'},
                 {"", -2},
-                {"Toggle bookmark  M-k", -1},
-                {"Next bookmark  M-j", -1},
-                {"Previous bookmark  M-i", -1},
-                {"Flush bookmarks  M-o", -1},
+                {"Toggle bookmark  M-k", 3, 't'},
+                {"Next bookmark    M-j", 4, 'n'},
+                {"Prev bookmark    M-i", 5, 'p'},
+                {"Flush bookmarks  M-o", 6, 'f'},
             },
             {
-                {"Go to line...  M-l", 0},
-                {"Toggle line numbers  M-n", 2},
-                {"Go to matching bracket  M-b", 1},
-                {"Toggle syntax highlighting  C-s", 3},
+                {"Go to line...                M-l", 0, 'g'},
+                {"Toggle line state            M-n", 2, 't'},
+                {"Go to matching bracket       M-b", 1, 'b'},
+                {"Toggle syntax highlighting   C-s", 3, 'y'},
                 {"", -2},
-                {"Find declaration", -1},
-                {"Back from declaration", -1},
-                {"Forward to declaration", -1},
+                {"Find declaration             M-Enter", 4, 'f'},
+                {"Back from declaration        M--", 5, 'd'},
+                {"Forward to declaration       M-+", 6, 'w'},
                 {"", -2},
-                {"Encoding...", -1},
+                {"Encoding...                  M-e", 7, 'i'},
                 {"", -2},
-                {"Refresh screen", -1},
+                {"Refresh screen               C-l", 8, 'r'},
                 {"", -2},
-                {"Start/Stop record macro", -1},
-                {"Delete macro...", -1},
-                {"Record/Repeat actions", -1},
+                {"Start/Stop record macro      C-r", 9, 's'},
+                {"Delete macro...", 10, 'o'},
+                {"Record/Repeat actions", 11, 'a'},
                 {"", -2},
                 {"Spell check", -1},
-                {"Check word", -1},
+                {"Check word                   C-p", -1},
                 {"Change spelling language...", -1},
                 {"", -2},
                 {"Mail...", -1},
             },
             {
-                {"Insert literal...  C-q", -1},
-                {"Insert date/time", -1},
+                {"Insert literal...   C-q", 0, 'l'},
+                {"Insert date/time", 1, 'd'},
                 {"", -2},
-                {"Format paragraph  M-p", -1},
-                {"Sort...  M-t", -1},
-                {"Paste output of...  M-u", -1},
-                {"External formatter", -1},
+                {"Format paragraph    M-p", 2, 'f'},
+                {"Sort...             M-t", 3, 's'},
+                {"Paste output of...  M-u", 4, 'p'},
+                {"External formatter", 5, 'e'},
             },
             {
-                {"Move window", -1},
-                {"Resize window", -1},
-                {"Toggle fullscreen", -1},
+                {"Move", 3, 'm'},
+                {"Resize", 4, 'r'},
+                {"Toggle fullscreen", 5, 't'},
                 {"", -2},
-                {"Next buffer", 0},
-                {"Previous buffer", 1},
-                {"Buffer list...", 2},
+                {"Next", 0, 'n'},
+                {"Previous", 1, 'p'},
+                {"List...", 2, 'l'},
             },
             {
-                {"General...", 0},
-                {"Save mode...", -1},
-                {"Learn keys...", -1},
-                {"Syntax highlighting...", -1},
+                {"General...", 0, 'g'},
+                {"Save mode...", 2, 'm'},
+                {"Learn keys...", 3, 'k'},
+                {"Syntax highlighting...", 4, 'h'},
                 {"", -2},
-                {"Syntax file", -1},
-                {"Menu file", -1},
+                {"Syntax file", 5, 'y'},
+                {"Menu file", 6, 'm'},
                 {"", -2},
-                {"Save setup", 1},
+                {"Save setup", 1, 's'},
             },
         }};
         return menus;
@@ -4789,7 +8660,7 @@ struct App::Impl {
                 );
                 continue;
             }
-            auto row = text(" " + items[index].label);
+            auto row = menu_row_label(items[index]);
             if (items[index].action < 0) {
                 row = row | color(Color::Grey66) | dim;
             }
@@ -4881,10 +8752,18 @@ struct App::Impl {
     }
 
     ftxui::Element render_editor_link_dialog() {
-        using namespace ftxui;
         const auto& path = editor_save_purpose == EditorSavePurpose::save_as
                                ? editor_save_path
                                : editor_save_buffer->path();
+        return render_link_dialog(path, editor_link_choice, editor_link_boxes);
+    }
+
+    ftxui::Element render_link_dialog(
+        const std::string& path,
+        const std::size_t choice,
+        std::array<ftxui::Box, 3>& boxes
+    ) {
+        using namespace ftxui;
         return vbox({
                    text("File has multiple hardlinks") | bold | center,
                    text(path_label(
@@ -4900,11 +8779,11 @@ struct App::Impl {
                    ),
                    separator(),
                    hbox({
-                       dialog_button("Detach", editor_link_choice == 0U, editor_link_boxes[0]),
+                       dialog_button("Detach", choice == 0U, boxes[0]),
                        text(" "),
-                       dialog_button("Preserve links", editor_link_choice == 1U, editor_link_boxes[1]),
+                       dialog_button("Preserve links", choice == 1U, boxes[1]),
                    }) | center,
-                   dialog_button("Cancel", editor_link_choice == 2U, editor_link_boxes[2]) | center,
+                   dialog_button("Cancel", choice == 2U, boxes[2]) | center,
                }) |
                borderStyled(LIGHT) |
                size(WIDTH, LESS_THAN, std::min(66, Terminal::Size().dimx));
@@ -5204,7 +9083,7 @@ struct App::Impl {
         }
         return vbox({
                    text(
-                       history ? "Editor history" : "Buffer list"
+                       history ? "History" : "Open files"
                    ) |
                        bold |
                        center,
@@ -5306,101 +9185,101 @@ struct App::Impl {
     >& pulldown_items() {
         static const std::array<std::vector<MenuRow>, 5> items{{
             {
-                {"File listing", 12},
-                {"Quick view         C-x q", 10},
-                {"Info               C-x i", 11},
-                {"Tree", 14},
+                {"File listing", 12, 'g'},
+                {"Quick view         C-x q", 10, 'q'},
+                {"Info               C-x i", 11, 'i'},
+                {"Tree", 14, 't'},
                 {"", -2},
-                {"Listing format...", -1},
-                {"Sort order...", -1},
-                {"Filter...", 13},
-                {"Encoding...        M-e", -1},
+                {"Listing format...", 16, 'l'},
+                {"Sort order...", 17, 's'},
+                {"Filter...", 13, 'f'},
+                {"Encoding...        M-e", 18, 'e'},
                 {"", -2},
                 {"FTP link...", -1},
                 {"Shell link...", -1},
                 {"SFTP link...", -1},
-                {"Panelize by name...", 15},
+                {"Panelize", 15, 'z'},
                 {"", -2},
-                {"Rescan             C-r", 7},
+                {"Rescan             C-r", 7, 'r'},
             },
             {
-                {"View              F3", 0},
-                {"View file...", 18},
-                {"Filtered view     M-!", -1},
-                {"Edit              F4", 1},
-                {"Copy              F5", 2},
-                {"Chmod             C-x c", 8},
-                {"Link              C-x l", 11},
-                {"Symlink           C-x s", 12},
-                {"Relative symlink  C-x v", 13},
-                {"Edit symlink      C-x C-s", -1},
-                {"Chown             C-x o", 9},
-                {"Advanced chown", -1},
-                {"Chattr            C-x e", -1},
-                {"Rename/Move       F6", 4},
-                {"Mkdir             F7", 5},
-                {"Delete            F8", 6},
-                {"Quick cd          M-c", 14},
+                {"View              F3", 0, 'v'},
+                {"View file...", 18, 'w'},
+                {"Filtered view     M-!", 22, 'f'},
+                {"Edit              F4", 1, 'e'},
+                {"Copy              F5", 2, 'c'},
+                {"Chmod             C-x c", 8, 'h'},
+                {"Link              C-x l", 11, 'l'},
+                {"Symlink           C-x s", 12, 's'},
+                {"Relative symlink  C-x v", 13, 'k'},
+                {"Edit symlink      C-x C-s", 19, 'y'},
+                {"Chown             C-x o", 9, 'o'},
+                {"Advanced chown", 20, 'a'},
+                {"Chattr            C-x e", 21, 't'},
+                {"Rename/Move       F6", 4, 'r'},
+                {"Mkdir             F7", 5, 'm'},
+                {"Delete            F8", 6, 'd'},
+                {"Quick cd          M-c", 14, 'q'},
                 {"", -2},
-                {"Select group      +", 15},
-                {"Unselect group    -", 16},
-                {"Invert selection  *", 17},
+                {"Select group      +", 15, 'g'},
+                {"Unselect group    -", 16, 'n'},
+                {"Invert selection  *", 17, 'i'},
                 {"", -2},
-                {"Exit              F10", 10},
+                {"Exit              F10", 10, 'x'},
             },
             {
-                {"User menu                     F2", 8},
-                {"Directory tree", -1},
-                {"Find file                     M-?", 0},
-                {"Swap panels                   C-u", 5},
-                {"Switch panels on/off          C-o", 3},
-                {"Compare directories           C-x d", 1},
-                {"Compare files                 C-x C-d", -1},
-                {"External panelize             C-x !", -1},
-                {"Show directory sizes          C-Space", -1},
+                {"User menu                     F2", 8, 'u'},
+                {"Directory tree", 11, 'd'},
+                {"Find file                     M-?", 0, 'f'},
+                {"Swap panels                   C-u", 5, 'w'},
+                {"Switch panels on/off          C-o", 3, 'p'},
+                {"Compare directories           C-x d", 1, 'c'},
+                {"Compare files                 C-x C-d", 12, 'o'},
+                {"External panelize             C-x !", 13, 'x'},
+                {"Show directory sizes          C-Space", 14, 'i'},
                 {"", -2},
-                {"Command history               M-h", -1},
-                {"Viewed/edited files history   M-E", -1},
-                {"Directory hotlist             C-\\", 7},
+                {"Command history               M-h", 15, 'h'},
+                {"Viewed/edited files history   M-E", 16, 's'},
+                {"Directory hotlist             C-\\", 7, 'r'},
                 {"Active VFS list               C-x a", -1},
-                {"Background jobs               C-x j", 10},
-                {"Screen list                   M-`", -1},
+                {"Background jobs               C-x j", 10, 'b'},
+                {"Screen list                   M-`", 17, 't'},
                 {"", -2},
                 {"Undelete files (ext2fs only)", -1},
                 {"", -2},
-                {"Edit extension file", -1},
-                {"Edit menu file", -1},
-                {"Edit highlighting group file", -1},
+                {"Edit extension file", 18, 'e'},
+                {"Edit menu file", 19, 'm'},
+                {"Edit highlighting group file", 20, 'g'},
             },
             {
-                {"Configuration...", -1},
-                {"Layout...", -1},
-                {"Panel options...", -1},
-                {"Confirmation...", -1},
-                {"Appearance...", -1},
-                {"Display bits...", -1},
-                {"Learn keys...", -1},
+                {"Configuration...", 20, 'c'},
+                {"Layout...", 21, 'l'},
+                {"Panel options...", 22, 'p'},
+                {"Confirmation...", 23, 'o'},
+                {"Appearance...", 24, 'a'},
+                {"Display bits...", 25, 'd'},
+                {"Learn keys...", 26, 'k'},
                 {"Virtual FS...", -1},
                 {"", -2},
-                {"Save setup", 3},
+                {"Save setup", 3, 's'},
             },
             {
-                {"File listing", 12},
-                {"Quick view         C-x q", 10},
-                {"Info               C-x i", 11},
-                {"Tree", 14},
+                {"File listing", 12, 'g'},
+                {"Quick view         C-x q", 10, 'q'},
+                {"Info               C-x i", 11, 'i'},
+                {"Tree", 14, 't'},
                 {"", -2},
-                {"Listing format...", -1},
-                {"Sort order...", -1},
-                {"Filter...", 13},
-                {"Encoding...        M-e", -1},
+                {"Listing format...", 16, 'l'},
+                {"Sort order...", 17, 's'},
+                {"Filter...", 13, 'f'},
+                {"Encoding...        M-e", 18, 'e'},
                 {"", -2},
                 {"FTP link...", -1},
                 {"Shell link...", -1},
                 {"SFTP link...", -1},
-                {"Panelize by name...", 15},
+                {"Panelize", 15, 'z'},
                 {"", -2},
-                {"Rescan             C-r", 7},
+                {"Rescan             C-r", 7, 'r'},
             },
         }};
         return items;
@@ -5420,7 +9299,7 @@ struct App::Impl {
                 rows.push_back(separator());
                 continue;
             }
-            auto row = text(" " + items[index].label + " ");
+            auto row = menu_row_label(items[index]);
             if (items[index].action < 0) {
                 row = row | color(Color::Grey66) | dim;
             }
@@ -5485,11 +9364,9 @@ struct App::Impl {
                     close_tree_panel(false);
                 }
                 active_index = panel_index;
-                start_prompt(
-                    PromptAction::panelize_search,
-                    "Panelize name pattern",
-                    "*"
-                );
+                active().restore_panelized();
+                mode = Mode::panels;
+                status = "Panelized listing restored";
                 return;
             }
             if (action == 12) {
@@ -5517,10 +9394,10 @@ struct App::Impl {
             active_index = panel_index;
             switch (action) {
                 case 0:
-                    detailed_view = false;
+                    config.panel_listing[panel_config_index(active())] = ListingFormat::brief;
                     break;
                 case 1:
-                    detailed_view = true;
+                    config.panel_listing[panel_config_index(active())] = ListingFormat::full;
                     break;
                 case 2:
                     active().set_show_hidden(!active().show_hidden());
@@ -5540,7 +9417,7 @@ struct App::Impl {
                     );
                     break;
                 case 7:
-                    active().refresh();
+                    active().refresh({}, true);
                     break;
                 case 8:
                     bookmark_cursor = 0;
@@ -5556,6 +9433,15 @@ struct App::Impl {
                         active().filter()
                     );
                     return;
+                case 16:
+                    show_listing_options();
+                    return;
+                case 17:
+                    show_sort_options();
+                    return;
+                case 18:
+                    show_filename_encoding();
+                    return;
                 default:
                     break;
             }
@@ -5568,25 +9454,13 @@ struct App::Impl {
                 case 0:
                     if (entry != nullptr &&
                         can_open_file(*entry)) {
-                        viewer.open(active().provider(), entry->path);
-                        viewer_search_needle.clear();
-                        viewer_return_mode = Mode::panels;
-                        mode = Mode::viewer;
+                        view_file(active().provider(), entry->path, Mode::panels);
                         return;
                     }
                     break;
                 case 1:
-                    if (entry != nullptr &&
-                        can_open_file(*entry)) {
-                        open_editor_buffer(
-                            active().provider(),
-                            entry->path,
-                            false
-                        );
-                        mode = Mode::editor;
-                        return;
-                    }
-                    break;
+                    request_main_edit(entry);
+                    return;
                 case 2:
                     start_operation_dialog(false, false);
                     return;
@@ -5606,7 +9480,7 @@ struct App::Impl {
                     return;
                 }
                 case 5:
-                    start_prompt(PromptAction::mkdir, "New directory");
+                    start_prompt(PromptAction::mkdir, "New directory", mkdir_default());
                     return;
                 case 6:
                     if (config.confirm_delete) {
@@ -5649,7 +9523,7 @@ struct App::Impl {
                     );
                     return;
                 case 10:
-                    exit_terminal();
+                    request_app_exit();
                     return;
                 case 11:
                     start_prompt(
@@ -5710,6 +9584,10 @@ struct App::Impl {
                     );
                     return;
                 }
+                case 22: show_filtered_view(); return;
+                case 19: show_edit_symlink(); return;
+                case 20: show_advanced_chown(); return;
+                case 21: show_file_attributes(); return;
                 default:
                     break;
             }
@@ -5755,10 +9633,33 @@ struct App::Impl {
                     mode = Mode::bookmarks;
                     return;
                 case 8:
-                    mode = Mode::user_menu;
+                    open_user_menu(Mode::panels);
                     return;
                 case 10:
                     open_jobs();
+                    return;
+                case 11: show_directory_chooser(active().path()); return;
+                case 12: show_file_comparison(); return;
+                case 13: show_external_panelize(); return;
+                case 14: show_directory_sizes(); return;
+                case 15: show_command_history(); return;
+                case 16: show_file_history(); return;
+                case 17: show_screens(Mode::panels); return;
+                case 18:
+                    open_config_editor(default_config_path().parent_path() / "extensions",
+                        "# File associations: pattern=command (%f, %d, %D, %% are supported)\n"
+                        "# *.txt=less -- %f\n");
+                    return;
+                case 19:
+                    open_config_editor(default_user_menu_path(),
+                        "# key|label|command; use %% for a literal percent\n"
+                        "i|Inspect selected path|stat -- %f\n"
+                        "d|Disk usage|du -sh -- %f\n");
+                    return;
+                case 20:
+                    open_config_editor(default_config_path().parent_path() / "highlighting",
+                        "# Enable File-type accents in Options / Appearance\n"
+                        "# pattern=red,green,blue\n# *.log=255,180,90\n");
                     return;
                 default:
                     break;
@@ -5767,6 +9668,14 @@ struct App::Impl {
             return;
         }
         if (pulldown_category == 3U) {
+            if (action == 26) {
+                show_learn_keys(Mode::panels);
+                return;
+            }
+            if (action >= 20 && action <= 25) {
+                show_settings(action);
+                return;
+            }
             switch (action) {
                 case 0:
                     toggle_quick_view();
@@ -5837,7 +9746,7 @@ struct App::Impl {
                    separator(),
                    vbox(std::move(rows)) | yframe | flex | reflect(bookmark_list_box),
                    separator(),
-                   text("Enter opens; Delete removes; Esc closes"),
+                   text("Enter opens; Insert adds current; Delete removes; Esc closes"),
                }) |
                borderStyled(LIGHT) | size(WIDTH, EQUAL, 62) |
                size(HEIGHT, LESS_THAN, std::max(5, Terminal::Size().dimy - 2));
@@ -5998,6 +9907,11 @@ struct App::Impl {
                       elapsed
                   )
                 : 0U;
+        const auto progress_bar = [&](const float ratio) {
+            return !config.classic_progressbar && operation_source_side == 1
+                       ? gaugeLeft(std::clamp(ratio, 0.0F, 1.0F))
+                       : gauge(std::clamp(ratio, 0.0F, 1.0F));
+        };
         std::string eta{"calculating"};
         if (bytes_per_second > 0U &&
             current.bytes_total >= current.bytes_done) {
@@ -6019,7 +9933,7 @@ struct App::Impl {
                        format_size(current.bytes_done) + " / " +
                        format_size(current.bytes_total)
                    ),
-                   gauge(std::clamp(byte_ratio, 0.0F, 1.0F)) |
+                   progress_bar(byte_ratio) |
                        color(Color::Grey11) |
                        bgcolor(Color::Grey70),
                    text(
@@ -6027,7 +9941,7 @@ struct App::Impl {
                        std::to_string(current.files_done) + " / " +
                        std::to_string(current.files_total)
                    ),
-                   gauge(std::clamp(file_ratio, 0.0F, 1.0F)) |
+                   progress_bar(file_ratio) |
                        color(Color::Grey11) |
                        bgcolor(Color::Grey70),
                    text(
@@ -6250,7 +10164,7 @@ struct App::Impl {
         for (std::size_t index = 0;
              index < search_results.size();
              ++index) {
-            auto row = text(path_label(
+            auto row = text(middle_truncate(
                 display_text(search_results[index].path),
                 static_cast<std::size_t>(std::max(1, Terminal::Size().dimx - 4))
             ));
@@ -6274,6 +10188,7 @@ struct App::Impl {
                              static_cast<std::size_t>(std::max(1, Terminal::Size().dimx - 4))
                          )) | bold,
                    text("F3 View  F4 Edit  Enter location  Esc closes"),
+                   native_button("Panelize", false, false, search_panelize_box) | center,
                }) |
                border;
     }
@@ -6452,7 +10367,7 @@ struct App::Impl {
         tree_row_boxes.clear();
         tree_row_boxes.resize(tree_nodes.size());
         tree_row_paths.assign(tree_nodes.size(), {});
-        const auto visible_rows = panel_visible_rows();
+        const auto visible_rows = panel_visible_rows(tree_panel ? *tree_panel : active_index);
         const auto first =
             tree_nodes.size() <= visible_rows
                 ? 0U
@@ -6627,7 +10542,16 @@ struct App::Impl {
         const auto display_mode =
             mode == Mode::conflict_dialog || mode == Mode::operation_error_dialog
                 ? operation_return_mode
-                : mode;
+                : mode == Mode::local_list ? local_list_return
+                : mode == Mode::local_command ? local_command_return
+                : mode == Mode::learn_key ? learn_key_return
+                : mode == Mode::learn_keys_dialog ? learn_key_return
+                : mode == Mode::native_input ? native_input_return
+                : mode == Mode::native_key_query ? key_query_return
+                : mode == Mode::native_message
+                    ? (native_message_return == Mode::learn_keys_dialog ? learn_key_return : native_message_return)
+                : mode == Mode::native_query ? native_query_return
+                : mode == Mode::user_menu ? user_menu_return : mode;
         const bool editor_context =
             display_mode == Mode::editor ||
             display_mode == Mode::editor_menu ||
@@ -6637,6 +10561,8 @@ struct App::Impl {
             display_mode == Mode::editor_replace_dialog ||
             display_mode == Mode::editor_replace_confirm ||
             display_mode == Mode::editor_save_dialog ||
+            display_mode == Mode::editor_save_mode_dialog ||
+            display_mode == Mode::editor_newline_warning ||
             display_mode == Mode::editor_close_dialog ||
             display_mode == Mode::editor_link_dialog ||
             display_mode == Mode::editor_overwrite_dialog ||
@@ -6651,6 +10577,7 @@ struct App::Impl {
             display_mode == Mode::viewer ||
             display_mode == Mode::viewer_message ||
             display_mode == Mode::viewer_close_dialog ||
+            display_mode == Mode::viewer_link_dialog ||
             (display_mode == Mode::viewer_wrap_dialog && !viewer_search_quick) ||
             (
                 display_mode == Mode::prompt &&
@@ -6664,7 +10591,7 @@ struct App::Impl {
         } else if (tree_panel) {
             if (*tree_panel == 1) {
                 right_entry_boxes.clear();
-                body = hbox({
+                body = render_panel_pair({
                     render_pane(
                         left,
                         !tree_panel_focused,
@@ -6676,7 +10603,7 @@ struct App::Impl {
                 });
             } else {
                 left_entry_boxes.clear();
-                body = hbox({
+                body = render_panel_pair({
                     render_tree_panel(left_width),
                     render_pane(
                         right,
@@ -6690,7 +10617,7 @@ struct App::Impl {
         } else if (information_panel) {
             if (*information_panel == 1) {
                 right_entry_boxes.clear();
-                body = hbox({
+                body = render_panel_pair({
                     render_pane(
                         left,
                         !information_panel_focused,
@@ -6702,7 +10629,7 @@ struct App::Impl {
                 });
             } else {
                 left_entry_boxes.clear();
-                body = hbox({
+                body = render_panel_pair({
                     render_information_panel(left_width),
                     render_pane(
                         right,
@@ -6716,7 +10643,7 @@ struct App::Impl {
         } else if (quick_view_panel) {
             if (*quick_view_panel == 1) {
                 right_entry_boxes.clear();
-                body = hbox({
+                body = render_panel_pair({
                     render_pane(
                         left,
                         !quick_view_focused,
@@ -6728,7 +10655,7 @@ struct App::Impl {
                 });
             } else {
                 left_entry_boxes.clear();
-                body = hbox({
+                body = render_panel_pair({
                     render_quick_view(left_width),
                     render_pane(
                         right,
@@ -6740,7 +10667,7 @@ struct App::Impl {
                 });
             }
         } else {
-            body = hbox({
+            body = render_panel_pair({
                 render_pane(
                     left,
                     active_index == 0,
@@ -6821,6 +10748,12 @@ struct App::Impl {
                 std::move(item) | reflect(top_menu_boxes[index])
             );
         }
+        menu_elements.push_back(filler());
+        if (config.rotating_dash && operation_running.load(std::memory_order_acquire)) {
+            const auto ticks = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - operation_started).count() / 125;
+            menu_elements.push_back(text(std::string(1, "-\\|/"[static_cast<std::size_t>(ticks) % 4U])));
+        } else menu_elements.push_back(text(" "));
         const auto* selected_file = active().current();
         const bool file_action = selected_file != nullptr && can_open_file(*selected_file);
         const bool source_action = !active().selected_entries().empty();
@@ -6919,13 +10852,15 @@ struct App::Impl {
             tree_keys.push_back(key("10", "Quit"));
             keybar = hbox(std::move(tree_keys));
         }
-        auto document = vbox({
-            gray_menu(hbox(std::move(menu_elements))),
-            body | flex,
-            text(display_text(hint)) |
-                color(Color::Grey11) |
-                bgcolor(Color::Grey62),
-            render_input(
+        const auto main_menubar = gray_menu(hbox(std::move(menu_elements)));
+        Elements screen_rows;
+        if (config.menubar_visible) screen_rows.push_back(main_menubar);
+        screen_rows.push_back(body | flex);
+        if (config.hintbar_visible) {
+            screen_rows.push_back(text(display_text(hint)) | color(Color::Grey11) | bgcolor(Color::Grey62));
+        }
+        if (command_prompt_shown()) {
+            screen_rows.push_back(render_input(
                       command_line,
                       command_input,
                       command_mode &&
@@ -6938,26 +10873,102 @@ struct App::Impl {
                               std::max(1, Terminal::Size().dimx / 2)
                           )
                       ) + " "
-                  ),
-            std::move(keybar),
-        });
+                  ));
+        }
+        if (config.keybar_visible) screen_rows.push_back(std::move(keybar));
+        auto document = vbox(std::move(screen_rows));
+        if (mode == Mode::pulldown && !config.menubar_visible) {
+            document = dbox({document, vbox({main_menubar, filler()})});
+        }
+        if (config.xterm_title) {
+            const auto title = "mcpp - " + display_text(active().path());
+            if (title != terminal_title) {
+                if (!terminal_title_pushed) {
+                    std::cout << "\033[22;0t";
+                    terminal_title_pushed = true;
+                }
+                terminal_title = title;
+                std::cout << "\033]0;" << title << '\a' << std::flush;
+            }
+        }
         if (viewer_context) {
             document = render_viewer();
         } else if (editor_context) {
             document = render_editor();
         }
-        const auto centered_modal = [](Element element) {
+        const auto centered_modal = [this](Element element) {
+            auto dialog = with_dialog_shadow(gray_dialog(std::move(element)) | clear_under);
             return vbox({
                 filler(),
                 hbox({
                     filler(),
-                    gray_dialog(std::move(element)) | clear_under,
+                    std::move(dialog),
                     filler(),
                 }),
                 filler(),
             });
         };
-        if (mode == Mode::prompt) {
+        const auto native_modal = [this](Element element) {
+            element->ComputeRequirement();
+            const auto height = element->requirement().min_y;
+            auto top = std::max(0, (Terminal::Size().dimy - height) / 2);
+            top -= top > 3 ? 2 : top == 3 ? 1 : 0;
+            return vbox({
+                filler() | size(HEIGHT, EQUAL, top),
+                hbox({filler(), with_dialog_shadow(gray_dialog(std::move(element)) | clear_under), filler()}),
+                filler(),
+            });
+        };
+        if (mode == Mode::listing_dialog) {
+            document = dbox({document, native_modal(render_listing_dialog())});
+        } else if (mode == Mode::sort_dialog) {
+            document = dbox({document, native_modal(render_sort_dialog())});
+        } else if (mode == Mode::confirmation_dialog) {
+            document = dbox({document, native_modal(render_confirmation_dialog())});
+        } else if (mode == Mode::layout_dialog) {
+            document = dbox({document, centered_modal(render_layout_dialog())});
+        } else if (mode == Mode::panel_options_dialog) {
+            document = dbox({document, native_modal(render_panel_options())});
+        } else if (mode == Mode::appearance_dialog) {
+            document = dbox({document, native_modal(render_appearance())});
+        } else if (mode == Mode::display_bits_dialog) {
+            document = dbox({document, native_modal(render_display_bits())});
+        } else if (mode == Mode::configure_dialog) {
+            document = dbox({document, native_modal(render_configure_dialog())});
+        } else if (mode == Mode::external_panelize_dialog) {
+            document = dbox({document, centered_modal(render_external_panelize())});
+        } else if (mode == Mode::chattr_dialog) {
+            document = dbox({document, centered_modal(render_file_attributes())});
+        } else if (mode == Mode::advanced_chown_dialog) {
+            document = dbox({document, centered_modal(render_advanced_chown())});
+        } else if (mode == Mode::native_input) {
+            document = dbox({document, native_modal(render_native_input())});
+        } else if (mode == Mode::native_key_query) {
+            document = dbox({document, native_modal(render_key_query())});
+        } else if (mode == Mode::native_message) {
+            if (native_message_return == Mode::learn_keys_dialog) {
+                document = dbox({document, centered_modal(render_learn_keys())});
+            }
+            document = dbox({document, native_modal(render_native_message())});
+        } else if (mode == Mode::native_query) {
+            document = dbox({document, native_modal(render_native_query())});
+        } else if (mode == Mode::editor_save_mode_dialog) {
+            document = dbox({document, native_modal(render_editor_save_mode())});
+        } else if (mode == Mode::editor_newline_warning) {
+            document = dbox({document, native_modal(render_newline_warning())});
+        } else if (mode == Mode::local_list) {
+            if (local_list_return == Mode::appearance_dialog) {
+                document = dbox({document, native_modal(render_appearance())});
+            }
+            document = dbox({document, local_list_native ? native_modal(render_local_list())
+                                                        : centered_modal(render_local_list())});
+        } else if (mode == Mode::local_command) {
+            document = dbox({document, centered_modal(render_local_command())});
+        } else if (mode == Mode::learn_key) {
+            document = dbox({document, centered_modal(render_learn_keys()), native_modal(render_learn_key())});
+        } else if (mode == Mode::learn_keys_dialog) {
+            document = dbox({document, centered_modal(render_learn_keys())});
+        } else if (mode == Mode::prompt) {
             const auto focused = [&](Element element,
                                      const std::size_t index) {
                 if (prompt_focus == index) {
@@ -7137,6 +11148,13 @@ struct App::Impl {
                 document,
                 centered_modal(render_viewer_close_dialog()),
             });
+        } else if (mode == Mode::viewer_link_dialog) {
+            document = dbox({
+                document,
+                centered_modal(render_link_dialog(
+                    viewer.path(), viewer_choice, viewer_choice_boxes
+                )),
+            });
         } else if (mode == Mode::viewer_wrap_dialog) {
             document = dbox({
                 document,
@@ -7159,13 +11177,8 @@ struct App::Impl {
             static constexpr std::array<int, 7> offsets{
                 0, 9, 18, 29, 41, 52, 63
             };
-            int menu_width = 2;
-            for (const auto& item : editor_menu_items()[editor_menu_category]) {
-                menu_width = std::max(
-                    menu_width,
-                    ftxui::string_width(item.label) + 3
-                );
-            }
+            static constexpr std::array<int, 7> menu_widths{23, 30, 23, 39, 26, 22, 27};
+            const auto menu_width = menu_widths[editor_menu_category];
             const auto popup_left = std::min(
                 offsets[editor_menu_category],
                 std::max(0, Terminal::Size().dimx - menu_width)
@@ -7269,7 +11282,7 @@ struct App::Impl {
         }
         return document |
                color(Color::Grey85) |
-               bgcolor(Color::Grey3);
+               bgcolor(config.theme == "default" ? Color::RGB(0, 0, 128) : Color::Grey3);
     }
 
     bool handle_prompt(const ftxui::Event& event) {
@@ -7399,7 +11412,9 @@ struct App::Impl {
     }
 
     void close_viewer() {
+        viewer_save_closes = false;
         viewer.close();
+        cleanup_viewer_temporary();
         mode = viewer_return_mode;
         viewer_return_mode = Mode::panels;
         viewer_hex_first_column = 0;
@@ -7417,6 +11432,51 @@ struct App::Impl {
         }
     }
 
+    void request_viewer_save(const bool close_after) {
+        viewer_save_closes = close_after;
+        if (viewer.dirty() && viewer.hardlink_count() > 1U) {
+            viewer_choice = 0;
+            mode = Mode::viewer_link_dialog;
+            return;
+        }
+        viewer.save_changes();
+        status = "Saved";
+        if (close_after) {
+            close_viewer();
+        } else {
+            mode = Mode::viewer;
+        }
+    }
+
+    bool handle_viewer_link_dialog(const ftxui::Event& event) {
+        const auto input = handle_button_input(
+            event, viewer_choice, viewer_choice_boxes, "dpc"
+        );
+        if (input == ButtonInput::cancel ||
+            (input == ButtonInput::activate && viewer_choice == 2U)) {
+            viewer_save_closes = false;
+            mode = Mode::viewer;
+        } else if (input == ButtonInput::activate) {
+            try {
+                viewer.save_changes(
+                    {}, viewer_choice == 0U ? ViewerLinkedSave::detach
+                                           : ViewerLinkedSave::preserve_links
+                );
+                status = "Saved";
+                if (viewer_save_closes) {
+                    close_viewer();
+                } else {
+                    mode = Mode::viewer;
+                }
+            } catch (const std::exception& error) {
+                viewer_message_title = "Viewer error";
+                viewer_message = error.what();
+                mode = Mode::viewer_message;
+            }
+        }
+        return input != ButtonInput::ignored;
+    }
+
     bool handle_viewer_close_dialog(const ftxui::Event& event) {
         const auto input = handle_button_input(
             event, viewer_choice, viewer_choice_boxes, "sdc"
@@ -7427,11 +11487,11 @@ struct App::Impl {
         } else if (input == ButtonInput::activate) {
             try {
                 if (viewer_choice == 0U) {
-                    viewer.save_changes();
+                    request_viewer_save(true);
                 } else {
                     viewer.discard_changes();
+                    close_viewer();
                 }
-                close_viewer();
             } catch (const std::exception& error) {
                 viewer_message_title = "Viewer error";
                 viewer_message = error.what();
@@ -7447,10 +11507,7 @@ struct App::Impl {
         const bool hexadecimal = quick ? quick_view_search_hex : viewer_search_hex;
         viewer_search_quick = quick;
         const auto return_mode = quick ? Mode::panels : Mode::viewer;
-        if (wrap) {
-            target.go_to_start();
-        }
-        if (target.find(needle, hexadecimal, {}, false)) {
+        if (target.find(needle, hexadecimal, {}, wrap)) {
             status = "Match found";
             mode = return_mode;
         } else if (!wrap && target.search_can_wrap()) {
@@ -7575,6 +11632,9 @@ struct App::Impl {
             }
             if (event == Event::F2) {
                 if (viewer.hex()) {
+                    if (viewer_temporary_file) {
+                        throw std::runtime_error("command output is read-only");
+                    }
                     viewer.toggle_hex_editing();
                 } else {
                     viewer.set_wrap(!viewer.wrap());
@@ -7600,8 +11660,7 @@ struct App::Impl {
                 return true;
             }
             if (event == Event::F6 && viewer.hex()) {
-                viewer.save_changes();
-                status = "Saved";
+                request_viewer_save(false);
                 return true;
             }
             if (viewer.hex() && event == Event::Tab) {
@@ -7819,7 +11878,8 @@ struct App::Impl {
     void open_editor_buffer(
         const ProviderPtr& provider,
         const std::string& path,
-        const bool create
+        const bool create,
+        const bool require_existing = false
     ) {
         const bool same_session =
             mode == Mode::editor || mode == Mode::editor_menu ||
@@ -7841,10 +11901,33 @@ struct App::Impl {
         }
         EditorBuffer next;
         next.set_tab_width(editor.tab_width());
-        if (create || !provider->exists(path)) {
+        if (editor.open()) {
+            next.fullscreen = editor.fullscreen;
+            next.window_x = editor.window_x;
+            next.window_y = editor.window_y;
+            next.window_width = editor.window_width;
+            next.window_height = editor.window_height;
+            next.window_geometry_saved = editor.window_geometry_saved;
+        }
+        next.set_save_mode(config.editor_save_mode == "backup" ? EditorSaveMode::backup
+                         : config.editor_save_mode == "in-place" ? EditorSaveMode::in_place
+                                                               : EditorSaveMode::atomic);
+        next.set_backup_extension(config.editor_backup_extension);
+        if (create || (!require_existing && !provider->exists(path))) {
             next.create(provider, path);
         } else {
             next.open(provider, path);
+            const auto saved = config.editor_positions.find(next.path());
+            if (saved != config.editor_positions.end()) {
+                next.set_position({saved->second.row, saved->second.column});
+                std::set<std::size_t> bookmarks;
+                for (const auto row : saved->second.bookmarks) {
+                    if (row < next.lines().size()) bookmarks.insert(row);
+                }
+                next.set_bookmarks(std::move(bookmarks));
+                next.first_row = next.row() > editor_visible_rows() / 2U
+                                     ? next.row() - editor_visible_rows() / 2U : 0U;
+            }
         }
         next.search.change_id = next.change_id();
         if (editor.open()) {
@@ -7912,6 +11995,14 @@ struct App::Impl {
             if (editor_save_buffer == nullptr) {
                 throw std::runtime_error("no buffer to save");
             }
+            const auto value = editor_save_buffer->text();
+            if (config.editor_check_newline && !newline_warning_accepted &&
+                !value.empty() && value.back() != '\n') {
+                newline_warning_preserve_links = preserve_links;
+                newline_warning_choice = 0;
+                mode = Mode::editor_newline_warning;
+                return;
+            }
             if (purpose == EditorSavePurpose::save_as && editor_save_overwrite &&
                 local->stat_follow(editor_save_path, {}).revision != editor_overwrite_revision) {
                 throw std::runtime_error("Save As destination changed while awaiting confirmation");
@@ -7932,11 +12023,23 @@ struct App::Impl {
                 editor_save_buffer->save(false);
             }
             remember_editor_path(editor_save_buffer->path());
+            const auto saved_path = std::filesystem::path(editor_save_buffer->path());
             editor_save_buffer = nullptr;
             prompt_action = PromptAction::none;
             prompt_value.clear();
             mode = Mode::editor;
             status = "Saved";
+            if (saved_path.parent_path() == default_config_path().parent_path() &&
+                (saved_path.filename() == "syntax" || saved_path.filename() == "extensions" ||
+                 saved_path.filename() == "highlighting")) {
+                try {
+                    reload_local_rules();
+                } catch (const std::exception& error) {
+                    editor_quit_requested = false;
+                    show_editor_message("Saved; configuration error", error.what());
+                    return;
+                }
+            }
             if (purpose == EditorSavePurpose::close || purpose == EditorSavePurpose::quit) {
                 accept_editor_close();
             }
@@ -7953,8 +12056,14 @@ struct App::Impl {
     ) {
         editor_save_buffer = &buffer;
         editor_save_purpose = purpose;
+        newline_warning_accepted = false;
+        continue_editor_buffer_save();
+    }
+
+    void continue_editor_buffer_save() {
         try {
-            if (buffer.hardlink_count() > 1U) {
+            if (editor_save_buffer == nullptr) throw std::runtime_error("no buffer to save");
+            if (editor_save_buffer->hardlink_count() > 1U) {
                 editor_link_choice = 0;
                 mode = Mode::editor_link_dialog;
             } else {
@@ -7968,6 +12077,7 @@ struct App::Impl {
     }
 
     void request_editor_save_as() {
+        newline_warning_accepted = false;
         auto path = std::filesystem::path(prompt_value);
         if (path.is_relative()) {
             path = std::filesystem::path(editor.path()).parent_path() / path;
@@ -8043,6 +12153,7 @@ struct App::Impl {
     }
 
     void close_editor() {
+        remember_editor_position(editor);
         reset_editor_view_state();
         editor.close();
         editor.search = {};
@@ -8098,6 +12209,7 @@ struct App::Impl {
             ++editor_quit_index;
         }
         editor_quit_requested = false;
+        for (const auto& buffer : editor_buffers) remember_editor_position(buffer);
         editor_buffers.erase(
             editor_buffers.begin() + static_cast<std::ptrdiff_t>(editor_session_base),
             editor_buffers.end()
@@ -8192,7 +12304,7 @@ struct App::Impl {
         }
     }
 
-    void execute_editor_menu_item() {
+    void execute_editor_menu_item() try {
         const auto category = editor_menu_category;
         const auto item =
             editor_menu_items()[category][editor_menu_item].action;
@@ -8200,6 +12312,75 @@ struct App::Impl {
             return;
         }
         mode = Mode::editor;
+        if (category == 0U && item >= 7) {
+            switch (item) {
+                case 7: show_insert_file(); break;
+                case 8: show_save_block(); break;
+                case 9: open_user_menu(Mode::editor); break;
+                case 10:
+                    show_editor_message("About mcpp",
+                        std::string("mcpp ") + MCPP_VERSION +
+                        "\nIndependent C++20 Linux file manager and editor.");
+                    break;
+                default: throw std::runtime_error("unknown editor file action");
+            }
+            return;
+        }
+        if (category == 2U && item >= 3) {
+            editor_bookmark_action(item);
+            return;
+        }
+        if (category == 3U && item == 7) {
+            show_editor_encoding();
+            return;
+        }
+        if (category == 3U && item >= 4 && item <= 6) {
+            if (item == 4) show_find_declaration();
+            else move_declaration_history(item == 6);
+            return;
+        }
+        if (category == 3U && item == 8) {
+            std::cout << "\033[H\033[2J" << std::flush;
+            return;
+        }
+        if (category == 3U && item >= 9 && item <= 11) {
+            if (item == 9) toggle_macro_recording();
+            else if (item == 10) show_delete_macro();
+            else show_repeat_actions();
+            return;
+        }
+        if (category == 4U) {
+            if (item == 0) show_literal_insert();
+            else if (item == 1) show_date_insert();
+            else if (item == 4) show_paste_output();
+            else show_editor_transform(item);
+            return;
+        }
+        if (category == 5U && item >= 3 && item <= 5) {
+            show_editor_window(item);
+            return;
+        }
+        if (category == 6U && item == 6) {
+            open_config_editor(default_user_menu_path());
+            return;
+        }
+        if (category == 6U && item == 2) {
+            show_editor_save_mode();
+            return;
+        }
+        if (category == 6U && item == 3) {
+            show_learn_keys(Mode::editor);
+            return;
+        }
+        if (category == 6U && item == 4) {
+            show_syntax_settings();
+            return;
+        }
+        if (category == 6U && item == 5) {
+            open_config_editor(default_config_path().parent_path() / "syntax",
+                "# Syntax overrides: filename-pattern=language\n# *.example=cpp\n");
+            return;
+        }
         if (category == 0U) {
             if (item == 0U) {
                 start_prompt(
@@ -8366,6 +12547,8 @@ struct App::Impl {
             return;
         }
         status = "No command in this menu";
+    } catch (const std::exception& error) {
+        show_editor_error(error);
     }
 
     void reset_editor_menu_item() {
@@ -8404,6 +12587,33 @@ struct App::Impl {
     }
 
     bool handle_editor_menu(const ftxui::Event& event) {
+        if (!editor_menu_dropped && event.is_character() &&
+            event.character().size() == 1U) {
+            const auto key = std::tolower(static_cast<unsigned char>(event.character()[0]));
+            for (std::size_t index = 0; index < editor_menu_names.size(); ++index) {
+                if (std::tolower(static_cast<unsigned char>(
+                        editor_menu_names[index][editor_menu_mnemonics[index]]
+                    )) == key) {
+                    editor_menu_category = index;
+                    reset_editor_menu_item();
+                    editor_menu_dropped = true;
+                    return true;
+                }
+            }
+        }
+        if (editor_menu_dropped && event.is_character() && event.character().size() == 1U) {
+            const auto key = std::tolower(static_cast<unsigned char>(event.character()[0]));
+            const auto& items = editor_menu_items()[editor_menu_category];
+            for (std::size_t index = 0; index < items.size(); ++index) {
+                if (items[index].mnemonic != 0 && items[index].mnemonic == key) {
+                    if (items[index].action >= 0) {
+                        editor_menu_item = index;
+                        execute_editor_menu_item();
+                    }
+                    return true;
+                }
+            }
+        }
         if (event.is_mouse()) {
             auto mouse_event = event;
             const auto& mouse = mouse_event.mouse();
@@ -8414,6 +12624,7 @@ struct App::Impl {
                  index < editor_menu_category_boxes.size();
                  ++index) {
                 if (editor_menu_category_boxes[index].Contain(mouse.x, mouse.y) &&
+                    mouse.x < ftxui::Terminal::Size().dimx &&
                     (mouse.motion == ftxui::Mouse::Moved ||
                      mouse.button == ftxui::Mouse::Left)) {
                     if (editor_menu_category != index || !editor_menu_dropped) {
@@ -9109,7 +13320,7 @@ struct App::Impl {
             show_editor_error(error);
             return true;
         }
-        const auto match = editor.selection();
+        const auto match = editor.search_selection();
         if (editor.replace_selection(
                 replacement,
                 &editor.search.scope
@@ -9184,6 +13395,13 @@ struct App::Impl {
     }
 
     bool handle_editor(const ftxui::Event& event) {
+        if (editor_window_action != 0) return handle_editor_window(event);
+        if (macro_recording && (event == ftxui::Event::F10 || event == ftxui::Event::Escape)) {
+            macro_recording = false;
+        }
+        if (!macro_replaying && recordable_editor_key(event)) {
+            if (macro_recording) macro_keys.push_back({event.is_character(), event.input()});
+        }
         if (event.is_mouse()) {
             auto mouse_event = event;
             const auto& mouse = mouse_event.mouse();
@@ -9220,8 +13438,28 @@ struct App::Impl {
             }
             if (mouse.button == ftxui::Mouse::Left &&
                 mouse.motion == ftxui::Mouse::Pressed) {
-                if (mouse.y == 0) {
+                const auto bounds = editor_window_bounds();
+                if (!editor.fullscreen && mouse.y == bounds[1] &&
+                    mouse.x >= bounds[0] && mouse.x < bounds[0] + bounds[2]) {
+                    show_editor_window(3);
+                    editor_window_mouse_drag = true;
+                    editor_window_mouse_offset = mouse.x - bounds[0];
+                    return true;
+                }
+                if (!editor.fullscreen && mouse.x == bounds[0] + bounds[2] - 1 &&
+                    mouse.y == bounds[1] + bounds[3] - 1) {
+                    show_editor_window(4);
+                    editor_window_mouse_drag = true;
+                    return true;
+                }
+                if (editor_header_box.Contain(mouse.x, mouse.y) &&
+                    mouse.x < ftxui::Terminal::Size().dimx) {
                     editor_menu_category = 0;
+                    if (!editor.fullscreen) {
+                        for (std::size_t index = 0; index < editor_menu_category_boxes.size(); ++index) {
+                            if (editor_menu_category_boxes[index].Contain(mouse.x, mouse.y)) editor_menu_category = index;
+                        }
+                    }
                     reset_editor_menu_item();
                     editor_menu_dropped = true;
                     mode = Mode::editor_menu;
@@ -9248,6 +13486,39 @@ struct App::Impl {
         if (editor_mouse_dragging) {
             editor.finish_mark();
             editor_mouse_dragging = false;
+        }
+        if (event == ftxui::Event::AltK || event == ftxui::Event::AltJ ||
+            event == ftxui::Event::AltI || event == ftxui::Event::AltO) {
+            editor_bookmark_action(event == ftxui::Event::AltK ? 3
+                                   : event == ftxui::Event::AltJ ? 4
+                                   : event == ftxui::Event::AltI ? 5 : 6);
+            return true;
+        }
+        if (event == ftxui::Event::F11) {
+            open_user_menu(Mode::editor);
+            return true;
+        }
+        if (event == ftxui::Event::AltE) {
+            show_editor_encoding();
+            return true;
+        }
+        if (event == ftxui::Event::CtrlR) {
+            toggle_macro_recording();
+            return true;
+        }
+        if (event == ftxui::Event::CtrlQ) {
+            show_literal_insert();
+            return true;
+        }
+        if (event == ftxui::Event::AltP || event == ftxui::Event::AltT ||
+            event == ftxui::Event::AltU) {
+            if (event == ftxui::Event::AltU) show_paste_output();
+            else show_editor_transform(event == ftxui::Event::AltP ? 2 : 3);
+            return true;
+        }
+        if (event == ftxui::Event::Special("\x1B[28~")) {
+            show_insert_file();
+            return true;
         }
         const auto column_move = [&](const ftxui::Event& key,
                                      const int rows,
@@ -9475,7 +13746,7 @@ struct App::Impl {
         if (event == ftxui::Event::F9) {
             editor_menu_category = 0;
             editor_menu_item = 0;
-            editor_menu_dropped = false;
+            editor_menu_dropped = config.drop_menus;
             mode = Mode::editor_menu;
             return true;
         }
@@ -9571,10 +13842,7 @@ struct App::Impl {
             return true;
         }
         if (event == ftxui::Event::CtrlF) {
-            show_editor_message(
-                "Save block",
-                "Saving a block to a file is not implemented"
-            );
+            show_save_block();
             return true;
         }
         if (event == ftxui::Event::Special("\x1B[1;5H")) {
@@ -9651,7 +13919,7 @@ struct App::Impl {
 
     bool handle_menu(const ftxui::Event& event) {
         if (modal_cancel(event) || event == ftxui::Event::F2) {
-            mode = Mode::panels;
+            mode = user_menu_return;
             return true;
         }
         if (!event.is_character()) {
@@ -9672,20 +13940,28 @@ struct App::Impl {
             return false;
         }
         const auto* selected = active().current();
-        mode = Mode::panels;
+        const auto return_mode = user_menu_return;
+        const auto selected_path = return_mode == Mode::editor ? editor.path()
+                                  : selected == nullptr ? std::string{} : selected->path;
+        const auto directory = return_mode == Mode::editor ? local->parent(editor.path()) : active().path();
+        mode = return_mode;
         try {
             const auto command = expand_user_menu_command(
                 match->command,
-                selected == nullptr ? "" : selected->path,
-                active().path(),
+                selected_path,
+                directory,
                 passive().path()
             );
-            const auto result = run_process(command, false);
+            const auto result = run_process(command, false, directory);
             status =
                 match->label + " exited " +
                 std::to_string(result);
+            if (result != 0 && return_mode == Mode::editor) {
+                show_editor_message("User menu", status);
+            }
         } catch (const std::exception& error) {
-            set_error(error);
+            if (return_mode == Mode::editor) show_editor_error(error);
+            else set_error(error);
         }
         return true;
     }
@@ -9772,6 +14048,20 @@ struct App::Impl {
                 }
             }
         }
+        if (pulldown_dropped && event.is_character() && event.character().size() == 1U) {
+            const auto key = std::tolower(static_cast<unsigned char>(event.character()[0]));
+            const auto& items = pulldown_items()[pulldown_category];
+            for (std::size_t index = 0; index < items.size(); ++index) {
+                if (items[index].mnemonic != 0 && items[index].mnemonic == key) {
+                    if (items[index].action >= 0) {
+                        pulldown_item = index;
+                        try { execute_pulldown(); }
+                        catch (const std::exception& error) { set_error(error); mode = Mode::panels; }
+                    }
+                    return true;
+                }
+            }
+        }
         if (event.is_mouse()) {
             auto mouse_event = event;
             const auto& mouse = mouse_event.mouse();
@@ -9820,6 +14110,10 @@ struct App::Impl {
                     }
                     return true;
                 }
+                if (!pulldown_dropped || !pulldown_viewport.Contain(mouse.x, mouse.y)) {
+                    mode = Mode::panels;
+                }
+                return true;
             }
         }
         if (event == ftxui::Event::ArrowLeft) {
@@ -9868,6 +14162,18 @@ struct App::Impl {
     }
 
     bool handle_bookmarks(const ftxui::Event& event) {
+        if (event == ftxui::Event::Insert || event == ftxui::Event::AltA) {
+            const auto path = active().path();
+            const auto found = std::ranges::find(config.bookmarks, path);
+            if (found == config.bookmarks.end()) {
+                config.bookmarks.push_back(path);
+                bookmark_cursor = config.bookmarks.size() - 1U;
+            } else {
+                bookmark_cursor = static_cast<std::size_t>(found - config.bookmarks.begin());
+            }
+            status = "Current directory added to hotlist";
+            return true;
+        }
         const auto input = handle_list_input(
             event, bookmark_cursor, config.bookmarks.size(),
             bookmark_boxes, bookmark_list_box
@@ -9881,6 +14187,18 @@ struct App::Impl {
         }
         if (event == ftxui::Event::Delete &&
             bookmark_cursor < config.bookmarks.size()) {
+            if (config.confirm_hotlist_delete) {
+               const auto index = bookmark_cursor;
+               show_native_query("Directory hotlist delete", "Delete this entry?", {"Yes", "No"},
+                   [this, index](const std::size_t selected) {
+                       if (selected == 0U && index < config.bookmarks.size()) {
+                           config.bookmarks.erase(config.bookmarks.begin() + static_cast<std::ptrdiff_t>(index));
+                           if (bookmark_cursor >= config.bookmarks.size() && bookmark_cursor > 0U) --bookmark_cursor;
+                       }
+                   }, Mode::bookmarks);
+                if (config.safe_delete) native_query_choice = 1;
+               return true;
+            }
             config.bookmarks.erase(
                 config.bookmarks.begin() +
                     static_cast<std::ptrdiff_t>(bookmark_cursor)
@@ -9907,6 +14225,24 @@ struct App::Impl {
     }
 
     bool handle_search_results(const ftxui::Event& event) {
+        bool panelize = event == ftxui::Event::AltP;
+        if (event.is_mouse()) {
+            auto copy = event;
+            panelize = copy.mouse().button == ftxui::Mouse::Left &&
+                       copy.mouse().motion == ftxui::Mouse::Pressed &&
+                       search_panelize_box.Contain(copy.mouse().x, copy.mouse().y);
+        }
+        if (panelize) {
+            auto results = search_results;
+            for (auto& entry : results) {
+                const auto relative = std::filesystem::path(entry.path).lexically_relative(active().path());
+                entry.name = relative.empty() ? entry.path : relative.string();
+            }
+            active().set_panelized(std::move(results));
+            mode = Mode::panels;
+            status = "Find results panelized";
+            return true;
+        }
         const auto input = handle_list_input(
             event, search_cursor, search_results.size(),
             search_result_boxes, search_list_box
@@ -9930,17 +14266,9 @@ struct App::Impl {
                         return true;
                     }
                     if (event == ftxui::Event::F3) {
-                        viewer.open(provider, result.path);
-                        viewer_search_needle.clear();
-                        viewer_return_mode = Mode::search_results;
-                        mode = Mode::viewer;
+                        view_file(provider, result.path, Mode::search_results);
                     } else {
-                        const auto retained =
-                            editor_buffers.size() + (editor.open() ? 1U : 0U);
-                        open_editor_buffer(provider, result.path, false);
-                        editor_session_base = retained;
-                        editor_return_mode = Mode::search_results;
-                        mode = Mode::editor;
+                        edit_file(provider, result.path, Mode::search_results);
                     }
                 } else {
                     active().change_directory(provider->parent(result.path));
@@ -10261,6 +14589,7 @@ struct App::Impl {
             if (command_input.dragging ||
                 (mouse.button == ftxui::Mouse::Left &&
                  mouse.motion == ftxui::Mouse::Pressed &&
+                 command_prompt_shown() &&
                  command_input.box.Contain(mouse.x, mouse.y))) {
                 command_mode = true;
                 quick_view_focused = false;
@@ -10370,7 +14699,7 @@ struct App::Impl {
                     static_cast<void>(
                         active().find(
                             panel_search,
-                            false,
+                            panel_search_case_sensitive(),
                             true,
                             true
                         )
@@ -10384,7 +14713,7 @@ struct App::Impl {
                     static_cast<void>(
                         active().find(
                             panel_search,
-                            false,
+                            panel_search_case_sensitive(),
                             false,
                             true
                         )
@@ -10396,7 +14725,7 @@ struct App::Impl {
                 const auto found =
                     active().find(
                         panel_search,
-                        false,
+                        panel_search_case_sensitive(),
                         true,
                         true
                     );
@@ -10429,12 +14758,18 @@ struct App::Impl {
                     execute_pulldown_action(1U, 9);
                 } else if (event == ftxui::Event::d) {
                     execute_pulldown_action(2U, 1);
+                } else if (event == ftxui::Event::CtrlD) {
+                    show_file_comparison();
+                } else if (event == ftxui::Event::CtrlS) {
+                    show_edit_symlink();
+                } else if (event == ftxui::Event::e) {
+                    show_file_attributes();
                 } else if (event == ftxui::Event::j) {
                     open_jobs();
                 } else if (
                     event == ftxui::Event::Character('!')
                 ) {
-                    status = "External panelize is not implemented";
+                    show_external_panelize();
                 } else if (event != ftxui::Event::Escape) {
                     status = "Unknown C-x command";
                 } else {
@@ -10502,15 +14837,52 @@ struct App::Impl {
             !(tree_panel && tree_panel_focused) &&
             !(quick_view_panel && quick_view_focused) &&
             !(information_panel && information_panel_focused);
+        if (listing_focused) {
+            try {
+                if (event == ftxui::Event::AltH) {
+                    show_command_history();
+                    return true;
+                }
+                if (event == ftxui::Event::AltE) {
+                    show_filename_encoding();
+                    return true;
+                }
+                if (event == ftxui::Event::Special("\x1B" "E")) {
+                    show_file_history();
+                    return true;
+                }
+                if (event == ftxui::Event::Special("\x1B!")) {
+                    show_filtered_view();
+                    return true;
+                }
+                if (event == ftxui::Event::Special("\x1B[32;5u")) {
+                    show_directory_sizes();
+                    return true;
+                }
+            } catch (const std::exception& error) {
+                set_error(error);
+                return true;
+            }
+        }
         const bool command_navigation =
             event == ftxui::Event::ArrowLeft ||
             event == ftxui::Event::ArrowRight ||
             event == ftxui::Event::Home ||
             event == ftxui::Event::End ||
             event == ftxui::Event::CtrlA;
+        if (!command_prompt_shown() && listing_focused && event.is_character() &&
+            !selection_shortcut && !panel_search_confirmed) {
+            if (!panel_search_mode) panel_search.clear();
+            panel_search_mode = true;
+            panel_search += event.character();
+            active().find(panel_search, panel_search_case_sensitive(), true, true);
+            status = "Quick search: " + panel_search;
+            return true;
+        }
         if (!command_mode && listing_focused &&
             (event == ftxui::Event::AltP || event == ftxui::Event::AltN) &&
             !command_input.history.empty()) {
+            command_prompt_override = !config.command_prompt;
             command_mode = true;
             command_input.reset(command_line);
         }
@@ -10518,6 +14890,7 @@ struct App::Impl {
             (!panel_shortcut || command_navigation) &&
             !panel_search_confirmed) {
             if (event == ftxui::Event::Escape) {
+                command_prompt_override = false;
                 command_mode = false;
                 command_line.clear();
                 command_input.reset(command_line);
@@ -10553,7 +14926,7 @@ struct App::Impl {
                     for (std::size_t index = 0;
                          index < top_menu_boxes.size();
                          ++index) {
-                        if (top_menu_boxes[index].Contain(
+                        if (config.menubar_visible && top_menu_boxes[index].Contain(
                                 mouse.x,
                                 mouse.y
                             )) {
@@ -10678,11 +15051,17 @@ struct App::Impl {
                 Pane* pane = nullptr;
                 int pane_index = active_index;
                 std::vector<ftxui::Box>* boxes = nullptr;
+                const bool overlap = !config.layout_horizontal &&
+                                     (listing_full_width(0) || listing_full_width(1));
+                const bool left_hit = left_box.Contain(mouse.x, mouse.y) &&
+                                      (!overlap || active_index == 0 || !right_box.Contain(mouse.x, mouse.y));
+                const bool right_hit = right_box.Contain(mouse.x, mouse.y) &&
+                                       (!overlap || active_index == 1 || !left_box.Contain(mouse.x, mouse.y));
                 if (
                     quick_view_panel != 0 &&
                     information_panel != 0 &&
                     tree_panel != 0 &&
-                    left_box.Contain(mouse.x, mouse.y)
+                    left_hit
                 ) {
                     pane_index = 0;
                     pane = &left;
@@ -10691,7 +15070,7 @@ struct App::Impl {
                     quick_view_panel != 1 &&
                     information_panel != 1 &&
                     tree_panel != 1 &&
-                    right_box.Contain(mouse.x, mouse.y)
+                    right_hit
                 ) {
                     pane_index = 1;
                     pane = &right;
@@ -10703,7 +15082,9 @@ struct App::Impl {
                     quick_view_focused = false;
                     information_panel_focused = false;
                     tree_panel_focused = false;
-                    pane->move_cursor(-3);
+                    if (config.mouse_page_scrolling && pane->first_row() > 0U) {
+                        pane->page_cursor(-static_cast<int>(panel_page_rows(*pane)));
+                    } else pane->move_cursor(-1);
                     return true;
                 }
                 if (pane != nullptr &&
@@ -10712,7 +15093,9 @@ struct App::Impl {
                     quick_view_focused = false;
                     information_panel_focused = false;
                     tree_panel_focused = false;
-                    pane->move_cursor(3);
+                    if (config.mouse_page_scrolling && pane->first_row() + panel_page_rows(*pane) < pane->entries().size()) {
+                        pane->page_cursor(static_cast<int>(panel_page_rows(*pane)));
+                    } else pane->move_cursor(1);
                     return true;
                 }
                 if (mouse.button != ftxui::Mouse::Left ||
@@ -10925,7 +15308,7 @@ struct App::Impl {
                     return true;
                 }
                 if (event == ftxui::Event::F2) {
-                    refresh(true);
+                    refresh(true, true);
                     return true;
                 }
                 if (event == ftxui::Event::F3) {
@@ -11041,8 +15424,8 @@ struct App::Impl {
                 }
                 if (event == ftxui::Event::PageUp) {
                     tree_cursor =
-                        tree_cursor > panel_visible_rows()
-                            ? tree_cursor - panel_visible_rows()
+                        tree_cursor > panel_visible_rows(*tree_panel)
+                            ? tree_cursor - panel_visible_rows(*tree_panel)
                             : 0U;
                     update_tree_selection();
                     return true;
@@ -11052,7 +15435,7 @@ struct App::Impl {
                         tree_nodes.empty()
                             ? 0U
                             : tree_nodes.size() - 1U,
-                        tree_cursor + panel_visible_rows()
+                        tree_cursor + panel_visible_rows(*tree_panel)
                     );
                     update_tree_selection();
                     return true;
@@ -11104,6 +15487,15 @@ struct App::Impl {
                 active().move_cursor(-1);
             } else if (event == ftxui::Event::ArrowLeft ||
                        event == ftxui::Event::ArrowRight) {
+                if (pane_listing_spec(active()).columns > 1U) {
+                    active().move_cursor(
+                        (event == ftxui::Event::ArrowLeft ? -1 : 1) *
+                        static_cast<int>(panel_visible_rows())
+                    );
+                } else if (config.navigate_with_arrows) {
+                    if (event == ftxui::Event::ArrowLeft) static_cast<void>(active().up());
+                    else static_cast<void>(active().enter());
+                }
                 return true;
             } else if (
                 event == ftxui::Event::Special("\x1B[5;5~")
@@ -11115,11 +15507,11 @@ struct App::Impl {
                 static_cast<void>(active().enter());
             } else if (event == ftxui::Event::PageDown) {
                 active().page_cursor(
-                    static_cast<int>(panel_visible_rows())
+                    static_cast<int>(panel_page_rows(active()))
                 );
             } else if (event == ftxui::Event::PageUp) {
                 active().page_cursor(
-                    -static_cast<int>(panel_visible_rows())
+                    -static_cast<int>(panel_page_rows(active()))
                 );
             } else if (event == ftxui::Event::Home) {
                 active().move_cursor(
@@ -11130,13 +15522,13 @@ struct App::Impl {
                     static_cast<int>(active().entries().size())
                 );
             } else if (event == ftxui::Event::Return) {
-                static_cast<void>(active().enter());
+                if (!active().enter() && !panel_search_confirmed) activate_file_association();
             } else if (event == ftxui::Event::AltY) {
                 active().history_back();
             } else if (event == ftxui::Event::AltU) {
                 active().history_forward();
             } else if (event == ftxui::Event::Insert) {
-                active().toggle_selected();
+                active().toggle_selected(config.mark_moves_down ? 1 : 0);
             } else if (event == ftxui::Event::CtrlS ||
                        event == ftxui::Event::AltS) {
                 panel_search_mode = true;
@@ -11145,7 +15537,7 @@ struct App::Impl {
             } else if (event == ftxui::Event::CtrlA) {
                 active().select_all();
             } else if (event == ftxui::Event::CtrlR) {
-                refresh(true);
+                refresh(true, true);
                 if (!tree_panel ||
                     !tree_expansion_running.load(std::memory_order_acquire)) {
                     status = "Refreshed";
@@ -11191,24 +15583,15 @@ struct App::Impl {
             } else if (event == ftxui::Event::F1) {
                 mode = Mode::help;
             } else if (event == ftxui::Event::F2) {
-                mode = Mode::user_menu;
+                open_user_menu(Mode::panels);
             } else if (event == ftxui::Event::F3) {
                 const auto* entry = active().current();
                 if (entry != nullptr && can_open_file(*entry)) {
-                    viewer.open(active().provider(), entry->path);
-                    viewer_search_needle.clear();
-                    mode = Mode::viewer;
+                    view_file(active().provider(), entry->path, Mode::panels);
                 }
             } else if (event == ftxui::Event::F4) {
                 const auto* entry = active().current();
-                if (entry != nullptr && can_open_file(*entry)) {
-                    open_editor_buffer(
-                        active().provider(),
-                        entry->path,
-                        false
-                    );
-                    mode = Mode::editor;
-                }
+                request_main_edit(entry);
             } else if (event == ftxui::Event::F5) {
                 start_operation_dialog(false, false);
             } else if (event == ftxui::Event::F6) {
@@ -11220,7 +15603,8 @@ struct App::Impl {
             } else if (event == ftxui::Event::F7) {
                 start_prompt(
                     PromptAction::mkdir,
-                    "New directory"
+                    "New directory",
+                    mkdir_default()
                 );
             } else if (event == ftxui::Event::F8) {
                 if (config.confirm_delete) {
@@ -11241,7 +15625,7 @@ struct App::Impl {
                 pulldown_category =
                     menu_panel == 0 ? 0U : 4U;
                 reset_pulldown_item();
-                pulldown_dropped = false;
+                pulldown_dropped = config.drop_menus;
                 mode = Mode::pulldown;
             } else if (event == ftxui::Event::F10) {
                 if (traversal_running.load(
@@ -11258,7 +15642,7 @@ struct App::Impl {
                     status = "Cancel operation before quitting";
                     return true;
                 }
-                exit_terminal();
+                request_app_exit();
             } else if (
                 selection_shortcut &&
                 event == ftxui::Event::Character('+')
@@ -11290,8 +15674,72 @@ struct App::Impl {
         return true;
     }
 
+    bool handle_input(const ftxui::Event& event) try {
+        if (event == ftxui::Event::Custom && !event.is_character()) return false;
+        if (!config.single_escape && mode != Mode::native_key_query && mode != Mode::learn_key &&
+            mode != Mode::learn_keys_dialog) {
+            if (event == ftxui::Event::Escape && !escape_waiting) { escape_waiting = true; return true; }
+            escape_waiting = false;
+        }
+        if (macro_replaying) {
+            if (event == ftxui::Event::Escape || event == ftxui::Event::CtrlC) {
+                macro_replaying = false;
+                status = "Macro playback cancelled; completed edits can be undone";
+            }
+            return true;
+        }
+        auto translated = event;
+        if ((mode == Mode::panels || mode == Mode::editor || mode == Mode::viewer) &&
+            !event.is_mouse() && !event.input().empty()) {
+            const auto mapping = config.learned_keys.find(encode_hex_bytes(event.input()));
+            if (mapping != config.learned_keys.end()) translated = named_event(mapping->second);
+        }
+        if (mode == Mode::editor && !macro_recording) {
+            const auto macro = config.editor_macros.find(encode_hex_bytes(translated.input()));
+            if (macro != config.editor_macros.end()) {
+                start_macro(decode_macro(macro->second), 1);
+                return true;
+            }
+        }
+        return handle(translated);
+    } catch (const std::exception& error) {
+        if (mode == Mode::editor || mode == Mode::editor_menu) {
+            show_editor_error(error);
+        } else if (mode == Mode::viewer) {
+            viewer_message_title = "Viewer error";
+            viewer_message = error.what();
+            mode = Mode::viewer_message;
+        } else {
+            set_error(error);
+        }
+        return true;
+    }
+
     bool handle(const ftxui::Event& event) {
+        if (mode == Mode::advanced_chown_dialog) return handle_advanced_chown(event);
+        if (mode == Mode::chattr_dialog) return handle_file_attributes(event);
+        if (mode == Mode::external_panelize_dialog) return handle_external_panelize(event);
+        if (mode == Mode::configure_dialog) return handle_configure_dialog(event);
+        if (mode == Mode::display_bits_dialog) return handle_display_bits(event);
+        if (mode == Mode::appearance_dialog) return handle_appearance(event);
+        if (mode == Mode::panel_options_dialog) return handle_panel_options(event);
+        if (mode == Mode::layout_dialog) return handle_layout_dialog(event);
+        if (mode == Mode::confirmation_dialog) return handle_confirmation_dialog(event);
+        if (mode == Mode::native_query) return handle_native_query(event);
+        if (mode == Mode::learn_keys_dialog) return handle_learn_keys(event);
+        if (mode == Mode::native_message) return handle_native_message(event);
+        if (mode == Mode::editor_save_mode_dialog) return handle_editor_save_mode(event);
+        if (mode == Mode::editor_newline_warning) return handle_newline_warning(event);
+        if (mode == Mode::native_input) return handle_native_input(event);
+        if (mode == Mode::native_key_query) return handle_key_query(event);
+        if (mode == Mode::learn_key) return handle_learn_key(event);
+        if (event == ftxui::Event::Special("\x1B`") &&
+            (mode == Mode::panels || mode == Mode::viewer || mode == Mode::editor)) {
+            show_screens(mode);
+            return true;
+        }
         if (event.is_mouse() &&
+            (config.keybar_visible || mode == Mode::editor || mode == Mode::viewer) &&
             (mode == Mode::panels || mode == Mode::viewer ||
              mode == Mode::editor || mode == Mode::search_results)) {
             auto copy = event;
@@ -11314,11 +15762,22 @@ struct App::Impl {
         if (mode == Mode::prompt) {
             return handle_prompt(event);
         }
+        if (mode == Mode::listing_dialog) return handle_listing_dialog(event);
+        if (mode == Mode::sort_dialog) return handle_sort_dialog(event);
+        if (mode == Mode::local_list) {
+            return handle_local_list(event);
+        }
+        if (mode == Mode::local_command) {
+            return handle_local_command(event);
+        }
         if (mode == Mode::viewer) {
             return handle_viewer(event);
         }
         if (mode == Mode::viewer_close_dialog) {
             return handle_viewer_close_dialog(event);
+        }
+        if (mode == Mode::viewer_link_dialog) {
+            return handle_viewer_link_dialog(event);
         }
         if (mode == Mode::viewer_wrap_dialog) {
             return handle_viewer_wrap_dialog(event);
@@ -11453,7 +15912,7 @@ void App::open_viewer(const std::string& path) {
                   impl_->active().path(),
                   path
               );
-    impl_->viewer.open(impl_->active().provider(), resolved);
+    impl_->load_viewer(impl_->active().provider(), resolved);
     impl_->viewer_search_needle.clear();
     impl_->exit_after_viewer = true;
     impl_->mode = Mode::viewer;
@@ -11484,16 +15943,22 @@ std::string App::active_path() const {
 
 int App::run() {
     struct TerminalCleanup {
+        Impl* implementation;
         ~TerminalCleanup() {
             std::cout << "\033[0m\n" << std::flush;
+            if (implementation->terminal_title_pushed) {
+                std::cout << "\033[23;0t" << std::flush;
+                implementation->terminal_title_pushed = false;
+            }
         }
-    } terminal_cleanup;
+    } terminal_cleanup{impl_.get()};
     const auto run_terminal = [&] {
         auto terminal = ftxui::App::FullscreenAlternateScreen();
         terminal.ForceHandleCtrlC(false);
         terminal.ForceHandleCtrlZ(false);
         terminal.TrackMouse(true);
         impl_->terminal = &terminal;
+        if (impl_->config.auto_menus && impl_->mode == Mode::panels) impl_->open_user_menu(Mode::panels);
         struct OperationJoinGuard {
             Impl* implementation;
             bool finished{false};
@@ -11503,6 +15968,10 @@ int App::run() {
                     return;
                 }
                 finished = true;
+                implementation->local_command_cancellation.request();
+                if (implementation->local_command_thread.joinable()) {
+                    implementation->local_command_thread.join();
+                }
                 if (implementation->operation_running.load(
                         std::memory_order_acquire
                     )) {
@@ -11545,7 +16014,7 @@ int App::run() {
         component = ftxui::CatchEvent(
             std::move(component),
             [&](const ftxui::Event& event) {
-                const auto handled = impl_->handle(event);
+                const auto handled = impl_->handle_input(event);
                 impl_->update_editor_view();
                 return handled;
             }
@@ -11557,7 +16026,7 @@ int App::run() {
     impl_->store_panel_options_in_config();
     impl_->store_editor_options_in_config();
     try {
-        impl_->config.save(default_config_path());
+        if (impl_->config.auto_save_setup) impl_->config.save(default_config_path());
     } catch (const std::exception& error) {
         std::cerr << "mcpp: cannot save setup: " << error.what() << '\n';
         return 1;

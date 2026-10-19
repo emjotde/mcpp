@@ -7,6 +7,7 @@
 #include <compare>
 #include <cstdint>
 #include <optional>
+#include <set>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -22,6 +23,7 @@ struct EditorPosition {
 };
 
 enum class EditorLineEnding { unchanged, lf, crlf, cr };
+enum class EditorSaveMode { atomic, in_place, backup };
 
 class EditorModel {
 public:
@@ -43,8 +45,17 @@ public:
     [[nodiscard]] std::size_t column() const noexcept;
     [[nodiscard]] std::size_t byte_size() const noexcept;
     [[nodiscard]] std::size_t cursor_offset() const noexcept;
+    [[nodiscard]] std::size_t storage_byte_size() const;
+    [[nodiscard]] std::size_t storage_cursor_offset() const;
+    [[nodiscard]] std::size_t storage_selection_size() const;
+    [[nodiscard]] const std::string& encoding() const noexcept { return encoding_; }
+    void set_encoding(std::string codepage);
     [[nodiscard]] std::size_t selection_size() const;
     [[nodiscard]] std::uint64_t change_id() const noexcept;
+    [[nodiscard]] char line_separator() const noexcept { return line_separator_; }
+    void set_save_mode(EditorSaveMode mode) noexcept { save_mode_ = mode; }
+    [[nodiscard]] EditorSaveMode save_mode() const noexcept { return save_mode_; }
+    void set_backup_extension(std::string value);
     [[nodiscard]] bool marking() const noexcept;
     [[nodiscard]] bool overwrite() const noexcept;
     [[nodiscard]] bool column_selection() const noexcept;
@@ -52,6 +63,18 @@ public:
         EditorPosition,
         EditorPosition
     >> selection() const noexcept;
+    [[nodiscard]] std::optional<std::pair<EditorPosition, EditorPosition>>
+    search_selection() const;
+    [[nodiscard]] std::string text() const { return content(); }
+    [[nodiscard]] std::string text_range(EditorPosition begin, EditorPosition end) const;
+    void replace_text(EditorPosition begin, EditorPosition end, std::string_view value);
+    void replace_block(std::string_view value);
+    void set_text(std::string_view value);
+    void toggle_bookmark();
+    [[nodiscard]] bool jump_bookmark(int direction);
+    void clear_bookmarks() noexcept;
+    void set_bookmarks(std::set<std::size_t> rows);
+    [[nodiscard]] const std::set<std::size_t>& bookmarks() const noexcept { return bookmarks_; }
 
     void move(int rows, int columns);
     void move_word(int direction);
@@ -75,6 +98,7 @@ public:
     void insert(char character);
     void insert(std::string_view text);
     void paste(std::string_view text);
+    void paste_bytes(std::string_view bytes);
     void newline(bool auto_indent = false);
     void tab(std::size_t indent_width, bool fill_spaces = false);
     void backspace(std::size_t indent_width = 0);
@@ -86,6 +110,7 @@ public:
     [[nodiscard]] bool move_selection();
     [[nodiscard]] bool delete_selection();
     [[nodiscard]] std::optional<std::string> selected_text() const;
+    [[nodiscard]] std::optional<std::string> selected_bytes() const;
     [[nodiscard]] std::optional<std::pair<
         std::size_t,
         std::size_t
@@ -180,6 +205,11 @@ private:
         std::string path, bool force, EditorLineEnding ending,
         bool preserve_links, const Cancellation& cancellation
     );
+    void backup_target(
+        const std::string& storage, const std::string& path,
+        const std::optional<std::string>& expected,
+        const Cancellation& cancellation
+    );
     struct Snapshot {
         std::size_t row{0};
         std::size_t column{0};
@@ -189,6 +219,7 @@ private:
         bool column_selection{false};
         std::optional<std::size_t> column_selection_width;
         std::size_t byte_size{0};
+        char line_separator{'\n'};
     };
     struct UndoRecord {
         Snapshot before;
@@ -202,6 +233,11 @@ private:
     };
 
     [[nodiscard]] std::string content() const;
+    [[nodiscard]] std::string encode_content(std::string_view value) const;
+    void update_storage_offsets() const;
+    [[nodiscard]] std::string search_content() const;
+    void validate_search_options(const EditorSearchOptions& options) const;
+    [[nodiscard]] std::string normalize_insert(std::string_view value) const;
     void set_content(std::string_view content);
     [[nodiscard]] std::size_t offset(EditorPosition position) const;
     [[nodiscard]] EditorPosition position(std::size_t offset) const;
@@ -237,7 +273,11 @@ private:
     std::string path_;
     std::string storage_path_;
     std::string revision_;
+    std::string encoding_;
+    mutable std::uint64_t storage_change_id_{0};
+    mutable std::vector<std::size_t> storage_offsets_;
     std::vector<std::string> lines_;
+    std::set<std::size_t> bookmarks_;
     std::size_t row_{0};
     std::size_t column_{0};
     std::optional<std::size_t> preferred_display_column_;
@@ -250,6 +290,9 @@ private:
     std::optional<std::size_t> column_selection_width_;
     bool overwrite_{false};
     bool new_file_{false};
+    EditorSaveMode save_mode_{EditorSaveMode::atomic};
+    std::string backup_extension_{"~"};
+    char line_separator_{'\n'};
     std::size_t tab_width_{8};
     std::string clipboard_;
     std::vector<UndoRecord> undo_;

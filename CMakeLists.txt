@@ -25,6 +25,7 @@ set(FTXUI_BUILD_TESTS_FUZZER OFF CACHE BOOL "" FORCE)
 set(FTXUI_ENABLE_INSTALL OFF CACHE BOOL "" FORCE)
 set(FTXUI_DEV_WARNINGS OFF CACHE BOOL "" FORCE)
 add_subdirectory(third_party/ftxui)
+include(cmake/ftxui_input.cmake)
 
 find_package(Threads REQUIRED)
 
@@ -60,9 +61,12 @@ endfunction()
 add_library(
     mcpp_core
     src/config.cpp
+    src/entry.cpp
+    src/listing.cpp
     src/compare.cpp
     src/location.cpp
     src/local_provider.cpp
+    src/local_tools.cpp
     src/operations.cpp
     src/pane.cpp
     src/search.cpp
@@ -267,6 +271,16 @@ if(MCPP_BUILD_TESTS)
                     ${MCPP_TMUX_EXECUTABLE}
             )
             set_tests_properties(mcpp_audit_ui PROPERTIES TIMEOUT 180)
+            add_test(
+                NAME mcpp_remaining_audit_ui
+                COMMAND
+                    ${MCPP_PYTHON_EXECUTABLE}
+                    -B
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_remaining_audit_ui.py
+                    $<TARGET_FILE:mcpp>
+                    ${MCPP_TMUX_EXECUTABLE}
+            )
+            set_tests_properties(mcpp_remaining_audit_ui PROPERTIES TIMEOUT 180)
             add_test(
                 NAME mcpp_operation_controls
                 COMMAND

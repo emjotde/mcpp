@@ -1785,7 +1785,7 @@ void test_viewer_text_windows() {
     );
     check_equal(viewer.view_end(), std::uint64_t{4}, "clipped tab byte count");
 
-    write_file(path, "1234567\tX\nNEXT\n");
+    write_file(path, "1234567\tX\nNEXT\nTAIL\n");
     viewer.open(provider, path.string());
     viewer.set_wrap(true);
     check_equal(
@@ -1867,6 +1867,7 @@ void test_viewer_text_windows() {
         "unwrapped huge line refills without hiding following lines"
     );
     check_equal(viewer.view_end(), viewer.size(), "unwrapped huge displayed end");
+    static_cast<void>(viewer.lines(width, 1));
     viewer.scroll_lines(1, width);
     check_equal(
         viewer.offset(),

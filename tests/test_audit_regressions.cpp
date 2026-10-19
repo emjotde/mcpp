@@ -2,7 +2,10 @@
 #include "mcpp/compare.hpp"
 #include "mcpp/editor.hpp"
 #include "mcpp/local_provider.hpp"
+#include "mcpp/local_tools.hpp"
+#include "mcpp/listing.hpp"
 #include "mcpp/operations.hpp"
+#include "mcpp/pane.hpp"
 #include "mcpp/search.hpp"
 #include "mcpp/viewer.hpp"
 
@@ -44,6 +47,189 @@ std::string read_file(const fs::path& path) {
 void run(const fs::path& root) {
     auto provider = std::make_shared<mcpp::LocalProvider>(root);
     mcpp::OperationEngine engine;
+    const auto full_listing = mcpp::parse_listing_format(
+        mcpp::listing_format(mcpp::ListingFormat::full, 2, ""));
+    check(!full_listing.full_width && full_listing.columns == 1U &&
+              full_listing.fields.size() == 6U &&
+              mcpp::listing_field_widths(full_listing, 48) == std::vector<int>{1, 26, 1, 7, 1, 12},
+          "native Full format uses type/name, size and modification time");
+    const auto brief_listing = mcpp::parse_listing_format(
+        mcpp::listing_format(mcpp::ListingFormat::brief, 3, ""));
+    check(brief_listing.columns == 3U && brief_listing.fields.size() == 2U,
+          "native Brief accepts its configured column count");
+    const auto long_listing = mcpp::parse_listing_format(
+        mcpp::listing_format(mcpp::ListingFormat::long_list, 2, ""));
+    check(long_listing.full_width && long_listing.fields.front().name == "perm" &&
+              long_listing.fields.back().name == "name",
+          "native Long is full-width with permission/link/owner/group metadata in one row");
+    const auto user_listing = mcpp::parse_listing_format(
+        "full 2 <name:12+ | >size:7 =owner:8 perm mode nlink inode nuid ngid atime ctime mark dot");
+    check(user_listing.full_width && user_listing.columns == 2U &&
+              user_listing.fields.front().expand &&
+              user_listing.fields[2].alignment == mcpp::ListingAlignment::right &&
+              user_listing.fields[3].alignment == mcpp::ListingAlignment::center,
+          "native display format handles frame, columns, alignment, widths and expansion");
+    bool bad_listing = false;
+    try { static_cast<void>(mcpp::parse_listing_format("half unknown")); }
+    catch (const std::runtime_error&) { bad_listing = true; }
+    check(bad_listing, "unknown display tags fail explicitly");
+    std::vector<mcpp::Entry> sortable(3);
+    for (std::size_t index = 0; index < sortable.size(); ++index) sortable[index].kind = mcpp::EntryKind::file;
+    sortable[0].name = "file10"; sortable[1].name = "file2"; sortable[2].name = "file1";
+    sortable[0].size = 10; sortable[1].size = 2; sortable[2].size = 1;
+    sortable[0].modified = std::chrono::system_clock::time_point{std::chrono::seconds(3)};
+    sortable[1].modified = std::chrono::system_clock::time_point{std::chrono::seconds(1)};
+    sortable[2].modified = std::chrono::system_clock::time_point{std::chrono::seconds(2)};
+    sortable[0].accessed = sortable[1].modified;
+    sortable[1].accessed = sortable[0].modified;
+    sortable[2].accessed = sortable[2].modified;
+    sortable[0].changed = sortable[2].modified;
+    sortable[1].changed = sortable[0].modified;
+    sortable[2].changed = sortable[1].modified;
+    sortable[0].inode = 3; sortable[1].inode = 1; sortable[2].inode = 2;
+    const std::vector<std::pair<mcpp::SortField, std::vector<std::string>>> sort_cases{
+        {mcpp::SortField::unsorted, {"file10", "file2", "file1"}},
+        {mcpp::SortField::name, {"file1", "file10", "file2"}},
+        {mcpp::SortField::version, {"file1", "file2", "file10"}},
+        {mcpp::SortField::size, {"file1", "file2", "file10"}},
+        {mcpp::SortField::modified, {"file2", "file1", "file10"}},
+        {mcpp::SortField::accessed, {"file10", "file1", "file2"}},
+        {mcpp::SortField::changed, {"file1", "file10", "file2"}},
+        {mcpp::SortField::inode, {"file2", "file1", "file10"}}
+    };
+    for (const auto& [field, expected] : sort_cases) {
+        auto values = sortable;
+        mcpp::sort_entries(values, {.directories_first=false, .sort=field});
+        std::vector<std::string> names;
+        for (const auto& entry : values) names.push_back(entry.name);
+        check(names == expected, "native sort field orders its actual metadata");
+    }
+    auto extensions = sortable;
+    extensions[0].name = "left.z"; extensions[1].name = "middle.a"; extensions[2].name = "right.m";
+    mcpp::sort_entries(extensions, {.sort=mcpp::SortField::extension});
+    check(extensions[0].name == "middle.a" && extensions[1].name == "right.m" &&
+              extensions[2].name == "left.z", "Extension sort uses the filename extension");
+    auto executable = sortable;
+    executable[1].permissions = fs::perms::owner_exec;
+    mcpp::sort_entries(executable, {.directories_first=false, .executables_first=true});
+    check(executable.front().name == "file2", "Executable first groups executable files before name order");
+    auto folded = sortable;
+    folded[0].name = "é"; folded[1].name = "É"; folded[2].name = "a";
+    mcpp::sort_entries(folded, {.case_sensitive=false});
+    check(folded[0].name == "a" && folded[1].name == "é" && folded[2].name == "É",
+          "case-insensitive filename sorting folds UTF-8 without changing names");
+    const auto command = mcpp::capture_shell("printf 'first\\000second'; printf problem >&2; exit 7", root);
+    check(command.status == 7 && command.output == std::string("first\0second", 12) &&
+              command.error == "problem",
+          "local command capture retains binary output, stderr and nonzero status");
+    const auto argument = mcpp::capture_command({"/usr/bin/printf", "%s", "a b'\"c"}, root);
+    check(argument.status == 0 && argument.output == "a b'\"c",
+          "direct command arguments are not interpreted by a shell");
+    check(mcpp::convert_encoding("\xe9", "ISO-8859-1", "UTF-8") == "é",
+          "local encoding conversion preserves the represented character");
+    bool invalid_encoding = false;
+    try {
+        static_cast<void>(mcpp::convert_encoding("\xff", "UTF-8", "UTF-8"));
+    } catch (const std::system_error&) {
+        invalid_encoding = true;
+    }
+    check(invalid_encoding, "invalid encoding input fails explicitly");
+    write_file(root / "panel-options/a.txt", "a");
+    write_file(root / "panel-options/b.txt~", "backup");
+    write_file(root / "panel-options/c.txt", "ccc");
+    for (int index = 0; index < 20; ++index) {
+        write_file(root / "panel-options" / ("item-" + std::to_string(index)), "x");
+    }
+    auto panel_provider = std::make_shared<mcpp::LocalProvider>(root);
+    mcpp::Pane preferences(panel_provider, (root / "panel-options").string());
+    preferences.set_show_backups(false);
+    check(std::ranges::none_of(preferences.entries(), [](const mcpp::Entry& entry) { return entry.name.ends_with('~'); }),
+          "Show backup files controls tilde-suffixed entries");
+    preferences.set_viewport_rows(5);
+    preferences.set_navigation(true, false);
+    preferences.move_cursor(-100);
+    for (int step = 0; step < 5; ++step) preferences.move_cursor(1);
+    check(preferences.first_row() == 2U, "native Page scrolling advances the viewport by half a screen");
+    preferences.move_cursor(-100);
+    preferences.set_navigation(false, true);
+    for (int step = 0; step < 3; ++step) preferences.move_cursor(1);
+    check(preferences.first_row() == 1U, "Center scrolling starts when the cursor passes halfway");
+    preferences.set_fast_reload(true);
+    write_file(root / "panel-options/a.txt", "longer");
+    preferences.refresh();
+    const auto cached = std::ranges::find(preferences.entries(), std::string("a.txt"), &mcpp::Entry::name);
+    check(cached != preferences.entries().end() && cached->size == 1U,
+          "fast reload reuses a directory whose revision has not changed");
+    preferences.refresh({}, true);
+    const auto rescanned = std::ranges::find(preferences.entries(), std::string("a.txt"), &mcpp::Entry::name);
+    check(rescanned != preferences.entries().end() && rescanned->size == 6U,
+          "explicit Rescan bypasses the fast-reload cache");
+    write_file(root / "panel-other/z.txt", "zz");
+    mcpp::Pane other_panel(panel_provider, (root / "panel-other").string());
+    other_panel.set_sort(mcpp::SortField::size, true);
+    preferences.set_sort(mcpp::SortField::name, false);
+    preferences.find("a.txt", true);
+    preferences.toggle_selected(0);
+    const auto original_directory = preferences.path();
+    preferences.swap_contents(other_panel);
+    check(preferences.path() == (root / "panel-other").string() &&
+              other_panel.path() == original_directory &&
+              preferences.sort_field() == mcpp::SortField::name &&
+              other_panel.sort_field() == mcpp::SortField::size &&
+              other_panel.marked_count() == 1U,
+          "native content swap preserves physical sort settings and moves marks with the files");
+    other_panel.set_panelized(other_panel.selected_entries());
+    other_panel.change_directory((root / "panel-other").string());
+    other_panel.restore_panelized();
+    check(other_panel.panelized() && other_panel.entries().size() == 1U &&
+              other_panel.entries().front().path == (root / "panel-options/a.txt").string() &&
+              other_panel.path() == (root / "panel-other").string(),
+          "Panelize restores the saved listing without changing the current directory");
+    preferences.change_directory((root / "panel-options").string());
+    preferences.set_shell_patterns(false);
+    preferences.clear_selection();
+    preferences.select_pattern("^a[.]txt$", true);
+    check(preferences.marked_count() == 1U, "Shell patterns off uses regular expressions for selection");
+    fs::create_directories(root / "cd-links/actual/child");
+    fs::create_directory_symlink("actual/child", root / "cd-links/alias");
+    mcpp::Pane links(panel_provider, (root / "cd-links").string());
+    links.change_directory((root / "cd-links/alias").string());
+    check(links.path().ends_with("/alias"), "logical cd retains the directory symlink");
+    links.set_follow_links(false);
+    links.up();
+    check(links.path() == (root / "cd-links/actual").string(),
+          "Cd follows links off uses the physical parent");
+    write_file(root / "totals-source/one", "one");
+    write_file(root / "totals-source/two", "two!");
+    fs::create_directories(root / "totals-destination");
+    std::vector<mcpp::TransferProgress> unmeasured;
+    engine.copy(*panel_provider,
+        {panel_provider->stat((root / "totals-source/one").string(), {}),
+         panel_provider->stat((root / "totals-source/two").string(), {})},
+        *panel_provider, (root / "totals-destination").string(),
+        {.collision={}, .compute_totals=false}, {},
+        [&](const mcpp::TransferProgress& value) { unmeasured.push_back(value); });
+    check(!unmeasured.empty() && unmeasured.front().files_total <= 1U &&
+              read_file(root / "totals-destination/one") == "one" &&
+              read_file(root / "totals-destination/two") == "two!",
+          "Compute totals off skips the pre-count while preserving copied bytes");
+    panel_provider->set_preallocate(true);
+    write_file(root / "preallocate", "original");
+    std::istringstream short_preallocation("abc");
+    bool preallocation_failed = false;
+    try {
+        panel_provider->write((root / "preallocate").string(), short_preallocation, 4U, true,
+                             std::nullopt, {}, {});
+    } catch (const std::exception&) {
+        preallocation_failed = true;
+    }
+    check(preallocation_failed && read_file(root / "preallocate") == "original",
+          "preallocation never publishes a short source");
+    std::istringstream complete_preallocation("complete");
+    panel_provider->write((root / "preallocate").string(), complete_preallocation, 8U, true,
+                         std::nullopt, {}, {});
+    check(read_file(root / "preallocate") == "complete", "Preallocate space preserves exact output bytes");
+    panel_provider->set_preallocate(false);
     write_file(root / "source/tree/a", "OLD SOURCE");
     write_file(root / "target/tree/a", "NEW TARGET");
     std::size_t child_queries = 0;
@@ -207,7 +393,10 @@ void run(const fs::path& root) {
         const mcpp::EditorSearchOptions options{.mode=mode};
         check(model.find(mode == mcpp::EditorSearchMode::wildcard ? "?" : ".", options, false, false),
               "character search finds a UTF-8 character");
-        check(model.selected_text() == "\xC3\xA9", "character matches do not split UTF-8");
+        check(model.search_selection() ==
+                  std::optional<std::pair<mcpp::EditorPosition, mcpp::EditorPosition>>{
+                      {{0, 0}, {0, 2}}
+                  }, "character matches do not split UTF-8");
         check(model.replace_selection("X"), "replace character match");
         model.save(false);
         check(read_file(root / "search-edit") == "X\n", "replacement preserves valid UTF-8");
@@ -240,7 +429,10 @@ void run(const fs::path& root) {
     check(indentation.lines()[0].empty(), "Backspace removes the indentation step");
     auto wildcard = reopen("a1b2b");
     const mcpp::EditorSearchOptions glob{.mode=mcpp::EditorSearchMode::wildcard};
-    check(wildcard.find("a*b", glob, false, false) && wildcard.selected_text() == "a1b2b",
+    check(wildcard.find("a*b", glob, false, false) && wildcard.search_selection() ==
+              std::optional<std::pair<mcpp::EditorPosition, mcpp::EditorPosition>>{
+                  {{0, 0}, {0, 5}}
+              },
           "wildcard captures are greedy");
     check(wildcard.replacement_for_selection("a*b", "x*", glob) == "x1b2",
           "wildcard replacement expands captures");
@@ -372,10 +564,117 @@ void run(const fs::path& root) {
     check(viewer.dirty() && read_file(root / "hex-edit") == "ABCD", "hex edits remain staged");
     viewer.save_changes();
     check(read_file(root / "hex-edit") == "ZBCD" && !viewer.dirty(), "hex save publishes staged edits");
+    viewer.go_to_start();
     check(viewer.find("Z", true, {}, false) == 0U, "viewer search reads the edited data");
     check(!viewer.find("Z", true, {}, false) && viewer.search_can_wrap(), "viewer reports exhausted search origin");
     viewer.go_to_start();
     check(viewer.find("Z", true, {}, false) == 0U, "approved search wrap restarts at zero");
+
+    write_file(root / "viewer-linked", "ABCD");
+    fs::create_hard_link(root / "viewer-linked", root / "viewer-alias");
+    mcpp::ViewerModel linked_view;
+    linked_view.open(provider, (root / "viewer-linked").string());
+    linked_view.toggle_hex_editing();
+    linked_view.edit_ascii_byte('Z');
+    bool link_choice_required = false;
+    try {
+        linked_view.save_changes();
+    } catch (const std::runtime_error& error) {
+        link_choice_required = std::string(error.what()).find("choice") != std::string::npos;
+    }
+    check(link_choice_required && linked_view.dirty() &&
+              read_file(root / "viewer-alias") == "ABCD",
+          "hex save requires an explicit hardlink policy and retains staged bytes");
+    linked_view.save_changes({}, mcpp::ViewerLinkedSave::preserve_links);
+    check(read_file(root / "viewer-linked") == "ZBCD" &&
+              read_file(root / "viewer-alias") == "ZBCD" &&
+              fs::equivalent(root / "viewer-linked", root / "viewer-alias"),
+          "preserve-links hex save updates every alias without replacing the inode");
+    linked_view.edit_ascii_byte('Y');
+    linked_view.save_changes({}, mcpp::ViewerLinkedSave::detach);
+    check(read_file(root / "viewer-linked") == "ZYCD" &&
+              read_file(root / "viewer-alias") == "ZBCD" &&
+              !fs::equivalent(root / "viewer-linked", root / "viewer-alias"),
+          "explicit detach changes this name only");
+
+    for (const auto& name : {"a.txt", "é.txt", "界.txt", "ab.txt"}) {
+        write_file(root / "unicode-mask" / name, "x");
+    }
+    mcpp::Pane unicode_mask(provider, (root / "unicode-mask").string());
+    unicode_mask.select_pattern("?.txt", true);
+    check(unicode_mask.marked_count() == 3U, "question-mark masks count Unicode code points");
+    unicode_mask.clear_selection();
+    unicode_mask.select_pattern("??.txt", true);
+    check(unicode_mask.marked_count() == 1U &&
+              unicode_mask.selected_entries().front().name == "ab.txt",
+          "a multibyte character is not treated as several question marks");
+    unicode_mask.clear_selection();
+    unicode_mask.select_pattern("*?.txt", true);
+    check(unicode_mask.marked_count() == 4U, "star backtracking retains Unicode boundaries");
+
+    mcpp::ViewerModel eof_view;
+    write_file(root / "viewer-eof", "ONE\nTWO\nTHREE\n");
+    eof_view.open(provider, (root / "viewer-eof").string());
+    static_cast<void>(eof_view.lines(100, 24));
+    eof_view.scroll_lines(40, 100);
+    check(eof_view.offset() == 0U && eof_view.lines(100, 24).front() == "ONE",
+          "a complete short file cannot be scrolled into a blank EOF page");
+    const auto far_text = "BEGIN|" + std::string(6500, 'x') +
+                          "NEEDLE|" + std::string(1500, 'y') + "\nEND\n";
+    write_file(root / "viewer-far-match", far_text);
+    eof_view.open(provider, (root / "viewer-far-match").string());
+    static_cast<void>(eof_view.lines(100, 24));
+    check(eof_view.find("NEEDLE", true, {}, false) == 6506U,
+          "wrapped far text match is found at its original byte offset");
+    auto revealed = eof_view.lines(100, 24);
+    check(revealed.front().find("NEEDLE") != std::string::npos,
+          "wrapped search reveals the matching screen row");
+    eof_view.go_to_start();
+    eof_view.set_wrap(false);
+    check(eof_view.find("NEEDLE", true, {}, false) == 6506U,
+          "unwrapped far text match is found");
+    revealed = eof_view.lines(100, 24);
+    check(revealed.front().find("NEEDLE") != std::string::npos &&
+              eof_view.text_highlight(0).has_value(),
+          "unwrapped search reveals and highlights the actual match");
+    std::string cursor_matches(4096, '.');
+    cursor_matches.replace(32, 6, "needle");
+    cursor_matches.replace(160, 6, "needle");
+    cursor_matches.replace(480, 6, "needle");
+    write_file(root / "viewer-cursor-search", cursor_matches);
+    mcpp::ViewerModel cursor_search;
+    cursor_search.open(provider, (root / "viewer-cursor-search").string());
+    cursor_search.toggle_hex();
+    static_cast<void>(cursor_search.lines(100, 24));
+    cursor_search.set_hex_cursor(192, false);
+    check(cursor_search.find("needle", true, {}, false) == 480U,
+          "fresh hex search starts at the current byte, not the viewport");
+    cursor_search.set_hex_cursor(224, false);
+    check(cursor_search.find("needle", true, {}, false) == 480U,
+          "manual cursor movement resets repeat origin");
+    cursor_search.goto_offset(4095);
+    const auto failed_offset = cursor_search.offset();
+    check(!cursor_search.find("absent", true, {}, false) &&
+              !cursor_search.find("absent", true, {}, true) &&
+              cursor_search.offset() == failed_offset && cursor_search.hex_cursor() == 4095U,
+          "failed wrapped search preserves the previous cursor and viewport");
+    check(cursor_search.position_percent() == 100U, "the final hex byte reports 100 percent");
+    std::string text_matches;
+    for (std::size_t row = 0; row < 120U; ++row) {
+        text_matches += "ROW_" + std::to_string(row) +
+                        (row == 0U || row == 50U || row == 100U ? " HIT\n" : "\n");
+    }
+    write_file(root / "viewer-repeat-text", text_matches);
+    mcpp::ViewerModel text_repeat;
+    text_repeat.open(provider, (root / "viewer-repeat-text").string());
+    static_cast<void>(text_repeat.lines(100, 24));
+    check(text_repeat.find("HIT", true, {}, false).has_value(), "find first text hit");
+    for (int row = 0; row < 60; ++row) {
+        text_repeat.scroll_lines(1, 100);
+    }
+    check(text_repeat.find("HIT", true, {}, false).has_value() &&
+              text_repeat.lines(100, 24).front() == "ROW_100 HIT",
+          "single-line manual scrolling resets text repeat origin");
 
     mcpp::ViewerModel text_search;
     write_file(root / "viewer-highlights", "aaaaa\nab\té界tail\n");

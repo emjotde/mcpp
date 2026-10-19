@@ -416,12 +416,14 @@ panelized_skip() {
     cp "$current/src/a/same.txt" "$current/expected/first"
     snapshot before
     start_session
-    # Up wraps to Rescan; the preceding enabled row is Panelize by name.
-    send '\033[20~\r\033[A\033[A\r'
-    wait_log 'Panelize name pattern'
+    send '\033?'
+    wait_log 'Recursive name pattern'
     checkpoint
     send '\025*.txt\r'
-    wait_log '2 panelized result(s)'
+    wait_log 'Search results'
+    wait_log '2 search result(s)'
+    send '\033p'
+    wait_log 'Find results panelized'
     send '\001\033[15~'
     wait_log 'Source mask:'
     checkpoint

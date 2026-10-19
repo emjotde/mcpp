@@ -38,6 +38,7 @@ struct OperationOptions {
     bool preserve_symlinks{true};
     CollisionResolver collision;
     OperationErrorResolver error{};
+    bool compute_totals{true};
 };
 
 struct SkippedSource {
@@ -103,7 +104,8 @@ public:
         const Cancellation& cancellation,
         const ProgressCallback& progress = {},
         OperationResult* result = nullptr,
-        const OperationErrorResolver& error = {}
+        const OperationErrorResolver& error = {},
+        bool compute_totals = true
     ) const;
 
 private:

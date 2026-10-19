@@ -1,4 +1,5 @@
 #include "mcpp/local_provider.hpp"
+#include <iostream>
 
 #include <algorithm>
 #include <array>
@@ -127,22 +128,6 @@ std::string revision_for(const struct stat& status) {
            std::to_string(status.st_size) + ":" +
            std::to_string(status.st_ctim.tv_sec) + ":" +
            std::to_string(status.st_ctim.tv_nsec);
-}
-
-std::string lowercase(std::string value) {
-    std::transform(
-        value.begin(),
-        value.end(),
-        value.begin(),
-        [](const unsigned char character) {
-            return static_cast<char>(std::tolower(character));
-        }
-    );
-    return value;
-}
-
-std::string extension_of(const std::string& name) {
-    return lowercase(std::filesystem::path(name).extension().string());
 }
 
 std::string identity_name(
@@ -534,6 +519,17 @@ Entry LocalProvider::make_entry(
                 std::chrono::seconds(native_status.st_mtim.tv_sec) +
                 std::chrono::nanoseconds(native_status.st_mtim.tv_nsec)
             };
+        result.accessed = std::chrono::system_clock::time_point{
+            std::chrono::seconds(native_status.st_atim.tv_sec) +
+            std::chrono::nanoseconds(native_status.st_atim.tv_nsec)};
+        result.changed = std::chrono::system_clock::time_point{
+            std::chrono::seconds(native_status.st_ctim.tv_sec) +
+            std::chrono::nanoseconds(native_status.st_ctim.tv_nsec)};
+        result.inode = static_cast<std::uint64_t>(native_status.st_ino);
+        result.links = static_cast<std::uint64_t>(native_status.st_nlink);
+        result.uid = static_cast<std::uint32_t>(native_status.st_uid);
+        result.gid = static_cast<std::uint32_t>(native_status.st_gid);
+        result.mode = static_cast<std::uint32_t>(native_status.st_mode);
         result.revision = revision_for(native_status);
     }
     return result;
@@ -574,52 +570,7 @@ std::vector<Entry> LocalProvider::list(
         );
     }
 
-    const auto compare = [&](const Entry& left, const Entry& right) {
-        const auto left_directory =
-            left.kind == EntryKind::directory ||
-            left.target_is_directory;
-        const auto right_directory =
-            right.kind == EntryKind::directory ||
-            right.target_is_directory;
-        if (request.directories_first &&
-            left_directory != right_directory) {
-            return left_directory;
-        }
-        int comparison = 0;
-        switch (request.sort) {
-            case SortField::extension:
-                comparison = extension_of(left.name).compare(
-                    extension_of(right.name)
-                );
-                break;
-            case SortField::size:
-                comparison =
-                    left.size < right.size
-                        ? -1
-                        : left.size > right.size ? 1 : 0;
-                break;
-            case SortField::modified:
-                comparison =
-                    left.modified < right.modified
-                        ? -1
-                        : left.modified > right.modified ? 1 : 0;
-                break;
-            case SortField::name:
-                comparison = lowercase(left.name).compare(
-                    lowercase(right.name)
-                );
-                break;
-        }
-        if (comparison == 0) {
-            comparison = lowercase(left.name).compare(
-                lowercase(right.name)
-            );
-        }
-        return request.descending
-                   ? comparison > 0
-                   : comparison < 0;
-    };
-    std::stable_sort(entries.begin(), entries.end(), compare);
+    sort_entries(entries, request);
 
     const auto begin = std::min(request.offset, entries.size());
     const auto end =
@@ -818,6 +769,14 @@ void LocalProvider::write_impl(
         if (fchmod(descriptor, static_cast<mode_t>(destination_permissions)) != 0) {
             throw std::system_error(errno, std::generic_category(), "set temporary output permissions");
         }
+        if (preallocate_space_.load(std::memory_order_relaxed) && length && *length > 0U) {
+            cancellation.throw_if_requested();
+            if (*length > static_cast<std::uint64_t>(std::numeric_limits<off_t>::max())) {
+                throw std::runtime_error("output is too large to preallocate");
+            }
+            const auto error = posix_fallocate(descriptor, 0, static_cast<off_t>(*length));
+            if (error != 0) throw std::system_error(error, std::generic_category(), "preallocate output");
+        }
         while (input) {
             cancellation.throw_if_requested();
             input.read(
@@ -950,6 +909,41 @@ void LocalProvider::ensure_writable(const std::string_view path) const {
         throw std::system_error(
             errno, std::generic_category(), "file is not writable: " + target.string()
         );
+    }
+}
+
+void LocalProvider::replace_symlink(
+    const std::string_view path, const std::string_view target,
+    const std::string& expected_revision
+) {
+    if (target.empty() || target.find('\0') != std::string_view::npos) {
+        throw std::invalid_argument("symlink target is empty or contains NUL");
+    }
+    const auto original = resolve(path);
+    const auto entry = stat(path, {});
+    if (entry.kind != EntryKind::symlink || entry.revision != expected_revision) {
+        throw std::runtime_error("symlink changed before editing: " + original.string());
+    }
+    auto pattern = (original.parent_path() / ".mcpp-link-XXXXXX").string();
+    std::vector<char> name(pattern.begin(), pattern.end());
+    name.push_back('\0');
+    const auto descriptor = mkstemp(name.data());
+    if (descriptor < 0) throw std::system_error(errno, std::generic_category(), "create replacement symlink");
+    const std::filesystem::path temporary(name.data());
+    const auto closed = close(descriptor);
+    try {
+        if (closed != 0) throw std::system_error(errno, std::generic_category(), "close symlink temporary");
+        std::filesystem::remove(temporary);
+        std::filesystem::create_symlink(std::string(target), temporary);
+        if (stat(path, {}).revision != expected_revision) {
+            throw std::runtime_error("symlink changed while awaiting replacement");
+        }
+        std::filesystem::rename(temporary, original);
+    } catch (...) {
+        std::error_code error;
+        std::filesystem::remove(temporary, error);
+        if (error) std::cerr << "mcpp: symlink temporary cleanup failed: " << error.message() << '\n';
+        throw;
     }
 }
 

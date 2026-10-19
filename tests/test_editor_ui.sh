@@ -142,6 +142,8 @@ for expected in \
 done
 
 printf 'buffer one\n' >"$temporary/buffer-one.txt"
+mkdir -p "$temporary/buffer-config/mcpp"
+printf 'escape_timeout=50000\n' >"$temporary/buffer-config/mcpp/config"
 mkfifo "$temporary/buffer-input"
 printf -v buffer_command 'XDG_CONFIG_HOME=%q %q -e %q' \
     "$temporary/buffer-config" \
@@ -155,9 +157,9 @@ exec 6>"$temporary/buffer-input"
 sleep 1
 printf '\016\rbuffer-two\033[12~\r' >&6
 sleep 0.5
-printf '\033[20~\033[C\033[C\033[C\033[C\033[C\r\r' >&6
+printf '\033[20~wn' >&6
 sleep 0.5
-printf '\033[20~\033[C\033[C\033[C\033[C\033[C\r\033[B\033[B\r' >&6
+printf '\033[20~wl' >&6
 sleep 0.5
 printf '\033' >&6
 sleep 0.3
@@ -180,7 +182,7 @@ if [[ "$(cat "$temporary/new-file")" != "buffer-two" ]]; then
     exit 1
 fi
 
-if ! grep -aFq 'Buffer list' "$temporary/buffer-output" ||
+if ! grep -aFq 'Open files' "$temporary/buffer-output" ||
    ! grep -aFq 'buffer-one.txt' "$temporary/buffer-output" ||
    ! grep -aFq 'new-file' "$temporary/buffer-output"; then
     printf 'editor buffer list did not show both buffers\n' >&2

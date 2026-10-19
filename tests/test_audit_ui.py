@@ -39,14 +39,24 @@ def select_file(terminal, name):
 
 
 def menu(terminal, category, item):
-    if category not in terminal.text().splitlines()[0]:
+    def menubar():
+        return next((index for index, line in enumerate(terminal.text().splitlines())
+                     if all(name in line for name in ("File", "Edit", "Search", "Window"))), None)
+    if menubar() is None:
         terminal.press("F9")
-        terminal.wait(lambda: category in terminal.text().splitlines()[0],
+        terminal.wait(lambda: menubar() is not None,
                       f"Editor menu category {category} appears")
-    click(terminal, category, row=0)
-    terminal.wait_for(item)
-    click(terminal, item)
-    terminal.wait_for(item, present=False)
+    click(terminal, category, row=menubar())
+    terminal.wait(lambda: any(item in line and "│" in line for line in terminal.text().splitlines()),
+                  f"Editor dropdown contains {item}")
+    lines = terminal.text().splitlines()
+    row = next(index for index, line in enumerate(lines) if item in line and "│" in line)
+    start = lines[row].rfind("│", 0, lines[row].index(item))
+    end = lines[row].find("│", lines[row].index(item))
+    before = lines[row][start:end + 1]
+    click(terminal, item, row=row)
+    terminal.wait(lambda: terminal.text().splitlines()[row][start:end + 1] != before,
+                  f"Editor menu action {item} closes its dropdown")
 
 
 def focused(terminal, suffix):
@@ -125,6 +135,9 @@ class AuditUI(unittest.TestCase):
             (left / f"item_{index:03}.txt").write_text(str(index))
             (right / f"right_{index:03}.txt").write_text(str(index))
         (left / "Ångström.txt").write_text("unicode")
+        config = root / "ui/config/mcpp/config"
+        config.parent.mkdir(parents=True)
+        config.write_text("quick_search_mode=0\n")
         with self.terminal(root / "ui", [left, right]) as t:
             t.wait_for("item_000")
             t.press(*(["Down"] * 15))
@@ -539,7 +552,7 @@ class AuditUI(unittest.TestCase):
         path = left / "source.txt"
         path.write_bytes(b"unchanged\n")
         with self.terminal(root / "ui", [left, right], 40, 12) as t:
-            t.wait_for("source.txt")
+            t.wait_for("Name")
             for key in ("F5", "F6"):
                 t.press("Home", "Down", key)
                 t.wait_for("[ OK ]")
@@ -564,7 +577,7 @@ class AuditUI(unittest.TestCase):
         with self.terminal(root / "ui", [left, right], 80, 12) as t:
             t.wait_for("Name")
             click(t, "Options", row=0)
-            t.wait_for("Save setup")
+            t.wait_for("Configuration...")
             t.press("Up")
             t.wait_for("Save setup")
             t.wait(lambda: focused(t, "Save setup"), "Last menu action is visible and focused")
@@ -711,6 +724,7 @@ class AuditUI(unittest.TestCase):
             self.assertEqual(target.read_bytes(), b"RESULT TARGET\n")
             t.press("F4")
             t.wait_editor(dirty=False)
+            t.press("Home")
             t.type("X")
             save(t, target, b"XRESULT TARGET\n")
             t.press("F10")
@@ -741,18 +755,18 @@ class AuditUI(unittest.TestCase):
             t.press("Enter")
             t.wait_editor(bytes=7, dirty=False)
             t.type("Y")
-            menu(t, "Window", "Buffer list...")
-            t.wait_for("Buffer list")
+            menu(t, "Window", "List...")
+            t.wait_for("Open files")
             click(t, first.name)
             selected_result(t, "first.txt")
             t.press("Enter")
             t.wait_editor(bytes=7, dirty=True)
             t.raw(b"\x1bE")
-            t.wait_for("Editor history")
+            t.wait_for("History")
             t.press("End")
             selected_result(t, "second.txt")
             click(t, second.name, twice=True)
-            t.wait_for("Editor history", present=False)
+            t.wait_for("History", present=False)
             t.wait_editor(bytes=8, dirty=True)
             t.press("Escape")
             t.wait_for("Save before close?")
@@ -762,14 +776,14 @@ class AuditUI(unittest.TestCase):
                    "Escape also checks the inactive dirty buffer")
             click(t, "[ Cancel ]")
             t.wait_for("Save before close?", present=False)
-            menu(t, "Window", "Buffer list...")
-            t.wait_for("Buffer list")
+            menu(t, "Window", "List...")
+            t.wait_for("Open files")
             t.press("End")
             selected_result(t, "first.txt")
             t.press("PgUp")
             selected_result(t, "second.txt")
             t.press("F10")
-            t.wait_for("Buffer list", present=False)
+            t.wait_for("Open files", present=False)
             t.press("Escape")
             t.wait_for("Save before close?")
             click(t, "[ No ]")
@@ -1248,24 +1262,29 @@ class AuditUI(unittest.TestCase):
             t.wait_for("Compare directories")
             click(t, "[ Quick ]")
             t.wait_for("Compare directories", present=False)
-            rows = t.text().splitlines()[3:-6]
-            self.assertTrue(any("* newer.txt" in row[:50] for row in rows))
-            self.assertFalse(any("* newer.txt" in row[50:] for row in rows))
-            self.assertFalse(any("* /same-directory" in row for row in rows))
+            def marked(name, first, last):
+                for row in t.styled_rows()[3:-6]:
+                    column = row["text"].find(name, first, last)
+                    if column >= 0 and any(start <= column and end >= column + len(name)
+                                           for start, end in row["bold_spans"]):
+                        return True
+                return False
+            self.assertTrue(marked("newer.txt", 0, 50))
+            self.assertFalse(marked("newer.txt", 50, 100))
+            self.assertFalse(marked("same-directory", 0, 100))
             t.press("C-x")
             t.type("d")
             t.wait_for("Compare directories")
             t.press("Down", "Space")
             t.wait_for("Compare directories", present=False)
-            self.assertNotIn("* newer.txt", t.text())
+            self.assertFalse(marked("newer.txt", 0, 100))
             t.press("C-x")
             t.type("d")
             t.wait_for("Compare directories")
             click(t, "[ Thorough ]")
             t.wait_for("Compare directories", present=False)
-            rows = t.text().splitlines()[3:-6]
-            self.assertTrue(any("* bytes.txt" in row[:50] for row in rows))
-            self.assertTrue(any("* bytes.txt" in row[50:] for row in rows))
+            self.assertTrue(marked("bytes.txt", 0, 50))
+            self.assertTrue(marked("bytes.txt", 50, 100))
         for index in range(10):
             (left / f"node-{index:02}").mkdir()
         (left / "node-04/opened.txt").write_text("tree opened")

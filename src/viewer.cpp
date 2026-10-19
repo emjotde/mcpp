@@ -110,6 +110,7 @@ void ViewerModel::open(
     last_search_.clear();
     search_match_.reset();
     text_highlights_.clear();
+    last_text_page_.reset();
     next_search_offset_ = 0;
     search_begin_ = 0;
     hex_cursor_ = 0;
@@ -135,6 +136,7 @@ void ViewerModel::close() {
     last_search_.clear();
     search_match_.reset();
     text_highlights_.clear();
+    last_text_page_.reset();
     next_search_offset_ = 0;
     search_begin_ = 0;
     hex_cursor_ = 0;
@@ -159,6 +161,8 @@ void ViewerModel::go_to_start() {
     text_highlights_.clear();
     next_search_offset_ = 0;
     search_begin_ = 0;
+    hex_cursor_ = 0;
+    hex_low_nibble_ = false;
 }
 
 void ViewerModel::go_to_end(
@@ -171,14 +175,34 @@ void ViewerModel::go_to_end(
     previous_offsets_.clear();
     horizontal_offset_ = 0;
     const auto height = std::max<std::size_t>(1U, viewport_lines);
+    viewport_width_ = std::max<std::size_t>(1U, viewport_width);
+    viewport_rows_ = height;
     if (hex_) {
         const auto rows = size_ == 0U ? 0U : (size_ - 1U) / 16U + 1U;
         offset_ = (rows - std::min<std::uint64_t>(rows, height)) * 16U;
     } else {
-        const auto offsets = text_offsets_before(size_, viewport_width, height);
-        offset_ = offsets.empty() ? 0U : offsets.front();
+        offset_ = last_text_page(viewport_width_, height);
     }
     view_end_ = offset_;
+    navigation_changed();
+}
+
+void ViewerModel::navigation_changed() {
+    last_search_.clear();
+    next_search_offset_ = hex_ ? hex_cursor_ : offset_;
+}
+
+std::uint64_t ViewerModel::last_text_page(
+    const std::size_t width, const std::size_t rows
+) {
+    if (!last_text_page_ || last_text_page_->width != width ||
+        last_text_page_->rows != rows || last_text_page_->wrap != wrap_) {
+        const auto offsets = text_offsets_before(size_, width, rows);
+        last_text_page_ = LastTextPage{
+            width, rows, wrap_, offsets.empty() ? 0U : offsets.front()
+        };
+    }
+    return last_text_page_->offset;
 }
 
 void ViewerModel::scroll_lines(
@@ -188,13 +212,18 @@ void ViewerModel::scroll_lines(
     if (!open()) {
         return;
     }
+    const auto original_offset = offset_;
+    viewport_width_ = std::max<std::size_t>(1U, viewport_width);
+    const auto maximum = !hex_ && amount > 0
+                             ? last_text_page(viewport_width_, viewport_rows_)
+                             : size_;
     if (offset_ < window_offset_ ||
         offset_ >= window_offset_ + window_.size()) {
         load_window(offset_, window_size, {});
     }
     if (amount > 0) {
         for (int line = 0;
-             line < amount && offset_ < size_;
+             line < amount && offset_ < maximum;
              ++line) {
             auto next_offset = offset_;
             if (hex_) {
@@ -208,6 +237,7 @@ void ViewerModel::scroll_lines(
                     {}
                 );
             }
+            next_offset = std::min(next_offset, maximum);
             if (next_offset <= offset_) {
                 break;
             }
@@ -238,6 +268,9 @@ void ViewerModel::scroll_lines(
             previous_offsets_.pop_back();
         }
     }
+    if (offset_ != original_offset) {
+        navigation_changed();
+    }
 }
 
 void ViewerModel::page(
@@ -245,6 +278,7 @@ void ViewerModel::page(
     const std::size_t viewport_width,
     const std::size_t viewport_lines
 ) {
+    viewport_rows_ = std::max<std::size_t>(1U, viewport_lines);
     scroll_lines(
         direction * static_cast<int>(viewport_lines),
         viewport_width
@@ -260,6 +294,7 @@ void ViewerModel::scroll_columns(const int amount) {
     horizontal_offset_ = static_cast<std::size_t>(
         std::max<long long>(0, next)
     );
+    navigation_changed();
 }
 
 void ViewerModel::toggle_hex() {
@@ -273,6 +308,7 @@ void ViewerModel::toggle_hex() {
     }
     previous_offsets_.clear();
     horizontal_offset_ = 0;
+    navigation_changed();
 }
 
 void ViewerModel::goto_offset(const std::uint64_t requested) {
@@ -285,6 +321,7 @@ void ViewerModel::goto_offset(const std::uint64_t requested) {
     horizontal_offset_ = 0;
     hex_low_nibble_ = false;
     next_search_offset_ = offset_;
+    navigation_changed();
 }
 
 void ViewerModel::goto_line(
@@ -351,8 +388,9 @@ std::uint64_t ViewerModel::line_number(const Cancellation& cancellation) {
 
 unsigned int ViewerModel::position_percent() const noexcept {
     const auto position = hex_ ? hex_cursor_ : view_end_;
-    return size_ == 0U ? 100U : static_cast<unsigned int>(std::min(
-        100.0L, static_cast<long double>(position) * 100.0L / size_
+    const auto total = hex_ && size_ > 0U ? size_ - 1U : size_;
+    return total == 0U ? 100U : static_cast<unsigned int>(std::min(
+        100.0L, static_cast<long double>(position) * 100.0L / total
     ));
 }
 
@@ -390,12 +428,14 @@ void ViewerModel::set_hex_cursor(
     hex_ascii_ = ascii;
     hex_low_nibble_ = !ascii && low_nibble;
     keep_hex_cursor_visible();
+    navigation_changed();
 }
 
 void ViewerModel::move_hex_cursor(const long long delta) {
     if (size_ == 0U) {
         return;
     }
+    const auto previous = hex_cursor_;
     if (delta < 0) {
         const auto distance = static_cast<std::uint64_t>(-(delta + 1LL)) + 1U;
         hex_cursor_ -= std::min(hex_cursor_, distance);
@@ -404,14 +444,17 @@ void ViewerModel::move_hex_cursor(const long long delta) {
     }
     keep_hex_cursor_visible();
     hex_low_nibble_ = false;
+    if (hex_cursor_ != previous) {
+        navigation_changed();
+    }
 }
 
 void ViewerModel::keep_hex_cursor_visible() {
     const auto row = hex_cursor_ / 16U;
     if (hex_cursor_ < offset_) {
         offset_ = row * 16U;
-    } else if (row >= offset_ / 16U + hex_view_rows_) {
-        offset_ = (row - hex_view_rows_ + 1U) * 16U;
+    } else if (row >= offset_ / 16U + viewport_rows_) {
+        offset_ = (row - viewport_rows_ + 1U) * 16U;
     }
 }
 
@@ -433,6 +476,7 @@ void ViewerModel::scroll_hex_lines(const int amount) {
     hex_cursor_ = offset_ + std::min(relative, size_ - 1U - offset_);
     hex_low_nibble_ = false;
     previous_offsets_.clear();
+    navigation_changed();
 }
 
 void ViewerModel::set_byte(const std::uint64_t offset, const unsigned char value) {
@@ -446,6 +490,8 @@ void ViewerModel::set_byte(const std::uint64_t offset, const unsigned char value
         throw std::runtime_error("file changed while editing hex data");
     }
     search_match_.reset();
+    last_text_page_.reset();
+    navigation_changed();
     if (static_cast<unsigned char>(original[0]) == value) {
         edits_.erase(offset);
     } else {
@@ -489,17 +535,39 @@ void ViewerModel::edit_ascii_byte(const char byte) {
     move_hex_cursor(1);
 }
 
-void ViewerModel::save_changes(const Cancellation& cancellation) {
+std::uintmax_t ViewerModel::hardlink_count() const {
+    if (const auto* local = dynamic_cast<const LocalProvider*>(provider_.get())) {
+        return local->hardlink_count(storage_path_);
+    }
+    throw std::runtime_error("hardlink inspection is unavailable for this provider");
+}
+
+void ViewerModel::save_changes(
+    const Cancellation& cancellation,
+    const ViewerLinkedSave linked
+) {
     if (!dirty()) {
         return;
     }
     if (const auto* local = dynamic_cast<const LocalProvider*>(provider_.get())) {
         local->ensure_writable(storage_path_);
+        if (linked == ViewerLinkedSave::require_choice &&
+            local->hardlink_count(storage_path_) > 1U) {
+            throw std::runtime_error("linked file requires a detach or preserve-links choice");
+        }
     }
     EditedInput buffer(*provider_, storage_path_, size_, edits_, cancellation);
     std::istream input(&buffer);
     input.exceptions(std::ios::badbit);
-    provider_->write(storage_path_, input, size_, true, revision_, cancellation, {});
+    if (linked == ViewerLinkedSave::preserve_links) {
+        auto* local = dynamic_cast<LocalProvider*>(provider_.get());
+        if (local == nullptr) {
+            throw std::runtime_error("linked saves are unavailable for this provider");
+        }
+        local->write_in_place(storage_path_, input, size_, revision_, cancellation);
+    } else {
+        provider_->write(storage_path_, input, size_, true, revision_, cancellation, {});
+    }
     revision_ = provider_->stat(storage_path_, cancellation).revision;
     edits_.clear();
     window_.clear();
@@ -509,6 +577,7 @@ void ViewerModel::discard_changes() {
     edits_.clear();
     window_.clear();
     search_match_.reset();
+    last_text_page_.reset();
     hex_low_nibble_ = false;
 }
 
@@ -736,16 +805,16 @@ std::vector<std::string> ViewerModel::lines(
     const Cancellation& cancellation
 ) {
     text_highlights_.clear();
+    viewport_width_ = std::max<std::size_t>(1U, width);
+    viewport_rows_ = std::max<std::size_t>(1U, height);
     if (!open()) {
         view_end_ = 0;
         return {};
     }
     std::vector<std::string> result;
     result.reserve(height);
-    hex_view_rows_ = std::max<std::size_t>(1U, height);
     view_end_ = offset_;
     if (hex_) {
-        hex_view_rows_ = std::max<std::size_t>(1U, height);
         constexpr std::size_t bytes_per_line = 16U;
         for (std::size_t row = 0; row < height; ++row) {
             const auto bytes = window_at(
@@ -827,7 +896,7 @@ std::optional<std::uint64_t> ViewerModel::find(
         requested == last_search_ &&
         case_sensitive == last_search_case_sensitive_;
     const auto search_begin =
-        repeat ? std::min(next_search_offset_, size_) : offset_;
+        repeat ? std::min(next_search_offset_, size_) : hex_ ? hex_cursor_ : offset_;
     search_begin_ = search_begin;
     constexpr std::uint64_t chunk_size = 256U * 1024U;
     const auto search_range = [&](const std::uint64_t begin,
@@ -903,16 +972,43 @@ std::optional<std::uint64_t> ViewerModel::find(
     );
     const auto prefix = std::move(prefix_output).str();
     const auto newline = prefix.rfind('\n');
-    offset_ =
+    auto next_offset =
         newline == std::string::npos
             ? prefix_begin
             : prefix_begin + newline + 1U;
+    std::size_t next_column = 0;
     if (hex_) {
         hex_cursor_ = found->first;
-        offset_ = found->first / 16U * 16U;
+        next_offset = found->first / 16U * 16U;
+    } else if (wrap_) {
+        while (next_offset < found->first) {
+            const auto next = read_text_row(next_offset, viewport_width_, nullptr, cancellation);
+            if (next <= next_offset || next > found->first) {
+                break;
+            }
+            next_offset = next;
+        }
+    } else {
+        const auto begin = newline == std::string::npos ? 0U : newline + 1U;
+        std::size_t column = 0;
+        for (auto index = begin; index < prefix.size();) {
+            const auto next = next_utf8(prefix, index);
+            const auto glyph = std::string_view(prefix).substr(index, next - index);
+            if (glyph == "\t") {
+                column += 8U - column % 8U;
+            } else if (static_cast<unsigned char>(glyph.front()) >= 32U &&
+                       glyph.front() != '\x7f') {
+                column += static_cast<std::size_t>(std::max(0, ftxui::string_width(glyph)));
+            }
+            index = next;
+        }
+        if (column >= viewport_width_) {
+            next_column = column - viewport_width_ / 2U;
+        }
     }
+    offset_ = next_offset;
     previous_offsets_.clear();
-    horizontal_offset_ = 0;
+    horizontal_offset_ = next_column;
     search_match_ = found;
     return found->first;
 }

@@ -86,13 +86,21 @@ int main(const int argc, char** argv) {
                 path.is_absolute() ? path : current / path
             ).lexically_normal().string();
         };
+        const auto saved_path = [&](const std::string& value, const char* panel) {
+            if (!config.auto_save_panels_setup || value.empty()) return current.string();
+            const auto path = pane_path(value);
+            std::error_code error;
+            if (std::filesystem::is_directory(path, error) && !error) return path;
+            std::cerr << "mcpp: cannot restore saved " << panel << " panel; using the current directory\n";
+            return current.string();
+        };
         const auto left =
             paths.empty()
-                ? current.string()
+                ? saved_path(config.saved_left_path, "left")
                 : pane_path(paths[0]);
         const auto right =
             paths.size() < 2U
-                ? current.string()
+                ? saved_path(config.saved_right_path, "right")
                 : pane_path(paths[1]);
         mcpp::App app(left, right, std::move(config));
         if (view_file) {

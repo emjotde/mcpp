@@ -1,4 +1,5 @@
 from pathlib import Path
+import re
 import shutil
 import sys
 import tempfile
@@ -142,8 +143,9 @@ def deletion(binary, tmux, root):
         session.press("F9")
         session.wait_for("Options")
         click(session, "Edit", header=True)
-        session.wait_for("Delete  F8")
-        click(session, "Delete  F8")
+        session.wait(lambda: re.search(r"Delete\s+F8", session.text()) is not None,
+                     "Native Delete menu item appears")
+        click(session, "Delete")
         session.wait_editor(lines=4, column=1)
         session.save_editor()
         session.wait_file(path, b"first line\nond line\nthird line\n")

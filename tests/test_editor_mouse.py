@@ -67,7 +67,7 @@ def main():
             session.type("a")
             session.wait_for("> gamma")
             click(session, "OK")
-            session.wait_editor(selection=5, column=8)
+            session.wait_editor(selection=0, column=8)
             session.save("linear-drag-and-menus")
         path.write_bytes(b"abcdef\nABCDEF\nabcdef\n")
         with TerminalSession(binary, tmux, profile(root / "columns"), ["--edit", path]) as session:

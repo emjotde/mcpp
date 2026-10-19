@@ -315,6 +315,109 @@ void test_resume_mark(const std::filesystem::path& root) {
           "Shift extension without a mark starts a linear block at the cursor");
 }
 
+void test_search_preserves_blocks(const std::filesystem::path& root) {
+    for (const bool column : {false, true}) {
+        const auto path = root / (column ? "search-column" : "search-linear");
+        auto editor = load(path, column ? "KEEP xx NEEDLE\nkeep yy other\n"
+                                        : "KEEP and NEEDLE and TAIL\n");
+        if (column) {
+            editor.begin_column_mark();
+        } else {
+            editor.begin_mark();
+        }
+        editor.move(0, 4);
+        if (column) {
+            editor.move(1, 0);
+        }
+        editor.finish_mark();
+        const auto marked = editor.selected_text();
+        editor.set_position({0, 0});
+        check(editor.find("NEEDLE", true), "find independently of the persistent block");
+        check(editor.selected_text() == marked && editor.column_selection() == column,
+              "search preserves the original block and its shape");
+        check(editor.search_selection().has_value(), "search has its own displayed range");
+        editor.delete_block_or_line();
+        editor.save(false);
+        check(read_file(path) == (column ? " xx NEEDLE\n yy other\n"
+                                        : " and NEEDLE and TAIL\n"),
+              "F8 after search deletes the user block, not the search highlight");
+    }
+}
+
+void test_cr_only_editing(const std::filesystem::path& root) {
+    auto editor = load(root / "cr-source", "alpha\nbeta\ngamma\n");
+    const auto path = root / "cr-output";
+    editor.save_as(path.string(), false, mcpp::EditorLineEnding::cr);
+    check(editor.lines().size() == 4U && editor.line_separator() == '\r' &&
+              read_file(path) == "alpha\rbeta\rgamma\r",
+          "CR Save As preserves logical editing lines");
+    editor.goto_line(2);
+    editor.home();
+    editor.delete_block_or_line();
+    editor.save(false);
+    check(read_file(path) == "alpha\rgamma\r", "F8 removes one CR line only");
+    check(editor.undo() && editor.lines().size() == 4U, "Undo restores the CR line");
+    editor.set_position({1, 0});
+    editor.paste("x\r\ny\n");
+    editor.save(false);
+    check(read_file(path) == "alpha\rx\ry\rbeta\rgamma\r",
+          "pasted LF/CRLF text retains CR output format");
+    editor.set_position({0, 0});
+    check(editor.find("^beta$", {.mode=mcpp::EditorSearchMode::regular_expression}, false, false),
+          "logical regex line anchors work in a CR document");
+    editor.close();
+    editor.open(std::make_shared<mcpp::LocalProvider>(root), path.string());
+    check(editor.lines().size() == 6U && editor.lines()[3] == "beta",
+          "reopening a CR file retains the same logical rows");
+}
+
+void test_codepage_view_and_original_bytes(const std::filesystem::path& root) {
+    const auto path = root / "codepage";
+    auto editor = load(path, std::string("caf\xe9\n", 5));
+    editor.set_encoding("ISO-8859-1");
+    check(!editor.dirty() && editor.lines().front() == "café" && editor.storage_byte_size() == 5U &&
+              read_file(path) == std::string("caf\xe9\n", 5),
+          "selecting a codepage changes interpretation, not the file or dirty state");
+    editor.move(0, 4);
+    check(editor.storage_cursor_offset() == 4U, "encoded cursor offsets remain physical file-byte offsets");
+    editor.set_position({0, 0});
+    editor.begin_mark();
+    editor.move(0, 4);
+    editor.finish_mark();
+    check(editor.storage_selection_size() == 4U && editor.selected_bytes() == std::string("caf\xe9", 4),
+          "block byte counts and file output retain the selected codepage");
+    editor.clear_selection();
+    editor.paste_bytes(std::string("\xe9", 1));
+    editor.save(false);
+    check(read_file(path) == std::string("caf\xe9\xe9\n", 6), "inserting encoded bytes saves in the original codepage");
+    bool rejected = false;
+    try { editor.insert("界"); }
+    catch (const std::system_error&) { rejected = true; }
+    check(rejected && !editor.dirty() && editor.storage_byte_size() == 6U,
+          "unrepresentable input fails before changing the buffer");
+    check(editor.undo(), "encoded edit remains undoable");
+    editor.save(false);
+    check(read_file(path) == std::string("caf\xe9\n", 5), "Undo does not change the file encoding");
+    const auto converted = root / "codepage-crlf";
+    editor.save_as(converted.string(), false, mcpp::EditorLineEnding::crlf);
+    check(read_file(converted) == std::string("caf\xe9\r\n", 6) && editor.storage_byte_size() == 6U,
+          "Save As converts line endings without converting the selected codepage");
+}
+
+void test_column_block_transform(const std::filesystem::path& root) {
+    auto editor = load(root / "column-transform", "LbbR\nLaaR\nLccR\n");
+    editor.set_position({0, 1});
+    editor.begin_column_mark();
+    editor.set_position({2, 3});
+    editor.finish_mark();
+    editor.replace_block("aa\nbb\ncc\n");
+    check(editor.text() == "LaaR\nLbbR\nLccR\n", "column transforms preserve the surrounding bytes");
+    check(editor.column_selection() && editor.selection_size() == 8U,
+          "column transforms retain the rectangle, including its serialized line separators");
+    check(editor.undo() && editor.text() == "LbbR\nLaaR\nLccR\n" && editor.column_selection(),
+          "a column transform is one undoable edit");
+}
+
 }  // namespace
 
 int main(const int argc, char** argv) {
@@ -339,6 +442,10 @@ int main(const int argc, char** argv) {
         {"Document jump preferred column", test_jump_preferred_column},
         {"MC word and newline stops", test_word_navigation},
         {"Persistent mark extension", test_resume_mark},
+        {"Search preserves persistent blocks", test_search_preserves_blocks},
+        {"CR-only save and editing", test_cr_only_editing},
+        {"Codepage view and byte-preserving saves", test_codepage_view_and_original_bytes},
+        {"Rectangular block transforms", test_column_block_transform},
     };
     int failures = 0;
     for (const auto& [name, test] : tests) {

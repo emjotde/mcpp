@@ -273,8 +273,9 @@ class PanelPrompts(unittest.TestCase):
             terminal.raw(b"\x1b\t")
             terminal.wait_for("2 paths;")
             terminal.raw(b"\x1b\t")
-            terminal.wait_for("> apple.txt")
-            terminal.raw(b"\x1b\t")
+            terminal.wait_for("Completion")
+            terminal.press("Down", "Enter")
+            terminal.wait_for("Completion", present=False)
             terminal.wait_for("> apricot.txt")
             terminal.press("Escape")
             terminal.wait_for("Filename:", present=False)
@@ -331,12 +332,15 @@ class PanelPrompts(unittest.TestCase):
 
     def test_view_file_default_for_nested_panelized_result(self):
         with session_case(BINARY, TMUX) as (terminal, _left, _right):
-            menu(terminal, "Left", "Panelize by name...")
-            terminal.wait_for("Panelize name pattern")
+            terminal.press("M-?")
+            terminal.wait_for("Recursive name pattern")
             terminal.press("C-u")
             terminal.type("target.txt")
             terminal.press("Enter")
-            terminal.wait_for("1 panelized result(s)")
+            terminal.wait_for("Search results")
+            terminal.wait_for("1 search result(s)")
+            click_label(terminal, "Panelize")
+            terminal.wait_for("Find results panelized")
             terminal.wait_for("target.txt")
             terminal.press("Insert")
             terminal.wait_for("1 selected,")
@@ -354,31 +358,32 @@ class PanelPrompts(unittest.TestCase):
             terminal.wait_for("Filename:", present=False)
             terminal.wait_for("1 selected,")
 
-    def test_external_panelize_disabled_and_name_panelize_retained(self):
+    def test_external_panelize_enabled_and_panelized_snapshot_restored(self):
         with session_case(BINARY, TMUX) as (terminal, _, _right):
             line = terminal.text().splitlines()[0]
             click(terminal, line.index("Command") + 2, 1)
             terminal.wait_for("External panelize")
-            self.assertTrue(styled(terminal, "External panelize", 2, 22))
+            self.assertFalse(styled(terminal, "External panelize", 2, 22))
             click_label(terminal, "External panelize")
-            focus(terminal, "External panelize")
-            self.assertTrue(styled(terminal, "External panelize", 2, 22))
-            self.assertNotIn("Panelize name pattern", terminal.text())
+            terminal.wait_for("External panelize")
             terminal.press("Escape")
             terminal.wait_for("External panelize", present=False)
             terminal.press("C-x")
             terminal.type("!")
-            terminal.wait_for("External panelize is not implemented")
-            self.assertNotIn("Panelize name pattern", terminal.text())
-
-            menu(terminal, "Left", "Panelize by name...")
-            terminal.wait_for("Panelize name pattern")
-            terminal.press("C-u")
-            terminal.type("target.txt")
+            terminal.wait_for("External panelize")
+            terminal.wait_for("Other command")
+            terminal.press("Tab", "C-u")
+            terminal.type("find . -name target.txt -type f -print")
             terminal.press("Enter")
+            terminal.wait_for("External panelization complete")
             terminal.wait_for("target.txt")
             terminal.wait_for("alpha.txt", present=False)
             terminal.wait_for("other.txt", present=False)
+            terminal.press("C-PgUp")
+            terminal.wait_for("[panelized]", present=False)
+            menu(terminal, "Left", "Panelize")
+            terminal.wait_for("Panelized listing restored")
+            terminal.wait_for("target.txt")
 
 
 if __name__ == "__main__":

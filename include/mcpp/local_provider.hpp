@@ -3,6 +3,7 @@
 #include "mcpp/provider.hpp"
 
 #include <filesystem>
+#include <atomic>
 
 namespace mcpp {
 
@@ -34,6 +35,10 @@ public:
     ) const;
     [[nodiscard]] std::uintmax_t hardlink_count(std::string_view path) const;
     void ensure_writable(std::string_view path) const;
+    void set_preallocate(bool value) noexcept { preallocate_space_.store(value, std::memory_order_relaxed); }
+    void replace_symlink(
+        std::string_view path, std::string_view target, const std::string& expected_revision
+    );
     void set_modified(
         std::string_view path,
         std::chrono::system_clock::time_point modified
@@ -146,6 +151,7 @@ private:
     ) const;
 
     std::filesystem::path root_;
+    std::atomic_bool preallocate_space_{false};
 };
 
 }  // namespace mcpp

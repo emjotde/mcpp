@@ -31,6 +31,7 @@ struct EditorSearchMatch {
 
 class EditorSearch {
 public:
+    [[nodiscard]] static std::string fold_case(std::string_view text);
     [[nodiscard]] static bool filename_matches(
         std::string_view name, std::string_view pattern, bool case_sensitive
     );

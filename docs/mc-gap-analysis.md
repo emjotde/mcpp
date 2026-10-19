@@ -10,17 +10,95 @@ spelling support remain deferred.
 
 The original 41 findings (A01-A16, B01-B11, C01-C10, H01-H03 and U01) were fixed
 in `13c9c34`. The six follow-up items D01-D05 and U02 are also resolved by the
-delivery below. The later screenshot/code walk against `e28a00d` records open
+delivery below. The later screenshot/code walk against `e28a00d` recorded
 E01-E05 and shared limitation U03. The original regression results do not imply
 complete MC parity. The subsequent 100-case investigation below records new
 F01-F07 and shared limitation U04. F01-F07 are now fixed by the seven-finding
-delivery below; U04 remains a shared limitation.
-The later walk against `4333955` records open G01-G05 and shared limitation
-U05, plus additional text-viewer evidence for E02. Not all known issues are fixed.
+delivery below. The later walk against `4333955` recorded G01-G05 and shared
+limitation U05, plus additional text-viewer evidence for E02.
+The current fix batch closes E01-E05, G01-G05 and U03-U05; shared limitations
+are treated as deliberate usability improvements, not retroactively reclassified
+as mcpp-only regressions.
 The eight broader capability groups remain a separate feature backlog; the
 explicitly paused providers and spelling remain paused.
 The source excerpts and line numbers in the historical audit sections describe the old
 `14b7a82` baseline, not the corrected code.
+
+## Current audit fixes and native-control rework
+
+The thirteen findings below have implementation and regression coverage.
+The broader capability backlog is separate and is not marked complete.
+
+| Findings | Corrected behavior |
+|---|---|
+| E01 | Hex Save asks for detach / preserve links / cancel, including Save-on-close. Model guards reject an unconfirmed linked save. The preserve choice writes the existing inode explicitly and non-atomically. |
+| E02-E03 | Hex searches start at the current byte, text repeats respect manual navigation, and cancelled or unsuccessful wrap attempts retain the visible cursor/viewport state. |
+| E04-E05 | Filename cells retain distinguishing tails, and the last hex byte reports 100%. |
+| G01 | Search hits have their own range and highlight. Persistent linear/rectangular marks, F8 targets, and undo/redo state remain independent. |
+| G02 | Text scrolling retains a filled final page instead of advancing into a blank EOF viewport. |
+| G03 | Long-parent Find labels retain the differing parent tails and complete result identity. |
+| G04-G05 | Editor categories and enabled dropdown items accept their mnemonics; outside clicks dismiss manager dropdowns without activating the clicked pane. |
+| U03 | CR-only Save As and later edits retain logical lines rather than collapsing the document. |
+| U04 | Question-mark masks consume a Unicode character rather than one UTF-8 byte; invalid filename bytes remain individually distinguishable. |
+| U05 | A successful text search reveals a far hit in wrapped and horizontally scrolled views. |
+
+After the user rejected simplified replacement dialogs, twelve complete native
+menu inventories were captured from MC 4.8.30 and compared with mcpp. Labels,
+order, separators, and printed shortcuts match. The new generic option-form
+implementation was removed rather than presented as native parity.
+
+Listing format now uses the native radio choices, Brief column count, user
+format, and user mini-status controls. Long is a full-width single-row listing,
+not a two-line mcpp layout. Sort order offers all nine native fields and exactly
+Executable first, Case sensitive, and Reverse; the former made-up
+Directories first sort control is gone. Mix all files is in Panel options.
+Native format tags, alignments, widths, frame/column selection, and expansion
+are parsed independently in C++.
+
+Configuration, Layout, Panel options, Confirmation, Appearance, Learn keys,
+Chattr, Advanced chown, and editor Save mode have reference-derived controls
+with working local bindings. Layout uses actual row/column split sizes and
+functional visibility controls. File / Filtered view executes the entered
+command; Compare files uses the two selected files rather than inventing a
+filename-selection form. External panelize has its command list and
+Panelize/Remove/Add new/Cancel actions, with saved named commands.
+Left/Right / Panelize restores a previous panelized listing.
+
+Editor insert/save-block prompts, codepage chooser, hotkey macro dialogs,
+record/repeat count, literal-key query, immediate date/time insertion,
+marked-block sort, paragraph format, and arrow-driven window geometry no
+longer use the rejected replacement options. Rectangular transforms retain
+their surrounding bytes and undo as one edit. Managed clipfile defaults do not
+insert or overwrite clipboard headers as document text.
+
+Intentional differences and remaining work are explicit:
+
+- Safe save remains the default instead of native Quick save. Linked
+  preservation and stale-file safeguards remain mandatory.
+- Gray/default-blue skins and the built-in syntax set are independently
+  implemented subsets, not copies of MC resources.
+- The FTXUI renderer still requires a UTF-8 terminal. Legacy Display bits
+  choices are unavailable; pane/editor data codepages do not change the
+  terminal encoding.
+- Editor codepage changes preserve physical bytes and saving uses the selected
+  encoding, but changing codepage with undo history or hexadecimal search in
+  that decoded view requires reopening. This limitation is reported, not
+  silently treated as conversion or a failed match.
+- Editor General options, full modal Tree behavior, side-by-side diff/merge,
+  complete user-menu/configuration syntax compatibility, additional viewer
+  actions, and the earlier broad feature groups are not complete.
+
+Native/source comparison artifacts are retained in the session's
+`native-menu-rework` directory, including all twelve inventories, paired
+listing/sort/editor captures, exact filesystem results, and normal-suite logs.
+The normal Release suite passed all 20 CTest entries, including the 32-case
+existing UI audit and 36 focused audit/control regressions. These are regression
+results, not a claim that every MC feature has passed parity.
+Tests run as UID 1001 in an owned disposable Docker container with no host
+mounts and no network. No sanitizers, optional profiling, package installations,
+or new project libraries were used. The pinned FTXUI source stays unchanged:
+the build compiles a checked build-directory copy of its input normalizer to
+separate physical Ctrl-Space from redraw events and honor the Escape timeout.
 
 Core fixes now have bounded normal regressions for directory merge policy,
 source-cycle rejection, copied timestamps/hardlink sets/permissions, pre-publication
@@ -663,7 +741,10 @@ MC Info did not take focus in the tested Tab/mouse attempts. Its retained
 listing operations were observed, but they are not an equivalent control
 for mcpp's explicitly focused Info mode.
 
-## Current local functionality and remaining gaps
+## Historical local functionality snapshot (`e28a00d`)
+
+This snapshot predates the current audit fixes and native-control rework above.
+Its missing-feature lists describe that older baseline, not the current binary.
 
 ### Panels and menus
 

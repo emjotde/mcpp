@@ -865,7 +865,9 @@ void OperationEngine::copy(
     const ProgressCallback& progress,
     OperationResult* result
 ) const {
-    auto state = measure(source_provider, sources, cancellation, static_cast<bool>(options.error));
+    auto state = options.compute_totals
+                     ? measure(source_provider, sources, cancellation, static_cast<bool>(options.error))
+                     : TransferProgress{};
     auto links = std::make_shared<LinkCache>();
     for (const auto& source : sources) {
         try {
@@ -927,7 +929,9 @@ void OperationEngine::copy_exact(
         );
         return;
     }
-    auto state = measure(source_provider, {source}, cancellation, static_cast<bool>(options.error));
+    auto state = options.compute_totals
+                     ? measure(source_provider, {source}, cancellation, static_cast<bool>(options.error))
+                     : TransferProgress{};
     try {
         std::string skip_reason;
         if (copy_entry(
@@ -965,7 +969,9 @@ void OperationEngine::move(
             source_provider.capabilities(),
             ProviderCapability::rename
         )) {
-        auto state = measure(source_provider, sources, cancellation, static_cast<bool>(options.error));
+        auto state = options.compute_totals
+                         ? measure(source_provider, sources, cancellation, static_cast<bool>(options.error))
+                         : TransferProgress{};
         for (const auto& source : sources) {
             cancellation.throw_if_requested();
             state.current_path = source.path;
@@ -1041,7 +1047,7 @@ void OperationEngine::move(
                 }
                 record_completed(result, source);
                 TransferProgress completed;
-                accumulate_entry(
+                if (options.compute_totals) accumulate_entry(
                     destination_provider,
                     destination_provider.stat(
                         destination,
@@ -1051,6 +1057,10 @@ void OperationEngine::move(
                     completed,
                     true
                 );
+                else {
+                    completed.files_total = 1;
+                    completed.bytes_total = source.kind == EntryKind::file ? source.size : 0U;
+                }
                 state.bytes_done += completed.bytes_total;
                 state.files_done += completed.files_total;
                 state.current_path = source.path;
@@ -1110,7 +1120,9 @@ void OperationEngine::move(
         }
         return;
     }
-    auto state = measure(source_provider, sources, cancellation, static_cast<bool>(options.error));
+    auto state = options.compute_totals
+                     ? measure(source_provider, sources, cancellation, static_cast<bool>(options.error))
+                     : TransferProgress{};
     for (const auto& source : sources) {
         try {
             const auto destination = destination_provider.join(
@@ -1172,10 +1184,11 @@ void OperationEngine::remove(
     const Cancellation& cancellation,
     const ProgressCallback& progress,
     OperationResult* result,
-    const OperationErrorResolver& error
+    const OperationErrorResolver& error,
+    const bool compute_totals
 ) const {
     TransferProgress state;
-    for (const auto& entry : entries) {
+    if (compute_totals) for (const auto& entry : entries) {
         accumulate_removal(provider, entry, cancellation, state, static_cast<bool>(error));
     }
     for (const auto& entry : entries) {
@@ -1278,7 +1291,9 @@ void OperationEngine::move_exact(
                 throw OperationCancelled{};
         }
     }
-    auto state = measure(source_provider, {source}, cancellation, static_cast<bool>(options.error));
+    auto state = options.compute_totals
+                     ? measure(source_provider, {source}, cancellation, static_cast<bool>(options.error))
+                     : TransferProgress{};
     state.current_path = source.path;
     try {
         emit_progress(progress, state);

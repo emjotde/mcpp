@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <filesystem>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace mcpp {
@@ -25,9 +26,11 @@ struct SyntaxSpan {
 
 class SyntaxHighlighter {
 public:
+    [[nodiscard]] static const std::vector<std::string>& languages();
     [[nodiscard]] std::vector<std::vector<SyntaxSpan>> highlight(
         const std::filesystem::path& path,
-        const std::vector<std::string>& lines
+        const std::vector<std::string>& lines,
+        std::string_view language = "auto"
     ) const;
 };
 

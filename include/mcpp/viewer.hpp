@@ -12,6 +12,8 @@
 
 namespace mcpp {
 
+enum class ViewerLinkedSave { require_choice, detach, preserve_links };
+
 class ViewerModel {
 public:
     void open(
@@ -47,7 +49,11 @@ public:
     void edit_hex_digit(char digit);
     void edit_ascii_byte(char byte);
     [[nodiscard]] bool dirty() const noexcept;
-    void save_changes(const Cancellation& cancellation = {});
+    [[nodiscard]] std::uintmax_t hardlink_count() const;
+    void save_changes(
+        const Cancellation& cancellation = {},
+        ViewerLinkedSave linked = ViewerLinkedSave::require_choice
+    );
     void discard_changes();
     void set_wrap(bool value);
     [[nodiscard]] bool wrap() const noexcept;
@@ -99,6 +105,15 @@ private:
     );
     void set_byte(std::uint64_t offset, unsigned char value);
     void keep_hex_cursor_visible();
+    void navigation_changed();
+    [[nodiscard]] std::uint64_t last_text_page(std::size_t width, std::size_t rows);
+
+    struct LastTextPage {
+        std::size_t width;
+        std::size_t rows;
+        bool wrap;
+        std::uint64_t offset;
+    };
 
     ProviderPtr provider_;
     std::string path_;
@@ -122,7 +137,9 @@ private:
     bool hex_ascii_{false};
     std::uint64_t hex_cursor_{0};
     bool hex_low_nibble_{false};
-    std::size_t hex_view_rows_{1};
+    std::size_t viewport_width_{80};
+    std::size_t viewport_rows_{1};
+    std::optional<LastTextPage> last_text_page_;
     std::map<std::uint64_t, unsigned char> edits_;
     std::string revision_;
 };

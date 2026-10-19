@@ -5,6 +5,7 @@
 #include <cctype>
 #include <span>
 #include <string_view>
+#include <stdexcept>
 
 namespace mcpp {
 namespace {
@@ -21,6 +22,13 @@ enum class Language {
     markdown,
     config,
 };
+
+constexpr std::array<std::pair<std::string_view, Language>, 10> named_languages{{
+    {"plain", Language::none}, {"cpp", Language::cpp}, {"rust", Language::rust},
+    {"go", Language::go}, {"javascript", Language::javascript}, {"python", Language::python},
+    {"shell", Language::shell}, {"json", Language::json}, {"markdown", Language::markdown},
+    {"config", Language::config}
+}};
 
 using Words = std::span<const std::string_view>;
 
@@ -527,12 +535,31 @@ void highlight_data_line(
 
 }  // namespace
 
+const std::vector<std::string>& SyntaxHighlighter::languages() {
+    static const auto result = [] {
+        std::vector<std::string> names{"auto"};
+        for (const auto& [name, language] : named_languages) {
+            static_cast<void>(language);
+            names.emplace_back(name);
+        }
+        return names;
+    }();
+    return result;
+}
+
 std::vector<std::vector<SyntaxSpan>> SyntaxHighlighter::highlight(
     const std::filesystem::path& path,
-    const std::vector<std::string>& lines
+    const std::vector<std::string>& lines,
+    const std::string_view requested_language
 ) const {
     std::vector<std::vector<SyntaxSpan>> result(lines.size());
-    const auto language = language_for(path);
+    auto language = language_for(path);
+    if (requested_language != "auto") {
+        const auto selected = std::ranges::find(named_languages, requested_language,
+                                               &std::pair<std::string_view, Language>::first);
+        if (selected == named_languages.end()) throw std::runtime_error("unknown syntax language");
+        language = selected->second;
+    }
     bool block_comment = false;
     for (std::size_t index = 0; index < lines.size(); ++index) {
         if (language == Language::cpp ||

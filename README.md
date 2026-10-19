@@ -155,13 +155,66 @@ kills to the end, `Ctrl-W` kills the previous word, and `Ctrl-Y` yanks it back.
 the commander's `Ctrl-U` pane-swap shortcut is unchanged.
 
 Use `Alt-Tab` (or Escape followed by Tab) to complete a dialog path.
-Repeated `Alt-Tab` cycles ambiguous matches. This completes filesystem paths,
+The first press completes the common prefix; a second opens the matching paths.
+Configuration / Complete: show all opens that list on the first press.
+This completes filesystem paths,
 not shell variables or command names. Editor file dialogs resolve and complete
 relative paths against the edited file's directory.
 
-Left / Right / Panelize by name... performs local recursive filename matching.
-External-command panelization is not implemented: its Command menu entry is
-disabled, and `Ctrl-X !` reports that it is unavailable.
+Find results can be panelized with the Panelize button or `Alt-P`.
+Left / Right / Panelize restores the last panelized listing; it does not start a
+new filename search. Command / External panelize (`Ctrl-X !`) offers the
+reference command list, editable command, Panelize, Remove, Add new, and Cancel
+controls. It runs in the pane directory and checks every returned pathname
+before replacing the listing. Named commands persist in mcpp's configuration.
+
+## Local menu controls
+
+The five manager menus and seven editor menus follow MC 4.8.30's labels, order,
+separators, and printed shortcuts. Underlined item letters activate enabled
+actions inside an open dropdown, and an outside click dismisses the menu.
+
+Listing format uses Full / Brief / Long / User defined radio choices, Brief's
+column count, the user format input, and User mini status. Brief supports 1-9
+columns; Long is the full-width, single-row permissions/link/owner/group listing.
+User formats accept MC's `half` / `full`, column count, field names,
+`<` / `=` / `>` alignment, `:width`, and `+` expansion syntax.
+For example: `half type name | size | mtime`.
+
+Sort order offers Unsorted, Name, Version, Extension, Size, Modify time, Access
+time, Change time, and Inode, with Executable first, Case sensitive, and Reverse.
+Mix all files belongs in Panel options, not Sort order. Panel options also
+controls mini-status, SI units, backup/hidden files, fast reload, marking,
+navigation, highlighting, quick-search case handling, and saved pane setup.
+Explicit Rescan / `Ctrl-R` bypasses fast reload. Explicit CLI pane paths override
+automatically saved paths.
+
+Configuration, Layout, Confirmation, Appearance, Learn keys, Chattr, Advanced
+chown, and editor Save mode use reference controls rather than generic
+substitute options. Layout's split buttons display actual columns or rows, not
+percentages. Hidden command input cannot execute an invisible draft.
+Appearance currently provides independently implemented gray and default-blue
+skins and optional dialog shadows.
+
+The terminal renderer requires UTF-8. Display bits reports that fixed terminal
+mode; legacy non-UTF-8 terminal output and 7-bit input are not implemented.
+The separate pane/editor Encoding commands use the reference Choose codepage
+list to interpret file data without renaming files or converting them on disk.
+Editor codepage changes require a clean buffer without undo/redo history;
+unrepresentable input is rejected before changing the draft. Saving retains the
+selected file encoding. Raw hexadecimal search in another file codepage
+requires reopening with No translation.
+
+Learn keys tests the listed terminal keys and teaches a missing sequence.
+Printable ASCII keys, Tab, and Return are not accepted as replacement terminal
+sequences. Configuration controls single/double Escape and the single-Escape
+timeout. The build normalizes physical Ctrl-Space separately from FTXUI's
+internal redraw events without modifying the pinned submodule.
+
+This is not complete MC parity. Editor General options, the full modal Tree,
+side-by-side diff/merge, and additional viewer actions still need further work.
+The supported syntax choices and mcpp's rule/configuration file formats are
+not MC's complete syntax database or configuration-file compatibility layer.
 
 ## Viewer controls
 
@@ -178,13 +231,21 @@ and horizontal clipping; repeating a search moves it to the next occurrence.
 The wheel scrolls hex content immediately while retaining the cursor's relative
 row. Hex progress follows the active byte. Click a hex digit or ASCII byte to
 position the cursor, including the low nibble of a hex byte. Edits stay staged
-until `F6` Save or an explicit save decision on exit.
+until `F6` Save or an explicit save decision on exit. Hardlinked files offer
+detach / preserve links / cancel before publication; preserve links is an
+explicit non-atomic write. The final byte reports 100%.
+Manual navigation becomes the next search origin. Cancelled/failed wrap
+attempts retain the visible location, and successful text searches reveal
+their hit through wrapping and horizontal scrolling.
 
 ## Editor buffers
 
 Each editor buffer keeps its own search query, options, selection scope, cursor,
 viewport, mark, and undo history. Moving a block keeps its destination marked. Rectangular
 copies preserve real spaces without filling virtual source cells.
+Search highlighting is separate from the user's persistent linear or column
+mark; searching never changes what F8 or block-copy/delete will operate on.
+CR-only files keep logical lines after Save As and subsequent editing.
 
 Atomic editor saves retain user attributes, access ACLs and ownership where
 permitted. A linked file offers an explicit detach/preserve-links/cancel choice.
@@ -192,6 +253,31 @@ Preserving links writes the existing inode and is not atomic; cancellation and
 write errors are reported rather than represented as a completed atomic save.
 Read-only files are not silently replaced. Save As supports confirmed replacement
 and unchanged/LF/CRLF/CR line endings.
+
+File / Insert file and Copy to file use the reference filename prompts.
+Their default managed clipfile remains compatible with mcpp's linear/column
+clipboard format. Bookmarks (`Alt-K`, `Alt-J`, `Alt-I`, `Alt-O`) and saved
+file positions are retained. Window / Move and Resize use arrows and mouse
+dragging; Enter accepts and Escape rolls back the geometry.
+
+Save mode offers Quick save, Safe save, and backups with an editable extension,
+plus the POSIX-newline warning. Safe save remains mcpp's safer default.
+Backup files retain the old bytes and metadata. Quick save is explicitly
+in-place; hardlinked saves still require a detach/preserve decision.
+
+Start/Stop record macro records editing keys and asks for the macro hotkey when
+stopped. Delete macro asks for that hotkey. Record/Repeat actions starts and
+stops recording, then asks only for the repeat count. Literal insertion reads
+the next key, not a made-up hexadecimal-input dialog. Date/time inserts the
+locale's current date/time immediately. Sort requires a marked block and asks
+for `sort(1)` options; paragraph formatting uses the configured wrap length.
+
+External formatter reads the first command from
+`$XDG_DATA_HOME/mcpp/mcedit/macros.d/macro.0.sh` (or the equivalent
+`~/.local/share` path), using mcpp's existing `key|label|command` menu format.
+Its stdin is the marked text; stdout replaces that block, or is inserted at the
+cursor if no block exists. Missing/failed commands do not change the draft.
+This resource format is not MC macro-file compatibility.
 
 Undo stores edit differences rather than a full document for every keystroke, so
 large documents retain useful history within the memory budget. Persistent marks
