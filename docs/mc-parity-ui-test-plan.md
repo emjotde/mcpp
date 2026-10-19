@@ -6,6 +6,8 @@ Status: **all 100 case IDs investigated; not 100 passes**. Prepared on
 Per-case outcomes are recorded below.
 The subsequent F01-F07 fix delivery is recorded separately below; the original
 investigation outcomes have not been relabelled as passes.
+The later [12-workflow usability follow-up](mc-gap-analysis.md#ui-and-usability-follow-up-4333955)
+records G01-G05/U05 and additional E02 evidence separately from this 100-case count.
 
 These are 100 additional workflow cases, counted once even when both programs
 run them. Use paired MC controls where an equivalent exists; explicitly

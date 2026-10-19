@@ -1,6 +1,6 @@
 # mcpp versus GNU Midnight Commander
 
-Review dates: 2026-10-17 and 2026-10-18
+Review dates: 2026-10-17 through 2026-10-19 (UTC)
 
 This is a functional review of the supported Linux local-filesystem workflows,
 not a claim that mcpp is a complete MC clone. Archive, SSH/SFTP, Azure, and
@@ -15,6 +15,8 @@ E01-E05 and shared limitation U03. The original regression results do not imply
 complete MC parity. The subsequent 100-case investigation below records new
 F01-F07 and shared limitation U04. F01-F07 are now fixed by the seven-finding
 delivery below; U04 remains a shared limitation.
+The later walk against `4333955` records open G01-G05 and shared limitation
+U05, plus additional text-viewer evidence for E02. Not all known issues are fixed.
 The eight broader capability groups remain a separate feature backlog; the
 explicitly paused providers and spelling remain paused.
 The source excerpts and line numbers in the historical audit sections describe the old
@@ -63,6 +65,87 @@ all four Go to modes, and correction after invalid percentage input.
 Successful terminal captures are retained in this session's
 `ui-fixes-20261018` artifacts. No new dependencies, sanitizers or optional
 profiling were used.
+
+## UI and usability follow-up (`4333955`)
+
+The previous fix delivery closed F01-F07, not the entire backlog. E01-E05
+remain open: linked-file hex saves, search origin, failed-wrap positioning,
+listing filename identification and final-byte progress. U03/U04 and the
+sort/hotlist capability gaps were not fixed by that delivery either.
+
+This round investigated **12 paired workflows** against the current Release and
+installed MC 4.8.30, with 24 canonical application records and 18 additional
+fresh-profile confirmation attempts. It found **five new mcpp bugs**, a shared
+MC limitation, and a text-mode extension of existing E02. It did not find 12
+passes, and it did not change product code.
+
+### New confirmed mcpp findings
+
+| ID | Priority | Failure and consequence | MC control and current code |
+|---|---|---|---|
+| G01 | P2 | Searching replaces a persistent block with the search hit. F8 then deletes the hit rather than the block the user marked. With a rectangle, the mark also changes from `C` to `B`. | UX-08/UX-09 saved exact differing bytes: mcpp removed `NEEDLE`; MC retained the original mark and removed `KEEP` or its marked columns. `EditorModel::find()` (`src/editor.cpp:1948-1956`) writes the found range into `selection_begin_`/`selection_end_` and clears column mode. |
+| G02 | P2 | Ordinary Down navigation can scroll a text viewer into a completely blank EOF viewport, even when the entire short file already fits. It also scrolls the final page of a longer file away. | UX-03/UX-04: MC retains the three visible lines or the final page containing `LAST`; mcpp shows no file rows. `ViewerModel::scroll_lines()` (`src/viewer.cpp:197-218`) advances to `offset_ == size_`, leaving no rows for `lines()` to render. |
+| G03 | P2 | Find results with the same basename under long differing parents render as identical paths. The user cannot tell which result will be activated. | UX-10: MC's grouped headings visibly retain `alpha` and `beta`; mcpp drops both parent tails. `path_label()` (`src/app.cpp:584`) keeps the beginning of the directory prefix plus the basename, and `render_search_results()` (`:6245`) uses it for each result. This is separate from E04's ordinary listing filename cells. |
+| G04 | P2 | Displayed editor-menu mnemonics are ignored. F9, `s`, Enter opens the File dropdown instead of Search. | UX-07: MC opens its Search dialog. The editor renders underlined category letters (`src/app.cpp:4558-4570`), but `handle_editor_menu()` (`:8406`) has no character dispatch. F03 fixed the separate main-menu handler, not this one. |
+| G05 | P3 | Clicking outside a main dropdown does not dismiss it, leaving the menu active until keyboard cancellation. | UX-05: a right-pane click closes MC's File menu but leaves mcpp's open. `handle_pulldown()` (`src/app.cpp:9753`) handles menu hits without cancelling an outside left press. The analogous editor outside-click control works in both programs. |
+
+G01 was checked using the actual saved bytes, not selection colors alone.
+For the linear fixture `KEEP and NEEDLE and TAIL\n`, F8/Save after searching
+produced `KEEP and  and TAIL\n` in mcpp versus ` and NEEDLE and TAIL\n` in MC.
+The rectangular fixture likewise removed the search hit only in mcpp, while
+MC removed the originally marked columns from both lines.
+
+### Existing finding extended, and shared limitation
+
+- **E02 also affects text repeat search.** UX-11 finds the first `HIT`, manually
+  scrolls to `ROW_060`, then repeats. mcpp jumps backwards to `ROW_050`; MC finds
+  `ROW_100` ahead. `src/viewer.cpp:829-830` chooses cached
+  `next_search_offset_` without accounting for the manually viewed region.
+  This is additional coverage of E02, not a sixth new mcpp finding.
+- **U05, P2 shared limitation:** successful text search does not reveal a far
+  match on a long logical line in either program. UX-01/UX-02 place `NEEDLE`
+  at byte 6506; wrapped and unwrapped searches leave it outside the viewport.
+  Normal search was explicitly selected, and no error modal remained.
+  mcpp resets to the logical line start and horizontal column zero
+  (`src/viewer.cpp:894-916`). Reference MC has the analogous line-start path
+  in `src/viewer/move.c:396-414`, whose scroll-to-cursor helper (`:73-90`) only
+  handles hex mode. This is an improvement opportunity, not a mcpp-only
+  parity regression.
+
+### Workflow outcomes and evidence
+
+| Case | Outcome | Observation |
+|---|---|---|
+| UX-01 | U05 shared | Wrapped far match stays offscreen in both programs. |
+| UX-02 | U05 shared | Unwrapped far match stays offscreen in both programs. |
+| UX-03 | G02 | Short-file Down scrolling reaches a blank mcpp viewport. |
+| UX-04 | G02 | Down after the final page hides all mcpp file rows. |
+| UX-05 | G05 | Outside click leaves the main dropdown open only in mcpp. |
+| UX-06 | No new failure | Both dismiss the editor menu on an outside click. |
+| UX-07 | G04 | Editor mnemonic selects the wrong subsequent menu/action only in mcpp. |
+| UX-08 | G01 | Search retargets the persistent linear block; exact F8/Save bytes differ. |
+| UX-09 | G01 | Search replaces the rectangle with a linear hit; exact F8/Save bytes differ. |
+| UX-10 | G03 | Same-basename Find parents are distinguishable in MC, not mcpp. |
+| UX-11 | E02 extension | Text repeat search ignores the manually advanced region in mcpp. |
+| UX-12 | No new failure | Both retain the current match and text after cancelling a new query. |
+
+Every new finding was repeated with fresh fixtures/profiles. The canonical
+result/action JSON, ANSI/text captures, file metadata and saved byte outcomes
+are retained in this session's `usability-followup-4333955/evidence/`.
+All 12 paired screenshots and the additional before-delete rectangular-mark
+comparison were opened and inspected; their selected sources are recorded in
+`screenshot-manifest.json`. `case-results.json` groups the seven new mcpp-only
+workflow failures into five bugs rather than counting duplicates; the shared
+limitation and existing E02 extension remain separate.
+
+Both binaries ran as UID 1001 in an owned Linux/arm64 disposable container with
+no host mounts or network. Test setup copied the installed MC runtime/resources
+after its missing-library preflight failure; no project dependencies or packages
+were installed. The normal Release SHA-256 remained
+`17f624e181db734b9d2300100fb7ed9d2ebf049e4992b8831c6b564b1a4929d9`;
+MC 4.8.30's was `35a55f42a97c6685b950539d9ce1bcc9959be1049bc0cbb89d1525025fc4a7c8`.
+No sanitizer, profiling or optional stress run was used. The earlier five
+E findings and the original 100-case count were not counted again.
 
 ## Seven-finding fix delivery
 
