@@ -113,6 +113,38 @@ the accepted directory, and the sidebar-selection/cache workflow passes.
 The container runners use Docker's init process to reap orphaned terminal-test
 children rather than exhausting their PID limit on a long sequence of sessions.
 
+### Skin collection
+
+The additional skin request expands the built-in collection from two to sixteen:
+classic blue, grayscale, Amber, Cobalt, Contrast, Ember, Forest, Graphite, Green,
+Ice, Midnight, Ocean, Paper, Plum, Rose, and Sand. Three are light palettes;
+Amber and Green also tint syntax colors. The grayscale default is unchanged.
+
+Panes, Tree, menus, dialogs, hints, key bars, viewer, diff, editor selections,
+and syntax use the selected palette instead of fixed gray colors. Appearance
+keeps the native skin list, immediate preview, OK/Cancel, and shadow controls.
+Cancel restores both the saved skin and any launch-only override. `-S` /
+`--skin` works in all four executables without replacing the saved preference.
+Unknown names fail explicitly. Capability-specific caches retain valid palette
+references when the terminal changes its reported color depth.
+
+Classic blue's marked active selection now uses black text on cyan instead of
+the previous low-contrast yellow; inactive selection uses light text on blue.
+The active marked and inactive text contrast ratios improve from 1.31:1 and
+3.33:1 to 6.54:1 and 5.43:1 respectively.
+
+The normal Release suite passed **25/25** entries. The skin workflows check all
+sixteen palettes in panels, viewer, dialogs and editor, including marked and
+inactive selections, readable syntax, unchanged document bytes, saved setup,
+preview cancellation, all four CLI frontends, and transient overrides. Sampled
+normal text, selections, dialog text and syntax meet a 4.5:1 contrast check.
+Sixty-four real terminal captures were rendered into panel/editor and dialog
+galleries and inspected.
+
+This completes the extra built-in-skins request, not L23 in full. MC-format skin
+files and filename-highlighting compatibility remain open. In total,
+31 baseline local work packages remain open.
+
 ## Audit fix delivery
 
 The original 41 findings (A01-A16, B01-B11, C01-C10, H01-H03 and U01) were fixed

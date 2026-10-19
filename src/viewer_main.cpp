@@ -3,6 +3,7 @@
 
 #include <filesystem>
 #include <iostream>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -11,6 +12,7 @@
 int main(const int argc, char** argv) {
     try {
         std::vector<std::string> files;
+        std::optional<std::string> skin;
         bool options = true;
         for (int index = 1; index < argc; ++index) {
             const std::string argument(argv[index]);
@@ -19,6 +21,7 @@ int main(const int argc, char** argv) {
                           << "Usage: mcppview [options] file\n"
                           << "  -h, --help     Show this help\n"
                           << "  -V, --version  Show the version\n"
+                          << "  -S, --skin <name>  Select a skin for this run\n"
                           << "  --             Treat remaining arguments as file names\n";
                 return 0;
             }
@@ -27,12 +30,18 @@ int main(const int argc, char** argv) {
                 return 0;
             }
             if (options && argument == "--") options = false;
+            else if (options && (argument == "-S" || argument == "--skin")) {
+                if (++index >= argc) throw std::invalid_argument(argument + " requires a value");
+                skin = argv[index];
+            }
+            else if (options && argument.starts_with("--skin=")) skin = argument.substr(7);
             else if (options && argument.starts_with('-')) throw std::invalid_argument("unknown option: " + argument);
             else if (argument.empty()) throw std::invalid_argument("file name is empty");
             else files.push_back(argument);
         }
         if (files.size() != 1U) throw std::invalid_argument("expected one file; use --help for usage");
         auto config = mcpp::Config::load(mcpp::default_config_path());
+        config.theme_override = std::move(skin);
         const auto current = std::filesystem::current_path().string();
         mcpp::App app(current, current, std::move(config));
         app.open_viewer(files.front());

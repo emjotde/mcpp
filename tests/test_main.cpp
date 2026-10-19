@@ -7,9 +7,12 @@
 #include "mcpp/operations.hpp"
 #include "mcpp/pane.hpp"
 #include "mcpp/search.hpp"
+#include "mcpp/skin.hpp"
 #include "mcpp/syntax.hpp"
 #include "mcpp/user_menu.hpp"
 #include "mcpp/viewer.hpp"
+
+#include <ftxui/screen/terminal.hpp>
 
 #include <algorithm>
 #include <atomic>
@@ -2767,6 +2770,64 @@ void test_viewer_editor() {
     );
 }
 
+void test_skins() {
+    struct RestoreColorSupport {
+        ftxui::Terminal::Color previous{ftxui::Terminal::ColorSupport()};
+        ~RestoreColorSupport() { ftxui::Terminal::SetColorSupport(previous); }
+    } restore;
+    ftxui::Terminal::SetColorSupport(ftxui::Terminal::Color::TrueColor);
+    const auto& skins = mcpp::builtin_skins();
+    check(skins.size() == 16U, "sixteen independently authored skins");
+    std::vector<std::string> ids;
+    for (const auto& skin : skins) {
+        check(!skin.id.empty() && !skin.label.empty(), "skin identity and label");
+        check(std::ranges::find(ids, skin.id) == ids.end(), "unique skin identity");
+        for (const auto* pair : {&skin.normal, &skin.menu, &skin.menu_selected, &skin.dialog,
+                                &skin.error, &skin.selected, &skin.marked_selected,
+                                &skin.inactive_selected, &skin.inactive_marked_selected,
+                                &skin.search, &skin.viewer_cursor, &skin.hint,
+                                &skin.key_number, &skin.key_label, &skin.progress, &skin.diff_changed}) {
+            check(pair->foreground != pair->background, "text and background colors differ");
+        }
+        for (const auto& previous : ids) {
+            check(mcpp::find_skin(previous).normal.background != skin.normal.background,
+                  "each skin has a distinct base background");
+        }
+        check(&mcpp::find_skin(skin.id) == &skin, "skin lookup retains the registered palette");
+        ids.push_back(skin.id);
+    }
+    check(std::ranges::count_if(skins, [](const auto& skin) { return skin.light; }) == 3,
+          "paper, sand and ice provide light palettes");
+    check(mcpp::find_skin("gray").id == "grayscale" &&
+          mcpp::find_skin("type-colors").id == "grayscale" &&
+          mcpp::find_skin("blue").id == "default", "legacy skin aliases remain accepted");
+    check(mcpp::find_skin("grayscale").normal.background == ftxui::Color(ftxui::Color::Grey3) &&
+          mcpp::find_skin("grayscale").dialog.background == ftxui::Color(ftxui::Color::Grey82),
+          "the grayscale default retains its existing colors");
+    bool rejected = false;
+    try {
+        static_cast<void>(mcpp::find_skin("not-a-skin"));
+    } catch (const std::invalid_argument&) {
+        rejected = true;
+    }
+    check(rejected, "unknown skins do not silently fall back");
+    ftxui::Terminal::SetColorSupport(ftxui::Terminal::Color::Palette256);
+    const auto& reduced = mcpp::builtin_skins();
+    check(reduced.size() == skins.size() && &reduced != &skins,
+          "palettes adapt when terminal color capabilities change");
+    ftxui::Terminal::SetColorSupport(ftxui::Terminal::Color::TrueColor);
+    check(&mcpp::builtin_skins() == &skins && mcpp::find_skin("paper").light,
+          "cached palettes and their references remain valid across capability changes");
+    TemporaryDirectory temporary;
+    mcpp::Config config;
+    config.theme = "forest";
+    config.theme_override = "paper";
+    config.save(temporary.path() / "skin-config");
+    const auto restored = mcpp::Config::load(temporary.path() / "skin-config");
+    check(restored.theme == "forest" && !restored.theme_override,
+          "a launch-only skin override does not replace the saved preference");
+}
+
 void test_config() {
     TemporaryDirectory temporary;
     const auto path = temporary.path() / "config";
@@ -3351,6 +3412,7 @@ int main() {
         {"viewer Home/End", test_viewer_home_end},
         {"viewer/editor", test_viewer_editor},
         {"config", test_config},
+        {"skins", test_skins},
         {"editor clipboard", test_editor_clipboard},
         {"search/compare", test_search_compare},
         {"syntax", test_syntax},

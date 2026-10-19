@@ -95,6 +95,8 @@ struct Config {
     bool safe_overwrite{false};
     bool auto_save_setup{true};
     std::string theme{"grayscale"};
+    // Launch-only; the saved theme is unchanged.
+    std::optional<std::string> theme_override;
     bool shadows{true};
     bool editor_syntax{true};
     bool editor_line_numbers{false};

@@ -7,6 +7,7 @@
 #include "mcpp/location.hpp"
 #include "mcpp/listing.hpp"
 #include "mcpp/search.hpp"
+#include "mcpp/skin.hpp"
 #include "mcpp/spelling.hpp"
 #include "mcpp/syntax.hpp"
 #include "mcpp/terminal_input.hpp"
@@ -886,7 +887,7 @@ ftxui::Element native_window(const std::string& title, ftxui::Element body, cons
 
 class DialogShadow final : public ftxui::Node {
 public:
-    explicit DialogShadow(ftxui::Element child) : Node({std::move(child)}) {}
+    DialogShadow(ftxui::Element child, ftxui::Color color) : Node({std::move(child)}), color_(color) {}
     void SetBox(ftxui::Box box) override {
         Node::SetBox(box);
         children_.front()->SetBox(box);
@@ -896,13 +897,15 @@ public:
             for (int column = box_.x_min + 2; column <= box_.x_max + 2; ++column) {
                 auto& cell = screen.CellAt(column, row);
                 cell.character = " ";
-                cell.foreground_color = ftxui::Color::Grey11;
-                cell.background_color = ftxui::Color::Grey11;
+                cell.foreground_color = color_;
+                cell.background_color = color_;
                 cell.automerge = false;
             }
         }
         Node::Render(screen);
     }
+private:
+    ftxui::Color color_;
 };
 
 std::string type_prefix(const Entry& entry) {
@@ -925,13 +928,6 @@ bool can_open_file(const Entry& entry) {
                entry.kind == EntryKind::symlink &&
                !entry.target_is_directory
            );
-}
-
-ftxui::Element gray_dialog(ftxui::Element element) {
-    using namespace ftxui;
-    return std::move(element) |
-           color(Color::Grey11) |
-           bgcolor(Color::Grey82);
 }
 
 ftxui::Element mnemonic_label(
@@ -1005,61 +1001,6 @@ ftxui::Element render_viewer_text(
         segments.push_back(std::move(segment));
     }
     return hbox(std::move(segments));
-}
-
-ftxui::Element gray_menu(ftxui::Element element) {
-    using namespace ftxui;
-    return std::move(element) |
-           color(Color::Grey11) |
-           bgcolor(Color::Grey78);
-}
-
-ftxui::Element gray_selected(
-    ftxui::Element element,
-    const bool marked,
-    const bool active
-) {
-    using namespace ftxui;
-    const auto foreground =
-        active ? Color::Grey0 : Color::Grey93;
-    const auto background =
-        active ? Color::Grey85 : Color::Grey27;
-    auto result = std::move(element) |
-                  color(foreground) |
-                  bgcolor(background);
-    return marked ? result | bold : result;
-}
-
-ftxui::Element gray_entry(
-    ftxui::Element element,
-    const Entry& entry,
-    const bool type_colors = false
-) {
-    using namespace ftxui;
-    if (entry.kind == EntryKind::directory) {
-        return std::move(element) |
-               color(type_colors ? Color::RGB(95, 160, 255) : Color::Grey100);
-    }
-    if (entry.kind == EntryKind::symlink) {
-        return std::move(element) |
-               color(type_colors ? Color::RGB(95, 215, 215) : Color::Grey66);
-    }
-    if (entry.kind == EntryKind::other) {
-        return std::move(element) | color(Color::Grey46);
-    }
-    const auto executable =
-        (
-            entry.permissions &
-            (
-                std::filesystem::perms::owner_exec |
-                std::filesystem::perms::group_exec |
-                std::filesystem::perms::others_exec
-            )
-        ) != std::filesystem::perms::none;
-    return executable
-               ? std::move(element) |
-                     color(type_colors ? Color::RGB(95, 215, 135) : Color::Grey100) | underlined
-               : std::move(element) | color(Color::Grey85);
 }
 
 std::string permission_text(const Entry& entry) {
@@ -1251,6 +1192,7 @@ struct App::Impl {
     bool terminal_title_pushed{false};
     std::string appearance_skin;
     std::string appearance_original_skin;
+    std::optional<std::string> appearance_original_override;
     bool appearance_shadows{true};
     bool appearance_original_shadows{true};
     std::size_t appearance_focus{0};
@@ -1678,6 +1620,7 @@ struct App::Impl {
           right_location(open_location(right_path, local)),
           left(left_location.provider, left_location.path),
           right(right_location.provider, right_location.path) {
+        static_cast<void>(palette());
         user_menu = load_user_menu(default_user_menu_path());
         try {
             known_tree_directories = load_tree_cache(tree_cache_path());
@@ -1873,15 +1816,15 @@ struct App::Impl {
         ));
         function_key_enabled[index] = enabled && !label.empty();
         auto description = text(truncate_text(label, label_width)) |
-                           color(enabled ? Color::Grey85 : Color::Grey50) |
-                           bgcolor(Color::Grey11);
+                           color(enabled ? palette().key_label.foreground : palette().dim) |
+                           bgcolor(palette().key_label.background);
         if (!enabled) {
             description = description | dim;
         }
         return hbox({
                    text(number) |
-                       color(enabled ? Color::Grey0 : Color::Grey50) |
-                       bgcolor(Color::Grey85),
+                       color(enabled ? palette().key_number.foreground : palette().dim) |
+                       bgcolor(palette().key_number.background),
                    std::move(description) | flex,
                }) |
                size(WIDTH, EQUAL, key_width) |
@@ -2245,7 +2188,7 @@ struct App::Impl {
             rows.push_back(std::move(row));
         }
         auto extension = render_input(save_mode_extension, save_mode_extension_input, save_mode_focus == 1U, "");
-        if (save_mode_choice != 2U) extension = extension | dim | color(Color::Grey50);
+        if (save_mode_choice != 2U) extension = extension | dim | color(palette().dim);
         rows.push_back(hbox({text(" "), std::move(extension) | reflect(save_mode_boxes[3]), text(" ")}));
         rows.push_back(separator());
         auto check = hbox({text(save_mode_check_newline ? " [x] " : " [ ] "),
@@ -4749,7 +4692,7 @@ struct App::Impl {
                 const auto begin = editor_offset_for_width(content, diff_horizontal, diff_tab_size);
                 auto element = text(prefix + content.substr(begin));
                 if (aligned.hunk) {
-                    element = element | bgcolor(Color::Grey19) | color(Color::Grey93);
+                    element = paint(std::move(element), palette().diff_changed);
                     if (*aligned.hunk == diff_hunk) element = element | bold;
                 }
                 if (diff_search_match && diff_search_match->first == row && side == diff_order) element = element | inverted;
@@ -5808,21 +5751,53 @@ struct App::Impl {
         return ::mcpp::format_size(value, config.use_si_units);
     }
 
+    const std::string& skin_id() const {
+        return config.theme_override ? *config.theme_override : config.theme;
+    }
+
+    const Skin& palette() const {
+        return find_skin(skin_id());
+    }
+
+    ftxui::Element paint(ftxui::Element element, const SkinPair& colors) const {
+        return std::move(element) | ftxui::color(colors.foreground) | ftxui::bgcolor(colors.background);
+    }
+
+    ftxui::Element gray_dialog(ftxui::Element element) const {
+        return paint(std::move(element), palette().dialog);
+    }
+
     ftxui::Element gray_menu(ftxui::Element element) const {
-        if (config.theme != "default") return ::mcpp::gray_menu(std::move(element));
-        return std::move(element) | ftxui::color(ftxui::Color::Grey0) |
-               ftxui::bgcolor(ftxui::Color::RGB(0, 160, 160));
+        return paint(std::move(element), palette().menu);
     }
 
     ftxui::Element gray_selected(ftxui::Element element, const bool marked, const bool active) const {
-        if (config.theme != "default") return ::mcpp::gray_selected(std::move(element), marked, active);
-        return std::move(element) | ftxui::color(marked ? ftxui::Color(ftxui::Color::Yellow)
-                                                       : ftxui::Color(ftxui::Color::Grey0)) |
-               ftxui::bgcolor(active ? ftxui::Color::RGB(0, 160, 160) : ftxui::Color::RGB(0, 100, 160));
+        const auto& skin = palette();
+        auto selected = paint(std::move(element), active
+            ? (marked ? skin.marked_selected : skin.selected)
+            : (marked ? skin.inactive_marked_selected : skin.inactive_selected));
+        return marked ? selected | ftxui::bold : selected;
+    }
+
+    ftxui::Element gray_entry(ftxui::Element element, const Entry& entry, const bool type_colors) const {
+        using namespace ftxui;
+        const auto& skin = palette();
+        if (entry.kind == EntryKind::directory) {
+            return std::move(element) | color(type_colors ? Color::RGB(95, 160, 255) : skin.directory);
+        }
+        if (entry.kind == EntryKind::symlink) {
+            return std::move(element) | color(type_colors ? Color::RGB(95, 215, 215) : skin.symlink);
+        }
+        if (entry.kind == EntryKind::other) return std::move(element) | color(skin.special);
+        const bool executable = (entry.permissions & (std::filesystem::perms::owner_exec |
+            std::filesystem::perms::group_exec | std::filesystem::perms::others_exec)) != std::filesystem::perms::none;
+        return executable ? std::move(element) |
+            color(type_colors ? Color::RGB(95, 215, 135) : skin.executable) | underlined
+            : std::move(element) | color(skin.normal.foreground);
     }
 
     ftxui::Element with_dialog_shadow(ftxui::Element element) const {
-        return config.shadows ? std::make_shared<DialogShadow>(std::move(element)) : element;
+        return config.shadows ? std::make_shared<DialogShadow>(std::move(element), palette().shadow) : element;
     }
 
     std::string display_filename(const Pane& pane, const std::string_view value) const {
@@ -6123,7 +6098,7 @@ struct App::Impl {
             if (index == 1U) {
                 auto columns = render_input(listing_brief_value, listing_brief_input,
                                             listing_focus == 1U, "");
-                if (listing_choice != 1U) columns = columns | dim | color(Color::Grey50);
+                if (listing_choice != 1U) columns = columns | dim | color(palette().dim);
                 rows.push_back(hbox({
                     text(" "), label | size(WIDTH, EQUAL, 21),
                     columns | size(WIDTH, EQUAL, 13) | reflect(listing_boxes[4]),
@@ -6134,7 +6109,7 @@ struct App::Impl {
             }
         }
         auto user = render_input(listing_user_value, listing_user_input, listing_focus == 2U, "");
-        if (listing_choice != 3U) user = user | dim | color(Color::Grey50);
+        if (listing_choice != 3U) user = user | dim | color(palette().dim);
         rows.push_back(hbox({text(" "), std::move(user) | reflect(listing_boxes[5]), text(" ")}));
         rows.push_back(separator());
         auto mini = hbox({text(listing_user_mini ? "[x] " : "[ ] "),
@@ -6143,7 +6118,7 @@ struct App::Impl {
         rows.push_back(hbox({text(" "), std::move(mini) | reflect(listing_boxes[6])}));
         auto mini_input = render_input(listing_status_values[listing_choice], listing_status_input,
                                        listing_focus == 4U, "");
-        if (!listing_user_mini) mini_input = mini_input | dim | color(Color::Grey50);
+        if (!listing_user_mini) mini_input = mini_input | dim | color(palette().dim);
         rows.push_back(hbox({text(" "), std::move(mini_input) | reflect(listing_boxes[7]), text(" ")}));
         if (!listing_error.empty()) rows.push_back(text(display_text(listing_error)) | bold);
         return native_window("Listing format", vbox({
@@ -6435,8 +6410,9 @@ struct App::Impl {
             mode = Mode::confirmation_dialog;
         } else if (action == 24) {
             appearance_original_skin = config.theme;
+            appearance_original_override = config.theme_override;
             appearance_original_shadows = config.shadows;
-            appearance_skin = config.theme == "default" ? "< Default >" : "gray";
+            appearance_skin = palette().label;
             appearance_shadows = config.shadows;
             appearance_focus = 0;
             mode = Mode::appearance_dialog;
@@ -6470,7 +6446,7 @@ struct App::Impl {
         other_options.push_back(text(""));
         auto timeout = render_input(configure_timeout, configure_timeout_input, configure_focus == 18U, " Timeout: ") |
                        reflect(configure_boxes[18]);
-        if (!configure_values[5]) timeout = timeout | dim | color(Color::Grey50);
+        if (!configure_values[5]) timeout = timeout | dim | color(palette().dim);
         static const std::array<std::string, 3> pause_labels{"Never", "On dumb terminals", "Always"};
         static constexpr std::array<std::size_t, 3> pause_keys{0,6,4};
         for (std::size_t index = 0; index < 3U; ++index) {
@@ -6615,18 +6591,26 @@ struct App::Impl {
     }
 
     void choose_skin() {
-        show_local_list("Skins", {"< Default >", "gray"}, [this](const std::size_t selected) {
-            appearance_skin = selected == 0U ? "< Default >" : "gray";
-            config.theme = selected == 0U ? "default" : "grayscale";
+        const auto& skins = builtin_skins();
+        std::vector<std::string> names;
+        for (const auto& skin : skins) names.push_back(skin.label);
+        const auto current = palette().id;
+        show_local_list("Skins", std::move(names), [this](const std::size_t selected) {
+            const auto& skin = builtin_skins().at(selected);
+            appearance_skin = skin.label;
+            config.theme = skin.id;
+            config.theme_override.reset();
         }, Mode::appearance_dialog);
         local_list_native = true;
-        local_list_cursor = appearance_skin == "gray" ? 1U : 0U;
+        local_list_cursor = static_cast<std::size_t>(
+            std::ranges::find(skins, current, &Skin::id) - skins.begin());
     }
 
     bool handle_appearance(const ftxui::Event& event) {
         using namespace ftxui;
         if (modal_cancel(event)) {
             config.theme = appearance_original_skin;
+            config.theme_override = appearance_original_override;
             config.shadows = appearance_original_shadows;
             mode = Mode::panels;
             return true;
@@ -6670,7 +6654,7 @@ struct App::Impl {
         return native_window("Display bits", vbox({
             hbox({text(" Input / display codepage: "), std::move(codepage), filler()}),
             separator(),
-            hbox({text(" [x] "), mnemonic_label("Full 8 bits input", 1)}) | dim | color(Color::Grey50),
+            hbox({text(" [x] "), mnemonic_label("Full 8 bits input", 1)}) | dim | color(palette().dim),
             separator(),
             hbox({native_button("OK", true, display_bits_focus == 1U, display_bits_boxes[1]), text(" "),
                   native_button("Cancel", false, display_bits_focus == 2U, display_bits_boxes[2])}) | center,
@@ -6854,8 +6838,8 @@ struct App::Impl {
         auto decrease = text("[<]") | reflect(layout_boxes[3]);
         auto increase = text("[>]") | reflect(layout_boxes[4]);
         if (layout_equal) {
-            decrease = decrease | dim | color(Color::Grey50);
-            increase = increase | dim | color(Color::Grey50);
+            decrease = decrease | dim | color(palette().dim);
+            increase = increase | dim | color(palette().dim);
         } else {
             if (layout_focus == 2U) decrease = decrease | inverted | focus;
             if (layout_focus == 3U) increase = increase | inverted | focus;
@@ -6866,7 +6850,7 @@ struct App::Impl {
             hbox({text(" " + count(split_size)), decrease, text(" = "), increase, text(count(total - split_size))}),
         }), LIGHT) | size(WIDTH, EQUAL, 26);
         auto console = window(text(" Console output "),
-            text(" Output lines:[+]00[-]") | dim | color(Color::Grey50), LIGHT) | size(WIDTH, EQUAL, 26);
+            text(" Output lines:[+]00[-]") | dim | color(palette().dim), LIGHT) | size(WIDTH, EQUAL, 26);
         static const std::array<std::string, 6> labels{
             "Menubar visible", "Command prompt", "Keybar visible", "Hintbar visible",
             "XTerm window title", "Show free space"
@@ -8903,9 +8887,9 @@ struct App::Impl {
             if (index == pane.cursor()) {
                 row = gray_selected(std::move(row), pane.is_selected(entry), focused);
             } else {
-                row = config.highlight_file_types ? gray_entry(std::move(row), entry, config.theme == "type-colors")
-                                                  : std::move(row) | color(Color::Grey85);
-                if (config.highlight_file_types && config.theme == "type-colors") {
+                row = config.highlight_file_types ? gray_entry(std::move(row), entry, skin_id() == "type-colors")
+                                                  : std::move(row) | color(palette().normal.foreground);
+                if (config.highlight_file_types && skin_id() == "type-colors") {
                     for (const auto& [pattern, foreground] : highlight_rules) {
                         if (EditorSearch::filename_matches(entry.name, pattern, true)) {
                             row = row | color(foreground);
@@ -8913,7 +8897,7 @@ struct App::Impl {
                         }
                     }
                 }
-                if (pane.is_selected(entry)) row = row | bold | color(Color::Grey100);
+                if (pane.is_selected(entry)) row = row | bold | color(palette().bright);
             }
             return std::move(row) | reflect(entry_boxes[index]);
         };
@@ -8978,11 +8962,11 @@ struct App::Impl {
             )
         ) + " ");
         if (focused) {
-            title = title | color(Color::Grey100) | bold;
+            title = title | color(palette().bright) | bold;
         } else {
-            title = title | color(Color::Grey58);
+            title = title | color(palette().inactive_title);
         }
-        Elements panel_rows{hbox(std::move(headers)) | color(Color::Grey93) | bold,
+        Elements panel_rows{hbox(std::move(headers)) | color(palette().column_header) | bold,
                             vbox(std::move(rows)) | flex};
         if (config.show_mini_status) {
             panel_rows.push_back(separator());
@@ -8995,7 +8979,7 @@ struct App::Impl {
             available = middle_truncate(available, static_cast<std::size_t>(panel_width_value - 6));
             framed = dbox({framed, vbox({
                 filler(),
-                hbox({filler(), text(" " + available + " ") | color(Color::Grey50),
+                hbox({filler(), text(" " + available + " ") | color(palette().dim),
                       filler() | size(WIDTH, EQUAL, 1)}),
             })});
         }
@@ -9144,9 +9128,7 @@ struct App::Impl {
             });
         }
         return vbox({
-            std::move(header) |
-                color(Color::Grey11) |
-                bgcolor(Color::Grey62),
+            paint(std::move(header), palette().viewer_cursor),
             vbox(std::move(elements)) | flex,
             hbox({
                 text(" "),
@@ -9223,30 +9205,30 @@ struct App::Impl {
                borderStyled(LIGHT) |
                size(WIDTH, LESS_THAN, 52);
     }
-    static ftxui::Element style_syntax(
+    ftxui::Element style_syntax(
         ftxui::Element element,
         const SyntaxStyle style
-    ) {
+    ) const {
         using namespace ftxui;
         switch (style) {
             case SyntaxStyle::keyword:
                 return std::move(element) |
-                       color(Color::RGB(86, 156, 214)) | bold;
+                       color(palette().syntax[1]) | bold;
             case SyntaxStyle::type:
                 return std::move(element) |
-                       color(Color::RGB(78, 201, 176));
+                       color(palette().syntax[2]);
             case SyntaxStyle::string_literal:
                 return std::move(element) |
-                       color(Color::RGB(206, 145, 120));
+                       color(palette().syntax[3]);
             case SyntaxStyle::comment:
                 return std::move(element) |
-                       color(Color::RGB(106, 153, 85)) | italic;
+                       color(palette().syntax[4]) | italic;
             case SyntaxStyle::number:
                 return std::move(element) |
-                       color(Color::RGB(181, 206, 168));
+                       color(palette().syntax[5]);
             case SyntaxStyle::preprocessor:
                 return std::move(element) |
-                       color(Color::RGB(197, 134, 192)) | bold;
+                       color(palette().syntax[6]) | bold;
             case SyntaxStyle::normal:
                 return element;
         }
@@ -9413,20 +9395,19 @@ struct App::Impl {
                                 ? displayed.substr(0U, 1U)
                                 : " "
                         ) |
-                        color(Color::Grey0) |
-                        bgcolor(Color::Grey85) |
+                        color(palette().selected.foreground) |
+                        bgcolor(palette().selected.background) |
                         bold
                     )
                 );
                 if (displayed.size() > 1U) {
                     auto remainder = text(displayed.substr(1U));
                     if (matched) {
-                        remainder = remainder | color(Color::Grey0) |
-                                    bgcolor(Color::Grey62) | bold;
+                        remainder = paint(std::move(remainder), palette().search) | bold;
                     } else if (selected) {
                         remainder = remainder |
-                                    color(Color::Grey0) |
-                                    bgcolor(Color::Grey85);
+                                    color(palette().selected.foreground) |
+                                    bgcolor(palette().selected.background);
                     }
                     segments.push_back(std::move(remainder));
                 }
@@ -9437,16 +9418,16 @@ struct App::Impl {
             if (cursor) {
                 segment = focusCursorBlock(
                     segment |
-                    color(Color::Grey0) |
-                    bgcolor(Color::Grey85) |
+                    color(palette().selected.foreground) |
+                    bgcolor(palette().selected.background) |
                     bold
                 );
             } else if (matched) {
-                segment = segment | color(Color::Grey0) | bgcolor(Color::Grey62) | bold;
+                segment = paint(std::move(segment), palette().search) | bold;
             } else if (selected) {
                 segment = segment |
-                          color(Color::Grey0) |
-                          bgcolor(Color::Grey85);
+                          color(palette().selected.foreground) |
+                          bgcolor(palette().selected.background);
             } else if (editor_syntax && index < syntax_spans.size()) {
                 while (syntax_index < syntax_spans[index].size() &&
                        syntax_spans[index][syntax_index].end <= begin) {
@@ -9495,9 +9476,9 @@ struct App::Impl {
             if (end <= begin) continue;
             auto cell = text(std::string(end - begin, ' '));
             if (virtual_cursor && begin == *virtual_cursor) {
-                cell = focusCursorBlock(cell | color(Color::Grey0) | bgcolor(Color::Grey85) | bold);
+                cell = focusCursorBlock(paint(std::move(cell), palette().selected) | bold);
             } else if (virtual_mark && begin >= virtual_mark->first && begin < virtual_mark->second) {
-                cell = cell | color(Color::Grey0) | bgcolor(Color::Grey85);
+                cell = paint(std::move(cell), palette().selected);
             }
             segments.push_back(std::move(cell));
         }
@@ -9511,7 +9492,7 @@ struct App::Impl {
         }
         return hbox({
             text(std::to_string(index + 1U)) |
-                color(Color::Grey50) |
+                color(palette().dim) |
                 size(WIDTH, EQUAL, 6),
             std::move(content),
         });
@@ -9583,10 +9564,7 @@ struct App::Impl {
                 editor_menu_mnemonics[index]
             );
             if (mode == Mode::editor_menu && index == editor_menu_category) {
-                item = item |
-                       color(Color::Grey100) |
-                       bgcolor(Color::Grey23) |
-                       bold;
+                item = paint(std::move(item), palette().menu_selected) | bold;
             }
             menu.push_back(
                 std::move(item) | reflect(editor_menu_category_boxes[index])
@@ -9820,7 +9798,7 @@ struct App::Impl {
             }
             auto row = menu_row_label(items[index]);
             if (items[index].action < 0) {
-                row = row | color(Color::Grey66) | dim;
+                row = row | color(palette().disabled) | dim;
             }
             if (index == editor_menu_item) {
                 row = row | inverted | focus;
@@ -9999,7 +9977,7 @@ struct App::Impl {
 
     ftxui::Element render_editor_error() {
         using namespace ftxui;
-        return vbox({
+        return paint(vbox({
                    text(editor_message_title) | bold | center,
                    separator(),
                    paragraph(display_text(editor_error_message)),
@@ -10007,9 +9985,7 @@ struct App::Impl {
                    dialog_button("OK", true, message_button_box) | center,
                }) |
                borderStyled(LIGHT) |
-               size(WIDTH, LESS_THAN, 72) |
-               color(Color::Grey100) |
-               bgcolor(Color::Grey19);
+               size(WIDTH, LESS_THAN, 72), palette().error);
     }
 
     ftxui::Element render_editor_search_dialog() {
@@ -10458,7 +10434,7 @@ struct App::Impl {
             }
             auto row = menu_row_label(items[index]);
             if (items[index].action < 0) {
-                row = row | color(Color::Grey66) | dim;
+                row = row | color(palette().disabled) | dim;
             }
             if (index == pulldown_item) {
                 row = row | inverted | focus;
@@ -11090,17 +11066,13 @@ struct App::Impl {
                        format_size(current.bytes_done) + " / " +
                        format_size(current.bytes_total)
                    ),
-                   progress_bar(byte_ratio) |
-                       color(Color::Grey11) |
-                       bgcolor(Color::Grey70),
+                   paint(progress_bar(byte_ratio), palette().progress),
                    text(
                        "Files: " +
                        std::to_string(current.files_done) + " / " +
                        std::to_string(current.files_total)
                    ),
-                   progress_bar(file_ratio) |
-                       color(Color::Grey11) |
-                       bgcolor(Color::Grey70),
+                   paint(progress_bar(file_ratio), palette().progress),
                    text(
                        "Speed: " +
                        format_size(bytes_per_second) +
@@ -11401,9 +11373,9 @@ struct App::Impl {
             )) |
             bold;
         if (quick_view_focused) {
-            title = title | color(Color::Grey100);
+            title = title | color(palette().bright);
         } else {
-            title = title | color(Color::Grey58);
+            title = title | color(palette().inactive_title);
         }
         const auto percent =
             quick_viewer.size() == 0U
@@ -11433,7 +11405,7 @@ struct App::Impl {
                         std::to_string(percent) + "%"
                     ),
                 }) |
-                    color(Color::Grey50),
+                    color(palette().dim),
             })
         );
     }
@@ -11506,8 +11478,8 @@ struct App::Impl {
         }
         auto title = text(" Info ");
         title = information_panel_focused
-                    ? title | color(Color::Grey100) | bold
-                    : title | color(Color::Grey58);
+                    ? title | color(palette().bright) | bold
+                    : title | color(palette().inactive_title);
         return window(
                    std::move(title),
                    vbox(std::move(rows)),
@@ -11637,7 +11609,7 @@ struct App::Impl {
                 row = row | focus;
                 row = modal || tree_panel_focused
                           ? row | inverted
-                          : row | color(Color::Grey70);
+                          : row | color(palette().inactive_tree);
             }
             rows.push_back(
                 std::move(row) | reflect(boxes[index])
@@ -11661,9 +11633,9 @@ struct App::Impl {
         auto title_text = text(" Directory tree ");
         title_text = tree_panel_focused
                          ? title_text |
-                               color(Color::Grey100) |
+                               color(palette().bright) |
                                bold
-                         : title_text | color(Color::Grey58);
+                         : title_text | color(palette().inactive_title);
         auto title = hbox({
                          filler(),
                          std::move(title_text),
@@ -11685,7 +11657,7 @@ struct App::Impl {
                                  )
                                : std::string{}
                        ) |
-                           color(Color::Grey50),
+                           color(palette().dim),
                    }),
                    LIGHT
                ) |
@@ -11915,10 +11887,7 @@ struct App::Impl {
             );
             if (mode == Mode::pulldown &&
                 index == pulldown_category) {
-                item = item |
-                       color(Color::Grey100) |
-                       bgcolor(Color::Grey23) |
-                       bold;
+                item = paint(std::move(item), palette().menu_selected) | bold;
             }
             menu_elements.push_back(
                 std::move(item) | reflect(top_menu_boxes[index])
@@ -12045,7 +12014,7 @@ struct App::Impl {
         if (config.menubar_visible) screen_rows.push_back(main_menubar);
         screen_rows.push_back(body | flex);
         if (config.hintbar_visible) {
-            screen_rows.push_back(text(display_text(hint)) | color(Color::Grey11) | bgcolor(Color::Grey62));
+            screen_rows.push_back(paint(text(display_text(hint)), palette().hint));
         }
         if (command_prompt_shown()) {
             screen_rows.push_back(render_input(
@@ -12479,9 +12448,7 @@ struct App::Impl {
                 positioned_menu,
             });
         }
-        return document |
-               color(Color::Grey85) |
-               bgcolor(config.theme == "default" ? Color::RGB(0, 0, 128) : Color::Grey3);
+        return paint(std::move(document), palette().normal);
     }
 
     bool handle_prompt(const ftxui::Event& event) {

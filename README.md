@@ -33,8 +33,8 @@ Azure Blob Storage through azcpp. SSH/SFTP work is currently paused.
 - Directory comparison plus fixed-width Quick view and live Info panels
 - Local command line, history, and a disposable interactive child shell
 - Persisted panel paths and preferences
-- MC-style visual state cues using a grayscale-only palette
-- Toggleable VS Code Dark+-style syntax colors within grayscale UI chrome
+- MC-style visual state cues, a grayscale default, and 16 selectable skins
+- Toggleable syntax colors adapted to dark, light, and monochrome skins
 - Toggleable editor line-number gutter and mcedit-style position header
 - Persisted editor tab width, indentation, auto-indent, and whitespace markers
 - Persistent linear/column blocks and atomic cross-session editor clipboard
@@ -239,8 +239,9 @@ Configuration, Layout, Confirmation, Appearance, Learn keys, Chattr, Advanced
 chown, and editor Save mode use reference controls rather than generic
 substitute options. Layout's split buttons display actual columns or rows, not
 percentages. Hidden command input cannot execute an invisible draft.
-Appearance currently provides independently implemented gray and default-blue
-skins and optional dialog shadows.
+Appearance provides 16 independently authored skins and optional dialog shadows.
+The native skin list previews a selected palette; Cancel restores both the
+original skin and shadows.
 
 The terminal renderer requires UTF-8. Display bits reports that fixed terminal
 mode; legacy non-UTF-8 terminal output and 7-bit input are not implemented.
@@ -261,6 +262,36 @@ The supported syntax choices and mcpp's rule/configuration file formats are
 not MC's complete syntax database or configuration-file compatibility layer.
 Remote providers remain explicitly paused. Local archive/VFS and persistent-shell
 work are tracked separately from these local menu controls.
+
+## Skins
+
+Choose **Options / Appearance / Skin** and accept with OK. Saved setup restores
+the choice on the next launch. Grayscale remains the default.
+
+| Style | Skin names |
+|---|---|
+| Dark | `default` (classic blue), `midnight`, `graphite`, `cobalt`, `ocean`, `forest`, `plum`, `rose`, `ember` |
+| Light | `paper`, `sand`, `ice` |
+| Grayscale / terminal | `grayscale` (shown as `gray`), `amber`, `green` |
+| High contrast | `contrast` |
+
+Skins color the panes, menus, dialogs, key bars, Tree, viewer, diff, and editor.
+Light skins use darker syntax colors; Amber and Green tint syntax as well as
+the surrounding UI. Grayscale retains its optional Dark+-style syntax colors.
+Palette selection follows the terminal's reported color capabilities.
+
+All four executables also accept a launch-only override:
+
+```bash
+build/release/mcpp --skin midnight
+build/release/mcppedit -S paper source.cpp
+build/release/mcppview --skin=ocean document.txt
+build/release/mcppdiff --skin contrast old.cpp new.cpp
+```
+
+The command-line override does not replace the saved skin. An explicit skin
+choice in Appearance does. Unknown skin names are errors rather than silent
+fallbacks. `gray` and `blue` remain aliases for `grayscale` and `default`.
 
 ## Modal Tree and diff/merge
 
