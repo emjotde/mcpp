@@ -16924,7 +16924,7 @@ void App::open_viewer(const std::string& path) {
     impl_->mode = Mode::viewer;
 }
 
-void App::open_editor(const std::string& path) {
+void App::open_editor(const std::string& path, const std::size_t line) {
     const auto resolved =
         std::filesystem::path(path).is_absolute()
             ? path
@@ -16939,6 +16939,30 @@ void App::open_editor(const std::string& path) {
     );
     impl_->exit_after_editor = true;
     impl_->mode = Mode::editor;
+    if (line != 0U) {
+        impl_->editor.goto_line(line);
+        impl_->editor.home();
+        impl_->update_editor_view();
+    }
+}
+
+void App::open_editors(const std::vector<std::string>& paths, const std::size_t first_line) {
+    if (paths.empty()) throw std::invalid_argument("at least one editor file is required");
+    std::vector<std::string> unique;
+    const auto provider = impl_->active().provider();
+    for (const auto& path : paths) {
+        if (path.empty()) throw std::invalid_argument("file name is empty");
+        const auto resolved = provider->normalize(std::filesystem::path(path).is_absolute()
+            ? path : provider->join(impl_->active().path(), path));
+        if (std::ranges::find(unique, resolved) == unique.end()) unique.push_back(resolved);
+    }
+    for (const auto& path : unique) open_editor(path);
+    if (unique.size() > 1U) static_cast<void>(impl_->switch_editor_buffer(true));
+    if (first_line != 0U) {
+        impl_->editor.goto_line(first_line);
+        impl_->editor.home();
+        impl_->update_editor_view();
+    }
 }
 
 std::string App::active_path() const {

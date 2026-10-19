@@ -61,8 +61,28 @@ cmake --build build/release --parallel 12
 ctest --test-dir build/release --output-on-failure
 ```
 
-The binary remains in the selected build directory; installation is not
+The `mcpp` and `mcppedit` binaries remain in the selected build directory; installation is not
 required.
+
+## Standalone editor
+
+`mcppedit` opens the shared editor directly, without entering the file manager:
+
+```bash
+build/release/mcppedit document.txt
+build/release/mcppedit +120 source.cpp other.cpp
+build/release/mcppedit -- -draft.txt
+```
+
+This is a separate C++ executable, not a shell wrapper or an installed alias.
+It shares the editor, preferences, histories, clipboard, and save protections
+with `mcpp --edit`. Existing and new filenames are supported; a filename is
+required. Multiple files open as buffers in argument order, duplicate paths are
+opened once, and `+line` selects the starting line in the first file.
+Closing the final buffer or quitting exits the editor process. Help and version
+are available through `--help` and `--version`.
+
+## Testing
 
 When Python 3 and tmux are available, CMake also enables isolated terminal
 workflow tests. These check selection, navigation, dialogs, and persisted

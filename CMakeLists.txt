@@ -95,7 +95,13 @@ set_target_properties(mcpp PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_link_options(mcpp PRIVATE -pie)
 mcpp_target_defaults(mcpp)
 
-install(TARGETS mcpp RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+add_executable(mcppedit src/editor_main.cpp)
+target_link_libraries(mcppedit PRIVATE mcpp_ui)
+set_target_properties(mcppedit PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_link_options(mcppedit PRIVATE -pie)
+mcpp_target_defaults(mcppedit)
+
+install(TARGETS mcpp mcppedit RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 install(FILES LICENSE DESTINATION ${CMAKE_INSTALL_DOCDIR})
 install(
     FILES third_party/ftxui/LICENSE
@@ -274,6 +280,17 @@ if(MCPP_BUILD_TESTS)
                     ${CMAKE_CURRENT_BINARY_DIR}/native-completion-ui
             )
             set_tests_properties(mcpp_native_completion_ui PROPERTIES TIMEOUT 180)
+            add_test(
+                NAME mcpp_standalone_editor
+                COMMAND
+                    ${MCPP_PYTHON_EXECUTABLE}
+                    -B
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_mcppedit.py
+                    $<TARGET_FILE:mcppedit>
+                    ${MCPP_TMUX_EXECUTABLE}
+                    ${CMAKE_CURRENT_BINARY_DIR}/standalone-editor-ui
+            )
+            set_tests_properties(mcpp_standalone_editor PROPERTIES TIMEOUT 90)
             add_test(
                 NAME mcpp_audit_ui
                 COMMAND

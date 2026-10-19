@@ -9,6 +9,7 @@
 #include <filesystem>
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace mcpp {
 
@@ -25,7 +26,8 @@ public:
     App& operator=(const App&) = delete;
 
     void open_viewer(const std::string& path);
-    void open_editor(const std::string& path);
+    void open_editor(const std::string& path, std::size_t line = 0);
+    void open_editors(const std::vector<std::string>& paths, std::size_t first_line = 0);
     [[nodiscard]] std::string active_path() const;
     int run();
 
