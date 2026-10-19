@@ -4,6 +4,7 @@
 
 #include <cstddef>
 #include <filesystem>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -52,7 +53,8 @@ private:
     const std::vector<std::string>& arguments,
     const std::filesystem::path& directory,
     const Cancellation& cancellation = {},
-    std::size_t limit = 64U * 1024U * 1024U
+    std::size_t limit = 64U * 1024U * 1024U,
+    std::optional<std::filesystem::path> input = std::nullopt
 );
 [[nodiscard]] CommandOutput capture_shell(
     std::string_view command,

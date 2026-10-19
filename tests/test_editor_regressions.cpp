@@ -1,4 +1,5 @@
 #include "mcpp/editor.hpp"
+#include "mcpp/diff.hpp"
 #include "mcpp/editor_search.hpp"
 #include "mcpp/local_provider.hpp"
 
@@ -418,6 +419,131 @@ void test_column_block_transform(const std::filesystem::path& root) {
           "a column transform is one undoable edit");
 }
 
+void test_native_general_behavior(const std::filesystem::path& root) {
+    auto editor = load(root / "native-general-tabs", "");
+    mcpp::EditorBehavior options;
+    options.fake_half_tabs = true;
+    editor.set_behavior(options);
+    editor.tab();
+    check(editor.text() == "    ", "Fake half tabs inserts half a tab in indentation");
+    editor.tab();
+    check(editor.text() == "\t", "a second fake half tab collapses to a real tab");
+    editor.backspace();
+    check(editor.text().empty(), "backspace removes a real indentation tab");
+    options.fill_tabs_with_spaces = true;
+    editor.set_behavior(options);
+    editor.tab(); editor.tab();
+    check(editor.text() == "        ", "Fill tabs with spaces prevents collapse");
+    options.backspace_through_tabs = true;
+    editor.set_behavior(options);
+    editor.backspace();
+    check(editor.text().empty(), "Backspace through tabs removes the indentation prefix");
+    check(editor.undo() && editor.text() == "        ", "indentation deletion is one undoable edit");
+
+    editor = load(root / "native-general-selection", "keep\n");
+    options = {};
+    options.persistent_selection = false;
+    editor.set_behavior(options);
+    editor.select_all();
+    editor.insert("replacement");
+    check(editor.text() == "replacement", "nonpersistent selection is replaced by typing");
+    check(editor.undo() && editor.text() == "keep\n", "selection replacement is one undoable edit");
+    editor.select_all();
+    editor.move(0, 1);
+    check(!editor.selection(), "ordinary motion clears a nonpersistent selection");
+
+    editor = load(root / "native-general-virtual", "a界\nx\n");
+    options = {};
+    options.cursor_beyond_eol = true;
+    editor.set_behavior(options);
+    editor.set_display_position(0, 7);
+    check(editor.display_cursor_column() == 7U && editor.virtual_column() == 4U &&
+              editor.storage_cursor_offset() == 4U, "virtual columns do not invent file bytes");
+    editor.insert("Z");
+    check(editor.text() == "a界    Z\nx\n", "typing materializes only the required virtual spaces");
+    check(editor.undo() && editor.text() == "a界\nx\n" && editor.virtual_column() == 4U,
+          "Undo restores both bytes and the virtual cursor");
+    editor.move(1, 0);
+    check(editor.display_cursor_column() == 7U && editor.virtual_column() == 6U,
+          "vertical virtual motion preserves the display column");
+    editor.set_display_position(0, 4);
+    editor.begin_column_mark();
+    editor.set_display_position(1, 6);
+    editor.finish_mark();
+    check(editor.column_mark_columns() == std::pair<std::size_t, std::size_t>{4,6},
+          "column marks retain virtual display coordinates");
+
+    editor = load(root / "native-general-undo", "");
+    options = {};
+    options.group_undo = true;
+    editor.set_behavior(options);
+    editor.insert('a'); editor.insert('b'); editor.insert('c');
+    check(editor.undo() && editor.text().empty(), "Group undo combines consecutive insertion actions");
+    check(editor.redo() && editor.text() == "abc", "grouped Redo restores the same insertion group");
+    editor.home(); editor.insert('X');
+    check(editor.undo() && editor.text() == "abc", "navigation separates undo groups");
+    options.group_undo = false;
+    editor.set_behavior(options);
+    editor.insert('A'); editor.insert('B');
+    check(editor.undo() && editor.text() == "Aabc", "Group undo off keeps individual insertions");
+
+    editor = load(root / "native-general-typewriter", "one two");
+    options = {};
+    options.wrap = mcpp::EditorWrapMode::typewriter;
+    options.wrap_length = 8;
+    editor.set_behavior(options);
+    editor.end();
+    editor.insert(" three");
+    check(editor.text() == "one two\nthree" && editor.row() == 1U && editor.column() == 5U,
+          "Type writer wrap breaks words without moving the insertion point");
+    check(editor.undo() && editor.text() == "one two", "automatic wrapping belongs to the typing edit");
+
+    editor = load(root / "native-general-dynamic", "one two three four five");
+    options.wrap = mcpp::EditorWrapMode::dynamic;
+    options.wrap_length = 12;
+    editor.set_behavior(options);
+    editor.end(); editor.insert(" six");
+    check(editor.text() == "one two\nthree four\nfive six" && editor.row() == 2U && editor.column() == 8U,
+          "Dynamic paragraphing reflows while preserving the logical insertion point");
+    check(editor.undo() && editor.text() == "one two three four five",
+          "dynamic paragraphing is one undoable edit");
+}
+
+void test_local_diff_and_merge(const std::filesystem::path& root) {
+    const auto first = root / "diff-first", second = root / "diff-second";
+    auto left = load(first, "same\nLEFT\ncommon\nLEFT2\nlast\n");
+    auto right = load(second, "same\nRIGHT\ncommon\nRIGHT2\nlast\n");
+    mcpp::DiffModel comparison;
+    comparison.compare(left, right);
+    check(comparison.hunks().size() == 2U && comparison.rows().size() == 5U,
+          "local diff aligns unchanged rows and distinct hunks");
+    comparison.merge(0, true, left, right);
+    check(right.text() == "same\nLEFT\ncommon\nRIGHT2\nlast\n" &&
+              read_file(second) == "same\nRIGHT\ncommon\nRIGHT2\nlast\n",
+          "directional merge stages only the selected hunk without publishing it");
+    check(right.undo() && right.text() == "same\nRIGHT\ncommon\nRIGHT2\nlast\n",
+          "a merged hunk is one undoable edit");
+    comparison.compare(left, right);
+    comparison.merge(1, false, left, right);
+    check(left.text() == "same\nLEFT\ncommon\nRIGHT2\nlast\n", "reverse merge updates only its target side");
+    left = load(first, "one\ntwo");
+    right = load(second, "one\n");
+    comparison.compare(left, right);
+    check(comparison.hunks().size() == 1U && comparison.hunks()[0].right_count == 0U,
+          "diff represents insertion at EOF explicitly");
+    comparison.merge(0, true, left, right);
+    check(right.text() == "one\ntwo", "EOF insertion preserves the absent final newline");
+    left = load(first, "");
+    right = load(second, "one\n");
+    comparison.compare(left, right);
+    comparison.merge(0, true, left, right);
+    check(right.text().empty(), "merging an empty side removes the selected target lines");
+    left = load(first, "Name\t \r\n");
+    right = load(second, "name \n");
+    comparison.compare(left, right, {.ignore_case=true, .ignore_all_space=true, .strip_trailing_cr=true});
+    check(comparison.hunks().empty(), "native diff options affect actual comparison");
+}
+
 }  // namespace
 
 int main(const int argc, char** argv) {
@@ -446,6 +572,8 @@ int main(const int argc, char** argv) {
         {"CR-only save and editing", test_cr_only_editing},
         {"Codepage view and byte-preserving saves", test_codepage_view_and_original_bytes},
         {"Rectangular block transforms", test_column_block_transform},
+        {"Native General editing behavior", test_native_general_behavior},
+        {"Local diff and staged merge", test_local_diff_and_merge},
     };
     int failures = 0;
     for (const auto& [name, test] : tests) {

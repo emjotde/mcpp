@@ -141,7 +141,8 @@ CommandOutput capture_command(
     const std::vector<std::string>& arguments,
     const std::filesystem::path& directory,
     const Cancellation& cancellation,
-    const std::size_t limit
+    const std::size_t limit,
+    const std::optional<std::filesystem::path> input
 ) {
     if (arguments.empty() || arguments.front().empty()) {
         throw std::invalid_argument("command is empty");
@@ -155,8 +156,23 @@ CommandOutput capture_command(
     Pipe output;
     Pipe error;
     SpawnSettings settings;
-    checked(posix_spawn_file_actions_addopen(&settings.actions, STDIN_FILENO, "/dev/null", O_RDONLY, 0),
-            "command standard input");
+    struct Input {
+        int descriptor{-1};
+        ~Input() { if (descriptor >= 0) close(descriptor); }
+    } source;
+    if (input) {
+        if (input->native().find('\0') != std::string::npos) throw std::invalid_argument("input path cannot contain NUL");
+        source.descriptor = open(input->c_str(), O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
+        if (source.descriptor < 0) throw std::system_error(errno, std::generic_category(), "open command input");
+        struct stat status{};
+        if (fstat(source.descriptor, &status) != 0) throw std::system_error(errno, std::generic_category(), "stat command input");
+        if (!S_ISREG(status.st_mode)) throw std::runtime_error("command input must be a regular file");
+        checked(posix_spawn_file_actions_adddup2(&settings.actions, source.descriptor, STDIN_FILENO), "command standard input");
+        checked(posix_spawn_file_actions_addclose(&settings.actions, source.descriptor), "close command input descriptor");
+    } else {
+        checked(posix_spawn_file_actions_addopen(&settings.actions, STDIN_FILENO, "/dev/null", O_RDONLY, 0),
+                "command standard input");
+    }
     checked(posix_spawn_file_actions_adddup2(&settings.actions, output.descriptors[1], STDOUT_FILENO),
             "command standard output");
     checked(posix_spawn_file_actions_adddup2(&settings.actions, error.descriptors[1], STDERR_FILENO),

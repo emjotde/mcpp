@@ -1,4 +1,7 @@
 #include "mcpp/editor_search.hpp"
+#include "mcpp/local_tools.hpp"
+#include <cerrno>
+#include <system_error>
 
 #include <algorithm>
 #include <array>
@@ -570,6 +573,10 @@ std::vector<EditorSearchMatch> matches(
 
 }  // namespace
 
+std::string EditorSearch::decode_hexadecimal(const std::string_view pattern) {
+    return hexadecimal_pattern(pattern);
+}
+
 std::string EditorSearch::fold_case(const std::string_view text) {
     const auto folded = fold_utf8(text);
     std::string result;
@@ -618,6 +625,52 @@ bool EditorSearch::filename_matches(
     return status == 0 &&
            match[0].rm_so == 0 &&
            static_cast<std::size_t>(match[0].rm_eo) == name.size();
+}
+
+std::optional<EditorSearchMatch> EditorSearch::find_codepages(
+    const std::string_view text, const std::string_view pattern, const std::size_t start,
+    const std::size_t range_begin, const std::size_t range_end, const EditorSearchOptions& options,
+    const bool wrap, const bool overlap
+) {
+    if (range_begin > range_end || range_end > text.size()) throw std::invalid_argument("invalid codepage search range");
+    const auto anchor = std::clamp(start, range_begin, range_end);
+    auto best = find(text, pattern, start, range_begin, range_end, options, wrap, overlap);
+    if (options.mode == EditorSearchMode::hexadecimal) return best;
+    const auto distance = [&](const EditorSearchMatch& match) {
+        if (options.backwards) return match.end <= anchor ? anchor - match.end
+            : anchor - range_begin + range_end - match.end;
+        return match.begin >= anchor ? match.begin - anchor : range_end - anchor + match.begin - range_begin;
+    };
+    for (const auto& page : supported_codepages()) {
+        if (page.id == "UTF-8") continue;
+        try {
+            const auto decoded = convert_encoding(text, page.id, "UTF-8");
+            const auto begin = convert_encoding(text.substr(0, range_begin), page.id, "UTF-8").size();
+            const auto end = convert_encoding(text.substr(0, range_end), page.id, "UTF-8").size();
+            const auto origin = convert_encoding(text.substr(0, std::min(start, text.size())), page.id, "UTF-8").size();
+            const auto candidate = find(decoded, pattern, origin, begin, end, options, wrap, overlap);
+            if (!candidate) continue;
+            const auto source_offset = [&](const std::size_t offset) {
+                if (offset == std::string::npos) return std::string::npos;
+                if (offset > decoded.size()) throw std::runtime_error("codepage search returned an invalid capture offset");
+                std::size_t count = 0;
+                for (std::size_t index = 0; index < offset;) {
+                    ++index;
+                    while (index < offset && (static_cast<unsigned char>(decoded[index]) & 0xc0U) == 0x80U) ++index;
+                    ++count;
+                }
+                return count;
+            };
+            EditorSearchMatch match{source_offset(candidate->begin), source_offset(candidate->end)};
+            for (const auto& capture : candidate->captures) {
+                match.captures.emplace_back(source_offset(capture.first), source_offset(capture.second));
+            }
+            if (!best || distance(match) < distance(*best)) best = std::move(match);
+        } catch (const std::system_error& error) {
+            if (error.code().value() != EILSEQ && error.code().value() != EINVAL) throw;
+        }
+    }
+    return best;
 }
 
 std::optional<EditorSearchMatch> EditorSearch::find(

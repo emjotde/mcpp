@@ -1,7 +1,9 @@
 #pragma once
 
 #include "mcpp/provider.hpp"
+#include "mcpp/editor_search.hpp"
 
+#include <array>
 #include <cstdint>
 #include <map>
 #include <optional>
@@ -13,6 +15,13 @@
 namespace mcpp {
 
 enum class ViewerLinkedSave { require_choice, detach, preserve_links };
+
+struct ViewerTextStyle {
+    std::size_t begin;
+    std::size_t end;
+    bool bold;
+    bool underline;
+};
 
 class ViewerModel {
 public:
@@ -32,7 +41,19 @@ public:
     );
     void scroll_columns(int amount);
     void toggle_hex();
+    void toggle_magic(const Cancellation& cancellation = {});
+    void toggle_nroff(const Cancellation& cancellation = {});
+    void set_encoding(std::string codepage, const Cancellation& cancellation = {});
+    [[nodiscard]] bool magic() const noexcept { return magic_; }
+    [[nodiscard]] bool nroff() const noexcept { return nroff_; }
+    [[nodiscard]] bool parsed() const noexcept { return magic_content_.has_value(); }
+    [[nodiscard]] const std::string& encoding() const noexcept { return encoding_; }
+    void select_bookmark(std::size_t slot);
+    void set_bookmark();
+    void goto_bookmark();
+    [[nodiscard]] std::size_t bookmark_slot() const noexcept { return bookmark_slot_; }
     void goto_offset(std::uint64_t offset);
+    void goto_data_offset(std::uint64_t offset);
     void goto_line(std::uint64_t line, const Cancellation& cancellation = {});
     void goto_percent(unsigned int percent);
     [[nodiscard]] std::uint64_t line_number(const Cancellation& cancellation = {});
@@ -62,6 +83,8 @@ public:
     [[nodiscard]] std::uint64_t size() const noexcept;
     [[nodiscard]] std::uint64_t offset() const noexcept;
     [[nodiscard]] std::uint64_t view_end() const noexcept;
+    [[nodiscard]] std::uint64_t source_view_end() const;
+    [[nodiscard]] std::uint64_t data_size() const noexcept;
     [[nodiscard]] std::size_t horizontal_offset() const noexcept;
     [[nodiscard]] const std::string& path() const noexcept;
     [[nodiscard]] std::vector<std::string> lines(
@@ -72,12 +95,20 @@ public:
     // Byte range in the last rendered row, after tab expansion and clipping.
     [[nodiscard]] std::optional<std::pair<std::size_t, std::size_t>>
     text_highlight(std::size_t row) const noexcept;
+    [[nodiscard]] const std::vector<ViewerTextStyle>& text_styles(std::size_t row) const noexcept;
     [[nodiscard]] bool search_can_wrap() const noexcept;
     [[nodiscard]] std::optional<std::uint64_t> find(
         std::string_view needle,
         bool case_sensitive,
         const Cancellation& cancellation = {},
         bool wrap = true
+    );
+    [[nodiscard]] std::optional<std::uint64_t> find(
+        std::string_view needle,
+        const EditorSearchOptions& options,
+        const Cancellation& cancellation = {},
+        bool wrap = true,
+        bool all_charsets = false
     );
 
 private:
@@ -96,7 +127,8 @@ private:
         std::size_t width,
         std::string* output,
         const Cancellation& cancellation,
-        std::optional<std::pair<std::size_t, std::size_t>>* highlight = nullptr
+        std::optional<std::pair<std::size_t, std::size_t>>* highlight = nullptr,
+        std::vector<ViewerTextStyle>* styles = nullptr
     );
     void load_window(
         std::uint64_t offset,
@@ -107,6 +139,15 @@ private:
     void keep_hex_cursor_visible();
     void navigation_changed();
     [[nodiscard]] std::uint64_t last_text_page(std::size_t width, std::size_t rows);
+    void read_view(std::uint64_t offset, std::uint64_t length, std::ostream& output,
+                   const Cancellation& cancellation);
+    void refresh_presentation(bool magic, bool nroff, std::string codepage, const Cancellation& cancellation);
+    void select_presentation();
+    [[nodiscard]] const std::string* presentation() const noexcept;
+    [[nodiscard]] std::string read_all(const Cancellation& cancellation);
+    [[nodiscard]] std::uint64_t source_position(std::uint64_t position) const;
+    [[nodiscard]] std::optional<std::uint64_t> reveal_search_match(
+        std::pair<std::uint64_t, std::uint64_t> match, const Cancellation& cancellation);
 
     struct LastTextPage {
         std::size_t width;
@@ -119,6 +160,20 @@ private:
     std::string path_;
     std::string storage_path_;
     std::uint64_t size_{0};
+    std::uint64_t source_size_{0};
+    bool magic_{true};
+    bool nroff_{false};
+    std::string encoding_;
+    std::optional<std::string> magic_content_;
+    std::optional<std::string> text_content_;
+    bool presentation_dirty_{false};
+    std::vector<ViewerTextStyle> presentation_styles_;
+    std::vector<std::pair<std::size_t, std::size_t>> nroff_offsets_;
+    std::vector<std::pair<std::size_t, std::size_t>> codepage_offsets_;
+    std::string decoded_content_;
+    std::vector<std::vector<ViewerTextStyle>> text_style_rows_;
+    std::array<std::uint64_t, 10> bookmarks_{};
+    std::size_t bookmark_slot_{0};
     std::uint64_t offset_{0};
     std::uint64_t view_end_{0};
     std::uint64_t window_offset_{0};
@@ -129,6 +184,10 @@ private:
     bool wrap_{true};
     std::string last_search_;
     bool last_search_case_sensitive_{false};
+    EditorSearchOptions last_search_options_;
+    std::string advanced_search_pattern_;
+    bool search_boundary_exhausted_{false};
+    bool last_search_all_charsets_{false};
     std::optional<std::pair<std::uint64_t, std::uint64_t>> search_match_;
     std::vector<std::optional<std::pair<std::size_t, std::size_t>>> text_highlights_;
     std::uint64_t next_search_offset_{0};

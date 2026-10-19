@@ -96,7 +96,7 @@ exec 5>"$temporary/options-input"
 sleep 1
 printf '\033[20~\033[C\033[C\033[C\033[C\033[C\033[C\r\r' >&5
 sleep 0.5
-printf '8\t2\t\t \t\r' >&5
+printf '\t\t\t\t8\t \r' >&5
 sleep 0.5
 printf '\033[20~\033[C\033[C\033[C\033[C\033[C\033[C\033[F\r' >&5
 sleep 0.5
@@ -117,7 +117,7 @@ if ((options_status != 0)); then
 fi
 
 if [[ "$(cat "$temporary/options.txt")" != \
-      $'a b\tc  \tY\n  X' ]]; then
+      $'a b\tc  \tY\n    X' ]]; then
     printf 'configured editor indentation was not applied\n' >&2
     exit 1
 fi
@@ -132,7 +132,7 @@ fi
 options_config="$temporary/options-config/mcpp/config"
 for expected in \
     'editor_tab_width=8' \
-    'editor_indent_width=2' \
+    'editor_indent_width=4' \
     'editor_auto_indent=true' \
     'editor_show_whitespace=true'; do
     if ! grep -Fq "$expected" "$options_config"; then

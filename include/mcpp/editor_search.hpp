@@ -31,6 +31,12 @@ struct EditorSearchMatch {
 
 class EditorSearch {
 public:
+    [[nodiscard]] static std::string decode_hexadecimal(std::string_view pattern);
+    [[nodiscard]] static std::optional<EditorSearchMatch> find_codepages(
+        std::string_view text, std::string_view pattern, std::size_t start,
+        std::size_t range_begin, std::size_t range_end, const EditorSearchOptions& options,
+        bool wrap, bool overlap
+    );
     [[nodiscard]] static std::string fold_case(std::string_view text);
     [[nodiscard]] static bool filename_matches(
         std::string_view name, std::string_view pattern, bool case_sensitive

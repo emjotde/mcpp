@@ -183,6 +183,34 @@ auto general_bool_settings(Configuration& config) {
     }};
 }
 
+template <typename Configuration>
+auto editor_bool_settings(Configuration& config) {
+    using Pointer = decltype(&config.editor_fake_half_tabs);
+    return std::array<std::pair<std::string_view, Pointer>, 10>{{
+        {"editor_fake_half_tabs", &config.editor_fake_half_tabs},
+        {"editor_backspace_through_tabs", &config.editor_backspace_through_tabs},
+        {"editor_fill_tabs_with_spaces", &config.editor_fill_tabs_with_spaces},
+        {"editor_confirm_save", &config.editor_confirm_save},
+        {"editor_save_position", &config.editor_save_position},
+        {"editor_visible_tabs", &config.editor_visible_tabs},
+        {"editor_visible_trailing_spaces", &config.editor_visible_trailing_spaces},
+        {"editor_persistent_selection", &config.editor_persistent_selection},
+        {"editor_cursor_beyond_eol", &config.editor_cursor_beyond_eol},
+        {"editor_group_undo", &config.editor_group_undo}
+    }};
+}
+
+template <typename Configuration>
+auto diff_bool_settings(Configuration& config) {
+    using Pointer = decltype(&config.diff_ignore_case);
+    return std::array<std::pair<std::string_view, Pointer>, 7>{{
+        {"diff_ignore_case", &config.diff_ignore_case}, {"diff_ignore_tab_expansion", &config.diff_ignore_tab_expansion},
+        {"diff_ignore_space_change", &config.diff_ignore_space_change}, {"diff_ignore_all_space", &config.diff_ignore_all_space},
+        {"diff_strip_trailing_cr", &config.diff_strip_trailing_cr}, {"diff_show_numbers", &config.diff_show_numbers},
+        {"diff_show_symbols", &config.diff_show_symbols}
+    }};
+}
+
 Config Config::load(const std::filesystem::path& path) {
     Config result;
     std::ifstream input(path);
@@ -194,6 +222,8 @@ Config Config::load(const std::filesystem::path& path) {
         }
         return result;
     }
+    bool visible_tabs_seen = false;
+    bool visible_trailing_seen = false;
     std::string line;
     while (std::getline(input, line)) {
         if (line.empty() || line.starts_with('#')) {
@@ -217,6 +247,21 @@ Config Config::load(const std::filesystem::path& path) {
             &std::pair<std::string_view, bool*>::first);
         if (general_boolean != general_settings.end()) {
             *general_boolean->second = parse_bool(value, key);
+            continue;
+        }
+        const auto editor_settings = editor_bool_settings(result);
+        const auto editor_boolean = std::ranges::find(editor_settings, key,
+            &std::pair<std::string_view, bool*>::first);
+        if (editor_boolean != editor_settings.end()) {
+            *editor_boolean->second = parse_bool(value, key);
+            if (key == "editor_visible_tabs") visible_tabs_seen = true;
+            if (key == "editor_visible_trailing_spaces") visible_trailing_seen = true;
+            continue;
+        }
+        const auto diff_settings = diff_bool_settings(result);
+        const auto diff_boolean = std::ranges::find(diff_settings, key, &std::pair<std::string_view, bool*>::first);
+        if (diff_boolean != diff_settings.end()) {
+            *diff_boolean->second = parse_bool(value, key);
             continue;
         }
         if (key == "show_hidden") {
@@ -350,6 +395,18 @@ Config Config::load(const std::filesystem::path& path) {
             result.editor_auto_indent = parse_bool(value, key);
         } else if (key == "editor_show_whitespace") {
             result.editor_show_whitespace = parse_bool(value, key);
+            if (!visible_tabs_seen) result.editor_visible_tabs = result.editor_show_whitespace;
+            if (!visible_trailing_seen) result.editor_visible_trailing_spaces = result.editor_show_whitespace;
+        } else if (key == "editor_wrap_mode") {
+            if (value == "none") result.editor_wrap_mode = 0;
+            else if (value == "dynamic") result.editor_wrap_mode = 1;
+            else if (value == "typewriter") result.editor_wrap_mode = 2;
+            else throw std::runtime_error("invalid editor wrap mode");
+        } else if (key == "diff_quality") {
+            const auto parsed = std::from_chars(value.data(), value.data() + value.size(), result.diff_quality);
+            if (parsed.ec != std::errc{} || parsed.ptr != value.data() + value.size() || result.diff_quality > 2U) {
+                throw std::runtime_error("invalid diff algorithm");
+            }
         } else if (key == "editor_cursor_after_inserted_block") {
             result.editor_cursor_after_inserted_block = parse_bool(value, key);
         } else if (key == "editor_save_mode") {
@@ -460,6 +517,15 @@ void Config::save(const std::filesystem::path& path) const {
            << "editor_show_whitespace="
            << (editor_show_whitespace ? "true" : "false") << '\n';
     output << "editor_save_mode=" << editor_save_mode << '\n';
+    for (const auto& [key, value] : diff_bool_settings(*this)) {
+        output << key << '=' << (*value ? "true" : "false") << '\n';
+    }
+    output << "diff_quality=" << diff_quality << '\n';
+    for (const auto& [key, value] : editor_bool_settings(*this)) {
+        output << key << '=' << (*value ? "true" : "false") << '\n';
+    }
+    if (editor_wrap_mode > 2U) throw std::runtime_error("invalid editor wrap mode");
+    output << "editor_wrap_mode=" << std::array{"none", "dynamic", "typewriter"}[editor_wrap_mode] << '\n';
     output << "editor_cursor_after_inserted_block=" << (editor_cursor_after_inserted_block ? "true" : "false") << '\n';
     for (const auto& [key, value] : panel_bool_settings(*this)) {
         output << key << '=' << (*value ? "true" : "false") << '\n';

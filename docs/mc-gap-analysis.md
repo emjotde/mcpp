@@ -84,9 +84,9 @@ Intentional differences and remaining work are explicit:
   encoding, but changing codepage with undo history or hexadecimal search in
   that decoded view requires reopening. This limitation is reported, not
   silently treated as conversion or a failed match.
-- Editor General options, full modal Tree behavior, side-by-side diff/merge,
-  complete user-menu/configuration syntax compatibility, additional viewer
-  actions, and the earlier broad feature groups are not complete.
+- Complete user-menu/configuration resource syntax compatibility remains outside
+  this independently implemented control set. The local General/Tree/diff/viewer
+  work listed as unfinished in `dfd3e52` is completed below.
 
 Native/source comparison artifacts are retained in the session's
 `native-menu-rework` directory, including all twelve inventories, paired
@@ -99,6 +99,40 @@ mounts and no network. No sanitizers, optional profiling, package installations,
 or new project libraries were used. The pinned FTXUI source stays unchanged:
 the build compiles a checked build-directory copy of its input normalizer to
 separate physical Ctrl-Space from redraw events and honor the Escape timeout.
+
+## Completion of the remaining local controls
+
+This delivery finishes the four groups explicitly left open in `dfd3e52` and
+the remaining local editor Mail menu entry. Remote/archive/spelling pauses and
+the unrelated parked persistent-shell files remain unchanged.
+
+| Group | Implemented behavior and outcome checks |
+|---|---|
+| Editor General | Actual native radio/checkbox/input groups, including both automatic wrapping modes, native half-tab handling, indentation backspace, independent tab/trailing markers, save confirmation/position, cursor-after-insertion, nonpersistent selection, virtual cursor and column marks, and grouped undo/redo. Wrapping and replacement are atomic undoable edits; virtual motion does not invent file bytes. |
+| Modal Tree | Shared hierarchical lazy Tree, visible-name search, expand/parent/sibling navigation, Rescan/Forget, private persistent cache, and Copy/Move/Rmdir return context. Cancel preserves listings, marks, and an existing sidebar's selection. Quoted cache paths round-trip whitespace/control characters; unsafe cache symlinks are rejected. |
+| Diff/merge | Side-by-side alignment, hunk navigation, directional staged merge and undo, native diff Options, search/codepages, split/symbol/number controls, editor round-trips and Save/Discard/Cancel. Linked-save decisions remain mandatory. A stale or unwritable destination retains the merged draft and external contents. |
+| Viewer | Functional Raw/Parse and nroff formatting, bold/underline spans, native four-type Search with backwards/whole-word/all-codepage behavior, codepages, bookmark slots, ruler, history, and guarded adjacent-file navigation. Parsed bytes cannot be hex-saved over a compressed original. Saving raw hex edits from a formatted view uses physical source bytes, not the presentation. |
+| Mail | Native To/Subject/Copies to controls and standard `mail(1)` argv/regular-file-stdin execution. Exact argv/body contracts, literal shell metacharacters, failed command retry, and unchanged unsaved document bytes are checked without sending mail outside the disposable environment. |
+
+Paired native MC 4.8.30 and current mcpp captures cover General, modal Tree,
+side-by-side diff, Diff Options, viewer Search/nroff, and Mail. Differences in
+palette, safer atomic-save defaults, following the active directory on Tree
+entry, and explicit resource limits are not presented as missing controls.
+General's former independent indentation input and combined whitespace checkbox
+were removed; old regression controllers now operate the actual native controls.
+
+Raw range viewing remains suitable for large local files. Parsed/formatted views
+and advanced/all-codepage searches use an explicit 64 MiB buffer limit; an
+overstrike-heavy nroff line is also bounded. Transform errors preserve raw data
+and drafts rather than returning a success-shaped empty view.
+
+The normal suite now includes the 18-case `mcpp_native_completion_ui` entry in
+addition to the earlier audit and operation checks. Successful captures and exact
+outcomes are retained under the session's `native-local-completion` artifacts.
+The final normal Release run passed all 21 CTest entries, including all 18 new
+completion workflows, 36 follow-up controls and 32 original audit UI cases.
+These are functional local regressions, not a claim of complete MC resource-file
+or legacy non-UTF-8-terminal compatibility.
 
 Core fixes now have bounded normal regressions for directory merge policy,
 source-cycle rejection, copied timestamps/hardlink sets/permissions, pre-publication

@@ -64,6 +64,7 @@ add_library(
     src/entry.cpp
     src/listing.cpp
     src/compare.cpp
+    src/diff.cpp
     src/location.cpp
     src/local_provider.cpp
     src/local_tools.cpp
@@ -72,6 +73,7 @@ add_library(
     src/search.cpp
     src/syntax.cpp
     src/user_menu.cpp
+    src/tree_cache.cpp
     src/viewer.cpp
     src/editor.cpp
     src/editor_clipboard.cpp
@@ -261,6 +263,17 @@ if(MCPP_BUILD_TESTS)
         )
         set_tests_properties(mcpp_editor_save PROPERTIES TIMEOUT 60)
         if(EXISTS "/review/.operation-regressions-disposable")
+            add_test(
+                NAME mcpp_native_completion_ui
+                COMMAND
+                    ${MCPP_PYTHON_EXECUTABLE}
+                    -B
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_native_completion_ui.py
+                    $<TARGET_FILE:mcpp>
+                    ${MCPP_TMUX_EXECUTABLE}
+                    ${CMAKE_CURRENT_BINARY_DIR}/native-completion-ui
+            )
+            set_tests_properties(mcpp_native_completion_ui PROPERTIES TIMEOUT 180)
             add_test(
                 NAME mcpp_audit_ui
                 COMMAND

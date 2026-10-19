@@ -21,11 +21,11 @@ class RemainingAuditUI(unittest.TestCase):
 
     def search(self, terminal, query, editor=False):
         terminal.press("F7")
-        terminal.wait_for("Case sensitive" if editor else "Find")
+        terminal.wait_for("Case sensitive" if editor else "Enter search string:")
         terminal.press("C-u")
         terminal.type(query)
         terminal.press("Enter")
-        terminal.wait_for("Case sensitive" if editor else "Find", present=False)
+        terminal.wait_for("Case sensitive" if editor else "Enter search string:", present=False)
 
     def main_menu(self, terminal, category, item):
         terminal.press("F9")
@@ -436,11 +436,19 @@ class RemainingAuditUI(unittest.TestCase):
         with self.terminal(root, ["--printwd", root / "cwd", left, right]) as t:
             t.wait_for("Name")
             self.main_menu(t, "c", "Directory tree")
-            t.wait_for("Directory tree:")
-            t.press("Down", "Right")
-            t.wait_for("+ inner")
+            t.wait(lambda: any("Directory tree" in row and "┌" in row for row in t.text().splitlines()),
+                   "Modal Tree opens")
+            t.wait_for("└─ A")
+            t.press("C-s")
+            t.type("A")
+            t.wait_for("Search: A")
+            t.wait(lambda: any(value.endswith("A") for value in t.focused_text()), "Tree search selects A")
+            t.press("Escape")
+            t.wait_for("Search: A", present=False)
+            t.press("Right")
+            t.wait_for("inner")
             t.press("Enter")
-            t.wait_for("Directory tree:", present=False)
+            t.wait_for("Directory changed")
             t.press("Down", "C-Space")
             t.wait_for("Directory sizes calculated")
             t.wait(lambda: any(len(columns := row.split("│")) > 2 and "inner" in columns[1] and
@@ -609,9 +617,9 @@ class RemainingAuditUI(unittest.TestCase):
             select_file(t, "a.txt")
             t.press("Tab")
             t.press("C-x", "C-d")
-            t.wait_for("-before")
-            t.wait_for("+after")
-            t.press("F3")
+            t.wait_for("9Options")
+            self.assertTrue(any("before" in row[:50] and "after" in row[50:] for row in t.text().splitlines()))
+            t.press("F10")
             t.wait_for("Name")
             t.raw(b"\x1b!")
             t.wait_for("Filtered view")

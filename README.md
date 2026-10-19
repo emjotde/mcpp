@@ -211,10 +211,35 @@ sequences. Configuration controls single/double Escape and the single-Escape
 timeout. The build normalizes physical Ctrl-Space separately from FTXUI's
 internal redraw events without modifying the pinned submodule.
 
-This is not complete MC parity. Editor General options, the full modal Tree,
-side-by-side diff/merge, and additional viewer actions still need further work.
 The supported syntax choices and mcpp's rule/configuration file formats are
 not MC's complete syntax database or configuration-file compatibility layer.
+Remote/archive providers and spelling remain explicitly paused; the separate
+persistent-shell work is not part of these local menu controls.
+
+## Modal Tree and diff/merge
+
+Command / Directory tree is the same lazy hierarchical Tree used by the panes,
+not a one-directory list. Right expands or selects a child; Left collapses or
+selects the parent. Enter chooses the directory and Escape cancels without
+changing the pane or its marks. `Ctrl-S` searches visible names. F2 rescans,
+F3 forgets cached entries without deleting directories, and F4 switches linear
+and sibling navigation. Copy/Move/Rmdir return to the Tree after their dialogs
+and operations. The original sidebar selection survives the modal chooser.
+Visited directories persist in the private `$XDG_CACHE_HOME/mcpp/Tree` cache;
+stale children are checked by lazy rescans.
+
+Command / Compare files (`Ctrl-X Ctrl-D`) compares the two selected regular
+files side by side. `n` / `p` navigate hunks, `F5` merges displayed left to
+right, and Shift-F5 merges right to left. Merges are staged and undoable with
+`Ctrl-Z`; no file changes until `F2` saves. Each save retains revision, read-only,
+metadata, symlink, and hardlink safeguards. Quit offers Save/Discard/Cancel
+without losing a failed-save draft.
+
+Diff `F4` opens the displayed left file in the editor and returns to the
+comparison; Shift-F4 edits the other file. F7 searches and F9 offers Normal,
+Fastest, Minimal, and the five native case/tab/space/carriage-return options.
+`Ctrl-U` swaps displayed sides, `Alt-N` toggles numbers, `Alt-S` toggles symbols,
+`<` / `>` adjust the split, and `=` restores equal widths.
 
 ## Viewer controls
 
@@ -227,6 +252,25 @@ stays in the dialog for correction, and 100% shows the final page.
 Text searches highlight the current occurrence in the viewer and Quick view.
 The highlight follows the original UTF-8 bytes through expanded tabs, wrapping
 and horizontal clipping; repeating a search moves it to the next occurrence.
+The native Search dialog offers Normal, Regular expression, Hexadecimal, and
+Wildcard search, with Case sensitive, Backwards, Whole words, and All charsets.
+`/` / `?` start forward/backward searches; `Ctrl-S` / `Ctrl-R` continue in that
+direction. All charsets interprets candidates using the supported codepages and
+maps hits back to the original bytes.
+
+F8 switches Raw/Parse. Parse recognizes gzip, bzip2, xz, and zstd data through
+the corresponding installed standard command; missing/failed tools are explicit
+errors. Parsed data is read-only, so hex Save cannot replace a compressed file
+with decompressed bytes. F9 toggles nroff overstrike formatting, including bold
+and underlined text. Formatting and codepages never convert the file on disk.
+Parsed/formatted buffers and advanced searches have a 64 MiB buffer limit;
+ordinary raw viewing and forward literal/hex search retain bounded range reads.
+
+Digits `0`-`9` choose a viewer bookmark slot; `m` stores the displayed position
+and `r` restores it. `Alt-R` cycles ruler off/top/bottom. `Alt-E` chooses a data
+codepage and `Alt-Shift-E` opens viewer history. `Ctrl-F` / `Ctrl-B` open adjacent
+files, checking staged hex changes first. Quick view remains deliberately
+read-only and supports Go to, native Search, Parse and codepage selection.
 
 The wheel scrolls hex content immediately while retaining the cursor's relative
 row. Hex progress follows the active byte. Click a hex digit or ASCII byte to
@@ -239,6 +283,20 @@ attempts retain the visible location, and successful text searches reveal
 their hit through wrapping and horizontal scrolling.
 
 ## Editor buffers
+
+General options uses the native Wrap mode, Tabulation, and Other options groups.
+None, Dynamic paragraphing, and Type writer wrap all change typing behavior.
+Tabulation controls fake half tabs, indentation backspace, fill-with-spaces and
+tab spacing; there is no independent invented indent-width control.
+Visible tabs and trailing spaces are separate preferences.
+
+Persistent selection off replaces a marked block when typing and clears it on
+ordinary motion. Cursor beyond end of line keeps a virtual display position
+without creating file bytes until insertion, including mouse positioning and
+column marks. Group undo combines consecutive editing actions; navigation and
+compound edits separate groups. Automatic wrapping and block replacement remain
+single undoable edits. Save confirmation, saved file positions, cursor-after-
+insertion and syntax highlighting are independently configurable.
 
 Each editor buffer keeps its own search query, options, selection scope, cursor,
 viewport, mark, and undo history. Moving a block keeps its destination marked. Rectangular
@@ -295,8 +353,16 @@ boundaries without splitting UTF-8 characters.
 Delete still removes one character, and `Ctrl-U` undoes either deletion.
 
 `F2` and File > Save ask for confirmation with Save/Cancel, including for a
-clean buffer. Cancel preserves the draft, cursor and selection. Choosing Yes
+clean buffer, when General / Confirm before saving is enabled. Cancel preserves
+the draft, cursor and selection. Choosing Yes
 in the modified-file close/quit dialog saves without asking a second time.
+
+Command / Mail (`Alt-M`) uses the native To/Subject/Copies to dialog and sends
+the current UTF-8 buffer snapshot to the installed `mail(1)` command through
+argv and a private regular-file stdin, never through shell expansion. Recipients
+cannot be command options and header fields reject control characters.
+Missing/failed mail commands retain both the dialog values and unsaved editor
+buffer. A completed command is not a guarantee of recipient delivery.
 
 Click the editor header or press `F9` to open its menus, then click a category
 or action. Drag with the left mouse button to mark text; hold `Alt` while

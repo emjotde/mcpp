@@ -3,6 +3,7 @@
 #include "mcpp/editor.hpp"
 #include "mcpp/local_provider.hpp"
 #include "mcpp/local_tools.hpp"
+#include "mcpp/tree_cache.hpp"
 #include "mcpp/listing.hpp"
 #include "mcpp/operations.hpp"
 #include "mcpp/pane.hpp"
@@ -230,6 +231,82 @@ void run(const fs::path& root) {
                          std::nullopt, {}, {});
     check(read_file(root / "preallocate") == "complete", "Preallocate space preserves exact output bytes");
     panel_provider->set_preallocate(false);
+    const std::set<std::string> cached_directories{
+        (root / "cached tree").string(), (root / "cached\nnewline").string()
+    };
+    const auto cache_path = root / "tree-cache/Tree";
+    mcpp::save_tree_cache(cache_path, cached_directories);
+    check(mcpp::load_tree_cache(cache_path) == cached_directories,
+          "persistent Tree cache round-trips spaces and control characters without splitting paths");
+    fs::remove(cache_path);
+    fs::create_symlink(root / "preallocate", cache_path);
+    bool unsafe_cache = false;
+    try { static_cast<void>(mcpp::load_tree_cache(cache_path)); }
+    catch (const std::exception&) { unsafe_cache = true; }
+    check(unsafe_cache && read_file(root / "preallocate") == "complete", "Tree cache never follows a symlink");
+    const auto nroff_path = root / "viewer-nroff";
+    const std::string nroff_bytes = "B\bBo\bol\bld\bd _\bU_\bN_\bD_\bE_\bR\n";
+    write_file(nroff_path, nroff_bytes);
+    mcpp::ViewerModel formatted;
+    formatted.open(panel_provider, nroff_path.string());
+    formatted.toggle_nroff();
+    check(formatted.lines(80, 4).front() == "Bold UNDER" &&
+              std::ranges::any_of(formatted.text_styles(0), [](const mcpp::ViewerTextStyle& style) { return style.bold; }) &&
+              std::ranges::any_of(formatted.text_styles(0), [](const mcpp::ViewerTextStyle& style) { return style.underline; }),
+          "nroff formatting combines overstrikes and retains bold/underline spans");
+    check(formatted.data_size() == nroff_bytes.size() && formatted.source_view_end() == nroff_bytes.size(),
+          "formatted progress still counts physical source bytes");
+    formatted.goto_data_offset(2);
+    check(formatted.offset() == 0U, "physical offsets inside an overstrike map to its visible character");
+    formatted.goto_data_offset(0);
+    formatted.toggle_hex();
+    formatted.toggle_hex_editing();
+    formatted.edit_hex_digit('5'); formatted.edit_hex_digit('a');
+    formatted.toggle_hex();
+    formatted.save_changes();
+    auto changed_nroff = nroff_bytes; changed_nroff[0] = 'Z';
+    check(read_file(nroff_path) == changed_nroff, "saving staged raw bytes from formatted text never writes presentation bytes");
+    const auto compressed = mcpp::capture_command({"gzip","-c","--",nroff_path.string()}, root);
+    check(compressed.status == 0, "standard gzip control produces the parsed fixture");
+    write_file(root / "viewer-compressed.gz", compressed.output);
+    mcpp::ViewerModel parsed;
+    parsed.open(panel_provider, (root / "viewer-compressed.gz").string());
+    check(parsed.parsed() && parsed.size() == changed_nroff.size(), "Parse mode exposes the decompressed data");
+    parsed.toggle_hex();
+    bool parsed_edit_rejected = false;
+    try { parsed.toggle_hex_editing(); } catch (const std::exception&) { parsed_edit_rejected = true; }
+    check(parsed_edit_rejected && !parsed.dirty(), "parsed data cannot be published as a damaged compressed file");
+    parsed.toggle_magic();
+    check(!parsed.parsed() && parsed.size() == compressed.output.size(), "Raw restores physical compressed bytes");
+    write_file(root / "viewer-modes", "catalog cat\nAlpha42\nalpha17\n");
+    mcpp::ViewerModel searched;
+    searched.open(panel_provider, (root / "viewer-modes").string());
+    mcpp::EditorSearchOptions expression{.mode=mcpp::EditorSearchMode::regular_expression};
+    const auto match_one = searched.find("alpha[0-9]+", expression, {}, false);
+    const auto match_two = searched.find("alpha[0-9]+", expression, {}, false);
+    check(match_one && match_two && *match_two > *match_one, "viewer regex continuation advances to the next match");
+    expression.backwards = true;
+    check(searched.find("alpha[0-9]+", expression, {}, false) == match_one,
+          "backwards continuation uses the current hit, not the line-start viewport");
+    searched.go_to_start();
+    check(searched.find("cat", mcpp::EditorSearchOptions{.whole_words=true}, {}, false) == 8U,
+          "viewer whole-word search rejects a longer containing word");
+    searched.goto_line(2);
+    const auto marked_offset = searched.offset();
+    searched.select_bookmark(3); searched.set_bookmark(); searched.go_to_start(); searched.goto_bookmark();
+    check(searched.offset() == marked_offset, "viewer bookmarks retain exact displayed positions");
+    write_file(root / "viewer-codepage", std::string("caf\xe9\n", 5));
+    searched.open(panel_provider, (root / "viewer-codepage").string());
+    check(searched.find("café", mcpp::EditorSearchOptions{}, {}, false, true) == 0U,
+          "All charsets searches legacy codepages and maps the hit to raw bytes");
+    searched.set_encoding("ISO-8859-1");
+    check(searched.lines(80, 3).front() == "café" && read_file(root / "viewer-codepage") == std::string("caf\xe9\n", 5),
+          "viewer codepage changes presentation without converting the file");
+    check(searched.data_size() == 5U && searched.source_view_end() == 5U,
+          "decoded codepage progress retains physical byte counters");
+    mcpp::TemporaryFile command_input("mail body\n");
+    const auto input_result = mcpp::capture_command({"cat"}, root, {}, 1024, command_input.path());
+    check(input_result.status == 0 && input_result.output == "mail body\n", "local argv commands receive exact regular-file stdin");
     write_file(root / "source/tree/a", "OLD SOURCE");
     write_file(root / "target/tree/a", "NEW TARGET");
     std::size_t child_queries = 0;

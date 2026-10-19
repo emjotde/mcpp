@@ -1,6 +1,7 @@
 #include "mcpp/viewer.hpp"
 #include "mcpp/editor_search.hpp"
 #include "mcpp/local_provider.hpp"
+#include "mcpp/local_tools.hpp"
 
 #include <algorithm>
 #include <array>
@@ -83,6 +84,82 @@ std::size_t next_utf8(
     return next;
 }
 
+struct NroffText {
+    std::string text;
+    std::vector<ViewerTextStyle> styles;
+    std::vector<std::pair<std::size_t, std::size_t>> offsets;
+};
+
+NroffText format_nroff(const std::string_view input) {
+    struct Cell { std::string_view text; std::size_t begin; std::size_t end; bool bold{false}; bool underline{false}; };
+    std::vector<Cell> cells;
+    std::string output;
+    std::vector<ViewerTextStyle> styles;
+    std::vector<std::pair<std::size_t, std::size_t>> offsets;
+    const auto mapped = [&](const std::size_t view, const std::size_t source, const bool force = false) {
+        if (!offsets.empty() && offsets.back().first == view) offsets.back().second = source;
+        else if (force || offsets.empty() || offsets.back().second + view - offsets.back().first != source) offsets.emplace_back(view, source);
+    };
+    std::size_t cursor = 0;
+    const auto flush = [&] {
+        for (const auto& cell : cells) {
+            const auto begin = output.size();
+            mapped(begin, cell.begin, cell.end - cell.begin != cell.text.size());
+            output += cell.text;
+            mapped(output.size(), cell.end);
+            if (cell.bold || cell.underline) {
+                if (!styles.empty() && styles.back().end == begin &&
+                    styles.back().bold == cell.bold && styles.back().underline == cell.underline) {
+                    styles.back().end = output.size();
+                } else styles.push_back({begin, output.size(), cell.bold, cell.underline});
+            }
+        }
+        cells.clear();
+        cursor = 0;
+    };
+    for (std::size_t index = 0; index < input.size();) {
+        if (cursor == 0U && cells.empty()) {
+            const auto newline = input.find('\n', index);
+            const auto length = newline == std::string_view::npos ? input.size() - index : newline - index;
+            const auto line = input.substr(index, length);
+            const auto control = line.find_first_of("\b\r");
+            if (control == std::string_view::npos || (control + 1U == line.size() && line.back() == '\r')) {
+                mapped(output.size(), index);
+                output.append(line.substr(0, control == std::string_view::npos ? line.size() : line.size() - 1U));
+                mapped(output.size(), index + length);
+                if (newline == std::string_view::npos) break;
+                output += '\n';
+                mapped(output.size(), newline + 1U);
+                index = newline + 1U;
+                continue;
+            }
+        }
+        if (input[index] == '\n') { flush(); mapped(output.size(), index); output += '\n'; mapped(output.size(), index + 1U); ++index; continue; }
+        if (input[index] == '\r') { cursor = 0; ++index; continue; }
+        if (input[index] == '\b') { if (cursor > 0U) --cursor; ++index; continue; }
+        const auto end = next_utf8(input, index);
+        const auto text = input.substr(index, end - index);
+        if (cursor >= cells.size()) {
+            if (cells.size() >= 1024U * 1024U) throw std::runtime_error("nroff line exceeds the formatted-view limit; raw viewing remains available");
+            cells.push_back({text, index, end});
+        }
+        else {
+            auto& cell = cells[cursor];
+            if (cell.text == text) cell.bold = true;
+            else if (cell.text == "_" || text == "_") {
+                if (text != "_") cell.text = text;
+                cell.underline = true;
+            } else cell = {text, index, end};
+            cell.end = end;
+        }
+        ++cursor;
+        index = end;
+    }
+    flush();
+    if (offsets.empty()) offsets.emplace_back(0, 0);
+    return {std::move(output), std::move(styles), std::move(offsets)};
+}
+
 }  // namespace
 
 void ViewerModel::open(
@@ -97,30 +174,16 @@ void ViewerModel::open(
     if (entry.kind != EntryKind::file) {
         throw std::runtime_error("viewer requires a regular file");
     }
-    std::ostringstream initial;
-    provider->read(entry.path, 0, std::min<std::uint64_t>(window_size, entry.size), initial, cancellation);
-    provider_ = std::move(provider);
-    path_ = std::move(path);
-    storage_path_ = entry.path;
-    size_ = entry.size;
-    offset_ = 0;
-    view_end_ = 0;
-    previous_offsets_.clear();
-    horizontal_offset_ = 0;
-    last_search_.clear();
-    search_match_.reset();
-    text_highlights_.clear();
-    last_text_page_.reset();
-    next_search_offset_ = 0;
-    search_begin_ = 0;
-    hex_cursor_ = 0;
-    hex_editing_ = false;
-    hex_ascii_ = false;
-    hex_low_nibble_ = false;
-    edits_.clear();
-    revision_ = entry.revision;
-    window_ = std::move(initial).str();
-    window_offset_ = 0;
+    ViewerModel next;
+    next.provider_ = std::move(provider);
+    next.path_ = std::move(path);
+    next.storage_path_ = entry.path;
+    next.source_size_ = next.size_ = entry.size;
+    next.revision_ = entry.revision;
+    next.hex_ = hex_;
+    next.wrap_ = wrap_;
+    next.refresh_presentation(magic_, nroff_, encoding_, cancellation);
+    *this = std::move(next);
 }
 
 void ViewerModel::close() {
@@ -129,6 +192,17 @@ void ViewerModel::close() {
     storage_path_.clear();
     window_.clear();
     size_ = 0;
+    source_size_ = 0;
+    magic_content_.reset();
+    text_content_.reset();
+    presentation_dirty_ = false;
+    presentation_styles_.clear();
+    nroff_offsets_.clear();
+    codepage_offsets_.clear();
+    decoded_content_.clear();
+    text_style_rows_.clear();
+    bookmarks_.fill(0);
+    bookmark_slot_ = 0;
     offset_ = 0;
     view_end_ = 0;
     previous_offsets_.clear();
@@ -189,6 +263,8 @@ void ViewerModel::go_to_end(
 
 void ViewerModel::navigation_changed() {
     last_search_.clear();
+    advanced_search_pattern_.clear();
+    search_boundary_exhausted_ = false;
     next_search_offset_ = hex_ ? hex_cursor_ : offset_;
 }
 
@@ -299,7 +375,12 @@ void ViewerModel::scroll_columns(const int amount) {
 
 void ViewerModel::toggle_hex() {
     const auto anchor = offset_;
+    const auto line = text_content_ || nroff_ || (!encoding_.empty() && encoding_ != "UTF-8") ? line_number() : 0U;
+    if (hex_ && (nroff_ || (!encoding_.empty() && encoding_ != "UTF-8"))) {
+        refresh_presentation(magic_, nroff_, encoding_, {});
+    }
     hex_ = !hex_;
+    select_presentation();
     if (!hex_) {
         hex_editing_ = false;
     } else {
@@ -308,8 +389,176 @@ void ViewerModel::toggle_hex() {
     }
     previous_offsets_.clear();
     horizontal_offset_ = 0;
+    if (line != 0U) goto_line(line);
     navigation_changed();
 }
+
+const std::string* ViewerModel::presentation() const noexcept {
+    if (!hex_ && text_content_) return &*text_content_;
+    return magic_content_ ? &*magic_content_ : nullptr;
+}
+
+void ViewerModel::select_presentation() {
+    const auto* content = presentation();
+    size_ = content != nullptr ? content->size() : source_size_;
+    offset_ = std::min(offset_, size_);
+    hex_cursor_ = size_ == 0U ? 0U : std::min(hex_cursor_, size_ - 1U);
+    window_.clear();
+    window_offset_ = 0;
+    last_text_page_.reset();
+    text_highlights_.clear();
+    text_style_rows_.clear();
+}
+
+void ViewerModel::read_view(const std::uint64_t offset, const std::uint64_t length,
+                            std::ostream& output, const Cancellation& cancellation) {
+    cancellation.throw_if_requested();
+    if (const auto* content = presentation()) {
+        if (offset > content->size()) throw std::out_of_range("viewer read is outside the presentation");
+        const auto count = static_cast<std::size_t>(std::min<std::uint64_t>(length, content->size() - offset));
+        output.write(content->data() + static_cast<std::ptrdiff_t>(offset), static_cast<std::streamsize>(count));
+        if (!output) throw std::runtime_error("cannot write viewer presentation");
+    } else provider_->read(storage_path_, offset, length, output, cancellation);
+}
+
+std::string ViewerModel::read_all(const Cancellation& cancellation) {
+    constexpr std::uint64_t maximum = 64U * 1024U * 1024U;
+    if (size_ > maximum) throw std::runtime_error("formatted or advanced search view exceeds the 64 MiB buffer limit; raw viewing remains available");
+    std::ostringstream output;
+    read_view(0, size_, output, cancellation);
+    auto content = std::move(output).str();
+    if (content.size() != size_) throw std::runtime_error("file changed while preparing the viewer");
+    for (const auto& [offset, byte] : edits_) {
+        if (offset < content.size()) content[static_cast<std::size_t>(offset)] = static_cast<char>(byte);
+    }
+    return content;
+}
+
+std::uint64_t ViewerModel::data_size() const noexcept {
+    return magic_content_ ? magic_content_->size() : source_size_;
+}
+
+std::uint64_t ViewerModel::source_position(std::uint64_t position) const {
+    if (hex_ || !text_content_) return std::min(position, data_size());
+    if (nroff_ && !nroff_offsets_.empty()) {
+        auto point = std::upper_bound(nroff_offsets_.begin(), nroff_offsets_.end(), position,
+            [](const std::uint64_t value, const auto& item) { return value < item.first; });
+        if (point != nroff_offsets_.begin()) --point;
+        position = point->second + position - point->first;
+    }
+    if (!codepage_offsets_.empty()) {
+        auto point = std::upper_bound(codepage_offsets_.begin(), codepage_offsets_.end(), position,
+            [](const std::uint64_t value, const auto& item) { return value < item.first; });
+        if (point != codepage_offsets_.begin()) --point;
+        auto decoded = point->first;
+        auto source = point->second;
+        while (decoded < position && decoded < decoded_content_.size()) {
+            decoded = next_utf8(decoded_content_, decoded);
+            ++source;
+        }
+        position = source;
+    }
+    return std::min(position, data_size());
+}
+
+std::uint64_t ViewerModel::source_view_end() const { return source_position(view_end_); }
+
+void ViewerModel::refresh_presentation(const bool magic, const bool nroff, std::string codepage,
+                                       const Cancellation& cancellation) {
+    std::optional<std::string> parsed;
+    if (magic) {
+        std::ostringstream initial;
+        provider_->read(storage_path_, 0, std::min<std::uint64_t>(12, source_size_), initial, cancellation);
+        const auto header = std::move(initial).str();
+        std::string tool;
+        if (header.starts_with(std::string("\x1f\x8b", 2))) tool = "gzip";
+        else if (header.starts_with("BZh")) tool = "bzip2";
+        else if (header.starts_with(std::string("\xfd\x37\x7a\x58\x5a\x00", 6))) tool = "xz";
+        else if (header.starts_with(std::string("\x28\xb5\x2f\xfd", 4))) tool = "zstd";
+        if (!tool.empty()) {
+            if (dynamic_cast<LocalProvider*>(provider_.get()) == nullptr) throw std::runtime_error("parsed viewing requires a local file");
+            const auto result = capture_command({tool, "-cd", "--", storage_path_},
+                std::filesystem::path(storage_path_).parent_path(), cancellation, 64U * 1024U * 1024U);
+            if (result.status != 0) throw std::runtime_error(tool + " exited " + std::to_string(result.status) + ": " + result.error);
+            parsed = result.output;
+        }
+    }
+    std::optional<std::string> text;
+    std::vector<ViewerTextStyle> styles;
+    std::vector<std::pair<std::size_t, std::size_t>> nroff_offsets, codepage_offsets;
+    std::string decoded_content;
+    if (nroff || (!codepage.empty() && codepage != "UTF-8")) {
+        std::string input;
+        if (parsed) input = *parsed;
+        else {
+            if (source_size_ > 64U * 1024U * 1024U) throw std::runtime_error("formatted viewing is limited to 64 MiB; raw viewing remains available");
+            std::ostringstream output;
+            provider_->read(storage_path_, 0, source_size_, output, cancellation);
+            input = std::move(output).str();
+            if (input.size() != source_size_) throw std::runtime_error("file changed while formatting the viewer");
+            for (const auto& [offset, byte] : edits_) {
+                if (offset < input.size()) input[static_cast<std::size_t>(offset)] = static_cast<char>(byte);
+            }
+        }
+        if (!codepage.empty() && codepage != "UTF-8") {
+            input = convert_encoding(input, codepage, "UTF-8");
+            codepage_offsets.emplace_back(0, 0);
+            std::size_t source = 0;
+            for (std::size_t offset = 0; offset < input.size();) {
+                offset = next_utf8(input, offset);
+                ++source;
+                if (source % 4096U == 0U) codepage_offsets.emplace_back(offset, source);
+            }
+            decoded_content = input;
+        }
+        if (nroff) {
+            auto formatted = format_nroff(input);
+            text = std::move(formatted.text);
+            styles = std::move(formatted.styles);
+            nroff_offsets = std::move(formatted.offsets);
+        } else text = std::move(input);
+    }
+    magic_ = magic;
+    nroff_ = nroff;
+    encoding_ = std::move(codepage);
+    magic_content_ = std::move(parsed);
+    if (magic_content_) hex_editing_ = false;
+    text_content_ = std::move(text);
+    presentation_styles_ = std::move(styles);
+    nroff_offsets_ = std::move(nroff_offsets);
+    codepage_offsets_ = std::move(codepage_offsets);
+    decoded_content_ = std::move(decoded_content);
+    presentation_dirty_ = false;
+    select_presentation();
+}
+
+void ViewerModel::toggle_magic(const Cancellation& cancellation) {
+    if (dirty()) throw std::runtime_error("save or discard hex edits before changing parse mode");
+    refresh_presentation(!magic_, nroff_, encoding_, cancellation);
+    goto_offset(0);
+}
+
+void ViewerModel::toggle_nroff(const Cancellation& cancellation) {
+    if (dirty()) throw std::runtime_error("save or discard hex edits before changing formatting");
+    const auto line = line_number(cancellation);
+    refresh_presentation(magic_, !nroff_, encoding_, cancellation);
+    goto_line(line, cancellation);
+}
+
+void ViewerModel::set_encoding(std::string codepage, const Cancellation& cancellation) {
+    if (dirty()) throw std::runtime_error("save or discard hex edits before changing codepage");
+    const auto line = line_number(cancellation);
+    refresh_presentation(magic_, nroff_, std::move(codepage), cancellation);
+    goto_line(line, cancellation);
+}
+
+void ViewerModel::select_bookmark(const std::size_t slot) {
+    if (slot >= bookmarks_.size()) throw std::out_of_range("viewer bookmark must be 0 through 9");
+    bookmark_slot_ = slot;
+}
+
+void ViewerModel::set_bookmark() { bookmarks_[bookmark_slot_] = offset_; }
+void ViewerModel::goto_bookmark() { goto_offset(bookmarks_[bookmark_slot_]); }
 
 void ViewerModel::goto_offset(const std::uint64_t requested) {
     if (!open()) {
@@ -322,6 +571,38 @@ void ViewerModel::goto_offset(const std::uint64_t requested) {
     hex_low_nibble_ = false;
     next_search_offset_ = offset_;
     navigation_changed();
+}
+
+void ViewerModel::goto_data_offset(const std::uint64_t requested) {
+    if (requested > data_size()) throw std::out_of_range("offset is outside the file data");
+    if (hex_ || !text_content_) { goto_offset(requested); return; }
+    std::size_t decoded = static_cast<std::size_t>(requested);
+    if (!codepage_offsets_.empty()) {
+        auto point = std::upper_bound(codepage_offsets_.begin(), codepage_offsets_.end(), requested,
+            [](const std::uint64_t value, const auto& item) { return value < item.second; });
+        if (point != codepage_offsets_.begin()) --point;
+        decoded = point->first;
+        for (auto source = point->second; source < requested && decoded < decoded_content_.size(); ++source) {
+            decoded = next_utf8(decoded_content_, decoded);
+        }
+    }
+    std::size_t view = decoded;
+    if (nroff_ && !nroff_offsets_.empty()) {
+        view = 0;
+        std::size_t best_source = 0;
+        for (std::size_t index = 0; index < nroff_offsets_.size(); ++index) {
+            const auto& point = nroff_offsets_[index];
+            if (point.second > decoded || point.second < best_source) continue;
+            best_source = point.second;
+            view = point.first + decoded - point.second;
+            if (index + 1U < nroff_offsets_.size()) {
+                const auto& next = nroff_offsets_[index + 1U];
+                if (decoded < next.second && next.second - point.second != next.first - point.first) view = point.first;
+                else view = std::min(view, next.first);
+            }
+        }
+    }
+    goto_offset(std::min<std::uint64_t>(view, size_));
 }
 
 void ViewerModel::goto_line(
@@ -360,7 +641,7 @@ void ViewerModel::goto_percent(const unsigned int percent) {
     if (percent > 100U) {
         throw std::out_of_range("percentage must be between 0 and 100");
     }
-    goto_offset(size_ / 100U * percent + size_ % 100U * percent / 100U);
+    goto_data_offset(data_size() / 100U * percent + data_size() % 100U * percent / 100U);
 }
 
 std::uint64_t ViewerModel::line_number(const Cancellation& cancellation) {
@@ -387,8 +668,8 @@ std::uint64_t ViewerModel::line_number(const Cancellation& cancellation) {
 }
 
 unsigned int ViewerModel::position_percent() const noexcept {
-    const auto position = hex_ ? hex_cursor_ : view_end_;
-    const auto total = hex_ && size_ > 0U ? size_ - 1U : size_;
+    const auto position = hex_ ? hex_cursor_ : source_view_end();
+    const auto total = hex_ && size_ > 0U ? size_ - 1U : data_size();
     return total == 0U ? 100U : static_cast<unsigned int>(std::min(
         100.0L, static_cast<long double>(position) * 100.0L / total
     ));
@@ -398,7 +679,8 @@ void ViewerModel::toggle_hex_editing() {
     if (!open()) {
         throw std::runtime_error("viewer is not open");
     }
-    hex_ = true;
+    if (parsed()) throw std::runtime_error("parsed data cannot be hex-edited; select Raw first");
+    if (!hex_) toggle_hex();
     hex_editing_ = !hex_editing_;
     hex_cursor_ = size_ == 0U ? 0U : std::min(std::max(hex_cursor_, offset_), size_ - 1U);
     hex_low_nibble_ = false;
@@ -409,7 +691,9 @@ bool ViewerModel::hex_ascii() const noexcept { return hex_ascii_; }
 std::uint64_t ViewerModel::hex_cursor() const noexcept { return hex_cursor_; }
 bool ViewerModel::hex_low_nibble() const noexcept { return hex_low_nibble_; }
 bool ViewerModel::dirty() const noexcept { return !edits_.empty(); }
-bool ViewerModel::search_can_wrap() const noexcept { return search_begin_ > 0U; }
+bool ViewerModel::search_can_wrap() const noexcept {
+    return last_search_options_.backwards ? search_begin_ < size_ : search_begin_ > 0U;
+}
 
 void ViewerModel::toggle_hex_navigation() {
     hex_ascii_ = !hex_ascii_;
@@ -549,6 +833,7 @@ void ViewerModel::save_changes(
     if (!dirty()) {
         return;
     }
+    if (parsed()) throw std::runtime_error("parsed data cannot be saved as raw hex edits");
     if (const auto* local = dynamic_cast<const LocalProvider*>(provider_.get())) {
         local->ensure_writable(storage_path_);
         if (linked == ViewerLinkedSave::require_choice &&
@@ -556,7 +841,7 @@ void ViewerModel::save_changes(
             throw std::runtime_error("linked file requires a detach or preserve-links choice");
         }
     }
-    EditedInput buffer(*provider_, storage_path_, size_, edits_, cancellation);
+    EditedInput buffer(*provider_, storage_path_, source_size_, edits_, cancellation);
     std::istream input(&buffer);
     input.exceptions(std::ios::badbit);
     if (linked == ViewerLinkedSave::preserve_links) {
@@ -564,9 +849,9 @@ void ViewerModel::save_changes(
         if (local == nullptr) {
             throw std::runtime_error("linked saves are unavailable for this provider");
         }
-        local->write_in_place(storage_path_, input, size_, revision_, cancellation);
+        local->write_in_place(storage_path_, input, source_size_, revision_, cancellation);
     } else {
-        provider_->write(storage_path_, input, size_, true, revision_, cancellation, {});
+        provider_->write(storage_path_, input, source_size_, true, revision_, cancellation, {});
     }
     revision_ = provider_->stat(storage_path_, cancellation).revision;
     edits_.clear();
@@ -579,6 +864,9 @@ void ViewerModel::discard_changes() {
     search_match_.reset();
     last_text_page_.reset();
     hex_low_nibble_ = false;
+    text_content_.reset();
+    presentation_styles_.clear();
+    presentation_dirty_ = !hex_ && (nroff_ || (!encoding_.empty() && encoding_ != "UTF-8"));
 }
 
 void ViewerModel::set_wrap(const bool value) {
@@ -691,7 +979,8 @@ std::uint64_t ViewerModel::read_text_row(
     const std::size_t viewport_width,
     std::string* output,
     const Cancellation& cancellation,
-    std::optional<std::pair<std::size_t, std::size_t>>* highlight
+    std::optional<std::pair<std::size_t, std::size_t>>* highlight,
+    std::vector<ViewerTextStyle>* styles
 ) {
     const auto width = std::max<std::size_t>(1U, viewport_width);
     std::size_t column = 0;
@@ -735,6 +1024,7 @@ std::uint64_t ViewerModel::read_text_row(
             return offset;
         }
         const auto glyph_begin = column;
+        const auto byte_begin = offset;
         const bool matched = search_match_ &&
             offset < search_match_->second && offset + length > search_match_->first;
         column += glyph_width;
@@ -770,6 +1060,13 @@ std::uint64_t ViewerModel::read_text_row(
                 (*highlight)->second = output->size();
             }
         }
+        if (styles != nullptr && output->size() > begin && nroff_) {
+            const auto style = std::lower_bound(presentation_styles_.begin(), presentation_styles_.end(), byte_begin,
+                [](const ViewerTextStyle& value, const std::uint64_t position) { return value.end <= position; });
+            if (style != presentation_styles_.end() && style->begin < byte_begin + length) {
+                styles->push_back({begin, output->size(), style->bold, style->underline});
+            }
+        }
         displayed_width += glyph_width;
     }
     return offset;
@@ -784,8 +1081,7 @@ void ViewerModel::load_window(
         return;
     }
     std::ostringstream output;
-    provider_->read(
-        storage_path_,
+    read_view(
         offset,
         std::min<std::uint64_t>(size, size_ - offset),
         output,
@@ -804,7 +1100,9 @@ std::vector<std::string> ViewerModel::lines(
     const std::size_t height,
     const Cancellation& cancellation
 ) {
+    if (presentation_dirty_) refresh_presentation(magic_, nroff_, encoding_, cancellation);
     text_highlights_.clear();
+    text_style_rows_.clear();
     viewport_width_ = std::max<std::size_t>(1U, width);
     viewport_rows_ = std::max<std::size_t>(1U, height);
     if (!open()) {
@@ -860,18 +1158,21 @@ std::vector<std::string> ViewerModel::lines(
     while (result.size() < height && view_end_ < size_) {
         std::string line;
         std::optional<std::pair<std::size_t, std::size_t>> highlight;
+        std::vector<ViewerTextStyle> styles;
         const auto next = read_text_row(
             view_end_,
             width,
             &line,
             cancellation,
-            &highlight
+            &highlight,
+            &styles
         );
         if (next <= view_end_) {
             break;
         }
         result.push_back(std::move(line));
         text_highlights_.push_back(highlight);
+        text_style_rows_.push_back(std::move(styles));
         view_end_ = next;
     }
     return result;
@@ -880,6 +1181,11 @@ std::vector<std::string> ViewerModel::lines(
 std::optional<std::pair<std::size_t, std::size_t>>
 ViewerModel::text_highlight(const std::size_t row) const noexcept {
     return row < text_highlights_.size() ? text_highlights_[row] : std::nullopt;
+}
+
+const std::vector<ViewerTextStyle>& ViewerModel::text_styles(const std::size_t row) const noexcept {
+    static const std::vector<ViewerTextStyle> empty;
+    return row < text_style_rows_.size() ? text_style_rows_[row] : empty;
 }
 
 std::optional<std::uint64_t> ViewerModel::find(
@@ -892,6 +1198,7 @@ std::optional<std::uint64_t> ViewerModel::find(
         return std::nullopt;
     }
     const auto requested = std::string(needle);
+    last_search_options_ = {.mode=EditorSearchMode::normal, .case_sensitive=case_sensitive};
     const bool repeat =
         requested == last_search_ &&
         case_sensitive == last_search_case_sensitive_;
@@ -907,8 +1214,7 @@ std::optional<std::uint64_t> ViewerModel::find(
              cursor += chunk_size) {
             cancellation.throw_if_requested();
             std::ostringstream output;
-            provider_->read(
-                storage_path_,
+            read_view(
                 cursor,
                 std::min(chunk_size, end - cursor),
                 output,
@@ -960,13 +1266,77 @@ std::optional<std::uint64_t> ViewerModel::find(
     last_search_ = requested;
     last_search_case_sensitive_ = case_sensitive;
     next_search_offset_ = found->second;
+    return reveal_search_match(*found, cancellation);
+}
+
+std::optional<std::uint64_t> ViewerModel::find(
+    const std::string_view needle, const EditorSearchOptions& options,
+    const Cancellation& cancellation, const bool wrap, const bool all_charsets
+) {
+    if (!open() || needle.empty()) return std::nullopt;
+    const bool continuing = advanced_search_pattern_ == needle && last_search_options_.mode == options.mode &&
+        last_search_options_.case_sensitive == options.case_sensitive &&
+        last_search_options_.whole_words == options.whole_words && last_search_all_charsets_ == all_charsets && !last_search_.empty();
+    const bool repeat = continuing && last_search_options_.backwards == options.backwards;
+    if (!all_charsets && !options.backwards && !options.whole_words &&
+        (options.mode == EditorSearchMode::normal || options.mode == EditorSearchMode::hexadecimal)) {
+        const auto bytes = options.mode == EditorSearchMode::hexadecimal ? EditorSearch::decode_hexadecimal(needle) : std::string(needle);
+        if (!repeat) {
+            if (continuing && search_match_) {
+                last_search_ = bytes;
+                last_search_case_sensitive_ = options.mode == EditorSearchMode::hexadecimal || options.case_sensitive;
+                next_search_offset_ = search_match_->second;
+            } else last_search_.clear();
+        }
+        const auto found = find(bytes, options.mode == EditorSearchMode::hexadecimal || options.case_sensitive, cancellation, wrap);
+        advanced_search_pattern_ = needle;
+        last_search_options_ = options;
+        last_search_all_charsets_ = false;
+        search_boundary_exhausted_ = false;
+        return found;
+    }
+    const auto content = read_all(cancellation);
+    auto start = repeat ? std::min<std::uint64_t>(next_search_offset_, size_)
+               : continuing && search_match_ ? options.backwards ? search_match_->first : search_match_->second
+               : hex_ ? hex_cursor_ : offset_;
+    search_begin_ = start;
+    if (repeat && search_boundary_exhausted_) {
+        if (!wrap) return std::nullopt;
+        start = options.backwards ? size_ : 0U;
+    }
+    const auto found = all_charsets
+        ? EditorSearch::find_codepages(content, needle, static_cast<std::size_t>(start), 0, content.size(), options, wrap, false)
+        : EditorSearch::find(content, needle, static_cast<std::size_t>(start), 0, content.size(), options, wrap, false);
+    advanced_search_pattern_ = needle;
+    last_search_ = needle;
+    last_search_options_ = options;
+    last_search_all_charsets_ = all_charsets;
+    last_search_case_sensitive_ = options.case_sensitive;
+    if (!found) {
+        if (!repeat) search_match_.reset();
+        next_search_offset_ = start;
+        return std::nullopt;
+    }
+    search_boundary_exhausted_ = false;
+    if (options.backwards) next_search_offset_ = found->begin;
+    else if (found->end > found->begin) next_search_offset_ = found->end;
+    else {
+        next_search_offset_ = next_utf8(content, found->end);
+        search_boundary_exhausted_ = found->end == content.size();
+    }
+    return reveal_search_match({found->begin, found->end}, cancellation);
+}
+
+std::optional<std::uint64_t> ViewerModel::reveal_search_match(
+    const std::pair<std::uint64_t, std::uint64_t> found, const Cancellation& cancellation
+) {
+    constexpr std::uint64_t chunk_size = 256U * 1024U;
     const auto prefix_begin =
-        found->first > chunk_size ? found->first - chunk_size : 0U;
+        found.first > chunk_size ? found.first - chunk_size : 0U;
     std::ostringstream prefix_output;
-    provider_->read(
-        storage_path_,
+    read_view(
         prefix_begin,
-        found->first - prefix_begin,
+        found.first - prefix_begin,
         prefix_output,
         cancellation
     );
@@ -978,12 +1348,12 @@ std::optional<std::uint64_t> ViewerModel::find(
             : prefix_begin + newline + 1U;
     std::size_t next_column = 0;
     if (hex_) {
-        hex_cursor_ = found->first;
-        next_offset = found->first / 16U * 16U;
+        hex_cursor_ = found.first;
+        next_offset = found.first / 16U * 16U;
     } else if (wrap_) {
-        while (next_offset < found->first) {
+        while (next_offset < found.first) {
             const auto next = read_text_row(next_offset, viewport_width_, nullptr, cancellation);
-            if (next <= next_offset || next > found->first) {
+            if (next <= next_offset || next > found.first) {
                 break;
             }
             next_offset = next;
@@ -1010,7 +1380,7 @@ std::optional<std::uint64_t> ViewerModel::find(
     previous_offsets_.clear();
     horizontal_offset_ = next_column;
     search_match_ = found;
-    return found->first;
+    return found.first;
 }
 
 }  // namespace mcpp
