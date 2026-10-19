@@ -96,7 +96,7 @@ const std::vector<Skin>& builtin_skins() {
 }
 
 const Skin& find_skin(std::string_view id) {
-    if (id == "gray" || id == "type-colors") id = "grayscale";
+    if (id == "gray" || id == "classic" || id == "type-colors") id = "grayscale";
     if (id == "blue") id = "default";
     const auto& skins = builtin_skins();
     const auto match = std::ranges::find(skins, id, &Skin::id);

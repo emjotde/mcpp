@@ -2799,6 +2799,7 @@ void test_skins() {
     check(std::ranges::count_if(skins, [](const auto& skin) { return skin.light; }) == 3,
           "paper, sand and ice provide light palettes");
     check(mcpp::find_skin("gray").id == "grayscale" &&
+          mcpp::find_skin("classic").id == "grayscale" &&
           mcpp::find_skin("type-colors").id == "grayscale" &&
           mcpp::find_skin("blue").id == "default", "legacy skin aliases remain accepted");
     check(mcpp::find_skin("grayscale").normal.background == ftxui::Color(ftxui::Color::Grey3) &&

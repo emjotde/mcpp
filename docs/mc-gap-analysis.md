@@ -127,6 +127,10 @@ Cancel restores both the saved skin and any launch-only override. `-S` /
 `--skin` works in all four executables without replacing the saved preference.
 Unknown names fail explicitly. Capability-specific caches retain valid palette
 references when the terminal changes its reported color depth.
+The legacy `theme=classic` setting is explicitly mapped to its previous
+grayscale appearance. It is not an invalid new skin name: rejecting it prevented
+older saved configurations from starting the release. Startup and normal exit
+are checked without changing that saved value.
 
 Classic blue's marked active selection now uses black text on cyan instead of
 the previous low-contrast yellow; inactive selection uses light text on blue.

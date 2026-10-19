@@ -292,6 +292,8 @@ build/release/mcppdiff --skin contrast old.cpp new.cpp
 The command-line override does not replace the saved skin. An explicit skin
 choice in Appearance does. Unknown skin names are errors rather than silent
 fallbacks. `gray` and `blue` remain aliases for `grayscale` and `default`.
+The legacy saved value `classic` retains its previous grayscale appearance, so
+upgrading does not prevent startup or require rewriting the configuration.
 
 ## Modal Tree and diff/merge
 

@@ -272,6 +272,16 @@ class SkinsUI(unittest.TestCase):
             terminal.wait_file(terminal.exit_file, b"0\n")
             self.assertIn("theme=forest\n", (terminal.root / "config/mcpp/config").read_text())
 
+    def test_legacy_classic_saved_skin_starts_without_rewriting_the_preference(self):
+        root, left, right = self.fixture(skin="classic")
+        with self.terminal(root, MANAGER, [left, right]) as terminal:
+            self.panels(terminal)
+            self.assertEqual(self.pair(terminal),
+                             (rgb(PALETTES["grayscale"][1]), rgb(PALETTES["grayscale"][0])))
+            terminal.press("F10")
+            terminal.wait_file(terminal.exit_file, b"0\n")
+            self.assertIn("theme=classic\n", (terminal.root / "config/mcpp/config").read_text())
+
     def test_all_frontends_accept_and_validate_skin_arguments(self):
         root, left, right = self.fixture()
         path = left / "sample.cpp"
