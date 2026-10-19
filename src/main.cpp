@@ -22,17 +22,19 @@ int main(const int argc, char** argv) {
             << "Usage: mcpp [options] [left-directory] "
                "[right-directory]\n"
             << "  -v, --view <file>    Open viewer\n"
-            << "  -e, --edit <file>    Open editor\n"
+            << "  -e, --edit [files]   Open editor (unnamed if no files)\n"
+            << "                      Files accept file:line or file:line:\n"
             << "  -P, --printwd <file> Write final directory\n";
         return 0;
     }
-    if (!arguments.empty() && arguments[0] == "--version") {
+    if (!arguments.empty() && (arguments[0] == "--version" || arguments[0] == "-V")) {
         std::cout << "mcpp " MCPP_VERSION << "\n";
         return 0;
     }
     try {
         std::optional<std::string> view_file;
-        std::optional<std::string> edit_file;
+        bool edit = false;
+        std::size_t first_line = 0;
         std::optional<std::filesystem::path> print_directory;
         std::vector<std::string> paths;
         for (std::size_t index = 0; index < arguments.size(); ++index) {
@@ -48,7 +50,12 @@ int main(const int argc, char** argv) {
             if (argument == "-v" || argument == "--view") {
                 view_file = take_value();
             } else if (argument == "-e" || argument == "--edit") {
-                edit_file = take_value();
+                edit = true;
+            } else if (argument.starts_with("--edit=")) {
+                edit = true;
+                paths.push_back(argument.substr(7));
+            } else if (edit && argument.starts_with('+')) {
+                first_line = mcpp::parse_line_number(std::string_view(argument).substr(1));
             } else if (argument == "-P" ||
                        argument == "--printwd") {
                 print_directory = take_value();
@@ -68,12 +75,12 @@ int main(const int argc, char** argv) {
                 paths.push_back(argument);
             }
         }
-        if (paths.size() > 2U) {
+        if (!edit && paths.size() > 2U) {
             throw std::invalid_argument(
                 "expected at most two pane paths"
             );
         }
-        if (view_file && edit_file) {
+        if (view_file && edit) {
             throw std::invalid_argument(
                 "--view and --edit cannot be combined"
             );
@@ -95,18 +102,25 @@ int main(const int argc, char** argv) {
             return current.string();
         };
         const auto left =
-            paths.empty()
+            edit || paths.empty()
                 ? saved_path(config.saved_left_path, "left")
                 : pane_path(paths[0]);
         const auto right =
-            paths.size() < 2U
+            edit || paths.size() < 2U
                 ? saved_path(config.saved_right_path, "right")
                 : pane_path(paths[1]);
         mcpp::App app(left, right, std::move(config));
         if (view_file) {
-            app.open_viewer(*view_file);
-        } else if (edit_file) {
-            app.open_editor(*edit_file);
+            if (view_file->empty()) throw std::invalid_argument("file name is empty");
+            app.open_viewer(pane_path(*view_file));
+        } else if (edit) {
+            std::vector<mcpp::EditorFile> files;
+            for (const auto& path : paths) {
+                auto file = mcpp::parse_editor_file(path);
+                file.path = pane_path(file.path);
+                files.push_back(std::move(file));
+            }
+            app.open_editor_files(files, first_line);
         }
         const auto status = app.run();
         if (print_directory) {

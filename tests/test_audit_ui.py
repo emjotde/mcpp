@@ -594,7 +594,10 @@ class AuditUI(unittest.TestCase):
         path.write_text("original\n")
         sibling.write_text("OUTSIDE SIBLING\n")
         (left / "edit-pane-only.txt").write_text("wrong base\n")
-        with self.terminal(root / "ui", ["--edit", path, left, right]) as t:
+        config = root / "ui/config/mcpp/config"
+        config.parent.mkdir(parents=True)
+        config.write_text(f"auto_save_panels_setup=true\nsaved_left_path={left}\nsaved_right_path={right}\n")
+        with self.terminal(root / "ui", ["--edit", path]) as t:
             t.wait_editor(dirty=False)
             t.press("F12")
             t.wait_for("Line endings:")

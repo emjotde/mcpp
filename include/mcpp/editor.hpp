@@ -63,6 +63,7 @@ public:
     void break_undo_group() noexcept;
     [[nodiscard]] std::size_t byte_size() const noexcept;
     [[nodiscard]] std::size_t cursor_offset() const noexcept;
+    [[nodiscard]] EditorPosition position(std::size_t offset) const;
     [[nodiscard]] std::size_t storage_byte_size() const;
     [[nodiscard]] std::size_t storage_cursor_offset() const;
     [[nodiscard]] std::size_t storage_selection_size() const;
@@ -275,7 +276,6 @@ private:
     [[nodiscard]] std::string normalize_insert(std::string_view value) const;
     void set_content(std::string_view content);
     [[nodiscard]] std::size_t offset(EditorPosition position) const;
-    [[nodiscard]] EditorPosition position(std::size_t offset) const;
     void update_mark();
     [[nodiscard]] std::pair<std::size_t, std::size_t>
     column_selection_columns() const;

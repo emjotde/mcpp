@@ -127,6 +127,7 @@ struct Config {
     std::string editor_backup_extension{"~"};
     bool editor_check_newline{false};
     std::string editor_syntax_language{"auto"};
+    std::string editor_spelling_language;
     std::vector<std::string> bookmarks;
     std::vector<std::string> editor_history;
     std::vector<std::string> viewer_history;

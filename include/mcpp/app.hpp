@@ -1,5 +1,6 @@
 #pragma once
 
+#include "mcpp/command_line.hpp"
 #include "mcpp/config.hpp"
 #include "mcpp/editor.hpp"
 #include "mcpp/operations.hpp"
@@ -28,6 +29,8 @@ public:
     void open_viewer(const std::string& path);
     void open_editor(const std::string& path, std::size_t line = 0);
     void open_editors(const std::vector<std::string>& paths, std::size_t first_line = 0);
+    void open_editor_files(const std::vector<EditorFile>& files, std::size_t first_line = 0);
+    void open_diff(const std::string& first, const std::string& second);
     [[nodiscard]] std::string active_path() const;
     int run();
 

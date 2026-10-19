@@ -2,9 +2,116 @@
 
 Review dates: 2026-10-17 through 2026-10-19 (UTC)
 
-This is a functional review of the supported Linux local-filesystem workflows,
-not a claim that mcpp is a complete MC clone. Archive, SSH/SFTP, Azure, and
-spelling support remain deferred.
+This is a functional review of the supported Linux workflows, not a claim that
+mcpp is a complete MC clone. Remote providers remain deferred. The current
+completion target includes local archives, spelling, and shell integration.
+
+## Measured local parity baseline
+
+The baseline is `fa5f3d1`, compared with the installed Linux MC 4.8.30.
+The ignored reference checkout is useful for studying interfaces, but its newer
+revision is not the version used for runtime comparisons.
+
+| Measure | Baseline | What this measures |
+|---|---:|---|
+| Main-menu actions | 66 / 75 enabled | Includes both panel menus; excludes separators. |
+| Editor-menu actions | 65 / 68 enabled | Excludes separators. |
+| Combined menu actions | 131 / 143 enabled (91.6%) | Availability, not correct behavior or full feature coverage. |
+| Local-scope menu actions | 131 / 137 enabled (95.6%) | Excludes the six FTP/Shell/SFTP entries in the two panel menus. |
+| Local non-POSIX VFS families | 0 / 5 | tar, cpio, sfs, extfs, and ext2 undelete. |
+| Standalone frontends | 2 / 4 | Manager and editor exist; separate viewer and diff frontends do not. |
+| Known local gap work packages | 34 open | The table below; packages are not equal-sized features. |
+
+There is no justified overall completion percentage. A menu can expose only part
+of a feature, and source presence is not proof of behavioral equivalence.
+The 67 addressed audit findings measure fixes in previously exercised workflows,
+not the fraction of MC implemented. Likewise, the historical 100-case
+investigation includes blocked, inconclusive, and deliberately different cases.
+The built-in syntax set has nine highlighting languages plus plain text; the
+reference checkout contains 109 syntax definition files. Those are different
+units and must not be presented as a language-coverage percentage.
+
+### Local gap checklist
+
+Every row is open at the baseline. Closing a row requires working behavior,
+appropriate outcome checks, and an updated disposition here; merely enabling a
+menu item or adding a command-line flag is not sufficient. This is a concrete
+backlog, not a claim that all untested behavior has been enumerated.
+
+| ID | Remaining work | Baseline evidence |
+|---|---|---|
+| L01 | Standalone viewer and diff frontends | `CMakeLists.txt` builds only `mcpp` and `mcppedit`. |
+| L02 | Unnamed editor startup, per-file line positions, and multi-file manager edit startup | `src/editor_main.cpp` requires a filename; `src/main.cpp` accepts one edit filename. |
+| L03 | Remaining applicable MC command-line options | The manager and editor implement only a subset of `mc --help-all`. |
+| L04 | Persistent Bash, environment and cwd synchronization, and screen toggling | `run_process()` starts a new child for each invocation; the parked shell draft is not built. |
+| L05 | Multiple concurrent operations and command execution alongside them | One `operation_thread`; `run_process()` rejects an active operation. |
+| L06 | Append and resume/reget collision choices | `CollisionDecision` has only overwrite, skip, and cancel. |
+| L07 | Copy/rename transformation masks, stable symlinks, and directory-placement choices | The dialog filters source names; `OperationOptions` has no destination transform or stable-link/dive policy. |
+| L08 | Recursive-delete per-directory/all/none decisions | Removal exposes error handling but no recursive-delete decision callback. |
+| L09 | Sparse and special-file copying | Regular-file copying writes every byte; non-file/directory/symlink types are rejected. |
+| L10 | Large-file editor confirmation instead of a 16 MiB hard rejection | `EditorModel::open()` and backup handling impose that fixed limit. |
+| L11 | Cross-session editor lock interaction | Open/save uses revision checks but no editor-lock lifecycle or takeover decision. |
+| L12 | Codepage changes with history and raw-byte search in decoded editor data | Documented reopen requirements in `README.md`; `EditorModel::set_encoding()`. |
+| L13 | Growing files and streamed viewer sources | `ViewerModel` retains the opened size and requires a seekable provider file. |
+| L14 | Large parsed/formatted views and advanced searches | Viewer transformations and advanced search impose a 64 MiB buffer limit. |
+| L15 | Shell-command, variable, user and hostname completion | `complete_path()` completes filesystem paths only. |
+| L16 | Persistent dialog input histories | `TextInputState` histories are session-local; config persists selected histories only. |
+| L17 | Hierarchical and named directory hotlist entries | `Config::bookmarks` is a flat vector of paths. |
+| L18 | MC-compatible configuration files and applicable options | `Config` uses mcpp's independent keys and file locations. |
+| L19 | Configurable MC-format keymaps | Learned terminal sequences are supported, but action keymap files are not loaded. |
+| L20 | MC user/editor menus, conditions, and complete macro expansion | `load_user_menu()` uses `key|label|command`; only `%f`, `%d`, `%D`, and `%%` are expanded. |
+| L21 | MC extension-file matching and action compatibility | Local extension handlers use mcpp's own resource format. |
+| L22 | MC syntax-rule format and external definitions | `src/syntax.cpp` has a fixed built-in language set. |
+| L23 | MC skin and filename-highlighting formats | Appearance and highlighting use independently defined subsets. |
+| L24 | Non-UTF-8 terminal output and 7-bit input modes | Display bits reports the renderer's fixed UTF-8 requirement. |
+| L25 | Context-sensitive navigable help | F1 shows a short key table, not the full help browser. |
+| L26 | Localized UI and help | UI text is emitted directly; no translation catalog is loaded. |
+| L27 | Spell check, current-word checking, and language selection | Three editor menu entries are disabled. |
+| L28 | Local tar archives, including compressed variants | Only `LocalProvider` is enabled; `open_location()` rejects other schemes. |
+| L29 | Local cpio archives | Same provider limitation. |
+| L30 | Single-file transformation VFS | Same provider limitation. |
+| L31 | External-filesystem helpers and their public interface | Same provider limitation; no extfs dispatcher. |
+| L32 | ext2 undelete | Menu action is disabled; no implementation. |
+| L33 | Local VFS cache lifecycle, active list, and options | Active VFS and Virtual FS menu entries are disabled. |
+| L34 | Independent viewer/diff screens in the screen selector | `show_screens()` tracks one viewer and editor buffers, but no diff screens or multiple viewers. |
+
+FTP, SFTP, FISH/SSH, and Azure are excluded by the user's current remote-work
+pause. Requested Tree behavior, the grayscale UI, and explicit save safeguards
+are retained; they are not bugs to remove in pursuit of default MC behavior.
+
+### Verified closures after the baseline
+
+| Package | Disposition |
+|---|---|
+| L01 | Closed: separate `mcppview` and `mcppdiff` executables share the existing viewer and diff/merge code. Quit exits the process; dirty Save/Discard/Cancel and diff-to-editor return paths retain their guards. |
+| L02 | Closed: unnamed startup and New buffers, name-on-save including inactive-buffer Quit, `file:line` / `file:line:` notation, `+line`, existing literal colon filenames, and ordered multi-file `mcpp --edit`. CLI filename resolution and unnamed CLI startup use process cwd rather than restored pane paths. |
+| L27 | Closed: whole-document and current-word checking, dictionary selection, native suggestions/Add word/Replace/Skip/Cancel controls, and persisted personal dictionaries through standard `aspell(1)`. Byte offsets are validated, replacements are undoable, marks/search settings remain separate, and errors retain the draft and retryable dialog. |
+
+Current menu availability is **134/143**, or **134/137 (97.8%)** after excluding
+remote links. Standalone frontends are **4/4**. **31 of the 34 baseline local
+work packages remain open**; neither figure is an overall parity percentage.
+The broader command-line option set is still L03, not implicitly completed by
+the new frontends.
+
+The normal Release suite passed **24/24** entries in the non-root, no-mount,
+no-network disposable environment. This includes the standalone-editor cases,
+eight frontend cases, twelve spelling cases, and existing local regressions.
+Installed MC controls confirmed unnamed startup, New, zero/explicit line
+positions, literal colon filenames, and spelling-dialog controls. Actual
+installed Aspell checks also verified exact replacement bytes and a personal
+word recognized by fresh checker processes without changing the document.
+
+The comparison found and fixed another UI issue: an unnecessary horizontal
+frame gave a fully fitted editor header one extra column, clipping the final
+codepoint digit with long filenames. A dedicated long-name regression and the
+existing editor parity walk now retain the complete readout.
+Follow-up also exposed a lazy Tree search race: a query entered before matching
+children arrived could remain on an earlier ancestor. Unmatched active modal
+queries are now retried when a directory load publishes children, without
+undoing subsequent manual navigation. A create-then-rescan regression checks
+the accepted directory, and the sidebar-selection/cache workflow passes.
+The container runners use Docker's init process to reap orphaned terminal-test
+children rather than exhausting their PID limit on a long sequence of sessions.
 
 ## Audit fix delivery
 

@@ -273,6 +273,27 @@ class NativeCompletionUI(unittest.TestCase):
             t.press("Left", "F2")
             t.wait_for("cached-B")
 
+    def test_modal_tree_retries_an_unmatched_search_after_loading_new_children(self):
+        root, left, right = self.fixture()
+        target = left / "zz-loaded-target"
+        output = root / "cwd"
+        with self.terminal(root, ["--printwd", output, left, right]) as t:
+            t.wait_for("Name")
+            self.tree(t)
+            t.press("C-s")
+            t.type(target.name)
+            t.wait_for("Search: " + target.name)
+            self.assertNotIn(target.name, t.text().replace("Search: " + target.name, ""))
+            target.mkdir()
+            t.press("F2")
+            t.wait(lambda: any(value.endswith(target.name) for value in t.focused_text()),
+                   "a newly loaded matching directory becomes the pending search result")
+            t.press("Enter")
+            t.wait_for("Directory changed")
+            t.press("F10")
+            t.wait_file(t.exit_file, b"0\n")
+        self.assertEqual(output.read_text(), str(target) + "\n")
+
     def test_modal_tree_file_operation_context(self):
         root, left, right = self.fixture()
         (left / "copy-branch").mkdir()

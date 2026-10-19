@@ -57,12 +57,14 @@ def normal_saves(binary, tmux, root):
         session.save("save-and-cancel")
         new = root / "new.txt"
         session.press("C-n")
-        prompt(session, new)
         session.wait_editor(row=1, column=1, dirty=False)
         session.type("NEW")
         request_save(session)
         assert not new.exists(), "Opening Save confirmation must not create the file"
-        session.confirm_editor_save()
+        session.press("Enter")
+        session.wait_for("Save as")
+        prompt(session, new)
+        session.wait_editor(dirty=False)
         session.wait_file(new, b"NEW")
 
 

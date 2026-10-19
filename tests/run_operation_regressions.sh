@@ -46,6 +46,7 @@ cleanup() {
 }
 trap cleanup EXIT
 container="$(docker create --pull=never \
+    --init \
     --name "mcpp-operation-regressions-${UID}-$$" \
     --network none --cpus 1 --memory 512m --pids-limit 96 \
     -e ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 \

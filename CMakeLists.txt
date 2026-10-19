@@ -60,6 +60,7 @@ endfunction()
 
 add_library(
     mcpp_core
+    src/command_line.cpp
     src/config.cpp
     src/entry.cpp
     src/listing.cpp
@@ -71,6 +72,7 @@ add_library(
     src/operations.cpp
     src/pane.cpp
     src/search.cpp
+    src/spelling.cpp
     src/syntax.cpp
     src/user_menu.cpp
     src/tree_cache.cpp
@@ -90,18 +92,17 @@ target_link_libraries(mcpp_ui PUBLIC mcpp_core ftxui::ftxui)
 mcpp_target_defaults(mcpp_ui)
 
 add_executable(mcpp src/main.cpp)
-target_link_libraries(mcpp PRIVATE mcpp_ui)
-set_target_properties(mcpp PROPERTIES POSITION_INDEPENDENT_CODE ON)
-target_link_options(mcpp PRIVATE -pie)
-mcpp_target_defaults(mcpp)
-
 add_executable(mcppedit src/editor_main.cpp)
-target_link_libraries(mcppedit PRIVATE mcpp_ui)
-set_target_properties(mcppedit PROPERTIES POSITION_INDEPENDENT_CODE ON)
-target_link_options(mcppedit PRIVATE -pie)
-mcpp_target_defaults(mcppedit)
+add_executable(mcppview src/viewer_main.cpp)
+add_executable(mcppdiff src/diff_main.cpp)
+foreach(tool IN ITEMS mcpp mcppedit mcppview mcppdiff)
+    target_link_libraries(${tool} PRIVATE mcpp_ui)
+    set_target_properties(${tool} PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    target_link_options(${tool} PRIVATE -pie)
+    mcpp_target_defaults(${tool})
+endforeach()
 
-install(TARGETS mcpp mcppedit RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+install(TARGETS mcpp mcppedit mcppview mcppdiff RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 install(FILES LICENSE DESTINATION ${CMAKE_INSTALL_DOCDIR})
 install(
     FILES third_party/ftxui/LICENSE
@@ -291,6 +292,30 @@ if(MCPP_BUILD_TESTS)
                     ${CMAKE_CURRENT_BINARY_DIR}/standalone-editor-ui
             )
             set_tests_properties(mcpp_standalone_editor PROPERTIES TIMEOUT 90)
+            add_test(
+                NAME mcpp_local_frontends
+                COMMAND
+                    ${MCPP_PYTHON_EXECUTABLE}
+                    -B
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_local_frontends.py
+                    $<TARGET_FILE:mcpp>
+                    $<TARGET_FILE:mcppview>
+                    $<TARGET_FILE:mcppdiff>
+                    ${MCPP_TMUX_EXECUTABLE}
+                    ${CMAKE_CURRENT_BINARY_DIR}/local-frontends-ui
+            )
+            set_tests_properties(mcpp_local_frontends PROPERTIES TIMEOUT 120)
+            add_test(
+                NAME mcpp_spelling_ui
+                COMMAND
+                    ${MCPP_PYTHON_EXECUTABLE}
+                    -B
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_spelling_ui.py
+                    $<TARGET_FILE:mcpp>
+                    ${MCPP_TMUX_EXECUTABLE}
+                    ${CMAKE_CURRENT_BINARY_DIR}/spelling-ui
+            )
+            set_tests_properties(mcpp_spelling_ui PROPERTIES TIMEOUT 120)
             add_test(
                 NAME mcpp_audit_ui
                 COMMAND

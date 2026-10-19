@@ -61,8 +61,8 @@ cmake --build build/release --parallel 12
 ctest --test-dir build/release --output-on-failure
 ```
 
-The `mcpp` and `mcppedit` binaries remain in the selected build directory; installation is not
-required.
+The `mcpp`, `mcppedit`, `mcppview`, and `mcppdiff` binaries remain in the
+selected build directory; installation is not required.
 
 ## Standalone editor
 
@@ -71,16 +71,42 @@ required.
 ```bash
 build/release/mcppedit document.txt
 build/release/mcppedit +120 source.cpp other.cpp
+build/release/mcppedit source.cpp:120 other.cpp:40:
 build/release/mcppedit -- -draft.txt
+build/release/mcppedit
 ```
 
 This is a separate C++ executable, not a shell wrapper or an installed alias.
 It shares the editor, preferences, histories, clipboard, and save protections
-with `mcpp --edit`. Existing and new filenames are supported; a filename is
-required. Multiple files open as buffers in argument order, duplicate paths are
-opened once, and `+line` selects the starting line in the first file.
+with `mcpp --edit`. Existing and new filenames are supported. Without filenames,
+an unnamed buffer opens; no placeholder file is created. Saving it requests a
+name, including when saving an inactive buffer during Quit, and cancellation
+retains the draft.
+
+Multiple files open as buffers in argument order, duplicate paths are opened
+once, and `+line` selects the starting line in the first file. Each filename can
+also carry `:line` or `:line:`; an existing literal filename takes precedence
+over that notation. A zero line selects the first line. `mcpp --edit` accepts
+the same multi-file and line-position forms. CLI filenames resolve against the
+process working directory, not an automatically restored panel directory.
+As in MC, all positional arguments with `--edit` are editor files, not pane
+directories; pane paths can still be restored from saved setup.
 Closing the final buffer or quitting exits the editor process. Help and version
 are available through `--help` and `--version`.
+
+## Standalone viewer and diff
+
+```bash
+build/release/mcppview document.txt
+build/release/mcppview -- -draft.txt
+build/release/mcppdiff old.cpp new.cpp
+```
+
+Both are separate C++ executables using the shared viewer or diff/merge UI.
+Quit exits the process rather than returning to the file manager. Staged hex
+edits and merged changes retain the same Save/Discard/Cancel, revision,
+read-only, and linked-file protections. Editing from a standalone diff returns
+to that comparison before quitting the process.
 
 ## Testing
 
@@ -233,8 +259,8 @@ internal redraw events without modifying the pinned submodule.
 
 The supported syntax choices and mcpp's rule/configuration file formats are
 not MC's complete syntax database or configuration-file compatibility layer.
-Remote/archive providers and spelling remain explicitly paused; the separate
-persistent-shell work is not part of these local menu controls.
+Remote providers remain explicitly paused. Local archive/VFS and persistent-shell
+work are tracked separately from these local menu controls.
 
 ## Modal Tree and diff/merge
 
@@ -383,6 +409,21 @@ argv and a private regular-file stdin, never through shell expansion. Recipients
 cannot be command options and header fields reject control characters.
 Missing/failed mail commands retain both the dialog values and unsaved editor
 buffer. A completed command is not a guarantee of recipient delivery.
+
+Command / Spell check checks the document, Check word (`Ctrl-P`) checks only the
+word at the cursor, and Change spelling language opens the installed dictionary
+list. The native Check word controls offer suggestions and Add word, Replace,
+Skip, and Cancel. Replacements remain unsaved edits with Undo; the user's block
+and search settings remain independent. Add word persists an Aspell personal
+dictionary and checks that a fresh checker process recognizes the word.
+
+Spelling uses the installed standard `aspell(1)` command through argv and a
+private regular-file stdin, not a new linked library. UTF-8 byte offsets are
+checked against the draft before replacement. Document lines cannot become
+Aspell dictionary commands. Missing tools/dictionaries, malformed responses,
+and failed personal-dictionary writes are reported without losing the draft;
+failed Add word can be retried in the same dialog. A selected dictionary is
+validated before replacing the saved spelling-language preference.
 
 Click the editor header or press `F9` to open its menus, then click a category
 or action. Drag with the left mouse button to mark text; hold `Alt` while

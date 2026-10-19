@@ -11,6 +11,7 @@ docker build \
 
 docker run \
     --rm \
+    --init \
     --network none \
     --cap-drop ALL \
     --security-opt no-new-privileges \

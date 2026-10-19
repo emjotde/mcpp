@@ -7,6 +7,7 @@
 #include "mcpp/location.hpp"
 #include "mcpp/listing.hpp"
 #include "mcpp/search.hpp"
+#include "mcpp/spelling.hpp"
 #include "mcpp/syntax.hpp"
 #include "mcpp/terminal_input.hpp"
 #include "mcpp/tree_cache.hpp"
@@ -72,6 +73,7 @@ struct EditorSearchState {
 
 struct EditorBuffer : EditorModel {
     EditorSearchState search;
+    std::string base_directory;
     std::size_t first_row{0};
     std::size_t first_column{0};
     bool fullscreen{true};
@@ -127,6 +129,7 @@ enum class Mode {
     diff_options,
     file_search_dialog,
     editor_mail_dialog,
+    editor_spelling_dialog,
     native_input,
     native_key_query,
     native_message,
@@ -1303,6 +1306,7 @@ struct App::Impl {
     bool diff_full{false};
     bool diff_saving{false};
     bool diff_closing{false};
+    bool exit_after_diff{false};
     std::size_t diff_save_index{0};
     std::optional<std::size_t> diff_edit_side;
     std::optional<std::size_t> diff_last_merged_side;
@@ -1317,6 +1321,16 @@ struct App::Impl {
     std::array<ftxui::Box, 5> mail_boxes{};
     std::size_t mail_focus{0};
     std::string mail_error;
+    std::vector<SpellingIssue> spelling_issues;
+    std::size_t spelling_index{0};
+    std::size_t spelling_suggestion{0};
+    std::size_t spelling_focus{0};
+    bool spelling_whole_file{false};
+    std::string spelling_error;
+    std::optional<std::pair<EditorPosition, EditorPosition>> spelling_match;
+    std::vector<ftxui::Box> spelling_suggestion_boxes;
+    ftxui::Box spelling_list_box;
+    std::array<ftxui::Box, 4> spelling_button_boxes{};
     std::string native_input_title;
     std::string native_input_label;
     std::string native_input_value;
@@ -1498,6 +1512,8 @@ struct App::Impl {
     std::size_t editor_overwrite_choice{1};
     EditorSavePurpose editor_save_purpose{EditorSavePurpose::save};
     EditorBuffer* editor_save_buffer{nullptr};
+    EditorBuffer* editor_unnamed_save_buffer{nullptr};
+    std::optional<EditorSavePurpose> editor_save_as_continuation;
     std::string editor_save_path;
     std::string editor_overwrite_revision;
     bool editor_save_overwrite{false};
@@ -1557,6 +1573,7 @@ struct App::Impl {
     std::size_t tree_cursor{0};
     bool tree_search_mode{false};
     std::string tree_search;
+    bool modal_tree_search_pending{false};
     bool tree_dynamic{false};
     std::optional<TreeSnapshot> modal_tree_snapshot;
     int modal_tree_source{0};
@@ -1975,8 +1992,14 @@ struct App::Impl {
         }
     }
 
+    std::string editor_directory(const EditorBuffer& buffer) const {
+        const auto& pane = active_index == 0 ? left : right;
+        if (!buffer.path().empty()) return local->parent(buffer.path());
+        return buffer.base_directory.empty() ? pane.navigation_path() : buffer.base_directory;
+    }
+
     std::string editor_relative_path(const std::string& path) const {
-        return local->join(local->parent(editor.path()), path);
+        return local->join(editor_directory(editor), path);
     }
 
     std::string read_local_text(const std::string& path) const {
@@ -2043,7 +2066,7 @@ struct App::Impl {
             } else editor.paste_bytes(read_local_text(path));
             if (!config.editor_cursor_after_inserted_block) editor.set_position(before);
             status = "File inserted";
-        }, Mode::editor, local->parent(editor.path()));
+        }, Mode::editor, editor_directory(editor));
     }
 
     void show_save_block() {
@@ -2089,7 +2112,7 @@ struct App::Impl {
                 show_native_query("File exists", "Overwrite " + display_text(path) + "?",
                                   {"Overwrite", "Cancel"}, continue_save, Mode::editor);
             } else continue_save(0);
-        }, Mode::editor, local->parent(editor.path()));
+        }, Mode::editor, editor_directory(editor));
     }
 
     void open_user_menu(
@@ -2158,7 +2181,7 @@ struct App::Impl {
         arguments.push_back("--");
         for (const auto& address : *recipients) { check_address(address); arguments.push_back(address); }
         auto input = std::make_shared<TemporaryFile>(editor.text());
-        const auto directory = local->parent(editor.path());
+        const auto directory = editor_directory(editor);
         start_local_task("Mail", [input, arguments, directory](const Cancellation& cancellation) {
             return capture_command(arguments, directory, cancellation, 1024U * 1024U, input->path());
         }, [this, input](CommandOutput result) {
@@ -2880,7 +2903,7 @@ struct App::Impl {
             const auto path = editor.path();
             const auto change = editor.change_id();
             const EditorPosition position{editor.row(), editor.column()};
-            const auto directory = local->parent(path);
+            const auto directory = editor_directory(editor);
             start_local_task("Capturing command output",
                 [command, directory](const Cancellation& cancellation) {
                     return capture_shell(command, directory, cancellation, 16U * 1024U * 1024U);
@@ -2927,7 +2950,7 @@ struct App::Impl {
             const auto entries = load_user_menu(path);
             if (entries.empty()) throw std::runtime_error("external formatter menu has no command");
             const auto command = expand_user_menu_command(entries.front().command, editor.path(),
-                                                          local->parent(editor.path()), active().path());
+                                                          editor_directory(editor), active().path());
             run_editor_transform({}, command, false);
         }
     }
@@ -2953,7 +2976,7 @@ struct App::Impl {
         auto input = std::make_shared<TemporaryFile>(source);
         const auto file = editor.path();
         const auto change = editor.change_id();
-        const auto directory = local->parent(file);
+        const auto directory = editor_directory(editor);
         if (command.empty()) arguments.insert(arguments.end(), {"--", input->path().string()});
         else command += " < " + expand_user_menu_command("%f", input->path().string(), directory, directory);
         start_local_task("Transforming editor text",
@@ -2990,6 +3013,219 @@ struct App::Impl {
         }
         remember_editor_position(editor);
         update_editor_view();
+    }
+
+    void finish_spelling(const bool cancelled) {
+        spelling_issues.clear();
+        spelling_match.reset();
+        spelling_error.clear();
+        mode = Mode::editor;
+        status = cancelled ? "Spell check cancelled" : "Spell check complete";
+    }
+
+    void show_next_spelling_issue() {
+        if (spelling_index >= spelling_issues.size()) {
+            finish_spelling(false);
+            return;
+        }
+        const auto& issue = spelling_issues[spelling_index];
+        const auto text = editor.text();
+        if (issue.offset > text.size() || issue.word.size() > text.size() - issue.offset ||
+            text.compare(issue.offset, issue.word.size(), issue.word) != 0) {
+            throw std::runtime_error("the misspelled word no longer matches the draft");
+        }
+        spelling_match = {{editor.position(issue.offset), editor.position(issue.offset + issue.word.size())}};
+        editor.set_position(spelling_match->first);
+        update_editor_view();
+        spelling_suggestion = spelling_focus = 0;
+        spelling_error.clear();
+        mode = Mode::editor_spelling_dialog;
+    }
+
+    void show_spelling(const bool whole_file) {
+        const auto text = editor.text();
+        const auto path = editor.path();
+        const auto change = editor.change_id();
+        const auto cursor = editor.cursor_offset();
+        const auto directory = editor_directory(editor);
+        const auto language = config.editor_spelling_language;
+        auto issues = std::make_shared<std::vector<SpellingIssue>>();
+        spelling_match.reset();
+        spelling_whole_file = whole_file;
+        start_local_task("Checking spelling",
+            [issues, text, language, directory](const Cancellation& cancellation) {
+                *issues = check_spelling(text, language, directory, cancellation);
+                return CommandOutput{};
+            }, [this, issues, path, change, cursor, whole_file](CommandOutput) {
+                if (editor.path() != path || editor.change_id() != change) {
+                    throw std::runtime_error("buffer changed while checking spelling");
+                }
+                if (!whole_file) {
+                    std::erase_if(*issues, [cursor](const SpellingIssue& issue) {
+                        return cursor < issue.offset || cursor - issue.offset >= issue.word.size();
+                    });
+                }
+                spelling_issues = std::move(*issues);
+                spelling_index = 0;
+                show_next_spelling_issue();
+            }, Mode::editor);
+    }
+
+    void show_spelling_languages() {
+        auto languages = std::make_shared<std::vector<std::string>>();
+        const auto directory = editor_directory(editor);
+        start_local_task("Loading spelling languages",
+            [languages, directory](const Cancellation& cancellation) {
+                *languages = spelling_languages(directory, cancellation);
+                return CommandOutput{};
+            }, [this, languages, directory](CommandOutput) {
+                show_local_list("Select language", *languages,
+                    [this, languages, directory](const std::size_t index) {
+                        const auto language = languages->at(index);
+                        start_local_task("Changing spelling language",
+                            [language, directory](const Cancellation& cancellation) {
+                                static_cast<void>(check_spelling("", language, directory, cancellation));
+                                return CommandOutput{};
+                            }, [this, language](CommandOutput) {
+                                config.editor_spelling_language = language;
+                                status = "Spelling language: " + language;
+                            }, Mode::editor);
+                    }, Mode::editor);
+                local_list_native = true;
+                const auto current = std::ranges::find(*languages, config.editor_spelling_language);
+                if (current != languages->end()) {
+                    local_list_cursor = static_cast<std::size_t>(current - languages->begin());
+                }
+            }, Mode::editor);
+    }
+
+    void spelling_action(const std::size_t action) {
+        if (action == 3U) {
+            finish_spelling(true);
+            return;
+        }
+        const auto issue = spelling_issues.at(spelling_index);
+        if (action == 0U) {
+            const auto text = editor.text();
+            const auto path = editor.path();
+            const auto change = editor.change_id();
+            const auto language = config.editor_spelling_language;
+            const auto directory = editor_directory(editor);
+            const auto resume = issue.offset + issue.word.size();
+            const auto whole_file = spelling_whole_file;
+            auto remaining = std::make_shared<std::vector<SpellingIssue>>();
+            start_local_task("Adding dictionary word",
+                [issue, text, language, directory, resume, whole_file, remaining](const Cancellation& cancellation) {
+                    add_spelling_word(issue.word, language, directory, cancellation);
+                    if (whole_file) *remaining = check_spelling(std::string_view(text).substr(resume),
+                                                               language, directory, cancellation);
+                    return CommandOutput{};
+                }, [this, remaining, path, change, resume](CommandOutput) {
+                    if (editor.path() != path || editor.change_id() != change) {
+                        throw std::runtime_error("buffer changed while saving the dictionary word");
+                    }
+                    for (auto& next : *remaining) next.offset += resume;
+                    spelling_issues = std::move(*remaining);
+                    spelling_index = 0;
+                    show_next_spelling_issue();
+                }, Mode::editor_spelling_dialog);
+            return;
+        }
+        if (action == 1U) {
+            if (spelling_suggestion >= issue.suggestions.size()) {
+                throw std::runtime_error("no replacement suggestion is selected");
+            }
+            const auto& replacement = issue.suggestions[spelling_suggestion];
+            editor.replace_text(editor.position(issue.offset),
+                                editor.position(issue.offset + issue.word.size()), replacement);
+            for (auto index = spelling_index + 1U; index < spelling_issues.size(); ++index) {
+                if (replacement.size() >= issue.word.size()) {
+                    spelling_issues[index].offset += replacement.size() - issue.word.size();
+                } else {
+                    spelling_issues[index].offset -= issue.word.size() - replacement.size();
+                }
+            }
+        }
+        ++spelling_index;
+        show_next_spelling_issue();
+    }
+
+    ftxui::Element render_spelling() {
+        using namespace ftxui;
+        const auto& issue = spelling_issues.at(spelling_index);
+        const bool compact = Terminal::Size().dimy < 15;
+        spelling_suggestion_boxes.assign(issue.suggestions.size(), {});
+        Elements suggestions;
+        for (std::size_t index = 0; index < issue.suggestions.size(); ++index) {
+            auto row = text(display_text(issue.suggestions[index])) | reflect(spelling_suggestion_boxes[index]);
+            if (index == spelling_suggestion) {
+                row = row | inverted | focus;
+            }
+            suggestions.push_back(std::move(row));
+        }
+        if (suggestions.empty()) suggestions.push_back(text("(no suggestions)") | dim);
+        const auto list = window(text("Suggest"), vbox(std::move(suggestions)) | yframe |
+            size(HEIGHT, LESS_THAN, std::max(1, std::min(7, Terminal::Size().dimy - 11))) |
+            reflect(spelling_list_box), LIGHT) | size(WIDTH, EQUAL, std::max(10, std::min(25, Terminal::Size().dimx - 21)));
+        static const std::array<std::string, 4> labels{"Add word", "Replace", "Skip", "Cancel"};
+        Elements buttons;
+        for (std::size_t index = 0; index < labels.size(); ++index) {
+            buttons.push_back(native_button(labels[index], false, spelling_focus == index + 1U,
+                                            spelling_button_boxes[index]));
+            if (!compact && index + 1U < labels.size()) buttons.push_back(text(""));
+        }
+        Elements rows{
+            text(" Language: " + (config.editor_spelling_language.empty() ? std::string("Default")
+                                                                         : config.editor_spelling_language)),
+        };
+        if (!compact) rows.push_back(text(""));
+        rows.push_back(text(" Misspelled: " + display_text(issue.word)));
+        rows.push_back(hbox({list, text(" "), vbox(std::move(buttons))}));
+        if (!spelling_error.empty()) rows.push_back(paragraph(display_text(spelling_error)) | bold);
+        return native_window("Check word", vbox(std::move(rows)), 46);
+    }
+
+    bool handle_spelling(const ftxui::Event& event) try {
+        using namespace ftxui;
+        if (event == Event::Escape || event == Event::F10) {
+            finish_spelling(true);
+            return true;
+        }
+        if (event == Event::Tab || event == Event::TabReverse) {
+            spelling_focus = (spelling_focus + (event == Event::Tab ? 1U : 4U)) % 5U;
+            return true;
+        }
+        std::size_t button = spelling_focus == 0U ? 1U : spelling_focus - 1U;
+        if (event.is_mouse()) {
+            auto copy = event;
+            const auto& mouse = copy.mouse();
+            if (mouse.button == Mouse::Left && mouse.motion == Mouse::Pressed) {
+                for (std::size_t index = 0; index < spelling_button_boxes.size(); ++index) {
+                    if (spelling_button_boxes[index].Contain(mouse.x, mouse.y)) {
+                        spelling_action(index);
+                        return true;
+                    }
+                }
+            }
+        }
+        if (spelling_focus == 0U || event.is_mouse()) {
+            const auto& issue = spelling_issues.at(spelling_index);
+            const auto input = handle_list_input(event, spelling_suggestion, issue.suggestions.size(),
+                                                 spelling_suggestion_boxes, spelling_list_box);
+            if (input == ButtonInput::activate) spelling_action(1);
+            if (input == ButtonInput::changed || input == ButtonInput::activate) {
+                spelling_focus = 0;
+                return true;
+            }
+        }
+        const auto input = handle_button_input(event, button, spelling_button_boxes, "arsc");
+        if (input == ButtonInput::changed) spelling_focus = button + 1U;
+        else if (input == ButtonInput::activate) spelling_action(button);
+        else if (input == ButtonInput::cancel) finish_spelling(true);
+        return true;
+    } catch (const std::exception& error) {
+        spelling_error = error.what();
+        return true;
     }
 
     void open_config_editor(const std::filesystem::path& path, const std::string& starter = {}) {
@@ -3548,6 +3784,9 @@ struct App::Impl {
                             std::make_move_iterator(replacement.end())
                         );
                         restore_tree_selection(selected_path);
+                        if (modal_tree_snapshot && tree_search_mode && modal_tree_search_pending) {
+                            modal_tree_search_pending = !select_modal_tree_search();
+                        }
                         if (notify) {
                             status = rescan ? "Tree refreshed" : "Ready";
                         }
@@ -3792,7 +4031,7 @@ struct App::Impl {
     }
 
     void remember_editor_position(const EditorBuffer& buffer) {
-        if (!buffer.open() || !config.editor_save_position) return;
+        if (!buffer.open() || buffer.path().empty() || !config.editor_save_position) return;
         config.editor_positions[buffer.path()] = {
             buffer.row(), buffer.column(), {buffer.bookmarks().begin(), buffer.bookmarks().end()}
         };
@@ -3936,6 +4175,7 @@ struct App::Impl {
         tree_cursor = selected;
         tree_search_mode = false;
         tree_search.clear();
+        modal_tree_search_pending = false;
         tree_dynamic = false;
         mode = Mode::directory_tree_dialog;
         expand_tree_node(tree_cursor, false, false);
@@ -3956,6 +4196,7 @@ struct App::Impl {
         ++tree_load_id;
         auto saved = std::move(*modal_tree_snapshot);
         modal_tree_snapshot.reset();
+        modal_tree_search_pending = false;
         tree_nodes = std::move(saved.nodes);
         tree_cursor = saved.cursor;
         tree_search_mode = saved.searching;
@@ -3992,12 +4233,26 @@ struct App::Impl {
         status = "Tree branch forgotten; files were not removed";
     }
 
+    bool select_modal_tree_search() {
+        for (std::size_t step = 0; !tree_search.empty() && step < tree_nodes.size(); ++step) {
+            const auto index = (tree_cursor + step) % tree_nodes.size();
+            const auto name = std::filesystem::path(tree_nodes[index].path).filename().string();
+            if (EditorSearch::find(name, tree_search, 0, 0, name.size(),
+                                  {.case_sensitive=false}, false, false)) {
+                tree_cursor = index;
+                return true;
+            }
+        }
+        return false;
+    }
+
     bool handle_directory_chooser(const ftxui::Event& event) try {
         using namespace ftxui;
         const auto changed = [&] { load_tree_surroundings(); };
         if (event == Event::Escape && tree_search_mode) {
             tree_search_mode = false;
             tree_search.clear();
+            modal_tree_search_pending = false;
             return true;
         }
         if (modal_cancel(event)) { close_directory_chooser(false); return true; }
@@ -4025,18 +4280,11 @@ struct App::Impl {
         if (tree_search_mode && (event.is_character() || event == Event::Backspace)) {
             if (event == Event::Backspace) erase_last_utf8(tree_search);
             else tree_search += event.character();
-            for (std::size_t step = 0; !tree_search.empty() && step < tree_nodes.size(); ++step) {
-                const auto index = (tree_cursor + step) % tree_nodes.size();
-                const auto name = std::filesystem::path(tree_nodes[index].path).filename().string();
-                if (EditorSearch::find(name, tree_search, 0, 0, name.size(),
-                    {.case_sensitive=false}, false, false)) {
-                    tree_cursor = index;
-                    changed();
-                    break;
-                }
-            }
+            modal_tree_search_pending = !tree_search.empty() && !select_modal_tree_search();
+            if (!tree_search.empty() && !modal_tree_search_pending) changed();
             return true;
         }
+        modal_tree_search_pending = false;
         if (event == Event::ArrowRight) {
             if (!tree_nodes[tree_cursor].expanded) expand_tree_node(tree_cursor);
             else if (tree_cursor + 1U < tree_nodes.size() && tree_nodes[tree_cursor + 1U].depth > tree_nodes[tree_cursor].depth) {
@@ -4405,8 +4653,10 @@ struct App::Impl {
         if (first == nullptr || second == nullptr || !can_open_file(*first) || !can_open_file(*second)) {
             throw std::runtime_error("select a regular file in each pane");
         }
-        const auto first_path = first->path;
-        const auto second_path = second->path;
+        open_file_comparison(first->path, second->path);
+    }
+
+    void open_file_comparison(const std::string& first_path, const std::string& second_path) {
         diff_files[0].open(local, first_path);
         diff_files[1].open(local, second_path);
         diff_options = {config.diff_quality, config.diff_ignore_case, config.diff_ignore_tab_expansion,
@@ -4418,6 +4668,11 @@ struct App::Impl {
         diff_last_merged_side.reset();
         diff_search_cursor.reset();
         diff_search_match.reset();
+        if (terminal == nullptr) {
+            file_diff.compare(diff_files[0], diff_files[1], diff_options);
+            mode = Mode::diff;
+            return;
+        }
         auto compared = std::make_shared<DiffModel>();
         start_local_task("Comparing files", [this, compared](const Cancellation& cancellation) {
             compared->compare(diff_files[0], diff_files[1], diff_options, cancellation);
@@ -4520,6 +4775,10 @@ struct App::Impl {
         diff_files[1].close();
         file_diff = {};
         diff_saving = diff_closing = false;
+        if (exit_after_diff) {
+            exit_terminal();
+            return;
+        }
         mode = Mode::panels;
         refresh(false, true);
     }
@@ -5447,6 +5706,8 @@ struct App::Impl {
             show_editor_message("Local command", message);
         } else if (local_command_return == Mode::editor_mail_dialog) {
             mail_error = message;
+        } else if (local_command_return == Mode::editor_spelling_dialog) {
+            spelling_error = message;
         } else if (local_command_return == Mode::viewer) {
             viewer_message_title = "Local command";
             viewer_message = message;
@@ -7550,6 +7811,12 @@ struct App::Impl {
     }
 
     void cancel_prompt() {
+        if (prompt_action == PromptAction::editor_save_as && editor_save_as_continuation) {
+            editor_unnamed_save_buffer = nullptr;
+            editor_save_as_continuation.reset();
+            editor_save_buffer = nullptr;
+            editor_quit_requested = false;
+        }
         mode = mode_before_prompt;
         prompt_action = PromptAction::none;
         prompt_value.clear();
@@ -8341,11 +8608,8 @@ struct App::Impl {
                 case PromptAction::editor_open:
                 case PromptAction::editor_new: {
                     auto path = std::filesystem::path(prompt_value);
-                    if (path.is_relative()) {
-                        path =
-                            std::filesystem::path(editor.path())
-                                .parent_path() /
-                            path;
+                    if (!prompt_value.empty() && path.is_relative()) {
+                        path = std::filesystem::path(editor_directory(editor)) / path;
                     }
                     open_editor_buffer(
                         active().provider(),
@@ -8360,11 +8624,9 @@ struct App::Impl {
                     break;
                 }
                 case PromptAction::editor_save_as:
-                    if (!prompt_value.empty()) {
-                        request_editor_save_as();
-                        return;
-                    }
-                    break;
+                    if (prompt_value.empty()) throw std::invalid_argument("file name is empty");
+                    request_editor_save_as();
+                    return;
                 case PromptAction::editor_goto: {
                     std::size_t parsed = 0;
                     const auto line = std::stoull(
@@ -8490,7 +8752,8 @@ struct App::Impl {
             if (prompt_action == PromptAction::view_file ||
                 prompt_action == PromptAction::viewer_find ||
                 prompt_action == PromptAction::viewer_goto ||
-                prompt_action == PromptAction::quick_viewer_find) {
+                prompt_action == PromptAction::quick_viewer_find ||
+                prompt_action == PromptAction::editor_save_as) {
                 prompt_error = error.what();
                 prompt_focus = 0;
                 return;
@@ -9005,7 +9268,7 @@ struct App::Impl {
         }
         auto match_begin = line.size();
         auto match_end = std::size_t{0};
-        if (const auto match = editor.search_selection();
+        if (const auto match = mode == Mode::editor_spelling_dialog ? spelling_match : editor.search_selection();
             match && index >= match->first.row && index <= match->second.row) {
             match_begin = index == match->first.row ? match->first.column : 0U;
             match_end = index == match->second.row ? match->second.column : line.size();
@@ -9386,7 +9649,7 @@ struct App::Impl {
                       text(editor_flags),
                       text(position_status),
                   });
-        status_header = gray_menu(std::move(status_header)) | xframe |
+        status_header = gray_menu(std::move(status_header)) |
                         size(WIDTH, EQUAL, terminal_size.dimx);
         auto menubar = gray_menu(hbox(std::move(menu))) | reflect(editor_header_box);
         auto header = mode == Mode::editor_menu ? menubar : status_header | reflect(editor_header_box);
@@ -9504,9 +9767,9 @@ struct App::Impl {
                 {"Delete macro...", 10, 'o'},
                 {"Record/Repeat actions", 11, 'a'},
                 {"", -2},
-                {"Spell check", -1},
-                {"Check word                   C-p", -1},
-                {"Change spelling language...", -1},
+                {"Spell check", 13, 'p'},
+                {"Check word                   C-p", 14, 'h'},
+                {"Change spelling language...", 15, 'l'},
                 {"", -2},
                 {"Mail...", 12, 'm'},
             },
@@ -11479,6 +11742,7 @@ struct App::Impl {
             display_mode == Mode::editor_overwrite_dialog ||
             display_mode == Mode::editor_options_dialog ||
             display_mode == Mode::editor_mail_dialog ||
+            display_mode == Mode::editor_spelling_dialog ||
             display_mode == Mode::editor_history ||
             display_mode == Mode::editor_buffer_list ||
             (
@@ -11874,6 +12138,8 @@ struct App::Impl {
             document = dbox({document, native_modal(render_file_search())});
         } else if (mode == Mode::editor_mail_dialog) {
             document = dbox({document, native_modal(render_editor_mail())});
+        } else if (mode == Mode::editor_spelling_dialog) {
+            document = dbox({document, native_modal(render_spelling())});
         } else if (mode == Mode::native_input) {
             document = dbox({document, native_modal(render_native_input())});
         } else if (mode == Mode::native_key_query) {
@@ -12321,7 +12587,8 @@ struct App::Impl {
                         prompt_value,
                         prompt_inputs[prompt_action],
                         mode_before_prompt == Mode::editor
-                            ? std::filesystem::path(editor.path()).parent_path().string()
+                            ? editor_directory(editor_unnamed_save_buffer == nullptr
+                                ? editor : *editor_unnamed_save_buffer)
                             : active().path()
                     );
                     prompt_error.clear();
@@ -12889,6 +13156,12 @@ struct App::Impl {
         }
     }
 
+    void new_editor_buffer() {
+        open_editor_buffer(active().provider(), "", true);
+        mode = Mode::editor;
+        status = "New file";
+    }
+
     void open_editor_buffer(
         const ProviderPtr& provider,
         const std::string& path,
@@ -12914,6 +13187,9 @@ struct App::Impl {
             }
         }
         EditorBuffer next;
+        next.base_directory = path.empty()
+            ? (editor.open() ? editor_directory(editor) : active().navigation_path())
+            : provider->parent(path);
         next.set_tab_width(editor.tab_width());
         next.set_behavior(editor_behavior());
         if (editor.open()) {
@@ -13010,6 +13286,7 @@ struct App::Impl {
 
     void complete_editor_buffer_save(const bool preserve_links) {
         const auto purpose = editor_save_purpose;
+        const auto continuation = editor_save_as_continuation.value_or(purpose);
         try {
             if (editor_save_buffer == nullptr) {
                 throw std::runtime_error("no buffer to save");
@@ -13044,6 +13321,8 @@ struct App::Impl {
             if (purpose != EditorSavePurpose::diff_save) remember_editor_path(editor_save_buffer->path());
             const auto saved_path = std::filesystem::path(editor_save_buffer->path());
             editor_save_buffer = nullptr;
+            editor_unnamed_save_buffer = nullptr;
+            editor_save_as_continuation.reset();
             prompt_action = PromptAction::none;
             prompt_value.clear();
             mode = Mode::editor;
@@ -13065,11 +13344,13 @@ struct App::Impl {
                     return;
                 }
             }
-            if (purpose == EditorSavePurpose::close || purpose == EditorSavePurpose::quit) {
+            if (continuation == EditorSavePurpose::close || continuation == EditorSavePurpose::quit) {
                 accept_editor_close();
             }
         } catch (const std::exception& error) {
             editor_save_buffer = nullptr;
+            editor_unnamed_save_buffer = nullptr;
+            editor_save_as_continuation.reset();
             editor_quit_requested = false;
             if (purpose == EditorSavePurpose::diff_save) {
                 diff_saving = diff_closing = false;
@@ -13085,6 +13366,13 @@ struct App::Impl {
         editor_save_buffer = &buffer;
         editor_save_purpose = purpose;
         newline_warning_accepted = false;
+        if (buffer.path().empty() && purpose != EditorSavePurpose::save_as) {
+            editor_unnamed_save_buffer = &buffer;
+            editor_save_as_continuation = purpose;
+            mode = Mode::editor;
+            start_prompt(PromptAction::editor_save_as, "Save as");
+            return;
+        }
         continue_editor_buffer_save();
     }
 
@@ -13109,16 +13397,17 @@ struct App::Impl {
 
     void request_editor_save_as() {
         newline_warning_accepted = false;
+        auto& buffer = editor_unnamed_save_buffer == nullptr ? editor : *editor_unnamed_save_buffer;
         auto path = std::filesystem::path(prompt_value);
         if (path.is_relative()) {
-            path = std::filesystem::path(editor.path()).parent_path() / path;
+            path = std::filesystem::path(editor_directory(buffer)) / path;
         }
         editor_save_path = local->normalize(path.string());
         editor_save_overwrite = false;
-        editor_save_buffer = &editor;
+        editor_save_buffer = &buffer;
         editor_save_purpose = EditorSavePurpose::save_as;
-        if (editor_save_path == local->normalize(editor.path())) {
-            begin_editor_buffer_save(editor, EditorSavePurpose::save_as);
+        if (!buffer.path().empty() && editor_save_path == local->normalize(buffer.path())) {
+            begin_editor_buffer_save(buffer, EditorSavePurpose::save_as);
         } else if (local->exists(editor_save_path)) {
             const auto target = local->stat_follow(editor_save_path, {});
             if (target.kind != EntryKind::file) {
@@ -13144,9 +13433,12 @@ struct App::Impl {
         const auto input = handle_button_input(key, editor_link_choice, editor_link_boxes, "dpc");
         if (input == ButtonInput::cancel ||
             (input == ButtonInput::activate && editor_link_choice == 2U)) {
+            const bool unnamed = editor_save_as_continuation.has_value();
             editor_quit_requested = false;
             editor_save_buffer = nullptr;
-            mode = editor_save_purpose == EditorSavePurpose::save_as
+            editor_unnamed_save_buffer = nullptr;
+            editor_save_as_continuation.reset();
+            mode = unnamed ? Mode::editor : editor_save_purpose == EditorSavePurpose::save_as
                        ? Mode::prompt
                        : editor_save_purpose == EditorSavePurpose::diff_save ? Mode::diff : Mode::editor;
             if (editor_save_purpose == EditorSavePurpose::diff_save) diff_saving = diff_closing = false;
@@ -13385,6 +13677,8 @@ struct App::Impl {
             return;
         }
         if (category == 3U && item == 12) { show_editor_mail(); return; }
+        if (category == 3U && (item == 13 || item == 14)) { show_spelling(item == 13); return; }
+        if (category == 3U && item == 15) { show_spelling_languages(); return; }
         if (category == 4U) {
             if (item == 0) show_literal_insert();
             else if (item == 1) show_date_insert();
@@ -13425,15 +13719,7 @@ struct App::Impl {
                     editor.path()
                 );
             } else if (item == 1U) {
-                start_prompt(
-                    PromptAction::editor_new,
-                    "New file",
-                    (
-                        std::filesystem::path(editor.path())
-                            .parent_path() /
-                        "new-file"
-                    ).string()
-                );
+                new_editor_buffer();
             } else if (item == 2U) {
                 request_editor_close();
             } else if (item == 3U) {
@@ -14509,6 +14795,7 @@ struct App::Impl {
             return true;
         }
         if (event == ftxui::Event::AltM) { show_editor_mail(); return true; }
+        if (event == ftxui::Event::CtrlP) { show_spelling(false); return true; }
         if (event == ftxui::Event::CtrlR) {
             toggle_macro_recording();
             return true;
@@ -14783,15 +15070,7 @@ struct App::Impl {
             return true;
         }
         if (event == ftxui::Event::CtrlN) {
-            start_prompt(
-                PromptAction::editor_new,
-                "New file",
-                (
-                    std::filesystem::path(editor.path())
-                        .parent_path() /
-                    "new-file"
-                ).string()
-            );
+            new_editor_buffer();
             return true;
         }
         if (event == ftxui::Event::CtrlU) {
@@ -14950,7 +15229,7 @@ struct App::Impl {
         const auto return_mode = user_menu_return;
         const auto selected_path = return_mode == Mode::editor ? editor.path()
                                   : selected == nullptr ? std::string{} : selected->path;
-        const auto directory = return_mode == Mode::editor ? local->parent(editor.path()) : active().path();
+        const auto directory = return_mode == Mode::editor ? editor_directory(editor) : active().path();
         mode = return_mode;
         try {
             const auto command = expand_user_menu_command(
@@ -16718,6 +16997,7 @@ struct App::Impl {
 
     bool handle(const ftxui::Event& event) {
         if (mode == Mode::editor_mail_dialog) return handle_editor_mail(event);
+        if (mode == Mode::editor_spelling_dialog) return handle_spelling(event);
         if (mode == Mode::file_search_dialog) return handle_file_search(event);
         if (mode == Mode::advanced_chown_dialog) return handle_advanced_chown(event);
         if (mode == Mode::chattr_dialog) return handle_file_attributes(event);
@@ -16926,7 +17206,7 @@ void App::open_viewer(const std::string& path) {
 
 void App::open_editor(const std::string& path, const std::size_t line) {
     const auto resolved =
-        std::filesystem::path(path).is_absolute()
+        path.empty() || std::filesystem::path(path).is_absolute()
             ? path
             : impl_->active().provider()->join(
                   impl_->active().path(),
@@ -16935,7 +17215,7 @@ void App::open_editor(const std::string& path, const std::size_t line) {
     impl_->open_editor_buffer(
         impl_->active().provider(),
         resolved,
-        false
+        path.empty()
     );
     impl_->exit_after_editor = true;
     impl_->mode = Mode::editor;
@@ -16947,22 +17227,42 @@ void App::open_editor(const std::string& path, const std::size_t line) {
 }
 
 void App::open_editors(const std::vector<std::string>& paths, const std::size_t first_line) {
-    if (paths.empty()) throw std::invalid_argument("at least one editor file is required");
-    std::vector<std::string> unique;
+    std::vector<EditorFile> files;
+    for (const auto& path : paths) files.push_back({path, 0});
+    open_editor_files(files, first_line);
+}
+
+void App::open_editor_files(const std::vector<EditorFile>& files, const std::size_t first_line) {
+    if (files.empty()) {
+        open_editor("", first_line);
+        impl_->editor.base_directory = std::filesystem::current_path().string();
+        return;
+    }
+    std::vector<EditorFile> unique;
     const auto provider = impl_->active().provider();
-    for (const auto& path : paths) {
+    for (const auto& [path, line] : files) {
         if (path.empty()) throw std::invalid_argument("file name is empty");
         const auto resolved = provider->normalize(std::filesystem::path(path).is_absolute()
             ? path : provider->join(impl_->active().path(), path));
-        if (std::ranges::find(unique, resolved) == unique.end()) unique.push_back(resolved);
+        if (std::ranges::none_of(unique, [&](const auto& file) { return file.path == resolved; })) {
+            unique.push_back({resolved, line});
+        }
     }
-    for (const auto& path : unique) open_editor(path);
+    for (const auto& [path, line] : unique) open_editor(path, line);
     if (unique.size() > 1U) static_cast<void>(impl_->switch_editor_buffer(true));
     if (first_line != 0U) {
         impl_->editor.goto_line(first_line);
         impl_->editor.home();
         impl_->update_editor_view();
     }
+}
+
+void App::open_diff(const std::string& first, const std::string& second) {
+    if (first.empty() || second.empty()) throw std::invalid_argument("file name is empty");
+    const auto provider = impl_->active().provider();
+    impl_->open_file_comparison(provider->join(impl_->active().path(), first),
+                               provider->join(impl_->active().path(), second));
+    impl_->exit_after_diff = true;
 }
 
 std::string App::active_path() const {

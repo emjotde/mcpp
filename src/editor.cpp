@@ -209,11 +209,11 @@ void EditorModel::create(
     if (!provider) {
         throw std::invalid_argument("editor provider is null");
     }
-    if (std::filesystem::path(path).is_relative() && !path_.empty()) {
+    if (!path.empty() && std::filesystem::path(path).is_relative() && !path_.empty()) {
         path = provider->join(provider->parent(path_), path);
     }
-    path = provider->normalize(path);
-    if (provider->exists(path)) {
+    if (!path.empty()) path = provider->normalize(path);
+    if (!path.empty() && provider->exists(path)) {
         throw std::runtime_error("destination exists: " + path);
     }
     provider_ = std::move(provider);
@@ -711,6 +711,7 @@ std::size_t EditorModel::offset(EditorPosition position_value) const {
 }
 
 EditorPosition EditorModel::position(std::size_t offset_value) const {
+    if (lines_.empty()) throw std::runtime_error("editor is not open");
     offset_value = std::min(offset_value, byte_size());
     for (std::size_t row = 0; row < lines_.size(); ++row) {
         if (offset_value <= lines_[row].size()) {
@@ -2221,6 +2222,9 @@ void EditorModel::save(
     if (!provider_) {
         throw std::runtime_error("editor is not open");
     }
+    if (path_.empty()) {
+        throw std::runtime_error("an unnamed buffer requires Save as");
+    }
     if (!new_file_ && save_mode_ == EditorSaveMode::in_place && hardlink_count() == 1U) {
         save_preserving_links(force, cancellation);
         return;
@@ -2362,11 +2366,13 @@ void EditorModel::save_as_impl(
     if (!provider_) {
         throw std::runtime_error("editor is not open");
     }
-    if (std::filesystem::path(path).is_relative()) {
+    if (path.empty()) throw std::invalid_argument("file name is empty");
+    if (!path_.empty() && std::filesystem::path(path).is_relative()) {
         path = provider_->join(provider_->parent(path_), path);
     }
     path = provider_->normalize(path);
-    if (path == provider_->normalize(path_) && ending == EditorLineEnding::unchanged) {
+    const bool same_path = !path_.empty() && path == provider_->normalize(path_);
+    if (same_path && ending == EditorLineEnding::unchanged) {
         if (preserve_links) {
             save_preserving_links(force, cancellation);
         } else {
@@ -2374,7 +2380,6 @@ void EditorModel::save_as_impl(
         }
         return;
     }
-    const bool same_path = path == provider_->normalize(path_);
     if (!force && !same_path && provider_->exists(path)) {
         throw std::runtime_error("destination exists: " + path);
     }

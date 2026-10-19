@@ -18,13 +18,78 @@ class StandaloneEditor(unittest.TestCase):
         for option in ("--help", "--version", "-V"):
             result = subprocess.run([BINARY, option], capture_output=True, text=True, check=True)
             self.assertIn("mcppedit 0.1.0", result.stdout)
-        for arguments, message in (([], "file name is required"), (["+0", "file"], "positive integers"),
-                                   (["+bad", "file"], "positive integers"), (["--view"], "unknown option"),
+        for arguments, message in ((["+bad", "file"], "nonnegative integers"), (["--view"], "unknown option"),
                                    ([""], "file name is empty")):
             result = subprocess.run([BINARY, *arguments], capture_output=True, text=True)
             self.assertEqual(result.returncode, 1)
             self.assertIn("mcppedit: ", result.stderr)
             self.assertIn(message, result.stderr)
+
+    def test_unnamed_startup_and_explicit_save_as(self):
+        root = self.fixture()
+        path = root / "ui/named draft.txt"
+        with TerminalSession(BINARY, TMUX, root / "ui", [], record_exit=True) as terminal:
+            terminal.wait_editor(bytes=0, dirty=False)
+            terminal.type("unnamed draft")
+            terminal.press("F2")
+            terminal.wait_for("Save file")
+            terminal.press("Enter")
+            terminal.wait_for("Save as")
+            terminal.press("Enter")
+            terminal.wait_for("file name is empty")
+            self.assertFalse(path.exists())
+            terminal.type(path.name)
+            terminal.press("Enter")
+            terminal.wait_file(path, b"unnamed draft")
+            terminal.wait_editor(dirty=False)
+            terminal.press("F10")
+            terminal.wait_file(terminal.exit_file, b"0\n")
+        self.assertFalse((root / "ui/new-file").exists())
+
+    def test_unnamed_quit_save_as_cancel_and_retry(self):
+        root = self.fixture()
+        path = root / "ui/saved-on-quit.txt"
+        with TerminalSession(BINARY, TMUX, root / "ui", [], record_exit=True) as terminal:
+            terminal.wait_editor(bytes=0)
+            terminal.type("retained draft")
+            terminal.press("F10")
+            terminal.wait_for("Save before close?")
+            terminal.type("y")
+            terminal.wait_for("Save as")
+            terminal.press("Escape")
+            terminal.wait_for("Save as", present=False)
+            terminal.wait_editor(dirty=True)
+            terminal.press("F10")
+            terminal.wait_for("Save before close?")
+            terminal.type("y")
+            terminal.wait_for("Save as")
+            terminal.type(path.name)
+            terminal.press("Enter")
+            terminal.wait_file(terminal.exit_file, b"0\n")
+        self.assertEqual(path.read_bytes(), b"retained draft")
+
+    def test_quit_saves_the_inactive_unnamed_buffer_not_the_current_file(self):
+        root = self.fixture()
+        named = root / "existing.txt"
+        named.write_bytes(b"existing unchanged\n")
+        saved = root / "ui/inactive-draft.txt"
+        with TerminalSession(BINARY, TMUX, root / "ui", [], record_exit=True) as terminal:
+            terminal.wait_editor(bytes=0)
+            terminal.type("inactive draft")
+            menu(terminal, "File", "Open file...")
+            terminal.wait_for("Open file")
+            terminal.type(str(named))
+            terminal.press("Enter")
+            terminal.wait_editor(bytes=len(named.read_bytes()), dirty=False)
+            terminal.press("F10")
+            terminal.wait_for("Save before close?")
+            terminal.type("y")
+            terminal.wait_for("Save as")
+            terminal.type(saved.name)
+            terminal.press("Enter")
+            terminal.wait_file(terminal.exit_file, b"0\n")
+        self.assertEqual(saved.read_bytes(), b"inactive draft")
+        self.assertEqual(named.read_bytes(), b"existing unchanged\n")
 
     def test_named_new_file_save_and_editor_only_exit(self):
         root = self.fixture()
@@ -56,6 +121,69 @@ class StandaloneEditor(unittest.TestCase):
             terminal.wait_editor(row=3, column=1)
             terminal.press("F10")
             terminal.wait_file(terminal.exit_file, b"0\n")
+
+    def test_per_file_positions_and_existing_colon_filename(self):
+        root = self.fixture()
+        first, second, literal = root / "first", root / "second", root / "literal:3"
+        for path in (first, second, literal):
+            path.write_bytes(b"first\nsecond\nthird\nfourth\n")
+        with TerminalSession(BINARY, TMUX, root / "ui",
+                             [str(first) + ":3", str(second) + ":2:", literal], record_exit=True) as terminal:
+            terminal.wait_editor(row=3, column=1)
+            menu(terminal, "Window", "Next")
+            terminal.wait_editor(row=2, column=1)
+            self.assertIn("second", terminal.text().splitlines()[0])
+            menu(terminal, "Window", "Next")
+            terminal.wait_editor(row=1, column=1)
+            self.assertIn("literal:3", terminal.text().splitlines()[0])
+            terminal.press("F10")
+            terminal.wait_file(terminal.exit_file, b"0\n")
+
+    def test_long_filename_header_keeps_the_complete_character_readout(self):
+        root = self.fixture()
+        directory = root / ("long-directory-" + "x" * 70)
+        directory.mkdir()
+        path = directory / "distinct-document.txt"
+        path.write_bytes(b"first line\n")
+        with TerminalSession(BINARY, TMUX, root / "ui", [path], record_exit=True) as terminal:
+            terminal.wait_editor(offset=0)
+            terminal.press("End")
+            terminal.wait_for("0010 U+000A")
+            header = terminal.text().splitlines()[0]
+            self.assertIn("distinct-document.txt", header)
+            self.assertLessEqual(len(header), 100)
+            terminal.press("F10")
+            terminal.wait_file(terminal.exit_file, b"0\n")
+
+    def test_new_unnamed_buffer_keeps_its_file_and_command_base_directory(self):
+        root = self.fixture()
+        documents = root / "documents"
+        documents.mkdir()
+        original = documents / "original.txt"
+        original.write_bytes(b"unchanged\n")
+        saved = documents / "new.txt"
+        expected = (str(documents) + "\n").encode()
+        with TerminalSession(BINARY, TMUX, root / "ui", [original], record_exit=True) as terminal:
+            terminal.wait_editor(offset=0)
+            terminal.press("C-n")
+            terminal.wait_editor(bytes=0, dirty=False)
+            menu(terminal, "Format", "Paste output of...")
+            terminal.wait_for("Enter shell command(s):")
+            terminal.type("pwd")
+            terminal.press("Enter")
+            terminal.wait_editor(bytes=len(expected), dirty=True)
+            terminal.press("F2")
+            terminal.wait_for("Save file")
+            terminal.press("Enter")
+            terminal.wait_for("Save as")
+            terminal.type(saved.name)
+            terminal.press("Enter")
+            terminal.wait_file(saved, expected)
+            terminal.wait_editor(dirty=False)
+            terminal.press("F10")
+            terminal.wait_file(terminal.exit_file, b"0\n")
+        self.assertEqual(original.read_bytes(), b"unchanged\n")
+        self.assertFalse((root / "ui/new.txt").exists())
 
     def test_end_of_options_and_dirty_close(self):
         root = self.fixture()

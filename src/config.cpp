@@ -1,4 +1,5 @@
 #include "mcpp/config.hpp"
+#include "mcpp/spelling.hpp"
 #include "mcpp/syntax.hpp"
 #include "mcpp/local_tools.hpp"
 
@@ -424,6 +425,9 @@ Config Config::load(const std::filesystem::path& path) {
                 throw std::runtime_error("unknown syntax language: " + value);
             }
             result.editor_syntax_language = value;
+        } else if (key == "editor_spelling_language") {
+            result.editor_spelling_language = decode_value(value);
+            validate_spelling_language(result.editor_spelling_language);
         } else if (key == "bookmark") {
             result.bookmarks.push_back(decode_value(value));
         } else if (key == "editor_history") {
@@ -542,6 +546,7 @@ void Config::save(const std::filesystem::path& path) const {
            << "editor_check_newline=" << (editor_check_newline ? "true" : "false") << '\n';
     output << "reverse_files_only=" << (reverse_files_only ? "true" : "false") << '\n';
     output << "editor_syntax_language=" << editor_syntax_language << '\n';
+    output << "editor_spelling_language=" << encode_value(editor_spelling_language) << '\n';
     output << "layout_horizontal=" << (layout_horizontal ? "true" : "false") << '\n'
            << "equal_split=" << (equal_split ? "true" : "false") << '\n'
            << "panel_left_size=" << panel_left_size << '\n'

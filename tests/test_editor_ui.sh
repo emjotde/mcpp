@@ -155,7 +155,9 @@ printf -v buffer_command 'XDG_CONFIG_HOME=%q %q -e %q' \
 buffer_runner=$!
 exec 6>"$temporary/buffer-input"
 sleep 1
-printf '\016\rbuffer-two\033[12~\r' >&6
+printf '\016buffer-two\033[12~\r' >&6
+sleep 0.5
+printf '%s\r' "$temporary/new-file" >&6
 sleep 0.5
 printf '\033[20~wn' >&6
 sleep 0.5

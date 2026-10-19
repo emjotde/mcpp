@@ -1,4 +1,5 @@
 #include "mcpp/editor.hpp"
+#include "mcpp/command_line.hpp"
 #include "mcpp/diff.hpp"
 #include "mcpp/editor_search.hpp"
 #include "mcpp/local_provider.hpp"
@@ -51,6 +52,53 @@ mcpp::EditorModel load(
 
 void erase_block(mcpp::EditorModel& editor) {
     editor.delete_block_or_line();
+}
+
+void test_unnamed_editor_and_cli_positions(const std::filesystem::path& root) {
+    const auto provider = std::make_shared<mcpp::LocalProvider>(root);
+    mcpp::EditorModel editor;
+    editor.create(provider, "");
+    check(editor.open() && editor.path().empty() && !editor.dirty(), "unnamed buffer is open without a path");
+    editor.insert("draft");
+    bool rejected = false;
+    try {
+        editor.save(false);
+    } catch (const std::runtime_error&) {
+        rejected = true;
+    }
+    check(rejected && editor.dirty(), "unnamed Save requires a chosen path without discarding the draft");
+    const auto named = root / "named-from-unnamed";
+    editor.save_as(named.string(), false);
+    check(read_file(named) == "draft" && !editor.dirty() && editor.path() == named.string(),
+          "Save as publishes and names an unnamed buffer");
+    editor.create(provider, "");
+    check(editor.path().empty() && editor.text().empty(), "creating another unnamed buffer clears the old path");
+    check(read_file(named) == "draft", "unnamed creation does not alter the old file");
+
+    const auto target = mcpp::parse_editor_file((root / "not-created").string() + ":12:");
+    check(target.path == (root / "not-created").string() && target.line == 12U,
+          "parse per-file line with optional trailing colon");
+    check(mcpp::parse_editor_file("name:0").line == 1U &&
+          mcpp::parse_line_number("0") == 1U, "native zero line selects the first line");
+    check(mcpp::parse_editor_file("name:word").path == "name:word", "nonnumeric colon suffix is a filename");
+    const auto literal = root / "literal:12";
+    { std::ofstream output(literal); output << "literal"; }
+    check(mcpp::parse_editor_file(literal.string()).path == literal.string() &&
+          mcpp::parse_editor_file(literal.string()).line == 0U, "an existing colon filename wins over position syntax");
+    const auto dangling = root / "dangling:12";
+    std::filesystem::create_symlink(root / "missing-target", dangling);
+    check(mcpp::parse_editor_file(dangling.string()).path == dangling.string() &&
+          mcpp::parse_editor_file(dangling.string()).line == 0U,
+          "a dangling colon symlink is not silently retargeted to a different filename");
+    for (const auto value : {"", "-1", "12x", "999999999999999999999999999999"}) {
+        bool invalid = false;
+        try {
+            static_cast<void>(mcpp::parse_line_number(value));
+        } catch (const std::invalid_argument&) {
+            invalid = true;
+        }
+        check(invalid, "invalid and overflowing line numbers are rejected");
+    }
 }
 
 void test_linear_move(const std::filesystem::path& root) {
@@ -558,6 +606,7 @@ int main(const int argc, char** argv) {
         return 1;
     }
     const std::vector<std::pair<std::string_view, void (*)(const std::filesystem::path&)>> tests{
+        {"Unnamed editor and CLI positions", test_unnamed_editor_and_cli_positions},
         {"E1 linear move", test_linear_move},
         {"E1 rectangular move", test_rectangular_move},
         {"E4 virtual source copy and mark width", test_virtual_source_copy},
