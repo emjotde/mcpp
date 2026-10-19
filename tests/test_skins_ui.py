@@ -282,6 +282,73 @@ class SkinsUI(unittest.TestCase):
             terminal.wait_file(terminal.exit_file, b"0\n")
             self.assertIn("theme=classic\n", (terminal.root / "config/mcpp/config").read_text())
 
+    def test_menu_highlights_hotkeys_user_menu_and_dialog_focus_follow_the_skin(self):
+        selections = {
+            "midnight": ("79b8ff", "08111d"),
+            "forest": ("9fd188", "13220b"),
+            "paper": ("365f91", "ffffff"),
+        }
+        for skin, (background, foreground) in selections.items():
+            with self.subTest(skin=skin):
+                root, left, right = self.fixture(skin, skin)
+                selected = (rgb(foreground), rgb(background))
+                normal = (rgb(PALETTES[skin][3]), rgb(PALETTES[skin][2]))
+                with self.terminal(root, MANAGER, [left, right]) as terminal:
+                    self.panels(terminal)
+                    click(terminal, "Options", row=0)
+                    terminal.wait_for("Configuration...")
+                    lines = terminal.text().splitlines()
+                    row = next(index for index, line in enumerate(lines) if "Configuration..." in line and "│" in line)
+                    self.assertEqual(self.pair(terminal, lines[row].index("Configuration..."), row), selected)
+                    row = next(index for index, line in enumerate(lines) if "Appearance..." in line and "│" in line)
+                    column = lines[row].index("Appearance...")
+                    self.assertEqual(self.pair(terminal, column, row), (rgb(background), normal[1]))
+                    self.assertEqual(self.pair(terminal, column + 1, row), normal)
+                    terminal.save("main-menu")
+                    terminal.press("Escape")
+                    terminal.wait_for("Configuration...", present=False)
+                    self.panels(terminal)
+                    terminal.press("F2")
+                    terminal.wait_for("Inspect selected path")
+                    lines = terminal.text().splitlines()
+                    row = next(index for index, line in enumerate(lines) if "Inspect selected path" in line)
+                    column = lines[row].index("Inspect selected path")
+                    self.assertEqual(self.pair(terminal, column, row), normal)
+                    self.assertEqual(self.pair(terminal, column - 3, row), (rgb(background), normal[1]))
+                    terminal.save("user-menu")
+                    terminal.press("Escape")
+                    terminal.wait_for("Inspect selected path", present=False)
+                    self.panels(terminal)
+                    terminal.press("F7")
+                    terminal.wait_for("Directory name:")
+                    lines = terminal.text().splitlines()
+                    row = next(index for index, line in enumerate(lines) if "> " in line and "│" in line)
+                    self.assertEqual(self.pair(terminal, lines[row].index("> "), row), selected)
+                    terminal.press("Tab")
+                    terminal.wait(lambda: "[ OK ]" in terminal.focused_text(), "dialog OK button is focused")
+                    lines = terminal.text().splitlines()
+                    row = next(index for index, line in enumerate(lines) if "[ OK ]" in line)
+                    self.assertEqual(self.pair(terminal, lines[row].index("[ OK ]"), row), selected)
+                    terminal.save("focused-dialog")
+                    terminal.press("F10")
+                    terminal.wait_for("Directory name:", present=False)
+                    self.panels(terminal)
+                    terminal.press("F10")
+                    terminal.wait_file(terminal.exit_file, b"0\n")
+                with self.terminal(root / "editor", EDITOR, ["--skin", skin, left / "sample.cpp"]) as terminal:
+                    terminal.wait_editor(offset=0)
+                    terminal.press("F9")
+                    terminal.wait(lambda: all(label in terminal.text().splitlines()[0]
+                                             for label in ("File", "Edit", "Search")), "editor menu bar is visible")
+                    click(terminal, "File", row=0)
+                    terminal.wait_for("Open file...")
+                    lines = terminal.text().splitlines()
+                    row = next(index for index, line in enumerate(lines) if "Open file..." in line and "│" in line)
+                    self.assertEqual(self.pair(terminal, lines[row].index("Open file..."), row), selected)
+                    terminal.save("editor-menu")
+                    terminal.press("F10", "F10")
+                    terminal.wait_file(terminal.exit_file, b"0\n")
+
     def test_all_frontends_accept_and_validate_skin_arguments(self):
         root, left, right = self.fixture()
         path = left / "sample.cpp"

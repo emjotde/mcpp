@@ -21,8 +21,11 @@ struct Skin {
     SkinPair normal{ftxui::Color::Grey85, ftxui::Color::Grey3};
     SkinPair menu{ftxui::Color::Grey11, ftxui::Color::Grey78};
     SkinPair menu_selected{ftxui::Color::Grey100, ftxui::Color::Grey23};
+    SkinPair popup_selected{ftxui::Color::Grey78, ftxui::Color::Grey11};
     SkinPair dialog{ftxui::Color::Grey11, ftxui::Color::Grey82};
+    SkinPair dialog_focus{ftxui::Color::Grey82, ftxui::Color::Grey11};
     SkinPair error{ftxui::Color::Grey100, ftxui::Color::Grey19};
+    SkinPair error_focus{ftxui::Color::Grey19, ftxui::Color::Grey100};
     SkinPair selected{ftxui::Color::Grey0, ftxui::Color::Grey85};
     SkinPair marked_selected{ftxui::Color::Grey0, ftxui::Color::Grey85};
     SkinPair inactive_selected{ftxui::Color::Grey93, ftxui::Color::Grey27};
@@ -34,6 +37,7 @@ struct Skin {
     SkinPair key_label{ftxui::Color::Grey85, ftxui::Color::Grey11};
     SkinPair progress{ftxui::Color::Grey11, ftxui::Color::Grey70};
     SkinPair diff_changed{ftxui::Color::Grey93, ftxui::Color::Grey19};
+    ftxui::Color menu_hot{ftxui::Color::Grey11};
     ftxui::Color bright{ftxui::Color::Grey100};
     ftxui::Color dim{ftxui::Color::Grey50};
     ftxui::Color inactive_title{ftxui::Color::Grey58};

@@ -31,7 +31,7 @@ Azure Blob Storage through azcpp. SSH/SFTP work is currently paused.
 - Creation permissions follow the process umask when permissions are not preserved
 - Mode, owner/group, file information, free-space display, and links
 - Directory comparison plus fixed-width Quick view and live Info panels
-- Local command line, history, and a disposable interactive child shell
+- Local command line, history, and persistent Bash with Ctrl-O switching
 - Persisted panel paths and preferences
 - MC-style visual state cues, a grayscale default, and 16 selectable skins
 - Toggleable syntax colors adapted to dark, light, and monochrome skins
@@ -260,8 +260,37 @@ internal redraw events without modifying the pinned submodule.
 
 The supported syntax choices and mcpp's rule/configuration file formats are
 not MC's complete syntax database or configuration-file compatibility layer.
-Remote providers remain explicitly paused. Local archive/VFS and persistent-shell
-work are tracked separately from these local menu controls.
+Remote providers remain explicitly paused. Local archive/VFS and remaining
+shell-compatibility work are tracked separately from these local menu controls.
+
+## Shell
+
+With Bash, commander commands and `Ctrl-O` use the same interactive shell.
+Variables, functions, aliases, and the shell PID survive repeated commands and
+screen switches. `Ctrl-O` also hides a running foreground command or Bash
+`read`; it does not stop the command. Resume it with `Ctrl-O`.
+
+An unfinished shell line or running command prevents a second commander command
+from being injected into it. The rejected commander draft remains editable for
+retry. File-operation jobs can remain running or paused while shell commands
+execute. Completion updates the pane cwd without another key, but does not undo
+a directory the user navigated to manually.
+
+Bash startup uses `$XDG_DATA_HOME/mcpp/bashrc` (normally
+`~/.local/share/mcpp/bashrc`), falling back to `~/.bashrc`. An mcpp-specific
+`inputrc` in the same data directory is loaded when present. Existing prompt
+hooks and command status are retained. Logical paths and paths containing
+spaces or newlines are synchronized without shell interpolation.
+
+Exiting Bash quits mcpp through its existing confirmation and dirty-editor
+guards. Shell startup and transport errors restore the UI and report the
+failure. Pause-after-run displays the completed command's output before waiting
+for a key; hiding a still-running command does not trigger that pause.
+
+`mcpp -u` / `--nosubshell` selects the earlier one-shot behavior for that run;
+`-U` / `--subshell` enables persistent Bash. These overrides do not replace the
+saved `use_subshell` preference. Non-Bash shells currently retain one-shot
+behavior; persistent ash/dash, ksh, zsh, tcsh, and fish remain compatibility work.
 
 ## Skins
 
@@ -294,6 +323,9 @@ choice in Appearance does. Unknown skin names are errors rather than silent
 fallbacks. `gray` and `blue` remain aliases for `grayscale` and `default`.
 The legacy saved value `classic` retains its previous grayscale appearance, so
 upgrading does not prevent startup or require rewriting the configuration.
+Dropdown selections, shortcut letters, the F2 user menu, focused controls, and
+popup lists also use skin colors; highlights do not merely invert a near-white
+label color shared by several palettes.
 
 ## Modal Tree and diff/merge
 

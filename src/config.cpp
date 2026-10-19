@@ -171,7 +171,7 @@ auto panel_bool_settings(Configuration& config) {
 template <typename Configuration>
 auto general_bool_settings(Configuration& config) {
     using Pointer = decltype(&config.verbose_operation);
-    return std::array<std::pair<std::string_view, Pointer>, 18>{{
+    return std::array<std::pair<std::string_view, Pointer>, 19>{{
         {"verbose_operation", &config.verbose_operation}, {"compute_totals", &config.compute_totals},
         {"classic_progressbar", &config.classic_progressbar}, {"mkdir_autoname", &config.mkdir_autoname},
         {"preallocate_space", &config.preallocate_space}, {"single_escape", &config.single_escape},
@@ -180,7 +180,8 @@ auto general_bool_settings(Configuration& config) {
         {"drop_menus", &config.drop_menus}, {"shell_patterns", &config.shell_patterns},
         {"completion_show_all", &config.completion_show_all}, {"rotating_dash", &config.rotating_dash},
         {"cd_follows_links", &config.cd_follows_links}, {"safe_delete", &config.safe_delete},
-        {"safe_overwrite", &config.safe_overwrite}, {"auto_save_setup", &config.auto_save_setup}
+        {"safe_overwrite", &config.safe_overwrite}, {"auto_save_setup", &config.auto_save_setup},
+        {"use_subshell", &config.use_subshell}
     }};
 }
 

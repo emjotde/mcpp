@@ -72,6 +72,7 @@ add_library(
     src/operations.cpp
     src/pane.cpp
     src/search.cpp
+    src/shell.cpp
     src/skin.cpp
     src/spelling.cpp
     src/syntax.cpp
@@ -328,6 +329,17 @@ if(MCPP_BUILD_TESTS)
                     ${CMAKE_CURRENT_BINARY_DIR}/skins-ui
             )
             set_tests_properties(mcpp_skins_ui PROPERTIES TIMEOUT 180)
+            add_test(
+                NAME mcpp_shell_ui
+                COMMAND
+                    ${MCPP_PYTHON_EXECUTABLE}
+                    -B
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_shell_ui.py
+                    $<TARGET_FILE:mcpp>
+                    ${MCPP_TMUX_EXECUTABLE}
+                    ${CMAKE_CURRENT_BINARY_DIR}/shell-ui
+            )
+            set_tests_properties(mcpp_shell_ui PROPERTIES TIMEOUT 120)
             add_test(
                 NAME mcpp_audit_ui
                 COMMAND

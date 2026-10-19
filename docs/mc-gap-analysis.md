@@ -85,11 +85,13 @@ are retained; they are not bugs to remove in pursuit of default MC behavior.
 |---|---|
 | L01 | Closed: separate `mcppview` and `mcppdiff` executables share the existing viewer and diff/merge code. Quit exits the process; dirty Save/Discard/Cancel and diff-to-editor return paths retain their guards. |
 | L02 | Closed: unnamed startup and New buffers, name-on-save including inactive-buffer Quit, `file:line` / `file:line:` notation, `+line`, existing literal colon filenames, and ordered multi-file `mcpp --edit`. CLI filename resolution and unnamed CLI startup use process cwd rather than restored pane paths. |
+| L04 | Closed for the explicitly listed Bash work: persistent shell state and cwd, Ctrl-O hide/resume including running commands and Bash builtins, guarded drafts, native shell-exit behavior, asynchronous completion, safe shutdown, and command execution alongside file operations. Other shell variants are tracked separately below. |
 | L27 | Closed: whole-document and current-word checking, dictionary selection, native suggestions/Add word/Replace/Skip/Cancel controls, and persisted personal dictionaries through standard `aspell(1)`. Byte offsets are validated, replacements are undoable, marks/search settings remain separate, and errors retain the draft and retryable dialog. |
 
-Current menu availability is **134/143**, or **134/137 (97.8%)** after excluding
-remote links. Standalone frontends are **4/4**. **31 of the 34 baseline local
-work packages remain open**; neither figure is an overall parity percentage.
+Standalone frontends are **4/4**. **Four of the 34 baseline work packages are
+closed; 30 baseline packages remain open**. This is a feature backlog, not an
+overall parity percentage. Additional gaps discovered afterward are listed
+separately, rather than silently changing the baseline denominator.
 The broader command-line option set is still L03, not implicitly completed by
 the new frontends.
 
@@ -146,8 +148,48 @@ Sixty-four real terminal captures were rendered into panel/editor and dialog
 galleries and inspected.
 
 This completes the extra built-in-skins request, not L23 in full. MC-format skin
-files and filename-highlighting compatibility remain open. In total,
-31 baseline local work packages remain open.
+files and filename-highlighting compatibility remain open.
+
+### Menu skin corrections
+
+Follow-up feedback exposed states the first skin walk had not explicitly
+checked. Dropdown selection was still an inversion of the normal menu color,
+so several dark skins showed nearly the same pale highlight instead of their
+selected accent. Shortcut letters inherited the normal text color, the F2
+menu inherited dialog colors, and focused controls/list rows used the same
+plain inversion.
+
+Menu selection, mnemonic, dialog-focus and error-focus colors now have explicit
+bindings. Existing grayscale colors are retained. Main/editor dropdowns, F2
+entries, popup lists, active inputs, buttons, radio choices and checkboxes use
+the intended colors while retaining focus metadata and shortcuts. Captured
+RGB checks cover Midnight, Forest and Paper menu states, not just labels.
+
+### Persistent Bash
+
+The approved Bash workflow is now implemented with a PTY and separate framed
+control messages. Variables, aliases, functions, the PID, existing prompt
+hooks/status, logical cwd and unusual path bytes survive screen changes.
+Early Ctrl-O during startup retains a queued command; running builtins can be
+hidden without losing input. Completion does not steal a manually navigated
+pane. A paused file copy remains paused while Bash runs, and resumes with
+byte-identical results.
+
+Startup/IPC errors restore terminal handling. Request-channel writes do not
+raise SIGPIPE, shutdown does not wait on a background child's open PTY, and
+private PTY markers keep command output ahead of pause-after-run prompts.
+The running-command case does not pause merely because the user hid it.
+`-U`/`-u` overrides are launch-only; `use_subshell` is saved independently.
+
+The expanded normal run covered 26 CTest entries. It exposed one command-output
+ordering race in the existing pause workflow; after the fix, all 18 Bash
+workflows, the 36-case follow-up suite and terminal restoration smoke check pass.
+
+### Additional compatibility gaps
+
+| ID | Remaining work | Evidence |
+|---|---|---|
+| L35 | Persistent non-Bash shell variants | Native MC documents ash/dash, ksh variants, zsh, tcsh and fish. mcpp's persistent integration currently targets the approved Bash workflow; other `SHELL` values retain one-shot execution. |
 
 ## Audit fix delivery
 

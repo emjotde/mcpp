@@ -32,6 +32,8 @@ Skin colored_skin(
     skin.menu = skin.dialog = {rgb(surface_foreground), rgb(surface)};
     skin.menu_selected = skin.selected = skin.marked_selected =
         skin.search = skin.viewer_cursor = skin.key_number = {rgb(accent_foreground), rgb(accent)};
+    skin.popup_selected = skin.dialog_focus = skin.error_focus = skin.selected;
+    skin.menu_hot = rgb(accent);
     skin.inactive_selected = skin.diff_changed = {rgb(surface_foreground), rgb(surface)};
     skin.inactive_marked_selected = skin.inactive_selected;
     skin.error = {rgb(0xfff2f4), rgb(light ? 0x8a2638 : 0x712335)};
@@ -71,6 +73,8 @@ const std::vector<Skin>& builtin_skins() {
         classic.label = "< Default >";
         classic.normal.background = rgb(0x000080);
         classic.menu = classic.selected = {ftxui::Color::Grey0, rgb(0x00a0a0)};
+        classic.popup_selected = {rgb(0x00a0a0), ftxui::Color::Grey0};
+        classic.menu_hot = ftxui::Color::Grey0;
         classic.marked_selected = {ftxui::Color::Grey0, rgb(0x00a0a0)};
         classic.inactive_selected = {ftxui::Color::Grey93, rgb(0x0064a0)};
         classic.inactive_marked_selected = {ftxui::Color::YellowLight, rgb(0x0064a0)};

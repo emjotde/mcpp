@@ -7,6 +7,7 @@
 #include "mcpp/location.hpp"
 #include "mcpp/listing.hpp"
 #include "mcpp/search.hpp"
+#include "mcpp/shell.hpp"
 #include "mcpp/skin.hpp"
 #include "mcpp/spelling.hpp"
 #include "mcpp/syntax.hpp"
@@ -26,6 +27,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <exception>
 #include <functional>
 #include <fnmatch.h>
 #include <iomanip>
@@ -932,15 +934,18 @@ bool can_open_file(const Entry& entry) {
 
 ftxui::Element mnemonic_label(
     const std::string& label,
-    const std::size_t index
+    const std::size_t index,
+    const std::optional<ftxui::Color> foreground = std::nullopt
 ) {
     using namespace ftxui;
     if (index >= label.size()) {
         return text(label);
     }
+    auto mnemonic = text(label.substr(index, 1U)) | underlined | bold;
+    if (foreground) mnemonic = mnemonic | color(*foreground);
     return hbox({
         text(label.substr(0, index)),
-        text(label.substr(index, 1U)) | underlined | bold,
+        std::move(mnemonic),
         text(label.substr(index + 1U)),
     });
 }
@@ -1054,7 +1059,7 @@ struct MenuRow {
     char mnemonic{0};
 };
 
-ftxui::Element menu_row_label(const MenuRow& row) {
+ftxui::Element menu_row_label(const MenuRow& row, const std::optional<ftxui::Color> foreground = std::nullopt) {
     std::size_t index = std::string::npos;
     if (row.mnemonic != 0) {
         for (std::size_t offset = 0; offset < row.label.size(); ++offset) {
@@ -1064,7 +1069,7 @@ ftxui::Element menu_row_label(const MenuRow& row) {
             }
         }
     }
-    return ftxui::hbox({ftxui::text(" "), mnemonic_label(row.label, index)});
+    return ftxui::hbox({ftxui::text(" "), mnemonic_label(row.label, index, foreground)});
 }
 
 struct TreeNode {
@@ -1481,6 +1486,10 @@ struct App::Impl {
     std::chrono::steady_clock::time_point operation_started{};
     std::mutex operation_mutex;
     std::string command_line;
+    ShellSession shell;
+    bool shell_exit_requested{false};
+    std::optional<int> shell_panel_id;
+    std::string shell_expected_directory;
     bool command_prompt_override{false};
     bool command_mode{false};
     bool panel_ctrl_x{false};
@@ -2184,7 +2193,7 @@ struct App::Impl {
         for (std::size_t index = 0; index < labels.size(); ++index) {
             auto row = hbox({text(" "), text(save_mode_choice == index ? "(*) " : "( ) "),
                              mnemonic_label(labels[index], 0)}) | reflect(save_mode_boxes[index]);
-            if (save_mode_focus == 0U && save_mode_choice == index) row = row | inverted | focus;
+            if (save_mode_focus == 0U && save_mode_choice == index) row = focus_dialog(std::move(row));
             rows.push_back(std::move(row));
         }
         auto extension = render_input(save_mode_extension, save_mode_extension_input, save_mode_focus == 1U, "");
@@ -2193,7 +2202,7 @@ struct App::Impl {
         rows.push_back(separator());
         auto check = hbox({text(save_mode_check_newline ? " [x] " : " [ ] "),
                            mnemonic_label("Check POSIX new line", 6)}) | reflect(save_mode_boxes[4]);
-        if (save_mode_focus == 2U) check = check | inverted | focus;
+        if (save_mode_focus == 2U) check = focus_dialog(std::move(check));
         rows.push_back(std::move(check));
         return native_window("Edit Save Mode", vbox({
             vbox(std::move(rows)),
@@ -2721,7 +2730,7 @@ struct App::Impl {
                 if (index < keys.size()) {
                     cell = text("[" + fit_listing_text(keys[index].first, 16, ListingAlignment::left) + "]") |
                            reflect(learn_key_boxes[index]);
-                    if (learn_key_focus == index) cell = cell | inverted | focus;
+                    if (learn_key_focus == index) cell = focus_dialog(std::move(cell));
                     cell = hbox({std::move(cell), text(learn_key_detected[index] ? " OK" : "   "), filler()});
                 }
                 columns.push_back(std::move(cell) | size(WIDTH, EQUAL, 23));
@@ -3102,7 +3111,7 @@ struct App::Impl {
         for (std::size_t index = 0; index < issue.suggestions.size(); ++index) {
             auto row = text(display_text(issue.suggestions[index])) | reflect(spelling_suggestion_boxes[index]);
             if (index == spelling_suggestion) {
-                row = row | inverted | focus;
+                row = focus_dialog(std::move(row));
             }
             suggestions.push_back(std::move(row));
         }
@@ -4005,7 +4014,7 @@ struct App::Impl {
         for (std::size_t index = 0; index < local_list_items.size(); ++index) {
             auto row = text(middle_truncate(display_text(local_list_items[index]),
                 static_cast<std::size_t>(std::max(1, std::min(90, Terminal::Size().dimx - 4)))));
-            if (index == local_list_cursor) row = row | inverted | focus;
+            if (index == local_list_cursor) row = focus_dialog(std::move(row));
             rows.push_back(std::move(row) | reflect(local_list_boxes[index]));
         }
         if (rows.empty()) rows.push_back(text("<empty>") | dim);
@@ -4695,7 +4704,9 @@ struct App::Impl {
                     element = paint(std::move(element), palette().diff_changed);
                     if (*aligned.hunk == diff_hunk) element = element | bold;
                 }
-                if (diff_search_match && diff_search_match->first == row && side == diff_order) element = element | inverted;
+                if (diff_search_match && diff_search_match->first == row && side == diff_order) {
+                    element = highlight(std::move(element), palette().search);
+                }
                 rows.push_back(std::move(element) | size(WIDTH, EQUAL, std::max(1, width - 2)));
             }
             while (rows.size() < diff_visible_rows()) rows.push_back(text(""));
@@ -4830,11 +4841,11 @@ struct App::Impl {
         for (std::size_t index = 0; index < modes.size(); ++index) {
             auto row = text(std::string(file_search_draft.mode == modes[index] ? " (*) " : " ( ) ") + names[index]) |
                        reflect(file_search_boxes[index + 1U]);
-            if (file_search_focus == 1U && file_search_draft.mode == modes[index]) row = row | inverted | focus;
+            if (file_search_focus == 1U && file_search_draft.mode == modes[index]) row = focus_dialog(std::move(row));
             types.push_back(std::move(row));
             auto checkbox = text(std::string(checked[index] ? " [x] " : " [ ] ") + flags[index]) |
                             reflect(file_search_boxes[index + 5U]);
-            if (file_search_focus == index + 2U) checkbox = checkbox | inverted | focus;
+            if (file_search_focus == index + 2U) checkbox = focus_dialog(std::move(checkbox));
             options.push_back(std::move(checkbox));
         }
         Elements rows{
@@ -4938,13 +4949,13 @@ struct App::Impl {
         for (std::size_t index = 0; index < quality.size(); ++index) {
             auto row = text(std::string(diff_draft.quality == index ? " (*) " : " ( ) ") + quality[index]) |
                        reflect(diff_options_boxes[index]);
-            if (diff_options_focus == 0U && diff_draft.quality == index) row = row | inverted | focus;
+            if (diff_options_focus == 0U && diff_draft.quality == index) row = focus_dialog(std::move(row));
             algorithms.push_back(std::move(row));
         }
         for (std::size_t index = 0; index < extras.size(); ++index) {
             auto row = text(std::string(diff_draft.*diff_option_members[index] ? " [x] " : " [ ] ") + extras[index]) |
                        reflect(diff_options_boxes[index + 3U]);
-            if (diff_options_focus == index + 1U) row = row | inverted | focus;
+            if (diff_options_focus == index + 1U) row = focus_dialog(std::move(row));
             options.push_back(std::move(row));
         }
         return native_window("Diff Options", vbox({
@@ -5358,14 +5369,14 @@ struct App::Impl {
             }
             button.push_back(text("]"));
             auto field = hbox(std::move(button)) | reflect(ownership_boxes[group]);
-            if (ownership_focus == group) field = field | inverted | focus;
+            if (ownership_focus == group) field = focus_dialog(std::move(field));
             values.push_back(std::move(field));
             values.push_back(text(group == 2U ? "     " : "   "));
         }
         auto user = text("[" + middle_truncate(display_text(ownership_user), 15) + "]") | reflect(ownership_boxes[3]);
         auto group = text("[" + middle_truncate(display_text(ownership_group), 15) + "]") | reflect(ownership_boxes[4]);
-        if (ownership_focus == 3U) user = user | inverted | focus;
-        if (ownership_focus == 4U) group = group | inverted | focus;
+        if (ownership_focus == 3U) user = focus_dialog(std::move(user));
+        if (ownership_focus == 4U) group = focus_dialog(std::move(group));
         values.push_back(std::move(user) | size(WIDTH, EQUAL, 18));
         values.push_back(std::move(group) | size(WIDTH, EQUAL, 18));
         std::string flags = " Flag  " + std::string(ownership_flags.data(), 3) + "     " +
@@ -5552,7 +5563,7 @@ struct App::Impl {
             if (checked) letters[attribute.slot] = attribute.letter;
             auto row = text(std::string(checked ? " [x] (" : " [ ] (") + attribute.letter + ") " +
                             std::string(attribute.label)) | reflect(attribute_boxes[index]);
-            if (attribute_focus == index) row = row | inverted | focus;
+            if (attribute_focus == index) row = focus_dialog(std::move(row));
             rows.push_back(std::move(row));
         }
         const bool many = attribute_entries.size() > 1U;
@@ -5761,6 +5772,28 @@ struct App::Impl {
 
     ftxui::Element paint(ftxui::Element element, const SkinPair& colors) const {
         return std::move(element) | ftxui::color(colors.foreground) | ftxui::bgcolor(colors.background);
+    }
+
+    ftxui::Element highlight(ftxui::Element element, const SkinPair& colors) const {
+        return paint(std::move(element), {colors.background, colors.foreground}) | ftxui::inverted;
+    }
+
+    ftxui::Element focus_dialog(ftxui::Element element) const {
+        return highlight(std::move(element), palette().dialog_focus) | ftxui::focus;
+    }
+
+    ftxui::Element dialog_button(const std::string& label, const bool focused, ftxui::Box& box) const {
+        auto button = ::mcpp::dialog_button(label, false, box);
+        if (!focused) return button;
+        return highlight(std::move(button), mode == Mode::editor_error ? palette().error_focus
+                                                                     : palette().dialog_focus) | ftxui::focus;
+    }
+
+    ftxui::Element native_button(
+        const std::string& label, const bool primary, const bool focused, ftxui::Box& box
+    ) const {
+        auto button = ::mcpp::native_button(label, primary, false, box);
+        return focused ? focus_dialog(std::move(button)) : button;
     }
 
     ftxui::Element gray_dialog(ftxui::Element element) const {
@@ -6093,7 +6126,7 @@ struct App::Impl {
         for (std::size_t index = 0; index < labels.size(); ++index) {
             auto label = hbox({text(listing_choice == index ? "(*) " : "( ) "),
                                mnemonic_label(labels[index], 0)});
-            if (listing_focus == 0U && listing_choice == index) label = label | inverted | focus;
+            if (listing_focus == 0U && listing_choice == index) label = focus_dialog(std::move(label));
             label = label | reflect(listing_boxes[index]);
             if (index == 1U) {
                 auto columns = render_input(listing_brief_value, listing_brief_input,
@@ -6114,7 +6147,7 @@ struct App::Impl {
         rows.push_back(separator());
         auto mini = hbox({text(listing_user_mini ? "[x] " : "[ ] "),
                           mnemonic_label("User mini status", 5)});
-        if (listing_focus == 3U) mini = mini | inverted | focus;
+        if (listing_focus == 3U) mini = focus_dialog(std::move(mini));
         rows.push_back(hbox({text(" "), std::move(mini) | reflect(listing_boxes[6])}));
         auto mini_input = render_input(listing_status_values[listing_choice], listing_status_input,
                                        listing_focus == 4U, "");
@@ -6268,7 +6301,7 @@ struct App::Impl {
             auto radio = hbox({text(sort_choice == index ? "(*) " : "( ) "),
                                mnemonic_label(names[index], mnemonics[index])}) |
                          size(WIDTH, EQUAL, 21) | reflect(sort_boxes[index]);
-            if (sort_focus == 0U && sort_choice == index) radio = radio | inverted | focus;
+            if (sort_focus == 0U && sort_choice == index) radio = focus_dialog(std::move(radio));
             Element checkbox = text("");
             if (index < 3U) {
                 const bool checked = index == 0U ? sort_executable_first : index == 1U ? sort_case_sensitive : sort_reverse;
@@ -6276,7 +6309,7 @@ struct App::Impl {
                 checkbox = hbox({text(checked ? "[x] " : "[ ] "),
                                   mnemonic_label(label, index == 0U ? 11U : index == 1U ? 3U : 0U)}) |
                            reflect(sort_boxes[9U + index]);
-                if (sort_focus == index + 1U) checkbox = checkbox | inverted | focus;
+                if (sort_focus == index + 1U) checkbox = focus_dialog(std::move(checkbox));
             }
             rows.push_back(hbox({text(" "), std::move(radio), std::move(checkbox)}));
         }
@@ -6436,7 +6469,7 @@ struct App::Impl {
         const auto check = [&](const std::size_t index) {
             auto row = hbox({text(configure_values[index] ? " [x] " : " [ ] "), mnemonic_label(names[index], keys[index])}) |
                        reflect(configure_boxes[index]);
-            if (configure_focus == index) row = row | inverted | focus;
+            if (configure_focus == index) row = focus_dialog(std::move(row));
             return row;
         };
         Elements file_options, other_options, pause;
@@ -6453,7 +6486,7 @@ struct App::Impl {
             auto row = hbox({text(configure_pause == index ? " (*) " : " ( ) "),
                              mnemonic_label(pause_labels[index], pause_keys[index])}) |
                        reflect(configure_boxes[19U + index]);
-            if (configure_focus == 19U && configure_pause == index) row = row | inverted | focus;
+            if (configure_focus == 19U && configure_pause == index) row = focus_dialog(std::move(row));
             pause.push_back(std::move(row));
         }
         Elements content{
@@ -6578,10 +6611,10 @@ struct App::Impl {
         using namespace ftxui;
         auto skin = text("[ " + fit_listing_text(appearance_skin, 25, ListingAlignment::left) + " ]") |
                     reflect(appearance_boxes[0]);
-        if (appearance_focus == 0U) skin = skin | inverted | focus;
+        if (appearance_focus == 0U) skin = focus_dialog(std::move(skin));
         auto shadows = hbox({text(appearance_shadows ? " [x] " : " [ ] "), mnemonic_label("Shadows", 0)}) |
                        reflect(appearance_boxes[1]);
-        if (appearance_focus == 1U) shadows = shadows | inverted | focus;
+        if (appearance_focus == 1U) shadows = focus_dialog(std::move(shadows));
         return native_window("Appearance", vbox({
             hbox({text(" Skin:"), filler(), std::move(skin), text(" ")}),
             separator(), std::move(shadows), separator(),
@@ -6650,7 +6683,7 @@ struct App::Impl {
     ftxui::Element render_display_bits() {
         using namespace ftxui;
         auto codepage = text("[ UTF-8 ]") | reflect(display_bits_boxes[0]);
-        if (display_bits_focus == 0U) codepage = codepage | inverted | focus;
+        if (display_bits_focus == 0U) codepage = focus_dialog(std::move(codepage));
         return native_window("Display bits", vbox({
             hbox({text(" Input / display codepage: "), std::move(codepage), filler()}),
             separator(),
@@ -6698,7 +6731,7 @@ struct App::Impl {
         const auto check = [&](const std::size_t index) {
             auto row = hbox({text(panel_option_values[index] ? " [x] " : " [ ] "),
                              mnemonic_label(names[index], hotkeys[index])}) | reflect(panel_option_boxes[index]);
-            if (panel_option_focus == index) row = row | inverted | focus;
+            if (panel_option_focus == index) row = focus_dialog(std::move(row));
             return row;
         };
         Elements main, navigation, highlight, search;
@@ -6715,7 +6748,7 @@ struct App::Impl {
             auto row = hbox({text(panel_option_search == index ? " (*) " : " ( ) "),
                              mnemonic_label(search_names[index], search_hotkeys[index])}) |
                        reflect(panel_option_boxes[16U + index]);
-            if (panel_option_focus == 16U && panel_option_search == index) row = row | inverted | focus;
+            if (panel_option_focus == 16U && panel_option_search == index) row = focus_dialog(std::move(row));
             search.push_back(std::move(row));
         }
         return native_window("Panel options", vbox({
@@ -6815,13 +6848,13 @@ struct App::Impl {
                                const bool value, const std::size_t focus_index, const std::size_t box) {
             auto row = hbox({text(value ? " [x] " : " [ ] "), mnemonic_label(label, mnemonic)}) |
                        reflect(layout_boxes[box]);
-            if (layout_focus == focus_index) row = row | inverted | focus;
+            if (layout_focus == focus_index) row = focus_dialog(std::move(row));
             return row;
         };
         const auto radio = [&](const std::string& label, const bool horizontal, const std::size_t box) {
             auto row = hbox({text(layout_horizontal == horizontal ? " (*) " : " ( ) "), mnemonic_label(label, 0)}) |
                        reflect(layout_boxes[box]);
-            if (layout_focus == 0U && layout_horizontal == horizontal) row = row | inverted | focus;
+            if (layout_focus == 0U && layout_horizontal == horizontal) row = focus_dialog(std::move(row));
             return row;
         };
         const auto total = layout_horizontal
@@ -6841,8 +6874,8 @@ struct App::Impl {
             decrease = decrease | dim | color(palette().dim);
             increase = increase | dim | color(palette().dim);
         } else {
-            if (layout_focus == 2U) decrease = decrease | inverted | focus;
-            if (layout_focus == 3U) increase = increase | inverted | focus;
+            if (layout_focus == 2U) decrease = focus_dialog(std::move(decrease));
+            if (layout_focus == 3U) increase = focus_dialog(std::move(increase));
         }
         auto split = window(text(" Panel split "), vbox({
             radio("Vertical", false, 0), radio("Horizontal", true, 1),
@@ -6969,7 +7002,7 @@ struct App::Impl {
             auto row = hbox({text(confirmation_values[index] ? " [x] " : " [ ] "),
                              mnemonic_label(labels[index], mnemonics[index])}) |
                        reflect(confirmation_boxes[index]);
-            if (confirmation_focus == index) row = row | inverted | focus;
+            if (confirmation_focus == index) row = focus_dialog(std::move(row));
             rows.push_back(std::move(row));
         }
         return native_window("Confirmation", vbox({
@@ -7624,7 +7657,7 @@ struct App::Impl {
             text(std::string(prefix)),
             hbox(std::move(cells)) | xflex | xframe,
         }) | reflect(input.box);
-        return active ? field | inverted : field;
+        return active ? highlight(std::move(field), palette().dialog_focus) : field;
     }
 
     bool input_mouse(
@@ -8308,94 +8341,136 @@ struct App::Impl {
         }
     }
 
+    void synchronize_shell_directory(const ShellResult& result) {
+        if (!shell_panel_id || result.busy) return;
+        auto& pane = pane_ids[0] == *shell_panel_id ? left : right;
+        if (pane.path() != shell_expected_directory) return;
+        if (pane.path() != result.directory) {
+            pane.change_directory(result.directory);
+            shell_expected_directory = pane.path();
+        }
+    }
+
+    void process_shell_events(const bool finish_exit) {
+        try {
+            const auto result = shell.poll();
+            if (!result) return;
+            synchronize_shell_directory(*result);
+            if (result->exited) {
+                shell_exit_requested = true;
+                if (finish_exit) {
+                    shell_exit_requested = false;
+                    request_app_exit();
+                }
+            } else {
+                if (mode == Mode::panels && !command_mode && !panel_search_mode && !tree_search_mode) {
+                    status = "Command exited " + std::to_string(result->status);
+                }
+                refresh();
+            }
+        } catch (const std::exception& error) {
+            std::cerr << "mcpp: persistent shell: " << error.what() << '\n';
+            if (!finish_exit) throw;
+            set_error(error);
+        }
+    }
+
     int run_process(
         const std::string& command,
         const bool interactive,
         const std::string& directory = {}
     ) {
-        if (operation_running.load(std::memory_order_acquire)) {
-            throw std::runtime_error(
-                "cannot launch a command while a file operation is running"
-            );
-        }
         if (traversal_running.load(std::memory_order_acquire)) {
             throw std::runtime_error(
                 "cannot launch a command while search is running"
             );
         }
+        const bool persistent = config.subshell_override.value_or(config.use_subshell) && ShellSession::supported();
+        if (persistent) {
+            process_shell_events(false);
+            if (shell_exit_requested) throw std::runtime_error("the shell exited; command was not run");
+            if (!command.empty() && shell.busy()) {
+                throw ShellBusy("shell is already running a command; use Ctrl-O to resume it");
+            }
+            if (!shell.busy()) {
+                shell_panel_id = directory.empty() ? std::optional<int>{pane_ids[active_index]} : std::nullopt;
+                shell_expected_directory = active().path();
+            }
+        }
+        const auto execution_directory = directory.empty() ? active().path() : directory;
+        const auto* executable = std::getenv("SHELL");
+        if (executable == nullptr || *executable == '\0') executable = "/bin/sh";
+        ShellResult result;
+        std::exception_ptr failure;
         int child_status = 0;
         terminal->WithRestoredIO([&] {
-            if (interactive) {
-                std::cout << "\033[H\033[2J" << std::flush;
-            }
-            const auto child = fork();
-            if (child < 0) {
-                throw std::runtime_error("failed to fork shell");
-            }
-            if (child == 0) {
-                if (chdir((directory.empty() ? active().path() : directory).c_str()) != 0) {
-                    _exit(126);
-                }
-                const auto* shell = std::getenv("SHELL");
-                if (shell == nullptr || *shell == '\0') {
-                    shell = "/bin/sh";
-                }
-                if (interactive) {
-                    execl(shell, shell, static_cast<char*>(nullptr));
+            try {
+                if (persistent) {
+                    if (!shell.running()) std::cout << "\033[H\033[2J" << std::flush;
+                    result = shell.show(execution_directory, command);
                 } else {
-                    execl(
-                        shell,
-                        shell,
-                        "-c",
-                        command.c_str(),
-                        static_cast<char*>(nullptr)
-                    );
-                }
-                _exit(127);
-            }
-            while (waitpid(child, &child_status, 0) < 0) {
-                if (errno != EINTR) {
-                    throw std::runtime_error(
-                        "failed to wait for shell"
-                    );
-                }
-            }
-            const auto* term = std::getenv("TERM");
-            const bool dumb_terminal = term != nullptr &&
-                (std::string_view(term) == "dumb" || std::string_view(term) == "linux");
-            if (!interactive && (config.pause_after_run == 2U ||
-                (config.pause_after_run == 1U && dumb_terminal))) {
-                struct termios original{};
-                if (tcgetattr(STDIN_FILENO, &original) != 0) {
-                    throw std::system_error(errno, std::generic_category(), "read terminal settings");
-                }
-                auto one_key = original;
-                one_key.c_lflag &= static_cast<tcflag_t>(~(ICANON | ECHO));
-                one_key.c_cc[VMIN] = 1;
-                one_key.c_cc[VTIME] = 0;
-                if (tcsetattr(STDIN_FILENO, TCSANOW, &one_key) != 0) {
-                    throw std::system_error(errno, std::generic_category(), "set pause input mode");
-                }
-                try {
-                    std::cout << "\nPress any key to continue..." << std::flush;
-                    char key = 0;
-                    ssize_t count = 0;
-                    do { count = read(STDIN_FILENO, &key, 1); } while (count < 0 && errno == EINTR);
-                    if (count != 1) throw std::runtime_error("cannot read pause key");
-                    std::cout << '\n' << std::flush;
-                } catch (...) {
-                    if (tcsetattr(STDIN_FILENO, TCSANOW, &original) != 0) {
-                        std::cerr << "mcpp: cannot restore terminal settings after pause\n";
+                    if (interactive) std::cout << "\033[H\033[2J" << std::flush;
+                    const auto child = fork();
+                    if (child < 0) throw std::runtime_error("failed to fork shell");
+                    if (child == 0) {
+                        if (chdir(execution_directory.c_str()) != 0) _exit(126);
+                        if (interactive) {
+                            execlp(executable, executable, static_cast<char*>(nullptr));
+                        } else {
+                            execlp(executable, executable, "-c", command.c_str(), static_cast<char*>(nullptr));
+                        }
+                        _exit(127);
                     }
-                    throw;
+                    while (waitpid(child, &child_status, 0) < 0) {
+                        if (errno != EINTR) throw std::runtime_error("failed to wait for shell");
+                    }
                 }
-                if (tcsetattr(STDIN_FILENO, TCSANOW, &original) != 0) {
-                    throw std::system_error(errno, std::generic_category(), "restore terminal settings");
+                const auto* term = std::getenv("TERM");
+                const bool dumb_terminal = term != nullptr &&
+                    (std::string_view(term) == "dumb" || std::string_view(term) == "linux");
+                const bool finished = !persistent || (!result.busy && !result.exited);
+                if (!interactive && finished && (config.pause_after_run == 2U ||
+                    (config.pause_after_run == 1U && dumb_terminal))) {
+                    struct termios original{};
+                    if (tcgetattr(STDIN_FILENO, &original) != 0) {
+                        throw std::system_error(errno, std::generic_category(), "read terminal settings");
+                    }
+                    auto one_key = original;
+                    one_key.c_lflag &= static_cast<tcflag_t>(~(ICANON | ECHO));
+                    one_key.c_cc[VMIN] = 1;
+                    one_key.c_cc[VTIME] = 0;
+                    if (tcsetattr(STDIN_FILENO, TCSANOW, &one_key) != 0) {
+                        throw std::system_error(errno, std::generic_category(), "set pause input mode");
+                    }
+                    try {
+                        std::cout << "\nPress any key to continue..." << std::flush;
+                        char key = 0;
+                        ssize_t count = 0;
+                        do { count = read(STDIN_FILENO, &key, 1); } while (count < 0 && errno == EINTR);
+                        if (count != 1) throw std::runtime_error("cannot read pause key");
+                        std::cout << '\n' << std::flush;
+                    } catch (...) {
+                        if (tcsetattr(STDIN_FILENO, TCSANOW, &original) != 0) {
+                            std::cerr << "mcpp: cannot restore terminal settings after pause\n";
+                        }
+                        throw;
+                    }
+                    if (tcsetattr(STDIN_FILENO, TCSANOW, &original) != 0) {
+                        throw std::system_error(errno, std::generic_category(), "restore terminal settings");
+                    }
                 }
+            } catch (...) {
+                failure = std::current_exception();
             }
         })();
+        if (failure) std::rethrow_exception(failure);
+        if (persistent) {
+            synchronize_shell_directory(result);
+            shell_exit_requested = result.exited;
+        }
         terminal_title.clear();
         refresh();
+        if (persistent) return result.status;
         if (WIFEXITED(child_status)) {
             return WEXITSTATUS(child_status);
         }
@@ -8454,7 +8529,13 @@ struct App::Impl {
                 return;
             }
             const auto result = run_process(command, false);
-            status = "Command exited " + std::to_string(result);
+            status = shell.busy() ? "Shell command is running; Ctrl-O resumes it"
+                                  : "Command exited " + std::to_string(result);
+        } catch (const ShellBusy& error) {
+            command_line = command;
+            command_input.reset(command_line);
+            command_mode = true;
+            set_error(error);
         } catch (const std::exception& error) {
             set_error(error);
         }
@@ -9559,11 +9640,13 @@ struct App::Impl {
 
         Elements menu;
         for (std::size_t index = 0; index < editor_menu_names.size(); ++index) {
+            const bool selected = mode == Mode::editor_menu && index == editor_menu_category;
             auto item = mnemonic_label(
                 editor_menu_names[index],
-                editor_menu_mnemonics[index]
+                editor_menu_mnemonics[index],
+                selected ? std::nullopt : std::optional<ftxui::Color>{palette().menu_hot}
             );
-            if (mode == Mode::editor_menu && index == editor_menu_category) {
+            if (selected) {
                 item = paint(std::move(item), palette().menu_selected) | bold;
             }
             menu.push_back(
@@ -9796,12 +9879,14 @@ struct App::Impl {
                 );
                 continue;
             }
-            auto row = menu_row_label(items[index]);
+            const bool selected = index == editor_menu_item;
+            auto row = menu_row_label(items[index], selected || items[index].action < 0
+                ? std::nullopt : std::optional<ftxui::Color>{palette().menu_hot});
             if (items[index].action < 0) {
                 row = row | color(palette().disabled) | dim;
             }
-            if (index == editor_menu_item) {
-                row = row | inverted | focus;
+            if (selected && items[index].action >= 0) {
+                row = highlight(std::move(row), palette().popup_selected) | focus;
             }
             rows.push_back(
                 std::move(row) | reflect(editor_menu_item_boxes[index])
@@ -9826,7 +9911,7 @@ struct App::Impl {
         const auto button = [&](const std::string& label, const std::size_t index) {
             auto element = text("[ " + label + " ]");
             if (index == editor_save_choice) {
-                element = element | inverted | focus;
+                element = focus_dialog(std::move(element));
             }
             return element | reflect(editor_save_boxes[index]);
         };
@@ -9994,7 +10079,7 @@ struct App::Impl {
         const auto focused = [&](Element element,
                                  const std::size_t index) {
             if (editor_dialog_focus == index) {
-                element = element | inverted | focus;
+                element = focus_dialog(std::move(element));
             }
             return element | reflect(editor_search_boxes[index]);
         };
@@ -10116,7 +10201,7 @@ struct App::Impl {
                              mnemonic_label(names[index], hotkeys[index])}) |
                        reflect(editor_options_boxes[index + 3U]);
             const auto focus_index = index < 3U ? index + 1U : index + 2U;
-            if (editor_options_focus == focus_index) row = row | inverted | focus;
+            if (editor_options_focus == focus_index) row = focus_dialog(std::move(row));
             return row;
         };
         static const std::array<std::string, 3> wrap_names{"None", "Dynamic paragraphing", "Type writer wrap"};
@@ -10126,7 +10211,7 @@ struct App::Impl {
             auto row = hbox({text(editor_options_wrap == index ? " (*) " : " ( ) "),
                              mnemonic_label(wrap_names[index], wrap_keys[index])}) |
                        reflect(editor_options_boxes[index]);
-            if (editor_options_focus == 0U && editor_options_wrap == index) row = row | inverted | focus;
+            if (editor_options_focus == 0U && editor_options_wrap == index) row = focus_dialog(std::move(row));
             wrap.push_back(std::move(row));
         }
         const bool columns = Terminal::Size().dimx >= 77;
@@ -10182,7 +10267,7 @@ struct App::Impl {
                     )
                 );
                 if (index == editor_list_cursor) {
-                    row = row | inverted | focus;
+                    row = focus_dialog(std::move(row));
                 }
                 rows.push_back(std::move(row) | reflect(editor_list_boxes[index]));
             }
@@ -10206,7 +10291,7 @@ struct App::Impl {
                     )
                 );
                 if (index == editor_list_cursor) {
-                    row = row | inverted | focus;
+                    row = focus_dialog(std::move(row));
                 }
                 rows.push_back(std::move(row) | reflect(editor_list_boxes[index]));
             }
@@ -10297,19 +10382,15 @@ struct App::Impl {
             separator(),
         };
         for (const auto& item : user_menu) {
-            rows.push_back(
-                text(
-                    std::string(1, item.key) + "  " + item.label
-                )
-            );
+            rows.push_back(hbox({text(std::string(1, item.key)) | color(palette().menu_hot),
+                                 text("  " + item.label)}));
         }
         if (user_menu.empty()) {
             rows.push_back(text("<no menu entries>") | dim);
         }
         rows.push_back(separator());
         rows.push_back(text("Esc closes menu"));
-        return vbox(std::move(rows)) |
-               borderStyled(LIGHT) | size(WIDTH, EQUAL, 50);
+        return gray_menu(vbox(std::move(rows)) | borderStyled(LIGHT) | size(WIDTH, EQUAL, 50));
     }
 
     static const std::array<
@@ -10432,12 +10513,14 @@ struct App::Impl {
                 rows.push_back(separator());
                 continue;
             }
-            auto row = menu_row_label(items[index]);
+            const bool selected = index == pulldown_item;
+            auto row = menu_row_label(items[index], selected || items[index].action < 0
+                ? std::nullopt : std::optional<ftxui::Color>{palette().menu_hot});
             if (items[index].action < 0) {
                 row = row | color(palette().disabled) | dim;
             }
-            if (index == pulldown_item) {
-                row = row | inverted | focus;
+            if (selected && items[index].action >= 0) {
+                row = highlight(std::move(row), palette().popup_selected) | focus;
             }
             rows.push_back(
                 std::move(row) |
@@ -10748,10 +10831,12 @@ struct App::Impl {
                         active().path()
                     );
                     return;
-                case 3:
-                    status = "Subshell exited " +
-                             std::to_string(run_process("", true));
+                case 3: {
+                    const auto result = run_process("", true);
+                    status = shell.running() ? "Shell hidden; Ctrl-O resumes it"
+                                             : "Subshell exited " + std::to_string(result);
                     break;
+                }
                 case 4:
                     refresh();
                     break;
@@ -10867,7 +10952,7 @@ struct App::Impl {
                 ))
             ));
             if (index == bookmark_cursor) {
-                row = row | inverted | focus;
+                row = focus_dialog(std::move(row));
             }
             rows.push_back(std::move(row) | reflect(bookmark_boxes[index]));
         }
@@ -10926,7 +11011,7 @@ struct App::Impl {
         operation_dialog_boxes = {};
         const auto focused = [&](Element element, const std::size_t index) {
             if (dialog_focus == index) {
-                element = element | inverted | focus;
+                element = focus_dialog(std::move(element));
             }
             return element | reflect(operation_dialog_boxes[index]);
         };
@@ -10987,7 +11072,7 @@ struct App::Impl {
         const auto entries = current_operation_sources();
         const auto focused = [&](Element element, const std::size_t index) {
             if (dialog_focus == index) {
-                element = element | inverted | focus;
+                element = focus_dialog(std::move(element));
             }
             return element | reflect(delete_button_boxes[index]);
         };
@@ -11133,7 +11218,7 @@ struct App::Impl {
         for (std::size_t index = 0; index < labels.size(); ++index) {
             auto button = text(" [ " + labels[index] + " ] ");
             if (dialog_focus == index) {
-                button = button | inverted | focus;
+                button = focus_dialog(std::move(button));
             }
             buttons.push_back(
                 std::move(button) | reflect(operation_choice_boxes[index])
@@ -11247,7 +11332,7 @@ struct App::Impl {
                 )
             );
             if (job_cursor == index) {
-                row = row | inverted | focus;
+                row = focus_dialog(std::move(row));
             }
             rows.push_back(std::move(row) | reflect(job_row_boxes[index]));
         }
@@ -11298,7 +11383,7 @@ struct App::Impl {
                 static_cast<std::size_t>(std::max(1, Terminal::Size().dimx - 4))
             ));
             if (index == search_cursor) {
-                row = row | inverted | focus;
+                row = focus_dialog(std::move(row));
             }
             rows.push_back(std::move(row) | reflect(search_result_boxes[index]));
         }
@@ -11881,12 +11966,13 @@ struct App::Impl {
                       : status + progress_text;
         Elements menu_elements;
         for (std::size_t index = 0; index < top_menu_names.size(); ++index) {
+            const bool selected = mode == Mode::pulldown && index == pulldown_category;
             auto item = mnemonic_label(
                 top_menu_names[index],
-                top_menu_mnemonics[index]
+                top_menu_mnemonics[index],
+                selected ? std::nullopt : std::optional<ftxui::Color>{palette().menu_hot}
             );
-            if (mode == Mode::pulldown &&
-                index == pulldown_category) {
+            if (selected) {
                 item = paint(std::move(item), palette().menu_selected) | bold;
             }
             menu_elements.push_back(
@@ -12140,7 +12226,7 @@ struct App::Impl {
             const auto focused = [&](Element element,
                                      const std::size_t index) {
                 if (prompt_focus == index) {
-                    element = element | inverted;
+                    element = focus_dialog(std::move(element));
                 }
                 return element | reflect(prompt_boxes[index]);
             };
@@ -16825,8 +16911,8 @@ struct App::Impl {
                 status = "Cancelling search";
             } else if (event == ftxui::Event::CtrlO) {
                 const auto result = run_process("", true);
-                status = "Subshell exited " +
-                         std::to_string(result);
+                status = shell.running() ? "Shell hidden; Ctrl-O resumes it"
+                                         : "Subshell exited " + std::to_string(result);
             } else if (event == ftxui::Event::F1) {
                 mode = Mode::help;
             } else if (event == ftxui::Event::F2) {
@@ -17255,6 +17341,9 @@ int App::run() {
         terminal.ForceHandleCtrlZ(false);
         terminal.TrackMouse(true);
         impl_->terminal = &terminal;
+        impl_->shell.set_notify([implementation = impl_.get()] {
+            implementation->post_ui([implementation] { implementation->process_shell_events(true); });
+        });
         if (impl_->config.auto_menus && impl_->mode == Mode::panels) impl_->open_user_menu(Mode::panels);
         struct OperationJoinGuard {
             Impl* implementation;
@@ -17293,6 +17382,7 @@ int App::run() {
                 if (implementation->tree_thread.joinable()) {
                     implementation->tree_thread.join();
                 }
+                implementation->shell.close();
                 implementation->terminal = nullptr;
             }
 
@@ -17312,6 +17402,10 @@ int App::run() {
             std::move(component),
             [&](const ftxui::Event& event) {
                 const auto handled = impl_->handle_input(event);
+                if (impl_->shell_exit_requested) {
+                    impl_->shell_exit_requested = false;
+                    impl_->request_app_exit();
+                }
                 impl_->update_editor_view();
                 return handled;
             }

@@ -25,6 +25,8 @@ int main(const int argc, char** argv) {
             << "  -e, --edit [files]   Open editor (unnamed if no files)\n"
             << "                      Files accept file:line or file:line:\n"
             << "  -S, --skin <name>   Select a skin for this run\n"
+            << "  -U, --subshell      Enable persistent Bash for this run\n"
+            << "  -u, --nosubshell    Disable persistent Bash for this run\n"
             << "  -P, --printwd <file> Write final directory\n";
         return 0;
     }
@@ -38,6 +40,7 @@ int main(const int argc, char** argv) {
         std::size_t first_line = 0;
         std::optional<std::filesystem::path> print_directory;
         std::optional<std::string> skin;
+        std::optional<bool> subshell;
         std::vector<std::string> paths;
         for (std::size_t index = 0; index < arguments.size(); ++index) {
             const auto& argument = arguments[index];
@@ -53,6 +56,10 @@ int main(const int argc, char** argv) {
                 skin = take_value();
             } else if (argument.starts_with("--skin=")) {
                 skin = argument.substr(7);
+            } else if (argument == "-U" || argument == "--subshell") {
+                subshell = true;
+            } else if (argument == "-u" || argument == "--nosubshell") {
+                subshell = false;
             } else if (argument == "-v" || argument == "--view") {
                 view_file = take_value();
             } else if (argument == "-e" || argument == "--edit") {
@@ -93,6 +100,7 @@ int main(const int argc, char** argv) {
         }
         auto config = mcpp::Config::load(mcpp::default_config_path());
         config.theme_override = std::move(skin);
+        config.subshell_override = subshell;
         const auto current = std::filesystem::current_path();
         const auto pane_path = [&](const std::string& value) {
             const auto path = std::filesystem::path(value);

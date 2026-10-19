@@ -2782,8 +2782,9 @@ void test_skins() {
     for (const auto& skin : skins) {
         check(!skin.id.empty() && !skin.label.empty(), "skin identity and label");
         check(std::ranges::find(ids, skin.id) == ids.end(), "unique skin identity");
-        for (const auto* pair : {&skin.normal, &skin.menu, &skin.menu_selected, &skin.dialog,
-                                &skin.error, &skin.selected, &skin.marked_selected,
+        for (const auto* pair : {&skin.normal, &skin.menu, &skin.menu_selected, &skin.popup_selected,
+                                &skin.dialog, &skin.dialog_focus, &skin.error, &skin.error_focus,
+                                &skin.selected, &skin.marked_selected,
                                 &skin.inactive_selected, &skin.inactive_marked_selected,
                                 &skin.search, &skin.viewer_cursor, &skin.hint,
                                 &skin.key_number, &skin.key_label, &skin.progress, &skin.diff_changed}) {

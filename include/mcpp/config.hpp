@@ -82,6 +82,8 @@ struct Config {
     bool single_escape{true};
     int escape_timeout{1000000};
     std::size_t pause_after_run{1};
+    bool use_subshell{true};
+    std::optional<bool> subshell_override;
     bool use_internal_edit{true};
     bool use_internal_view{true};
     bool ask_new_filename{false};

@@ -38,8 +38,10 @@ printf 'touch cmd-created.txt\r' >&3
 sleep 1
 printf 'x\177\017' >&3
 sleep 1
-printf 'printf "C_O_SHELL\\n"\rexit\r' >&3
-sleep 1
+printf 'printf "C_O_SHELL\\n"\r' >&3
+sleep 0.5
+printf '\017' >&3
+sleep 0.5
 printf ' \t\033[21~' >&3
 set +e
 wait "$runner"
