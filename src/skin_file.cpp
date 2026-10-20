@@ -2,11 +2,14 @@
 
 #include "color_resource.hpp"
 
+#include <ftxui/screen/color_info.hpp>
 #include <ftxui/screen/terminal.hpp>
 
 #include <algorithm>
 #include <array>
 #include <charconv>
+#include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <functional>
 #include <optional>
@@ -193,7 +196,7 @@ public:
             } else if (name == "bold") result |= SkinPair::bold;
             else if (name == "italic") result |= SkinPair::italic;
             else if (name == "underline") result |= SkinPair::underline;
-            else if (name == "reverse") result |= SkinPair::reverse;
+            else if (name == "reverse" || name == "inverse") result |= SkinPair::reverse;
             else if (name == "blink") result |= SkinPair::blink;
             else color_resource_error(path_, line, "unknown attribute or alias: " + name);
             if (end == std::string::npos) break;
@@ -227,6 +230,59 @@ private:
     const std::filesystem::path& path_;
     const ColorSection* aliases_;
 };
+
+std::optional<double> color_luminance(const ftxui::Color& color) {
+    // FTXUI exposes colors through its ANSI encoder, not RGB accessors.
+    const auto encoded = color.Print(false);
+    unsigned red{}, green{}, blue{}, index{};
+    if (std::sscanf(encoded.c_str(), "38;2;%u;%u;%u", &red, &green, &blue) != 3) {
+        ftxui::ColorInfo info{};
+        if (std::sscanf(encoded.c_str(), "38;5;%u", &index) == 1) {
+            info = ftxui::GetColorInfo(static_cast<ftxui::Color::Palette256>(index));
+        } else {
+            unsigned code{};
+            const auto parsed = std::from_chars(encoded.data(), encoded.data() + encoded.size(), code);
+            if (parsed.ec != std::errc{} || parsed.ptr != encoded.data() + encoded.size()) return {};
+            if (code >= 30U && code <= 37U) index = code - 30U;
+            else if (code >= 90U && code <= 97U) index = code - 90U + 8U;
+            else return {};
+            info = ftxui::GetColorInfo(static_cast<ftxui::Color::Palette16>(index));
+        }
+        red = info.red; green = info.green; blue = info.blue;
+    }
+    const auto linear = [](const unsigned value) {
+        const auto component = static_cast<double>(value) / 255.0;
+        return component <= 0.04045 ? component / 12.92 : std::pow((component + 0.055) / 1.055, 2.4);
+    };
+    return linear(red) * 0.2126 + linear(green) * 0.7152 + linear(blue) * 0.0722;
+}
+
+void set_native_syntax_fallback(Skin& skin) {
+    auto editor = skin_color(skin, "editor", "_default_", skin.normal);
+    if ((editor.attributes & SkinPair::reverse) != 0U) std::swap(editor.foreground, editor.background);
+    const auto background = color_luminance(editor.background);
+    const auto foreground = color_luminance(editor.foreground);
+    skin.light = background ? *background > 0.3 : foreground && *foreground < 0.3;
+    const auto& preferred = find_skin(skin.light ? "paper" : "grayscale").syntax;
+    const auto& alternative = find_skin(skin.light ? "grayscale" : "paper").syntax;
+    const auto contrast = [&](const ftxui::Color& color) {
+        const auto light = color_luminance(color);
+        if (!light || !background) return 0.0;
+        return (std::max(*light, *background) + 0.05) / (std::min(*light, *background) + 0.05);
+    };
+    for (std::size_t index = 1; index < skin.syntax.size(); ++index) {
+        skin.syntax[index] = preferred[index];
+        if (!background || contrast(skin.syntax[index]) >= 4.5) continue;
+        if (contrast(alternative[index]) > contrast(skin.syntax[index])) skin.syntax[index] = alternative[index];
+        if (contrast(skin.syntax[index]) >= 4.5) continue;
+        if (contrast(editor.foreground) >= 4.5) skin.syntax[index] = editor.foreground;
+        else {
+            const auto black = ftxui::Color::RGB(0, 0, 0);
+            const auto white = ftxui::Color::RGB(255, 255, 255);
+            skin.syntax[index] = contrast(black) > contrast(white) ? black : white;
+        }
+    }
+}
 
 Skin parse_skin(const std::filesystem::path& path) {
     const auto document = detail::read_color_resource(path);
@@ -263,10 +319,15 @@ Skin parse_skin(const std::filesystem::path& path) {
         if (const auto* setting = core->find("_default_")) base = resolver.pair(*setting, base, base);
     }
     std::size_t count = 0;
+    bool widget_glyphs = false;
     for (const auto& group : document) {
         if (group.name == "skin" || group.name == "aliases") continue;
         if (group.name == "Lines") {
             if (!group.settings.empty()) skin.warning = "custom [Lines] glyphs are not supported";
+            continue;
+        }
+        if (group.name.starts_with("widget-")) {
+            widget_glyphs = widget_glyphs || !group.settings.empty();
             continue;
         }
         auto fallback = base;
@@ -274,18 +335,25 @@ Skin parse_skin(const std::filesystem::path& path) {
         auto& colors = skin.colors[group.name];
         colors["_default_"] = fallback;
         for (const auto& setting : group.settings) {
+            if (group.name == "editor" &&
+                (setting.key == "window-state-char" || setting.key == "window-close-char")) {
+                widget_glyphs = true;
+                continue;
+            }
             colors[setting.key] = resolver.pair(setting, fallback, base);
             ++count;
         }
     }
     if (count == 0U) color_resource_error(path, 0, "skin has no color definitions");
+    if (widget_glyphs) skin.warning = "custom line/widget glyphs are not supported";
     skin.normal = base;
     const auto role = [&](const std::string_view group, const std::string_view key,
                           const SkinPair& fallback) -> SkinPair {
         return skin_color(skin, group, key, fallback);
     };
     skin.menu = role("menu", "_default_", base);
-    skin.menu_selected = skin.popup_selected = role("menu", "menusel", skin.menu);
+    skin.menu_selected = role("menu", "menusel", skin.menu);
+    skin.popup_selected = role("popupmenu", "menusel", skin.menu_selected);
     skin.dialog = role("dialog", "_default_", base);
     skin.dialog_focus = role("dialog", "dfocus", skin.dialog);
     skin.error = role("error", "_default_", base);
@@ -314,6 +382,7 @@ Skin parse_skin(const std::filesystem::path& path) {
     skin.disabled = role("menu", "menuinactive", skin.menu).foreground;
     skin.shadow = role("core", "shadow", {ftxui::Color::Black, ftxui::Color::Black}).background;
     skin.syntax[0] = base.foreground;
+    set_native_syntax_fallback(skin);
     return skin;
 }
 

@@ -70,9 +70,13 @@ void options_and_display() {
             "editor-specific colors override only the editor palette");
     auto menu = mcpp::find_skin("default");
     mcpp::apply_cli_colors(menu, mcpp::parse_cli_colors(
-        std::array<std::string, 1>{"menuinactive=gray"}), mcpp::CliPaletteContext::panels);
+        std::array<std::string, 2>{"menuinactive=gray", "pmenusel=white,blue"}),
+        mcpp::CliPaletteContext::panels);
     require(menu.colors.at("menu").at("menuinactive").background == menu.menu.background,
             "foreground-only inactive menu colors retain the menu background");
+    require(menu.colors.at("popupmenu").at("menusel").background == ftxui::Color::Blue &&
+            menu.popup_selected.foreground == ftxui::Color::White,
+            "CLI popup selection overrides use the native popup menu key");
     const std::array<const mcpp::Skin*, 1> palettes{&skin};
     auto screen = ftxui::Screen::Create(ftxui::Dimension::Fixed(12), ftxui::Dimension::Fixed(3));
     const auto content = ftxui::text("┌ café") | ftxui::color(skin.normal.foreground) |

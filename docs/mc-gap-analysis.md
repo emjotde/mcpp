@@ -358,6 +358,18 @@ inactive-label contrast of at least 4.5:1 without faint styling. A related CLI
 override check preserves menu backgrounds. Other terminal sizes/capabilities
 were not swept again. External skins are under a separate follow-up inspection.
 
+That follow-up reproduced startup failures for all 36 installed external skin
+paths on `0ce334f`: glyph metadata was parsed as colors and the native `inverse`
+attribute was rejected. The loader now separates that metadata and accepts the
+attribute; unsupported custom glyphs remain explicitly warned. F2 uses native
+`popupmenu` normal/title/selection roles separately from main/editor dropdowns,
+and fallback syntax colors follow the actual editor background. The shared
+Release/Werror build, original native-resource model and a real popup-role
+workflow pass. All 36 external paths now start and complete Appearance preview,
+Cancel and saved-selection restart on the exact shared Release binaries, with
+no application stderr. Their existing captures are being visually reviewed in
+three disjoint groups; that inspection is not yet complete.
+
 ### Additional compatibility gaps
 
 | ID | Remaining work | Evidence |

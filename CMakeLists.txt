@@ -619,6 +619,7 @@ if(MCPP_BUILD_TESTS)
                     /review/cases/skin-visual-fixes
                     SkinsUI.test_diff_search_uses_skin_colors_on_changed_rows
                     SkinsUI.test_disabled_dropdown_labels_stay_readable
+                    SkinsUI.test_native_popup_menu_uses_its_own_roles
             )
             set_tests_properties(mcpp_skin_visual_fixes_ui PROPERTIES TIMEOUT 90)
             add_test(

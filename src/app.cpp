@@ -11739,7 +11739,8 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
                 row = disabled_menu_label(std::move(row));
             }
             if (selected && items[index].action >= 0) {
-                row = highlight(std::move(row), palette().popup_selected) | focus;
+                row = highlight(std::move(row),
+                    skin_color(palette(), "menu", "menusel", palette().popup_selected)) | focus;
             }
             rows.push_back(
                 std::move(row) | reflect(editor_menu_item_boxes[index])
@@ -12397,8 +12398,11 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
 
     ftxui::Element render_menu() {
         using namespace ftxui;
+        const auto& skin = palette();
+        const auto& normal = skin_color(skin, "popupmenu", "_default_", skin.menu);
         Elements header{
-            text("User menu") | bold | center,
+            paint(text("User menu") | bold | center,
+                  skin_color(skin, "popupmenu", "menutitle", normal)),
             separator(),
         };
         Elements rows;
@@ -12408,9 +12412,11 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
             const auto& item = user_menu[index];
             const auto label = display_text(item.label);
             width = std::max(width, string_width(label) + 6);
-            auto row = hbox({text(std::string(1, item.key)) | color(palette().menu_hot),
-                             text("  " + label), filler()});
-            if (index == user_menu_cursor) row = highlight(std::move(row), palette().popup_selected) | focus;
+            const bool selected = index == user_menu_cursor;
+            auto key = text(std::string(1, item.key));
+            if (!selected) key = key | color(skin.menu_hot);
+            auto row = hbox({std::move(key), text("  " + label), filler()});
+            if (selected) row = highlight(std::move(row), skin.popup_selected) | focus;
             rows.push_back(std::move(row) | reflect(user_menu_boxes[index]));
         }
         if (user_menu.empty()) {
@@ -12421,8 +12427,8 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
         if (!user_menu_error.empty()) header.push_back(paragraph(display_text(user_menu_error)) | bold);
         header.push_back(separator());
         header.push_back(text("Enter selects   Esc closes menu"));
-        return gray_menu(vbox(std::move(header)) | borderStyled(LIGHT) |
-            size(WIDTH, EQUAL, std::min(width, std::max(1, Terminal::Size().dimx - 2))));
+        return paint(vbox(std::move(header)) | borderStyled(LIGHT) |
+            size(WIDTH, EQUAL, std::min(width, std::max(1, Terminal::Size().dimx - 2))), normal);
     }
 
     static const std::array<
@@ -12552,7 +12558,8 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
                 row = disabled_menu_label(std::move(row));
             }
             if (selected && items[index].action >= 0) {
-                row = highlight(std::move(row), palette().popup_selected) | focus;
+                row = highlight(std::move(row),
+                    skin_color(palette(), "menu", "menusel", palette().popup_selected)) | focus;
             }
             rows.push_back(
                 std::move(row) |

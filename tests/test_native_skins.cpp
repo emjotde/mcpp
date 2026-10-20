@@ -120,6 +120,66 @@ extensions_case=false
           ftxui::Color::RGB(16, 32, 48), "explicit legacy filename colors work with every skin");
 }
 
+void native_widget_metadata_and_syntax(const std::filesystem::path& root) {
+    const auto path = root / "skins/widget-metadata.ini";
+    write(path, R"([core]
+_default_=white;#172330;none
+selected=black;#a0c040;inverse
+[menu]
+_default_=white;#1a3344;none
+menusel=black;#a0c040;none
+[popupmenu]
+_default_=white;#354050;none
+menusel=#ffdd44;#620052;bold
+menutitle=#9fe0c2;#182f2a;underline
+[editor]
+_default_=black;#f0f0dd;none
+window-state-char=*
+window-close-char=x
+[Lines]
+vert=|
+[widget-panel]
+sort-up-char=^
+sort-down-char=v
+[widget-common]
+sort-sign-up=^
+[widget-scrollbar]
+current-char=#
+[widget-scollbar]
+first-vert-char=^
+[widget-editor]
+window-close-char=x
+)");
+    const auto skin = mcpp::load_skin(path.string(), root);
+    check(skin.normal.background == ftxui::Color::RGB(23, 35, 48) &&
+          skin.selected.attributes == mcpp::SkinPair::reverse,
+          "native inverse is accepted without treating widget glyphs as colors");
+    check(skin.popup_selected.foreground == ftxui::Color::RGB(255, 221, 68) &&
+          skin.popup_selected.background == ftxui::Color::RGB(98, 0, 82) &&
+          skin.popup_selected.attributes == mcpp::SkinPair::bold,
+          "native popup selection is independent of the main menu selection");
+    check(skin.warning.find("glyphs") != std::string::npos && !skin.colors.contains("widget-panel"),
+          "unsupported widget glyphs are reported instead of silently becoming color roles");
+    check(skin.light && skin.syntax[1] == mcpp::find_skin("paper").syntax[1] &&
+          skin.syntax[2] == mcpp::find_skin("paper").syntax[2] &&
+          skin.syntax[5] == mcpp::find_skin("paper").syntax[5],
+          "syntax fallback follows the editor background, not the dark panel background");
+    const auto rejected = [&](const std::string_view contents, const std::string_view message) {
+        const auto invalid = root / "skins/invalid-widget-probe.ini";
+        write(invalid, contents);
+        try {
+            static_cast<void>(mcpp::load_skin(invalid.string(), root));
+        } catch (const std::exception& error) {
+            check(std::string_view(error.what()).find(message) != std::string_view::npos,
+                  "malformed color settings retain their diagnostic");
+            return;
+        }
+        throw std::runtime_error("invalid native skin was silently accepted");
+    };
+    rejected("[core]\n_default_=not-a-color;black\n[widget-panel]\nsort-up-char=^\n", "unknown color");
+    rejected("[widget-panel]\nsort-up-char=^\n", "no color definitions");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -132,6 +192,7 @@ int main(int argc, char** argv) {
         check(root.string().starts_with("/review/cases/native-skins/"), "use the owned native-skins case directory");
         std::filesystem::create_directories(root);
         native_colors_and_rules(root);
+        native_widget_metadata_and_syntax(root);
         std::cout << "native skin colors and filename rules passed\n";
         return 0;
     } catch (const std::exception& error) {

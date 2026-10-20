@@ -35,7 +35,7 @@ constexpr std::array roles{
     ColorRole{"errdhotfocus", "error", "errdfocus", {}, &Skin::error_focus},
     ColorRole{"menunormal", "menu", "_default_", {}, &Skin::menu},
     ColorRole{"menusel", "menu", "menusel", {}, &Skin::menu_selected},
-    ColorRole{"pmenusel", "popupmenu", "pmenusel", {}, &Skin::popup_selected},
+    ColorRole{"pmenusel", "popupmenu", "menusel", {}, &Skin::popup_selected},
     ColorRole{"bbarhotkey", "buttonbar", "hotkey", {}, &Skin::key_number},
     ColorRole{"bbarbutton", "buttonbar", "button", {}, &Skin::key_label},
     ColorRole{"marked", "core", "marked", {}, nullptr, &Skin::bright},

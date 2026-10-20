@@ -198,6 +198,38 @@ class SkinsUI(unittest.TestCase):
                     self.assertFalse(cell[3], "inactive role must not gain forced faint styling")
                     terminal.save("disabled-menu")
 
+    def test_native_popup_menu_uses_its_own_roles(self):
+        root, left, right = self.fixture("native-popup")
+        path = root / "popup.ini"
+        path.write_text(
+            "[core]\n_default_=white;#102030;none\n"
+            "[menu]\n_default_=white;#203040;none\nmenusel=black;#778899;none\n"
+            "menuhot=white;;none\n"
+            "[popupmenu]\n_default_=#e0e0e0;#354050;none\n"
+            "menusel=#ffdd44;#620052;bold\nmenutitle=#9fe0c2;#182f2a;underline\n")
+        (left / ".mc.menu").write_text(
+            "a Selected original action\n  true\nb Other original action\n  true\n")
+        with TerminalSession(MANAGER, TMUX, root / "ui", ["--skin", path, left, right],
+                             width=110, height=32) as terminal:
+            self.panels(terminal)
+            click(terminal, "Left", row=0)
+            terminal.wait_for("File listing")
+            self.assertEqual(self.text_cell(terminal, "File listing")[1:],
+                             (rgb("000000"), rgb("778899")))
+            terminal.press("Escape")
+            terminal.wait_for("File listing", present=False)
+            terminal.press("F2")
+            terminal.wait_for("Selected original action")
+            self.assertEqual(self.text_cell(terminal, "Selected original action")[1:],
+                             (rgb("ffdd44"), rgb("620052")))
+            self.assertEqual(self.text_cell(terminal, "a  Selected original action")[1:],
+                             (rgb("ffdd44"), rgb("620052")))
+            self.assertEqual(self.text_cell(terminal, "Other original action")[1:],
+                             (rgb("e0e0e0"), rgb("354050")))
+            self.assertEqual(self.text_cell(terminal, "User menu")[1:],
+                             (rgb("9fe0c2"), rgb("182f2a")))
+            terminal.save("native-popup-roles")
+
     def appearance(self, terminal):
         click(terminal, "Options", row=0)
         terminal.wait_for("Appearance...")
