@@ -82,6 +82,43 @@ std::uint64_t parse_editor_threshold(std::string_view value) {
     return bytes * multiplier;
 }
 
+void validate_color_terminal(const std::string_view name) {
+    if (name.empty() || name.find_first_of("=,[]") != std::string_view::npos ||
+        name.front() == '#' || name.front() == ';' ||
+        std::ranges::any_of(name, [](const unsigned char character) {
+            return character <= 0x20U || character == 0x7fU;
+        })) {
+        throw std::runtime_error("color terminal names must be nonempty single words");
+    }
+}
+
+std::vector<std::string_view> color_terminal_names(const std::string_view value) {
+    std::vector<std::string_view> result;
+    if (value.empty()) return result;
+    std::size_t begin = 0;
+    for (;;) {
+        const auto end = value.find(',', begin);
+        auto name = value.substr(begin, end == std::string_view::npos ? value.size() - begin : end - begin);
+        const auto first = name.find_first_not_of(" \t");
+        if (first == std::string_view::npos) name = {};
+        else name = name.substr(first, name.find_last_not_of(" \t") - first + 1U);
+        validate_color_terminal(name);
+        result.push_back(name);
+        if (end == std::string_view::npos) return result;
+        begin = end + 1U;
+    }
+}
+
+void validate_color_table(const std::string_view name, const std::string_view value) {
+    validate_color_terminal(name);
+    if (name == "color_terminals") throw std::runtime_error("color_terminals is a terminal list, not a color table");
+    if (std::ranges::any_of(value, [](const unsigned char character) {
+            return (character < 0x20U && character != '\t') || character == 0x7fU;
+        })) {
+        throw std::runtime_error("color tables must fit a single line without control characters");
+    }
+}
+
 std::string sort_name(const SortField field) {
     switch (field) {
         case SortField::extension:
@@ -546,6 +583,22 @@ Config Config::load(const std::filesystem::path& path) {
             }
         } else if (key == "theme") {
             result.theme = decode_value(value);
+        } else if (key == "color_terminals") {
+            auto terminals = decode_value(value);
+            static_cast<void>(color_terminal_names(terminals));
+            result.color_terminals = std::move(terminals);
+        } else if (key == "color_table") {
+            std::istringstream fields(value);
+            std::string name, data;
+            if (!(fields >> std::quoted(name) >> std::quoted(data))) {
+                throw std::runtime_error("invalid saved color table");
+            }
+            fields >> std::ws;
+            if (!fields.eof()) throw std::runtime_error("invalid saved color table");
+            name = decode_value(name);
+            data = decode_value(data);
+            validate_color_table(name, data);
+            result.color_tables[std::move(name)] = {std::move(data), config_setting_location(document, line)};
         } else if (key == "keymap") {
             result.keymap_file = decode_value(value);
         } else if (key == "vfs_timeout") {
@@ -882,6 +935,15 @@ void Config::save(const std::filesystem::path& path) const {
         output << "editor_macro=" << std::quoted(encode_value(name)) << ' '
                << std::quoted(encode_value(data)) << '\n';
     }
+    if (color_terminals) {
+        static_cast<void>(color_terminal_names(*color_terminals));
+        output << "color_terminals=" << encode_value(*color_terminals) << '\n';
+    }
+    for (const auto& [name, table] : color_tables) {
+        validate_color_table(name, table.value);
+        output << "color_table=" << std::quoted(encode_value(name)) << ' '
+               << std::quoted(encode_value(table.value)) << '\n';
+    }
     if (!output) {
         throw std::runtime_error("cannot serialize configuration");
     }
@@ -1019,6 +1081,12 @@ void Config::limit_histories() {
         command_history.erase(command_history.begin(),
             command_history.begin() + static_cast<std::ptrdiff_t>(command_history.size() - limit));
     }
+}
+
+bool Config::color_terminal_listed(const std::string_view terminal) const {
+    if (!color_terminals || terminal.empty()) return false;
+    const auto names = color_terminal_names(*color_terminals);
+    return std::ranges::find(names, terminal) != names.end();
 }
 
 bool Config::selection_matches(const Entry& entry, const std::string_view pattern) const {

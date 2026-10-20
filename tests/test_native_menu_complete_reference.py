@@ -1,6 +1,7 @@
 from pathlib import Path
 import json
 import os
+import subprocess
 import sys
 
 from terminal_session import TerminalSession
@@ -159,6 +160,78 @@ def extglobs(root):
     print(json.dumps(results, indent=2))
 
 
+def backticks(root):
+    left, right, ui = root / "left", root / "right", root / "ui"
+    left.mkdir()
+    right.mkdir()
+    (left / "selected").write_text("legacy substitution fixture\n")
+    commands = {
+        "nested": (
+            r'''printf '%%s\0' "`printf '%%s' "\`printf '%%s' %f\`"`"''',
+            b"selected\0",
+        ),
+        "three_layers": (
+            r'''printf '%%s\0' "`printf '%%s' "\`printf '%%s' "\\\`printf '%%s' 'layer " quoted \\\\tail'\\\`"\`"`"''',
+            b'layer " quoted \\tail\0',
+        ),
+        "modern_inside": (
+            r'''printf '%%s\0' "`printf '%%s' "$(printf '%%s' "\`printf '%%s' %{Backtick bytes}\`")"`"''',
+            b"prompt bytes\0",
+        ),
+        "literal": (
+            r'''printf '%%s\0' "`printf '%%s' 'literal \` dollar \$ slash \\ quote "'`"''',
+            b'literal ` dollar $ slash \\ quote "\0',
+        ),
+    }
+    observations = {}
+    for name, (command, expected) in commands.items():
+        source = command.replace("%f", "'selected'").replace(
+            "%{Backtick bytes}", "'prompt bytes'"
+        ).replace("%%", "%")
+        observations[name] = {"source": command, "expected_hex": expected.hex()}
+        for executable in ("/bin/bash", "/bin/dash"):
+            result = subprocess.run(
+                [executable, "-c", source], cwd=left, capture_output=True, timeout=5,
+            )
+            assert result.returncode == 0 and result.stdout == expected, (
+                executable, name, result.returncode, result.stdout, result.stderr
+            )
+            observations[name][executable] = {
+                "status": result.returncode, "output_hex": result.stdout.hex(),
+                "stderr": result.stderr.decode(),
+            }
+    menu = "b Record nested legacy substitutions\n    /bin/bash <<'L20_BACKTICK_BASH'\n"
+    for name, (command, _) in commands.items():
+        menu += "    " + command + " > " + str(root / (name + ".bin")) + "\n"
+    menu += "    printf done > " + str(root / "done") + "\n    L20_BACKTICK_BASH\n"
+    (left / ".mc.menu").write_text(menu)
+    config = ui / "config/mc"
+    config.mkdir(parents=True)
+    (config / "ini").write_text(
+        "[Midnight-Commander]\npause_after_run=0\nconfirm_exit=0\n"
+        "show_dot_files=0\n"
+    )
+    os.environ["LD_LIBRARY_PATH"] = "/review/control/lib"
+    with TerminalSession("/review/control/mc", "/usr/bin/tmux", ui,
+                         ["-u", left, right]) as terminal:
+        terminal.record_output()
+        terminal.wait_for("selected")
+        terminal.press("End", "F2")
+        terminal.wait_for("Record nested legacy substitutions")
+        terminal.press("b")
+        terminal.wait_for("Backtick bytes")
+        terminal.type("prompt bytes")
+        terminal.press("Enter")
+        terminal.wait_file(root / "done", b"done")
+        for name, (_, expected) in commands.items():
+            terminal.wait_file(root / (name + ".bin"), expected)
+            observations[name]["native_mc_hex"] = (root / (name + ".bin")).read_bytes().hex()
+        terminal.wait_idle()
+        terminal.save("native-nested-backticks")
+    (root / "observations.json").write_text(json.dumps(observations, indent=2) + "\n")
+    print(json.dumps(observations, indent=2))
+
+
 def main():
     if (os.geteuid() != 1001 or not Path("/.dockerenv").is_file() or
             not Path("/review/.operation-regressions-disposable").is_file()):
@@ -174,6 +247,8 @@ def main():
             cases(root)
         elif sys.argv[2] == "extglobs":
             extglobs(root)
+        elif sys.argv[2] == "backticks":
+            backticks(root)
         else:
             raise SystemExit("unknown native menu reference selector")
         return

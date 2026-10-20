@@ -333,7 +333,13 @@ actual history, editor-candidate and selection controls. Zero history disables
 use/recording without erasing disk data; `1K` means 1024 bytes and zero threshold
 warns for nonempty files. Absent keys keep the prior limits and 64 MiB approval
 behavior; declining or stale approval retains the current draft. Native
-selection-mask choices apply to real matches. `[Colors]` remains pending.
+selection-mask choices apply to real matches. `[Colors]` now retains base and
+exact-terminal definitions and terminal forcing; effective order is base,
+exact `TERM`, environment, CLI, with transient overlays excluded from saving.
+This completes the enumerated eight-key follow-up, not all L18 compatibility.
+Other unmapped local options, including editor margin/status preferences,
+output lines, display-codepage and clipboard command settings, remain diagnosed
+and preserved.
 
 Local user/editor menus now load native conditions, command blocks, prompts,
 pane/editor macros and view/cd directives, while retaining legacy menu rows.
@@ -342,8 +348,10 @@ quotes, arithmetic and heredocs. Ordinary values remain literal rather than
 becoming shell source. Named homes and CDPATH use a captured provider/directory;
 relative archive paths do not search the host filesystem. **L20 remains partial**
 against the original complete-expansion target: ordinary arithmetic values are
-decimal or hexadecimal literals only, nested old-style backticks remain
-unsupported, and unsafe or unsupported heredoc forms fail explicitly.
+decimal or hexadecimal literals only, and unsafe or unsupported heredoc forms
+fail explicitly. Escaped nested backticks and mixed modern substitutions now
+preserve literal macro data with the unchanged 128-level scanner bound; raw
+`%0` remains trusted and unrescanned.
 Standard `case` lists inside modern command substitutions now
 balance patterns, alternatives, nested cases and Bash fallthrough while keeping
 ordinary macro values literal. Requirements and expansion use the same scanner.
@@ -418,7 +426,8 @@ Formatted viewer/Quick view text now consumes `viewbold` and
 `viewunderline`, and original help headings/title/navigation use `helpbold` and
 `helpitalic`. Full pairs and explicit attributes are respected; missing roles
 retain prior emphasis, search colors win over nroff styles, and selected help
-links keep their styling. Native INI `[Colors]` is separate pending work.
+links keep their styling. Native INI `[Colors]` uses the same existing parser
+and supported-role set rather than adding unrendered no-op roles.
 
 PCRE2 is an explicitly approved dependency. Native menu conditions, extension
 rules, syntax-registry expressions and filename highlighting now use its Unicode,

@@ -131,6 +131,78 @@ void contexts(const std::filesystem::path& root) {
           "requirements must use the same shell contexts as expansion");
 }
 
+void backticks(const std::filesystem::path& root) {
+    const auto legacy = [](const std::string_view body) {
+        std::string result = "`";
+        for (const auto character : body) {
+            if (character == '\\' || character == '$' || character == '`') result += '\\';
+            result += character;
+        }
+        return result + '`';
+    };
+    auto captured = context(root);
+    captured.editor = true;
+    captured.block_file = "/captured/block ' \" `printf DATA`\\tail\nbytes";
+    captured.error_file = "/captured/error $(printf DATA)\\bytes";
+    const auto name = captured.active.file->name;
+    const auto names = name + name + name;
+    const auto joined = captured.active.tagged[0].name + " " + captured.active.tagged[1].name + " ";
+    const auto nested = legacy(
+        "printf '%%s' \"" + legacy("printf '%%s' %f '%f' \"%f\"") + "\"");
+    const auto triple = legacy("printf '%%s' \"" + nested + "\"");
+    const auto mixed = legacy(
+        "printf '%%s' \"$(printf '%%s' \"" +
+        legacy("printf '%%s' %{Legacy bytes} %b %e") + "\")\"");
+    const auto tagged = "$(printf '%%s' \"" +
+        legacy("printf '%%s' \"" + legacy("printf '<%%s>' %t \"%t\"") + "\"") + "\")";
+    const auto literal = legacy(
+        "printf '%%s' \"" + legacy("printf '%%s' 'literal ` dollar $ slash \\ quote \"'") + "\"");
+    const auto quotes = legacy("printf '%%s' \"" + legacy("printf '%%s' \\\"%f\\\"") + "\"");
+    const auto comment = legacy(
+        "printf '%%s' \"" + legacy("printf '%%s' %f # %{Ignored} %b %e") + "\"");
+    const auto ignored = mcpp::native_menu_requirements(comment, true);
+    check(ignored.prompts.empty() && !ignored.block_file && !ignored.error_file,
+          "legacy delimiters must end comments without collecting their macros");
+    const std::string label =
+        R"MENU(`printf '%%s' "\`printf '%%s' %{Label ` \ $}\`"`)MENU";
+    const std::string command =
+        "printf '%%s\\0' \"" + nested + "\" \"" + triple + "\" \"" + mixed +
+        "\" \"" + tagged + "\" \"" + literal + "\" \"" + quotes + "\" \"" +
+        comment + "\" \"" + label + "\"";
+    const auto requirements = mcpp::native_menu_requirements(command, true);
+    check(requirements.prompts == std::vector<std::string>{"Legacy bytes", "Label ` \\ $"} &&
+              requirements.block_file && requirements.error_file,
+          "nested legacy requirements must retain authored macro arguments and editor files");
+    const std::string answer = "reply ' \" \\ $(printf DATA) `printf DATA` %f\ncafé";
+    for (const auto* executable : {"/bin/bash", "/bin/dash"}) {
+        output(command, captured,
+               nul_values({names, names, answer + captured.block_file + captured.error_file,
+                           "<" + captured.active.tagged[0].name + "><" +
+                               captured.active.tagged[1].name + "><" + joined + ">",
+                           "literal ` dollar $ slash \\ quote \"", "\"" + name + "\"",
+                           name, answer}),
+               {answer, answer}, executable);
+    }
+    auto trusted = captured;
+    trusted.active.file = file("printf 'trusted %f'");
+    const auto raw = legacy("printf '%%s' \"" + legacy("%0f") + "\"");
+    auto expected = raw;
+    expected.replace(expected.find("%%"), 2U, "%");
+    expected.replace(expected.find("%0f"), 3U, trusted.active.file->name);
+    check(mcpp::expand_native_menu(raw, trusted).command == expected,
+          "raw legacy macros remain trusted source without rescanning or added escape layers");
+    for (const auto malformed : {
+             R"MENU(printf '%%s' "`printf '%%s' \`printf '%%s' %f`")MENU",
+             R"MENU(printf '%%s' "`printf '%%s' \`printf '%%s' %f\\\``")MENU",
+             R"MENU(printf '%%s' "`printf '%%s' \`printf '%%s' '%f\``")MENU",
+             R"MENU(printf '%%s' "`printf '%%s' $(printf '%%s' %f`")MENU"}) {
+        rejects([&] { static_cast<void>(mcpp::expand_native_menu(malformed, captured)); },
+                "malformed nested legacy quoting must fail during expansion");
+        rejects([&] { static_cast<void>(mcpp::native_menu_requirements(malformed, true)); },
+                "requirements must reject the same malformed nested legacy quoting");
+    }
+}
+
 void numbers(const std::filesystem::path& root) {
     auto captured = context(root);
     for (const auto* executable : {"/bin/bash", "/bin/dash"}) {
@@ -316,13 +388,14 @@ int main(int argc, char** argv) {
         return 1;
     }
     try {
-        check(argc == 3, "usage: native-menu-complete words|contexts|numbers|cases|extglobs|directories /review/cases/menu-complete-*");
+        check(argc == 3, "usage: native-menu-complete words|contexts|backticks|numbers|cases|extglobs|directories /review/cases/menu-complete-*");
         const auto root = std::filesystem::path(argv[2]).lexically_normal();
         check(root.string().starts_with("/review/cases/menu-complete-"), "invalid disposable menu fixture root");
         std::filesystem::create_directories(root);
         const std::string_view selected = argv[1];
         if (selected == "words") words(root);
         else if (selected == "contexts") contexts(root);
+        else if (selected == "backticks") backticks(root);
         else if (selected == "numbers") numbers(root);
         else if (selected == "cases") cases(root);
         else if (selected == "extglobs") extglobs(root);

@@ -1,4 +1,5 @@
 #include "mcpp/cli_display.hpp"
+#include "mcpp/config.hpp"
 #include "mcpp/skin_glyphs_ui.hpp"
 
 #include "color_resource.hpp"
@@ -8,6 +9,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdlib>
 #include <stdexcept>
 #include <utility>
 
@@ -195,6 +197,40 @@ std::vector<CliColorOverride> parse_cli_colors(const std::span<const std::string
         }
     }
     return result;
+}
+
+std::vector<std::vector<CliColorOverride>> parse_config_colors(
+    const Config& config, const std::string_view terminal,
+    const std::optional<std::string_view> environment
+) {
+    std::vector<std::vector<CliColorOverride>> result;
+    const auto add = [&](const std::string_view value, const std::string& location) {
+        if (detail::color_trim(value).empty()) return;
+        try {
+            const std::array values{std::string(value)};
+            result.push_back(parse_cli_colors(values));
+        } catch (const std::exception& error) {
+            throw std::runtime_error(location + ": " + error.what());
+        }
+    };
+    const auto table = [&](const std::string_view name) {
+        if (const auto found = config.color_tables.find(std::string(name)); found != config.color_tables.end()) {
+            add(found->second.value, found->second.location.empty()
+                ? "[Colors] " + found->first : found->second.location);
+        }
+    };
+    table("base_color");
+    if (!terminal.empty() && terminal != "base_color" && terminal != "color_terminals") table(terminal);
+    if (environment) add(*environment, "MC_COLOR_TABLE");
+    return result;
+}
+
+std::optional<bool> configured_color_mode(const Config& config, const std::optional<bool> color) {
+    if (color) return color;
+    const auto* no_color = std::getenv("NO_COLOR");
+    const auto* terminal = std::getenv("TERM");
+    if ((!no_color || !*no_color) && terminal && config.color_terminal_listed(terminal)) return true;
+    return color;
 }
 
 void apply_cli_colors(

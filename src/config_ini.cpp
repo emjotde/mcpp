@@ -102,6 +102,7 @@ constexpr NativeOption native_options[]{
     {"Misc", "source_codepage", "source_codepage", Conversion::codepage},
     {"Misc", "timeformat_recent", "timeformat_recent", Conversion::string},
     {"Misc", "timeformat_old", "timeformat_old", Conversion::string},
+    {"Colors", "color_terminals", "color_terminals", Conversion::string},
     {"Panels", "show_mini_info", "show_mini_status"},
     {"Panels", "kilobyte_si", "use_si_units"},
     {"Panels", "mix_all_files", "directories_first", Conversion::inverted},
@@ -352,6 +353,11 @@ std::optional<std::pair<std::string, std::string>> translate_config_setting(
         value << std::quoted(encode_flat(line.key)) << ' ' << std::quoted(encode_flat(decode_string(line.value, true)));
         return std::pair{std::string("panelize_command"), std::move(value).str()};
     }
+    if (line.section == "Colors" && line.key != "color_terminals") {
+        std::ostringstream value;
+        value << std::quoted(encode_flat(line.key)) << ' ' << std::quoted(encode_flat(decode_string(line.value, true)));
+        return std::pair{std::string("color_table"), std::move(value).str()};
+    }
     for (const auto& option : native_options) {
         if (option.section == line.section && option.key == line.key) {
             const auto key = option.conversion == Conversion::typewriter ? "native_typewriter_wrap" :
@@ -406,6 +412,15 @@ std::string serialize_config_document(
             }
         }
         if (!panels_only) {
+            if (const auto tables = values.find("color_table"); tables != values.end()) {
+                for (const auto& value : tables->second) {
+                    std::istringstream fields(value);
+                    std::string name, data;
+                    if (!(fields >> std::quoted(name) >> std::quoted(data))) throw std::runtime_error("invalid saved color table");
+                    add("Colors", decode_string(name, false), encode_native(decode_string(data, false)));
+                }
+            }
+            native_fields.emplace("color_table");
             const auto commands = values.find("panelize_command");
             bool native_commands = true;
             std::set<std::string> names;

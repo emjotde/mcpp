@@ -12,6 +12,8 @@
 
 namespace mcpp {
 
+struct Config;
+
 enum class CliPaletteContext { panels, editor, viewer, help, diff };
 
 struct CliColorOverride {
@@ -22,6 +24,11 @@ struct CliColorOverride {
 };
 
 [[nodiscard]] std::vector<CliColorOverride> parse_cli_colors(std::span<const std::string> values);
+[[nodiscard]] std::vector<std::vector<CliColorOverride>> parse_config_colors(
+    const Config& config, std::string_view terminal,
+    std::optional<std::string_view> environment = {}
+);
+[[nodiscard]] std::optional<bool> configured_color_mode(const Config& config, std::optional<bool> color);
 void apply_cli_colors(
     Skin& skin, std::span<const CliColorOverride> overrides, CliPaletteContext context
 );

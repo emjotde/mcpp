@@ -1594,6 +1594,7 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
     Config config;
     AppOptions launch_options;
     UiTranslations ui_translations;
+    std::vector<std::vector<CliColorOverride>> configured_colors;
     struct PaletteSet {
         Skin panels;
         Skin editor;
@@ -2143,7 +2144,7 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
                 has_container_parent(*right_location.provider)) {
         for (const auto& diagnostic : config.diagnostics) std::cerr << "mcpp: configuration: " << diagnostic << '\n';
         initialize_translations();
-        prepare_cli_terminal(launch_options.color, launch_options.stickchars);
+        initialize_colors();
         initialize_palette();
         active_index = config.current_is_left.value_or(true) ? 0 : 1;
         viewer.set_wrap(config.viewer_wrap);
@@ -7640,6 +7641,16 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
         return config.theme_override ? *config.theme_override : config.theme;
     }
 
+    void initialize_colors() {
+        launch_options.color = configured_color_mode(config, launch_options.color);
+        prepare_cli_terminal(launch_options.color, launch_options.stickchars);
+        const auto* term = std::getenv("TERM");
+        const std::string_view terminal_name = term ? term : "";
+        const auto* environment = std::getenv("MC_COLOR_TABLE");
+        configured_colors = parse_config_colors(config, terminal_name,
+            environment ? std::optional<std::string_view>(environment) : std::nullopt);
+    }
+
     std::shared_ptr<const PaletteSet> make_palette(Skin skin) const {
         auto result = std::make_shared<PaletteSet>();
         result->panels = std::move(skin);
@@ -7657,11 +7668,15 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
             adapt(result->help, "help");
             adapt(result->diff, "diffviewer");
         }
-        apply_cli_colors(result->panels, launch_options.colors, CliPaletteContext::panels);
-        apply_cli_colors(result->editor, launch_options.colors, CliPaletteContext::editor);
-        apply_cli_colors(result->viewer, launch_options.colors, CliPaletteContext::viewer);
-        apply_cli_colors(result->help, launch_options.colors, CliPaletteContext::help);
-        apply_cli_colors(result->diff, launch_options.colors, CliPaletteContext::diff);
+        const auto apply = [&](const std::span<const CliColorOverride> layer) {
+            apply_cli_colors(result->panels, layer, CliPaletteContext::panels);
+            apply_cli_colors(result->editor, layer, CliPaletteContext::editor);
+            apply_cli_colors(result->viewer, layer, CliPaletteContext::viewer);
+            apply_cli_colors(result->help, layer, CliPaletteContext::help);
+            apply_cli_colors(result->diff, layer, CliPaletteContext::diff);
+        };
+        for (const auto& layer : configured_colors) apply(layer);
+        apply(launch_options.colors);
         return result;
     }
 

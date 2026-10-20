@@ -592,7 +592,8 @@ private:
 
 class MacroScanner {
 public:
-    explicit MacroScanner(const std::string_view command) : command_(command) {}
+    explicit MacroScanner(const std::string_view command)
+        : original_(command), command_(command), original_end_(command.size()) {}
 
     CommandMacros scan() {
         shell('\0', false, 0U);
@@ -600,18 +601,92 @@ public:
     }
 
 private:
+    struct ShellByte {
+        std::size_t original;
+        std::size_t parent_end;
+        std::size_t backtick_end;
+    };
+
+    std::string_view original_;
     std::string_view command_;
+    std::size_t original_end_;
+    const std::vector<ShellByte>* positions_{nullptr};
     std::size_t index_{0};
     CommandMacros result_;
 
+    [[nodiscard]] std::size_t original_index(const std::size_t index) const {
+        if (index == command_.size()) return original_end_;
+        return positions_ == nullptr ? index : (*positions_)[index].original;
+    }
+
+    [[nodiscard]] std::size_t backtick_end(const std::size_t index) const {
+        return positions_ == nullptr || index == command_.size()
+            ? 0U : (*positions_)[index].backtick_end;
+    }
+
+    void backtick(const std::size_t backticks, const std::size_t depth) {
+        std::string decoded;
+        std::vector<ShellByte> positions;
+        const auto append = [&](const std::size_t index, const std::size_t parent_end,
+                                const std::size_t boundary) {
+            decoded += command_[index];
+            positions.push_back({original_index(index), parent_end, boundary});
+        };
+        // Mark outer delimiters before parsing the decoded shell, even inside its quotes.
+        auto index = index_;
+        std::size_t macro_end = 0U;
+        while (index < command_.size()) {
+            const auto original = original_index(index);
+            if (command_[index] == '%' && original >= macro_end) {
+                try {
+                    macro_end = read_macro(original_, original).end;
+                } catch (const std::invalid_argument&) {
+                    // Only the shell scanner decides whether comment or escaped text is a macro.
+                }
+            }
+            auto boundary = backtick_end(index);
+            if (boundary != 0U) {
+                append(index, index + 1U, boundary);
+                ++index;
+            } else if (command_[index] == '\\' && index + 1U < command_.size() &&
+                       backtick_end(index + 1U) == 0U &&
+                       std::string_view("$`\\\n").find(command_[index + 1U]) != std::string_view::npos) {
+                if (command_[index + 1U] != '\n') append(index + 1U, index + 2U, 0U);
+                index += 2U;
+            } else {
+                boundary = command_[index] == '`' ? backticks : 0U;
+                append(index, index + 1U, boundary);
+                ++index;
+            }
+            if (boundary != 0U && original >= macro_end) break;
+        }
+        const auto decoded_end = original_index(index);
+        const auto parent_command = command_;
+        const auto parent_original_end = original_end_;
+        const auto* parent_positions = positions_;
+        command_ = decoded;
+        original_end_ = decoded_end;
+        positions_ = &positions;
+        index_ = 0U;
+        shell('`', false, backticks, depth);
+        const auto parent_end = positions[index_ - 1U].parent_end;
+        command_ = parent_command;
+        original_end_ = parent_original_end;
+        positions_ = parent_positions;
+        index_ = parent_end;
+    }
+
     void macro(const ShellQuote quote, const bool arithmetic, const std::size_t backticks,
                const bool escaped = false) {
-        const auto value = read_macro(command_, index_);
+        const auto begin = original_index(index_);
+        const auto value = read_macro(original_, begin);
         if (escaped && value.kind != MacroKind::literal && !value.raw) {
             throw std::invalid_argument("a quoted menu macro cannot follow a backslash; remove the backslash or use %0");
         }
-        result_.macros.push_back({value, index_, quote, arithmetic, backticks});
-        index_ = value.end;
+        result_.macros.push_back({value, begin, quote, arithmetic, backticks});
+        do {
+            ++index_;
+        } while (index_ < command_.size() && original_index(index_) < value.end);
     }
 
     HereDocument delimiter() {
@@ -625,6 +700,9 @@ private:
         char quote = '\0';
         bool started = false;
         while (index_ < command_.size()) {
+            if (backtick_end(index_) != 0U) {
+                throw std::invalid_argument("unfinished here-document delimiter inside menu backticks");
+            }
             const auto character = command_[index_];
             if (quote == '\0' && (blank(character) || std::string_view(";&|<>()").find(character) != std::string_view::npos)) break;
             started = true;
@@ -657,7 +735,7 @@ private:
     }
 
     void body(HereDocument document, const std::size_t backticks) {
-        document.begin = index_;
+        document.begin = original_index(index_);
         while (index_ < command_.size()) {
             const auto line_begin = index_;
             auto line_end = index_;
@@ -678,7 +756,12 @@ private:
                 line_end = newline == std::string_view::npos ? command_.size() : newline + 1U;
             } while (continued && line_end < command_.size());
             if (logical_line == document.delimiter) {
-                document.end = line_begin;
+                for (auto index = line_begin; index < line_end; ++index) {
+                    if (backtick_end(index) != 0U) {
+                        throw std::invalid_argument("unfinished here-document inside menu backticks");
+                    }
+                }
+                document.end = original_index(line_begin);
                 result_.heredocs.push_back(std::move(document));
                 index_ = line_end;
                 return;
@@ -686,6 +769,9 @@ private:
             const auto quote = document.literal ? ShellQuote::heredoc_literal : ShellQuote::heredoc_expanding;
             bool escaped = false;
             while (index_ < line_end) {
+                if (backtick_end(index_) != 0U) {
+                    throw std::invalid_argument("unfinished here-document inside menu backticks");
+                }
                 if (command_[index_] == '%') {
                     macro(quote, false, backticks, escaped && !document.literal);
                     if (index_ > line_end) throw std::invalid_argument("a here-document menu macro must end on the same logical line");
@@ -707,30 +793,31 @@ private:
         std::vector<HereDocument> pending;
         SubstitutionCases cases(closing == ')' && !arithmetic && !pattern);
         while (index_ < command_.size()) {
+            if (const auto boundary = backtick_end(index_); boundary != 0U) {
+                if (closing != '`' || boundary != backticks) {
+                    throw std::invalid_argument("unfinished shell substitution inside menu backticks");
+                }
+                if (quote != ShellQuote::none || !pending.empty()) {
+                    throw std::invalid_argument("unfinished quoting or here-document inside menu backticks");
+                }
+                ++index_;
+                return;
+            }
             const auto character = command_[index_];
             if (character == '\\' && quote != ShellQuote::single) {
                 ++index_;
-                if (index_ == command_.size()) throw std::invalid_argument("unfinished shell escape in user-menu command");
-                if (command_[index_] != '\n') cases.quoted();
-                if (backticks != 0U && command_[index_] == '`') {
-                    throw std::invalid_argument("nested escaped menu backticks are unavailable; use $(...) instead");
+                if (index_ == command_.size() || backtick_end(index_) != 0U) {
+                    throw std::invalid_argument("unfinished shell escape in user-menu command");
                 }
+                if (command_[index_] != '\n') cases.quoted();
                 if (command_[index_] == '%') macro(quote, arithmetic, backticks, true);
                 else ++index_;
                 continue;
             }
-            if (character == '`' && (backticks != 0U ||
-                                    (quote != ShellQuote::single && quote != ShellQuote::ansi))) {
+            if (character == '`' && quote != ShellQuote::single && quote != ShellQuote::ansi) {
                 cases.quoted();
                 ++index_;
-                if (closing == '`') {
-                    if (quote != ShellQuote::none || !pending.empty()) {
-                        throw std::invalid_argument("unfinished quoting or here-document inside menu backticks");
-                    }
-                    return;
-                }
-                if (backticks != 0U) throw std::invalid_argument("nested menu backticks are unavailable; use $(...) instead");
-                shell('`', false, backticks + 1U, depth + 1U);
+                backtick(backticks + 1U, depth + 1U);
                 continue;
             }
             if (character == '$' && quote != ShellQuote::single && quote != ShellQuote::ansi &&
@@ -778,8 +865,10 @@ private:
                     (cases.enabled() ? !cases.word_started() :
                      (index_ == 0U || blank(command_[index_ - 1U]) ||
                       std::string_view(";|&()").find(command_[index_ - 1U]) != std::string_view::npos))) {
-                    const auto newline = command_.find('\n', index_);
-                    index_ = newline == std::string_view::npos ? command_.size() : newline;
+                    do {
+                        ++index_;
+                    } while (index_ < command_.size() && command_[index_] != '\n' &&
+                             backtick_end(index_) == 0U);
                     continue;
                 }
                 if (const auto length = cases.operation(command_.substr(index_)); length != 0U) {

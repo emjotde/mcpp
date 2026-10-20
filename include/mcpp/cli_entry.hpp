@@ -36,6 +36,8 @@ inline int run_cli(const CliFrontend frontend, const int argc, char** argv) {
             print_cli_action(options, std::cout);
             return 0;
         }
+        auto config = Config::load(default_config_path());
+        options.color = configured_color_mode(config, options.color);
         prepare_cli_terminal(options.color, options.stickchars);
         AppOptions launch{
             .mouse = options.mouse,
@@ -56,7 +58,6 @@ inline int run_cli(const CliFrontend frontend, const int argc, char** argv) {
                 editor_files.push_back(std::move(file));
             }
         }
-        auto config = Config::load(default_config_path());
         config.theme_override = std::move(options.skin);
         config.keymap_override = std::move(options.keymap);
         config.keymap_disabled = options.keymap_disabled;

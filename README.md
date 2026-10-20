@@ -99,7 +99,8 @@ titles and error focus (`pmenunormal`, `pmenutitle`, `editlinestate`, `dtitle`,
 attributes; omitted fields keep their current values and disabled-label contrast.
 `errdhotfocus` retains its earlier whole-error-focus alias, not separate mnemonic
 styling. Native skin and CLI colors share `#RGB`/`#RRGGBB` parsing and the
-`inverse`/`reverse` attribute aliases. This does not add native INI `[Colors]`.
+`inverse`/`reverse` attribute aliases. Native INI `[Colors]` layers apply before
+the final launch-only CLI overrides.
 Dialog fields use native `input`, `inputmark` and `inputunchanged` pairs.
 Pristine text and blank fill keep the unchanged style across blur; accepted
 interaction makes the field changed even if its bytes later match the original.
@@ -367,6 +368,12 @@ sets the large-file approval size (`1K` is 1024 bytes; zero warns for any nonemp
 file). Without that key, the earlier 64 MiB approval threshold remains.
 `select_flags` initializes the native shell-pattern, case-sensitive and
 files-only selection choices; for example, `6` enables the first two.
+Native `[Colors]` retains `base_color`, exact-`TERM` definitions and
+`color_terminals`. Effective color layers are base, exact terminal,
+`MC_COLOR_TABLE`, then CLI. A listed terminal can force color support, while an
+explicit CLI color choice wins. Environment and CLI overlays are never saved
+back into the native definitions. Inactive terminal tables remain stored and
+their role/field grammar is checked when activated.
 Absent optional native keys retain the earlier mcpp behavior.
 
 Compatibility is partial: unsupported settings are diagnosed and preserved,
@@ -460,8 +467,11 @@ fallthrough (`;&`/`;;&`). Quoted words and ordinary arguments do not become
 structural keywords. Nested Bash case patterns using `?()`, `*()`, `+()`,
 `@()` and `!()` are supported when the authored Bash command enables extglob
 before parsing, such as an explicit `bash -O extglob` runner. Mcpp does not
-silently enable shell options. Nested old-style backticks, unsupported heredoc
-delimiters, and values that would terminate a heredoc or lose tabs with `<<-`
+silently enable shell options. Escaped nested backtick substitutions are also
+supported, including mixed modern substitutions, with the existing 128-level
+scanner bound and normal shell splitting/newline removal. Raw `%0` remains
+trusted source rather than a second parsed grammar. Unsupported heredoc
+delimiters, and values that would terminate a heredoc or lose tabs with `<<-`,
 fail explicitly.
 
 ## External syntax definitions

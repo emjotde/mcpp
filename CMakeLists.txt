@@ -264,6 +264,9 @@ if(MCPP_BUILD_TESTS)
     add_executable(mcpp_native_config_tests tests/test_native_config.cpp)
     target_link_libraries(mcpp_native_config_tests PRIVATE mcpp_core)
     mcpp_target_defaults(mcpp_native_config_tests)
+    add_executable(mcpp_native_color_tests tests/test_native_colors.cpp)
+    target_link_libraries(mcpp_native_color_tests PRIVATE mcpp_ui)
+    mcpp_target_defaults(mcpp_native_color_tests)
     add_executable(mcpp_operation_job_tests tests/test_operation_jobs.cpp)
     target_link_libraries(mcpp_operation_job_tests PRIVATE mcpp_core)
     mcpp_target_defaults(mcpp_operation_job_tests)
@@ -370,7 +373,7 @@ if(MCPP_BUILD_TESTS)
                         /review/cases/native-regex-${regex_case}
             )
         endforeach()
-        foreach(menu_case IN ITEMS words contexts numbers cases extglobs directories)
+        foreach(menu_case IN ITEMS words contexts numbers cases extglobs backticks directories)
             add_test(
                 NAME mcpp_native_menu_${menu_case}
                 COMMAND mcpp_native_menu_complete_tests ${menu_case}
@@ -469,6 +472,13 @@ if(MCPP_BUILD_TESTS)
             COMMAND mcpp_native_config_tests remaining-three
                     /review/cases/native-config/model/remaining-three
         )
+        foreach(native_color_case IN ITEMS native legacy invalid)
+            add_test(
+                NAME mcpp_native_colors_${native_color_case}
+                COMMAND mcpp_native_color_tests ${native_color_case}
+                        /review/cases/mc-config/colors/model/${native_color_case}
+            )
+        endforeach()
         add_test(NAME mcpp_operation_job_tests COMMAND mcpp_operation_job_tests)
         add_test(
             NAME mcpp_input_history_tests

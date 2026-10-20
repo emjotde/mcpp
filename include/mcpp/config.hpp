@@ -27,6 +27,11 @@ struct SavedEditorPosition {
     std::vector<std::size_t> bookmarks;
 };
 
+struct ConfigColorTable {
+    std::string value;
+    std::string location;
+};
+
 struct Config {
     bool show_hidden{true};
     bool confirm_delete{true};
@@ -127,6 +132,8 @@ struct Config {
     bool safe_overwrite{false};
     bool auto_save_setup{true};
     std::string theme{"grayscale"};
+    std::map<std::string, ConfigColorTable> color_tables;
+    std::optional<std::string> color_terminals;
     // Launch-only; the saved theme is unchanged.
     std::optional<std::string> theme_override;
     bool shadows{true};
@@ -192,6 +199,7 @@ struct Config {
     [[nodiscard]] std::chrono::milliseconds double_click_timeout() const;
     [[nodiscard]] std::size_t history_limit(std::size_t fallback) const noexcept;
     void limit_histories();
+    [[nodiscard]] bool color_terminal_listed(std::string_view terminal) const;
     [[nodiscard]] bool selection_matches(const Entry& entry, std::string_view pattern) const;
     [[nodiscard]] std::string format_panel_time(
         std::chrono::system_clock::time_point point,
