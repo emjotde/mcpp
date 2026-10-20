@@ -500,6 +500,10 @@ if(MCPP_BUILD_TESTS)
             NAME mcpp_syntax_native_consumption
             COMMAND mcpp_syntax_rules_tests /review/cases/mc-syntax/native-consumption native-consumption
         )
+        add_test(
+            NAME mcpp_syntax_native_context
+            COMMAND mcpp_syntax_rules_tests /review/cases/mc-syntax/native-context native-context
+        )
         add_test(NAME mcpp_translation_tests COMMAND mcpp_translation_tests)
         add_test(
             NAME mcpp_sparse_special_tests

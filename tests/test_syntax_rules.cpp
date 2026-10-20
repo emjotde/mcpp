@@ -218,6 +218,146 @@ context <é> </é> brightmagenta black
     std::cout << "PASS MC-equivalent ASCII folding, byte sets, spelling, reload and builtin rules\n";
 }
 
+void test_native_contexts(const std::filesystem::path& root) {
+    struct Paint {
+        std::size_t begin;
+        std::size_t end;
+        int color;
+    };
+    struct Fixture {
+        std::string_view name;
+        std::string_view rules;
+        std::vector<std::string> lines;
+        std::vector<Paint> paint;
+        std::vector<mcpp::SyntaxSpellingRange> spelling;
+    };
+    const std::vector<Fixture> fixtures{
+        {"left", R"(context \[a\] ] brightmagenta black
+ spellcheck
+ keyword whole sentinel yellow
+)", {"sentinel", "qaa]z a] tail", "b aa] ] a]", ""}, {}, {}},
+        {"right", R"(context [ \[b\] brightmagenta black
+ spellcheck
+ keyword whole sentinel yellow
+)", {"sentinel", "q[bbz a[b] tail", "q[]z q[b]z", ""},
+            {{10U, 36U, 13}}, {{10U, 36U}}},
+        {"both", R"(context \[a\] \[b\] brightmagenta black
+ spellcheck
+ keyword whole sentinel yellow
+)", {"sentinel", "qaa]z abb tail", "b aa] ] a]", ""}, {}, {}},
+        {"neighbors", R"(context \[a\]L R\[b\] brightmagenta black
+ spellcheck
+ keyword whole sentinel yellow
+context M\[a\] \[b\]N brightgreen black
+ spellcheck
+ keyword whole sentinel yellow
+)", {"sentinel", "qLRz aaLRbbz LaRz", "qMNz MaaNbbz MbN", ""},
+            {{28U, 44U, 10}}, {{28U, 44U}}},
+        {"literal-positive", R"(context L\[a\] R\[b\] brightmagenta black
+ spellcheck
+)", {"sentinel", "qLRz LaaRbbz LwordRz", ""},
+            {{10U, 12U, 13}, {14U, 20U, 13}, {22U, 28U, 13}},
+            {{10U, 12U}, {14U, 20U}, {22U, 28U}}},
+        {"other-prefixes", R"(context \{LQ\} R brightmagenta black
+context + R brightcyan black
+context < > brightgreen black
+ spellcheck
+)", {"sentinel", "qLRz <yes> tail", ""}, {{14U, 19U, 10}}, {{14U, 19U}}},
+        {"empty-markers", R"(context \[\] \[\] brightmagenta black
+ spellcheck
+context [ \[\] brightgreen black
+ spellcheck
+)", {"sentinel", "qLRz [teh] outside", ""}, {{14U, 28U, 10}}, {{14U, 28U}}},
+        {"empty-neighbors", R"(context \[\]L R brightmagenta black
+ spellcheck
+context L\[\] R\[\] brightgreen black
+ spellcheck
+)", {"sentinel", "qLRz LR tail", ""},
+            {{10U, 12U, 10}, {14U, 16U, 10}}, {{10U, 12U}, {14U, 16U}}},
+    };
+    const auto registry = root / "Syntax";
+    mcpp::SyntaxHighlighter highlighter;
+    std::vector<std::vector<mcpp::SyntaxSpan>> last_spans;
+    const auto same_spans = [](const auto& left, const auto& right) {
+        if (left.size() != right.size()) return false;
+        for (std::size_t row = 0; row < left.size(); ++row) {
+            if (left[row].size() != right[row].size()) return false;
+            for (std::size_t index = 0; index < left[row].size(); ++index) {
+                const auto& a = left[row][index];
+                const auto& b = right[row][index];
+                if (a.begin != b.begin || a.end != b.end ||
+                    a.style != b.style || a.color != b.color) return false;
+            }
+        }
+        return true;
+    };
+    for (const auto& fixture : fixtures) {
+        write(registry, "file . Original\\sContext\\s" + std::string(fixture.name) +
+            "\ncontext default lightgray black\n keyword whole sentinel yellow\n" +
+            std::string(fixture.rules));
+        highlighter.load_registry(registry, root / "syntax.d");
+        std::size_t size = fixture.lines.size() - 1U;
+        for (const auto& line : fixture.lines) size += line.size();
+        std::vector<int> expected(size, 7);
+        for (std::size_t byte = 0; byte < 8U; ++byte) expected[byte] = 11;
+        for (const auto& paint : fixture.paint) {
+            check(paint.begin < paint.end && paint.end <= expected.size(),
+                  "native context fixture has a bounded positive paint range");
+            for (auto byte = paint.begin; byte < paint.end; ++byte) expected[byte] = paint.color;
+        }
+        const auto spans = highlighter.highlight("original.ctx", fixture.lines);
+        check(spans.size() == fixture.lines.size(), "native contexts preserve every row");
+        std::size_t offset = 0;
+        for (std::size_t row = 0; row < fixture.lines.size(); ++row) {
+            std::size_t next = 0;
+            for (const auto& span : spans[row]) {
+                check(span.begin == next && span.begin < span.end &&
+                      span.end <= fixture.lines[row].size(),
+                      "context scanning emits positive, contiguous, bounded visible spans");
+                next = span.end;
+            }
+            check(next == fixture.lines[row].size(), "native context spans cover every visible byte");
+            for (std::size_t byte = 0; byte < fixture.lines[row].size(); ++byte) {
+                const auto& color = color_at(spans[row], byte);
+                check(color.foreground == expected[offset + byte] && color.background == 0,
+                      "cached native context colors differ for " + std::string(fixture.name));
+            }
+            offset += fixture.lines[row].size() + 1U;
+        }
+        // These ranges preserve mcpp's context filter; native manual Spell check is a separate control.
+        const auto spelling = highlighter.spelling_ranges("original.ctx", fixture.lines);
+        check(spelling && *spelling == fixture.spelling,
+              "context classification preserves mcpp spelling ranges at original byte offsets");
+        for (const auto& range : *spelling) {
+            check(range.begin < range.end && range.end <= size,
+                  "ignored context transitions never emit empty or out-of-bounds spelling ranges");
+        }
+        const auto outside = highlighter.highlight("original.ctx", {"outside"});
+        const auto outside_spelling = highlighter.spelling_ranges("original.ctx", {"outside"});
+        check(color_at(outside.front(), 0U).foreground == 7 &&
+              outside_spelling && outside_spelling->empty(),
+              "active contexts do not leak between separate scans");
+        check(same_spans(highlighter.highlight("original.ctx", fixture.lines), spans) &&
+              highlighter.spelling_ranges("original.ctx", fixture.lines) == spelling,
+              "repeated context scans do not retain a stale transition cache");
+        last_spans = spans;
+    }
+    write(registry, "file . Broken\ncontext default lightgray black\nunsupported_rule\n");
+    bool rejected = false;
+    try {
+        highlighter.load_registry(registry, root / "syntax.d");
+    } catch (const std::exception& error) {
+        rejected = std::string_view(error.what()).find("unsupported syntax directive") !=
+                   std::string_view::npos;
+    }
+    check(rejected &&
+          same_spans(highlighter.highlight("original.ctx", fixtures.back().lines), last_spans) &&
+          highlighter.spelling_ranges("original.ctx", fixtures.back().lines) ==
+              std::optional(fixtures.back().spelling),
+          "unknown directives preserve the prior context registry, colors and spelling ranges");
+    std::cout << "PASS cached native context classification, positive progress and mcpp spelling ranges\n";
+}
+
 }  // namespace
 
 int main(const int argc, const char* const* argv) {
@@ -225,17 +365,19 @@ int main(const int argc, const char* const* argv) {
         if (argc != 2 && !(argc == 3 && (std::string_view(argv[2]) == "spellcheck" ||
                                        std::string_view(argv[2]) == "native-bytes" ||
                                        std::string_view(argv[2]) == "native-format" ||
-                                       std::string_view(argv[2]) == "native-consumption"))) {
+                                       std::string_view(argv[2]) == "native-consumption" ||
+                                       std::string_view(argv[2]) == "native-context"))) {
             throw std::runtime_error(
                 "usage: syntax-model owned-fixture-directory "
-                "[spellcheck|native-bytes|native-format|native-consumption]"
+                "[spellcheck|native-bytes|native-format|native-consumption|native-context]"
             );
         }
         const auto root = std::filesystem::path(argv[1]);
         const auto definitions = root / "syntax.d";
         std::filesystem::create_directories(definitions);
         if (argc == 3) {
-            if (std::string_view(argv[2]) == "native-consumption") test_native_consumption(root);
+            if (std::string_view(argv[2]) == "native-context") test_native_contexts(root);
+            else if (std::string_view(argv[2]) == "native-consumption") test_native_consumption(root);
             else if (std::string_view(argv[2]) == "native-format") test_native_format(root);
             else if (std::string_view(argv[2]) == "native-bytes") test_native_bytes(root);
             else test_spelling_contexts(root);

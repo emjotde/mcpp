@@ -491,9 +491,12 @@ No further directive or flag omissions were found in the installed MC 4.8.30
 format. Definitions are bounded to 8 MiB combined input, 64 active includes,
 64 active macro names and 512 pattern atoms. Repetition-only keywords are
 supported; a zero-byte keyword match colors and advances at least one byte.
-Truly empty patterns still fail, and context transitions require positive
-consumption. Native equivalence for that context bound is unverified, so complete
-syntax compatibility is not yet claimed. Keyword/context case
+Context delimiters keep their original leading-token classification:
+nonliteral-led and empty context delimiters are accepted but inert, while
+literal-led matches consume bytes, as in the native controls. Context patterns
+with `*` at a compiled edge remain rejected, although native MC loads the
+observed forms; atom-empty keyword behavior is still unverified and rejected.
+Complete syntax compatibility is not yet claimed. Keyword/context case
 folding and byte-based pattern sets match MC 4.8.30, including byte offsets
 inside UTF-8 text; they are not Unicode word matching. Unknown directives fail
 explicitly. The editor keeps UTF-8 characters intact when byte-oriented syntax

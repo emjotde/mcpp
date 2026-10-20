@@ -366,9 +366,13 @@ MC 4.8.30. Registry expressions now use PCRE2. No further directive or flag
 omissions were found in the installed format. Repetition-only keywords now
 match the cached native control, including zero-byte matches that color and
 advance at least one byte. **L22 is not yet counted closed**: truly empty
-patterns remain rejected and context transitions require positive consumption;
-native equivalence at that context boundary is unverified. Aggregate
-input/include/macro/atom bounds remain explicit. Native MC 4.8.30 controls
+keyword patterns remain rejected without a native acceptance control, and
+context wildcard-edge patterns are rejected although native MC loaded the
+observed forms without activating them on the supplied text.
+The context-boundary comparison now matches eight cached native controls:
+nonliteral-led and empty context delimiters are inert; literal-led neighbors
+match and consume bytes. No zero-length context transition is needed.
+Aggregate input/include/macro/atom bounds remain explicit. Native MC 4.8.30 controls
 confirm the existing ASCII-only case folding and byte-based sets, including
 partial UTF-8-byte matches; those are baseline behavior, not compatibility gaps.
 The editor now keeps UTF-8 characters visible across partial-byte syntax spans,
@@ -380,6 +384,8 @@ continuation results. Its focused workflow
 preserves UTF-8 offsets, explicit word checking, marks, Undo and saved bytes.
 Delimiter changes that newly expose text require another whole-document check.
 No MC resource collection is copied or bundled.
+Separate native manual-spelling observations do not establish equivalence with
+mcpp's context-filtered whole-document workflow; L27 is unchanged by this patch.
 
 Native skin selection, color aliases/attributes/inheritance and filename/type
 highlighting now affect the real UI, with Appearance preview/cancel/persistence

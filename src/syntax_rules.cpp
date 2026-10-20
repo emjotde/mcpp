@@ -137,6 +137,7 @@ struct Pattern {
     bool left{false};
     bool right{false};
     bool linestart{false};
+    bool starts_with_literal{false};
     std::string left_characters;
     std::string right_characters;
 };
@@ -176,6 +177,9 @@ Pattern parse_pattern(
     Pattern pattern,
     const bool delimiter
 ) {
+    // MC dispatches contexts by the first token, before empty repeat markers disappear.
+    pattern.starts_with_literal = !value.empty() && value.front() != '*' && value.front() != '+' &&
+        !value.starts_with("\\[") && !value.starts_with("\\{");
     for (std::size_t cursor = 0; cursor < value.size(); ++cursor) {
         const auto character = value[cursor];
         if (character == '*') {
@@ -217,10 +221,10 @@ Pattern parse_pattern(
             });
         }
     }
-    if (pattern.atoms.empty()) fail(line, "syntax pattern must consume at least one character");
+    if (pattern.atoms.empty() && !delimiter) fail(line, "syntax pattern must consume at least one character");
     if (pattern.atoms.size() > 512U) fail(line, "syntax pattern exceeds 512 elements");
-    if (delimiter && (pattern.atoms.front().kind == AtomKind::any ||
-                      pattern.atoms.back().kind == AtomKind::any)) {
+    if (delimiter && !pattern.atoms.empty() &&
+        (pattern.atoms.front().kind == AtomKind::any || pattern.atoms.back().kind == AtomKind::any)) {
         fail(line, "context wildcard cannot be the first or last pattern element");
     }
     return pattern;
@@ -283,6 +287,16 @@ std::optional<std::size_t> match(
         return {};
     };
     return visit(visit, 0U, begin);
+}
+
+std::optional<std::size_t> match_delimiter(
+    const Pattern& pattern,
+    const std::string_view text,
+    const std::size_t begin,
+    const bool insensitive
+) {
+    if (!pattern.starts_with_literal || pattern.atoms.empty()) return {};
+    return match(pattern, text, begin, insensitive);
 }
 
 int parse_color(const std::string_view original, const SourceLine& line) {
@@ -593,7 +607,7 @@ void scan_rules(const SyntaxRuleSet& rules, const std::string_view text, Emit em
         }
         if (consumed) continue;
         if (active != 0U) {
-            if (const auto end = match(context.end, text, cursor, rules.insensitive)) {
+            if (const auto end = match_delimiter(context.end, text, cursor, rules.insensitive)) {
                 const auto& delimiter = context.exclusive ? rules.contexts.front() : context;
                 emit(cursor, *end, delimiter.color, delimiter.spellcheck);
                 cursor = *end;
@@ -603,7 +617,7 @@ void scan_rules(const SyntaxRuleSet& rules, const std::string_view text, Emit em
         } else {
             for (std::size_t index = 1U; index < rules.contexts.size(); ++index) {
                 const auto& candidate = rules.contexts[index];
-                if (const auto end = match(candidate.begin, text, cursor, rules.insensitive)) {
+                if (const auto end = match_delimiter(candidate.begin, text, cursor, rules.insensitive)) {
                     const auto& delimiter = candidate.exclusive ? context : candidate;
                     emit(cursor, *end, delimiter.color, delimiter.spellcheck);
                     cursor = *end;
