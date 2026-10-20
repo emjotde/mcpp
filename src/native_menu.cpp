@@ -608,13 +608,18 @@ CommandMacros command_macros(const std::string_view command) {
 std::string arithmetic_value(const std::string_view value) {
     auto number = value;
     if (!number.empty() && (number.front() == '-' || number.front() == '+')) number.remove_prefix(1U);
-    if (number.empty() || !std::ranges::all_of(number, [](const unsigned char character) {
-            return character >= '0' && character <= '9';
+    const bool hexadecimal = number.starts_with("0x") || number.starts_with("0X");
+    if (hexadecimal) number.remove_prefix(2U);
+    if (number.empty() || !std::ranges::all_of(number, [hexadecimal](const unsigned char character) {
+            return (character >= '0' && character <= '9') ||
+                (hexadecimal && ((character >= 'a' && character <= 'f') ||
+                                 (character >= 'A' && character <= 'F')));
         })) {
-        throw std::invalid_argument("a menu macro in arithmetic must be a decimal integer; use %0 for a trusted expression");
+        throw std::invalid_argument("a menu macro in arithmetic must be a decimal or hexadecimal integer; use %0 for a trusted expression");
     }
     const bool negative = value.front() == '-';
-    return "(" + std::string(negative ? "-" : "") + "10#" + std::string(number) + ")";
+    return "(" + std::string(negative ? "-" : "") +
+        (hexadecimal ? "16#" : "10#") + std::string(number) + ")";
 }
 
 std::string macro_value(const std::string_view value, const LocatedMacro& location) {
@@ -1047,7 +1052,7 @@ NativeMenuExpansion expand_native_menu(
         }
         std::string replacement;
         if (list && location.arithmetic && !macro.raw && values.size() != 1U) {
-            throw std::invalid_argument("a tagged-file macro in arithmetic needs exactly one decimal integer");
+            throw std::invalid_argument("a tagged-file macro in arithmetic needs exactly one integer literal");
         }
         if (list && !location.arithmetic && (quote != ShellQuote::none || macro.raw)) {
             std::string joined;

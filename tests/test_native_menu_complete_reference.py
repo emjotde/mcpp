@@ -6,6 +6,42 @@ import sys
 from terminal_session import TerminalSession
 
 
+def numbers(root):
+    left, right, ui = root / "left", root / "right", root / "ui"
+    left.mkdir()
+    right.mkdir()
+    answer = root / "answer"
+    (left / ".mc.menu").write_text(
+        "n Hex numeric input\n"
+        "    printf '%%s' $((%{Integer}+2)) > " + str(answer) + "\n"
+    )
+    config = ui / "config/mc"
+    config.mkdir(parents=True)
+    (config / "ini").write_text(
+        "[Midnight-Commander]\npause_after_run=0\nconfirm_exit=0\n"
+    )
+    os.environ["LD_LIBRARY_PATH"] = "/review/control/lib"
+    results = {}
+    with TerminalSession("/review/control/mc", "/usr/bin/tmux", ui,
+                         ["-u", left, right]) as terminal:
+        terminal.record_output()
+        terminal.wait_for("Name")
+        for value, expected in (("0x2a", "44"), ("0Xf", "17")):
+            terminal.press("F2")
+            terminal.wait_for("Hex numeric input")
+            terminal.press("n")
+            terminal.wait_for("Integer")
+            terminal.press("C-u")
+            terminal.type(value)
+            terminal.press("Enter")
+            terminal.wait_file(answer, expected.encode())
+            terminal.wait_idle()
+            results[value] = answer.read_text()
+        terminal.save("native-hexadecimal-arithmetic")
+    (root / "observations.json").write_text(json.dumps(results, indent=2) + "\n")
+    print(json.dumps(results, indent=2))
+
+
 def main():
     if (os.geteuid() != 1001 or not Path("/.dockerenv").is_file() or
             not Path("/review/.operation-regressions-disposable").is_file()):
@@ -14,6 +50,11 @@ def main():
     if not str(root).startswith("/review/cases/menu-complete-"):
         raise SystemExit("Menu reference fixtures must use /review/cases/menu-complete-*")
     root.mkdir(parents=True)
+    if len(sys.argv) > 2:
+        if sys.argv[2] != "numbers":
+            raise SystemExit("unknown native menu reference selector")
+        numbers(root)
+        return
     left, right = root / "left", root / "right"
     left.mkdir()
     right.mkdir()

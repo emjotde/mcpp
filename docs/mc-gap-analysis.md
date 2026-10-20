@@ -319,13 +319,18 @@ quotes, arithmetic and heredocs. Ordinary values remain literal rather than
 becoming shell source. Named homes and CDPATH use a captured provider/directory;
 relative archive paths do not search the host filesystem. **L20 remains partial**
 against the original complete-expansion target: ordinary arithmetic values are
-signed decimal only, nested old-style backticks and `case` substitutions remain
-unsupported, and unsafe or unsupported heredoc forms fail explicitly.
+decimal or hexadecimal literals only, nested old-style backticks and `case`
+substitutions remain unsupported, and unsafe or unsupported heredoc forms fail explicitly.
 
 External `Syntax` registries and definitions now feed the actual editor chooser
 and color renderer, with transactional reload, saved selections and legacy-file
-preservation. Registry expressions now use PCRE2. **L22 is not yet counted
-closed** pending remaining native-directive checks. Native MC 4.8.30 controls
+preservation. Colorless keywords inherit their context colors, and empty
+`\[\]` repeat markers retain surrounding literal patterns, matching native
+MC 4.8.30. Registry expressions now use PCRE2. No further directive or flag
+omissions were found in the installed format. **L22 is not yet counted closed**:
+patterns made only of `*` and repeated sets remain rejected, and their native
+behavior has not been checked. Aggregate input/include/macro/atom bounds remain
+explicit. Native MC 4.8.30 controls
 confirm the existing ASCII-only case folding and byte-based sets, including
 partial UTF-8-byte matches; those are baseline behavior, not compatibility gaps.
 The editor now keeps UTF-8 characters visible across partial-byte syntax spans,

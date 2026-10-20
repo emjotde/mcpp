@@ -9,6 +9,7 @@
 #include <string>
 #include <string_view>
 #include <unistd.h>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -57,9 +58,10 @@ std::string nul_values(const std::vector<std::string>& values) {
 void output(
     const std::string_view command,
     const mcpp::NativeMenuContext& captured,
-    const std::string& expected
+    const std::string& expected,
+    const std::vector<std::string>& answers = {}
 ) {
-    const auto expanded = mcpp::expand_native_menu(command, captured);
+    const auto expanded = mcpp::expand_native_menu(command, captured, answers);
     const auto result = mcpp::capture_shell(expanded.command, captured.active.directory);
     check(result.status == 0, "expanded shell command failed: " + result.error + "\n" + expanded.command);
     check(result.output == expected, "menu argument bytes changed\n" + expanded.command);
@@ -126,6 +128,26 @@ void contexts(const std::filesystem::path& root) {
           "requirements must use the same shell contexts as expansion");
 }
 
+void numbers(const std::filesystem::path& root) {
+    auto captured = context(root);
+    for (const auto& [value, expected] : std::vector<std::pair<std::string, std::string>>{
+             {"008", "10"}, {"-007", "-5"}, {"0x2a", "44"},
+             {"0Xf", "17"}, {"+0x00Af", "177"}, {"-0Xf", "-13"}}) {
+        captured.active.file = file(value);
+        output("printf '%%s' $((%f+2))", captured, expected);
+        output("printf '%%s' $((%{Integer}+2))", captured, expected, {value});
+    }
+    captured.active.tagged = {file("0x2a")};
+    output("printf '%%s' $((%t+2))", captured, "44");
+    for (const auto value : {"0x", "-0x", "0x1g", "0x1+2", "0x$(printf BAD)", "16#f", "3+4"}) {
+        captured.active.file = file(value);
+        rejects([&] { static_cast<void>(mcpp::expand_native_menu("printf '%%s' $((%f))", captured)); },
+                "ordinary arithmetic values must remain integer data, not shell source");
+    }
+    captured.active.file = file("3+4");
+    output("printf '%%s' $((%0f))", captured, "7");
+}
+
 void directories(const std::filesystem::path& root) {
     const auto base = root / "files";
     const auto search = root / "search";
@@ -179,13 +201,14 @@ int main(int argc, char** argv) {
         return 1;
     }
     try {
-        check(argc == 3, "usage: native-menu-complete words|contexts|directories /review/cases/menu-complete-*");
+        check(argc == 3, "usage: native-menu-complete words|contexts|numbers|directories /review/cases/menu-complete-*");
         const auto root = std::filesystem::path(argv[2]).lexically_normal();
         check(root.string().starts_with("/review/cases/menu-complete-"), "invalid disposable menu fixture root");
         std::filesystem::create_directories(root);
         const std::string_view selected = argv[1];
         if (selected == "words") words(root);
         else if (selected == "contexts") contexts(root);
+        else if (selected == "numbers") numbers(root);
         else if (selected == "directories") directories(root);
         else throw std::invalid_argument("unknown focused menu case");
         std::cout << "PASS native menu " << selected << '\n';

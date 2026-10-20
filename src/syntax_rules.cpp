@@ -206,7 +206,11 @@ Pattern parse_pattern(
                 }
                 characters.push_back(escaped_character(value[cursor]));
             }
-            if (!closed || characters.empty()) fail(line, "empty or unclosed pattern character set");
+            if (!closed || (characters.empty() && escaped == '{')) {
+                fail(line, "empty or unclosed pattern character set");
+            }
+            // Native definitions use \[\] to keep reserved words literal.
+            if (characters.empty()) continue;
             pattern.atoms.push_back({
                 escaped == '[' ? AtomKind::set_many : AtomKind::set_one,
                 std::move(characters)
@@ -479,7 +483,6 @@ private:
         auto pattern = options(line, cursor);
         if (cursor >= line.words.size()) fail(line, "keyword requires a pattern");
         pattern = parse_pattern(line.words[cursor++], line, std::move(pattern), false);
-        if (cursor >= line.words.size()) fail(line, "keyword requires a foreground color");
         rules->contexts.back().keywords.push_back({
             std::move(pattern), parse_colors(line, cursor, rules->contexts.back().color)
         });

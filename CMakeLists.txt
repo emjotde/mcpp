@@ -322,7 +322,7 @@ if(MCPP_BUILD_TESTS)
                         /review/cases/native-regex-${regex_case}
             )
         endforeach()
-        foreach(menu_case IN ITEMS words contexts directories)
+        foreach(menu_case IN ITEMS words contexts numbers directories)
             add_test(
                 NAME mcpp_native_menu_${menu_case}
                 COMMAND mcpp_native_menu_complete_tests ${menu_case}
@@ -416,6 +416,10 @@ if(MCPP_BUILD_TESTS)
         add_test(
             NAME mcpp_syntax_native_bytes
             COMMAND mcpp_syntax_rules_tests /review/cases/mc-syntax/native-bytes native-bytes
+        )
+        add_test(
+            NAME mcpp_syntax_native_format
+            COMMAND mcpp_syntax_rules_tests /review/cases/mc-syntax/native-format native-format
         )
         add_test(
             NAME mcpp_sparse_special_tests

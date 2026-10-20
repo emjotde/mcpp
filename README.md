@@ -424,9 +424,10 @@ that behavior is intended and the value is trusted.
 `%cd` accepts one literal directory argument, menu macros, named homes, and
 CDPATH. Relative paths use the provider and directory captured before prompts;
 archive-relative paths never search host CDPATH directories.
-Ordinary arithmetic values must be signed decimal integers; trusted expressions
-require `%0`. Nested old-style backticks, `case` inside command substitutions,
-unsupported heredoc delimiters, and values that would terminate a heredoc or
+Ordinary arithmetic values must be signed decimal or `0x`/`0X` hexadecimal
+integers. Bare digits remain decimal even with leading zeroes; other trusted
+expressions require `%0`. Nested old-style backticks, `case` inside command
+substitutions, unsupported heredoc delimiters, and values that would terminate a heredoc or
 lose tabs with `<<-` fail explicitly. Modern `$(...)` substitutions are supported.
 
 ## External syntax definitions
@@ -434,13 +435,19 @@ lose tabs with `<<-` fail explicitly. Modern `$(...)` substitutions are supporte
 The editor can load a user-authored MC `Syntax` registry from its config
 directory and definitions from `syntax.d/`. Native patterns, contexts, keywords
 and explicit colors feed the existing renderer; available definitions appear
-in the syntax chooser. The lowercase legacy `syntax` override file and builtin
+in the syntax chooser. Keywords may omit colors to inherit their context's
+colors, and empty `\[\]` pattern markers retain surrounding literal text.
+The lowercase legacy `syntax` override file and builtin
 languages remain available. Selected external IDs persist in saved setup.
 Loading is transactional: a malformed replacement reports an error while
 retaining the current definition and draft. Registry filename and first-line
 expressions use PCRE2, including lookarounds, Unicode properties and case folding.
 
-Complete native directive coverage is not yet claimed. Keyword/context case
+No further directive or flag omissions were found in the installed MC 4.8.30
+format. Definitions are bounded to 8 MiB combined input, 64 active includes,
+64 active macro names and 512 pattern atoms. Patterns made only of `*` and
+repeated sets still fail explicitly; their native behavior is unverified, so
+complete syntax compatibility is not yet claimed. Keyword/context case
 folding and byte-based pattern sets match MC 4.8.30, including byte offsets
 inside UTF-8 text; they are not Unicode word matching. Unknown directives fail
 explicitly. The editor keeps UTF-8 characters intact when byte-oriented syntax

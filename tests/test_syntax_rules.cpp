@@ -73,6 +73,48 @@ context default red black
     std::cout << "PASS context spelling eligibility, byte offsets and builtin compatibility\n";
 }
 
+void test_native_format(const std::filesystem::path& root) {
+    const auto registry = root / "Syntax";
+    const auto definition = root / "syntax.d" / "original-format.syntax";
+    write(registry, "file . Original\\sNative\\sFormat\ninclude original-format.syntax\n");
+    write(definition, R"(define accent brightgreen black
+context default red black
+ keyword whole whole\[\] accent
+ keyword plain
+context [ ] brightmagenta black
+ keyword reset
+)");
+    mcpp::SyntaxHighlighter highlighter;
+    highlighter.load_registry(registry, root / "syntax.d");
+    const std::vector<std::string> lines{"whole plain [reset] wholeword"};
+    const auto spans = highlighter.highlight("original.fmt", lines);
+    for (std::size_t byte = 0; byte < lines[0].size(); ++byte) {
+        const auto expected = byte < 5U ? 10 : (byte >= 12U && byte < 19U ? 13 : 1);
+        check(color_at(spans[0], byte).foreground == expected &&
+              color_at(spans[0], byte).background == 0,
+              "native empty repeated sets and colorless keywords inherit their own context");
+    }
+    write(definition, "context default red black\nunsupported_rule\n");
+    bool rejected = false;
+    try {
+        highlighter.load_registry(registry, root / "syntax.d");
+    } catch (const std::exception& error) {
+        rejected = std::string_view(error.what()).find("unsupported syntax directive") !=
+                   std::string_view::npos;
+    }
+    const auto preserved = highlighter.highlight("original.fmt", lines);
+    check(rejected && preserved.size() == spans.size() &&
+          preserved[0].size() == spans[0].size(),
+          "unknown directives still fail without replacing native syntax rules");
+    for (std::size_t index = 0; index < spans[0].size(); ++index) {
+        check(preserved[0][index].begin == spans[0][index].begin &&
+              preserved[0][index].end == spans[0][index].end &&
+              preserved[0][index].color == spans[0][index].color,
+              "failed native-format reload preserves byte spans and colors");
+    }
+    std::cout << "PASS MC-native empty repeated sets, omitted keyword colors and transactional reload\n";
+}
+
 void test_native_bytes(const std::filesystem::path& root) {
     const auto registry = root / "Syntax";
     write(registry, R"(file . Original\sNative\sBytes
@@ -150,14 +192,18 @@ context <é> </é> brightmagenta black
 int main(const int argc, const char* const* argv) {
     try {
         if (argc != 2 && !(argc == 3 && (std::string_view(argv[2]) == "spellcheck" ||
-                                       std::string_view(argv[2]) == "native-bytes"))) {
-            throw std::runtime_error("usage: syntax-model owned-fixture-directory [spellcheck|native-bytes]");
+                                       std::string_view(argv[2]) == "native-bytes" ||
+                                       std::string_view(argv[2]) == "native-format"))) {
+            throw std::runtime_error(
+                "usage: syntax-model owned-fixture-directory [spellcheck|native-bytes|native-format]"
+            );
         }
         const auto root = std::filesystem::path(argv[1]);
         const auto definitions = root / "syntax.d";
         std::filesystem::create_directories(definitions);
         if (argc == 3) {
-            if (std::string_view(argv[2]) == "native-bytes") test_native_bytes(root);
+            if (std::string_view(argv[2]) == "native-format") test_native_format(root);
+            else if (std::string_view(argv[2]) == "native-bytes") test_native_bytes(root);
             else test_spelling_contexts(root);
             return 0;
         }
