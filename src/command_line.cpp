@@ -132,8 +132,9 @@ std::string_view cli_color_roles() {
     return "Color pairs: normal, selected, markselect, reverse, gauge, errors,\n"
            "dnormal, dfocus, dtitle, errdtitle, errdfocus, errdhotfocus,\n"
            "menunormal, menusel, menuinactive, pmenunormal, pmenusel, pmenutitle,\n"
-           "bbarhotkey, bbarbutton, editnormal, editbold, editmarked, editlinestate, viewnormal,\n"
-           "viewselected, helpnormal, helplink, helpslink.\n"
+           "bbarhotkey, bbarbutton, editnormal, editbold, editmarked, editlinestate,\n"
+           "viewnormal, viewbold, viewunderline, viewselected,\n"
+           "helpnormal, helpbold, helpitalic, helplink, helpslink.\n"
            "Foreground-only roles: marked, disabled, header, menuhot, editwhitespace.\n"
            "errdhotfocus is the existing whole-error-focus alias of errdfocus.\n"
            "Other MC roles are not rendered independently and are rejected.\n";

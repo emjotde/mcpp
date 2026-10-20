@@ -112,7 +112,14 @@ target_link_libraries(mcpp_core PUBLIC Threads::Threads screen PkgConfig::PCRE2)
 target_compile_definitions(mcpp_core PUBLIC MCPP_VERSION="${PROJECT_VERSION}")
 mcpp_target_defaults(mcpp_core)
 
-add_library(mcpp_ui src/app.cpp src/keymap_input.cpp src/cli_display.cpp src/skin_glyphs_ui.cpp)
+add_library(
+    mcpp_ui
+    src/app.cpp
+    src/keymap_input.cpp
+    src/cli_display.cpp
+    src/skin_glyphs_ui.cpp
+    src/viewer_help_styles.cpp
+)
 target_include_directories(mcpp_ui PUBLIC include)
 target_link_libraries(mcpp_ui PUBLIC mcpp_core ftxui::ftxui)
 mcpp_target_defaults(mcpp_ui)
@@ -242,6 +249,10 @@ if(MCPP_BUILD_TESTS)
     add_executable(mcpp_cli_color_tests tests/test_cli_color_roles.cpp)
     target_link_libraries(mcpp_cli_color_tests PRIVATE mcpp_ui)
     mcpp_target_defaults(mcpp_cli_color_tests)
+    add_executable(mcpp_viewer_help_style_tests tests/test_viewer_help_styles.cpp)
+    target_include_directories(mcpp_viewer_help_style_tests PRIVATE src)
+    target_link_libraries(mcpp_viewer_help_style_tests PRIVATE mcpp_ui)
+    mcpp_target_defaults(mcpp_viewer_help_style_tests)
     add_executable(mcpp_translation_tests tests/test_translation.cpp)
     target_link_libraries(mcpp_translation_tests PRIVATE mcpp_core)
     mcpp_target_defaults(mcpp_translation_tests)
@@ -296,6 +307,13 @@ if(MCPP_BUILD_TESTS)
                         /review/cases/cli-color-roles/${cli_color_case}-ctest
             )
         endforeach()
+        foreach(viewer_help_case IN ITEMS styles cli)
+            add_test(
+                NAME mcpp_viewer_help_${viewer_help_case}
+                COMMAND mcpp_viewer_help_style_tests ${viewer_help_case}
+                        /review/cases/viewer-help-colors/models/${viewer_help_case}-ctest
+            )
+        endforeach()
         add_test(
             NAME mcpp_archive_tests
             COMMAND mcpp_archive_tests /review/cases/agent-archives
@@ -343,7 +361,7 @@ if(MCPP_BUILD_TESTS)
                         /review/cases/native-regex-${regex_case}
             )
         endforeach()
-        foreach(menu_case IN ITEMS words contexts numbers directories)
+        foreach(menu_case IN ITEMS words contexts numbers cases directories)
             add_test(
                 NAME mcpp_native_menu_${menu_case}
                 COMMAND mcpp_native_menu_complete_tests ${menu_case}
@@ -436,6 +454,11 @@ if(MCPP_BUILD_TESTS)
             NAME mcpp_native_config_remaining_four
             COMMAND mcpp_native_config_tests remaining-four
                     /review/cases/native-config/model/remaining-four
+        )
+        add_test(
+            NAME mcpp_native_config_remaining_three
+            COMMAND mcpp_native_config_tests remaining-three
+                    /review/cases/native-config/model/remaining-three
         )
         add_test(NAME mcpp_operation_job_tests COMMAND mcpp_operation_job_tests)
         add_test(

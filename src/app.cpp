@@ -29,6 +29,7 @@
 #include "mcpp/diff.hpp"
 #include "mcpp/user_menu.hpp"
 #include "local_tools_stream.hpp"
+#include "viewer_help_styles.hpp"
 
 #include <algorithm>
 #include <array>
@@ -1338,35 +1339,6 @@ private:
     ftxui::Color color_;
 };
 
-class SkinPaint final : public ftxui::Node {
-public:
-    SkinPaint(ftxui::Element child, SkinPair colors) : Node({std::move(child)}), colors_(colors) {}
-    void SetBox(ftxui::Box box) override {
-        Node::SetBox(box);
-        children_.front()->SetBox(box);
-    }
-    void Render(ftxui::Screen& screen) override {
-        for (int row = box_.y_min; row <= box_.y_max; ++row) {
-            for (int column = box_.x_min; column <= box_.x_max; ++column) {
-                auto& cell = screen.CellAt(column, row);
-                cell.foreground_color = colors_.foreground;
-                cell.background_color = colors_.background;
-                cell.bold = (colors_.attributes & SkinPair::bold) != 0U;
-                cell.italic = (colors_.attributes & SkinPair::italic) != 0U;
-                cell.underlined = (colors_.attributes & SkinPair::underline) != 0U;
-                cell.inverted = (colors_.attributes & SkinPair::reverse) != 0U;
-                cell.blink = (colors_.attributes & SkinPair::blink) != 0U;
-                cell.dim = false;
-                cell.underlined_double = false;
-                cell.strikethrough = false;
-            }
-        }
-        Node::Render(screen);
-    }
-private:
-    SkinPair colors_;
-};
-
 std::string type_prefix(const Entry& entry) {
     switch (entry.kind) {
         case EntryKind::directory:
@@ -1416,54 +1388,6 @@ const std::array<std::string, 7> editor_menu_names{
     "Format     ", "Window     ", "Options"
 };
 constexpr std::array<std::size_t, 7> editor_menu_mnemonics{0, 0, 0, 0, 3, 0, 0};
-
-ftxui::Element render_viewer_text(
-    const std::string& row,
-    const std::optional<std::pair<std::size_t, std::size_t>> highlight,
-    const std::vector<ViewerTextStyle>& styles = {}
-) {
-    using namespace ftxui;
-    if (!highlight && styles.empty()) {
-        return glyph_text(row);
-    }
-    auto aligned = highlight;
-    std::size_t offset = 0;
-    for (const auto& glyph : Utf8ToGlyphs(row)) {
-        const auto next = offset + glyph.size();
-        if (highlight && offset <= highlight->first && highlight->first < next) {
-            aligned->first = offset;
-        }
-        if (highlight && offset < highlight->second && highlight->second <= next) {
-            aligned->second = next;
-            break;
-        }
-        offset = next;
-    }
-    std::vector<std::size_t> boundaries{0, row.size()};
-    if (aligned) {
-        boundaries.push_back(std::min(aligned->first, row.size()));
-        boundaries.push_back(std::min(aligned->second, row.size()));
-    }
-    for (const auto& style : styles) {
-        boundaries.push_back(std::min(style.begin, row.size()));
-        boundaries.push_back(std::min(style.end, row.size()));
-    }
-    std::ranges::sort(boundaries);
-    Elements segments;
-    for (std::size_t index = 1; index < boundaries.size(); ++index) {
-        const auto begin = boundaries[index - 1U], end = boundaries[index];
-        if (end <= begin) continue;
-        auto segment = glyph_text(row.substr(begin, end - begin));
-        if (aligned && begin >= aligned->first && begin < aligned->second) segment = segment | inverted | bold;
-        for (const auto& style : styles) {
-            if (begin < style.begin || begin >= style.end) continue;
-            if (style.bold) segment = segment | bold;
-            if (style.underline) segment = segment | underlined;
-        }
-        segments.push_back(std::move(segment));
-    }
-    return hbox(std::move(segments));
-}
 
 std::string permission_text(const Entry& entry) {
     std::string result =
@@ -1678,7 +1602,8 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
     std::shared_ptr<const PaletteSet> active_palette;
     std::shared_ptr<const PaletteSet> appearance_original_palette;
     PaletteContext palette_context{PaletteContext::panels};
-    InputHistories input_histories{default_config_path().parent_path() / "input-history"};
+    InputHistories input_histories{default_config_path().parent_path() / "input-history",
+                                  config.history_limit(InputHistories::default_limit)};
     std::optional<Keymap> keymap;
     std::optional<KeymapContext> keymap_prefix;
     Mode keymap_prefix_mode{Mode::panels};
@@ -2238,6 +2163,7 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
             static_cast<void>(named_event(action));
         }
         command_history = config.command_history;
+        if (config.history_limit(1U) == 0U) command_history.clear();
         command_input.history = command_history;
         initialize_input_histories();
         try {
@@ -2287,6 +2213,7 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
         editor_auto_indent = config.editor_auto_indent;
         editor_show_whitespace = config.editor_visible_tabs || config.editor_visible_trailing_spaces;
         editor_history = config.editor_history;
+        if (config.history_limit(1U) == 0U) editor_history.clear();
         initialize_archive_parent(left);
         initialize_archive_parent(right);
         left_location = {};
@@ -5537,8 +5464,27 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
         return active_index;
     }
 
+    void select_panel_pattern(const std::string_view pattern, const bool selected) {
+        if (!config.select_flags.has_value()) {
+            active().select_pattern(pattern, selected);
+            return;
+        }
+        Entry validation;
+        validation.kind = EntryKind::file;
+        static_cast<void>(config.selection_matches(validation, pattern));
+        auto& pane = active();
+        std::vector<std::string> paths;
+        for (const auto& entry : pane.entries()) {
+            if (config.selection_matches(entry, pattern) || (selected && pane.is_selected(entry))) {
+                paths.push_back(entry.path);
+            }
+        }
+        if (selected) pane.select_paths(paths);
+        else pane.unmark_paths(paths);
+    }
+
     void store_panel_options_in_config() {
-        config.command_history = command_history;
+        if (config.history_limit(1U) != 0U) config.command_history = command_history;
         config.show_hidden = left.show_hidden();
         config.directories_first = left.directories_first();
         config.sort = left.sort_field();
@@ -5596,7 +5542,7 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
         config.editor_indent_width = editor_indent_width;
         config.editor_auto_indent = editor_auto_indent;
         config.editor_show_whitespace = config.editor_visible_tabs && config.editor_visible_trailing_spaces;
-        config.editor_history = editor_history;
+        if (config.history_limit(1U) != 0U) config.editor_history = editor_history;
         remember_editor_position(editor);
         for (const auto& buffer : editor_buffers) remember_editor_position(buffer);
         store_viewer_positions_in_config();
@@ -5966,9 +5912,11 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
             labels.push_back("[Edit] " + path);
             files.emplace_back(true, path);
         }
-        for (const auto& path : config.viewer_history) {
-            labels.push_back("[View] " + path);
-            files.emplace_back(false, path);
+        if (config.history_limit(1U) != 0U) {
+            for (const auto& path : config.viewer_history) {
+                labels.push_back("[View] " + path);
+                files.emplace_back(false, path);
+            }
         }
         show_local_list("History", std::move(labels),
             [this](const std::size_t index) {
@@ -6038,10 +5986,12 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
             return;
         } else if (local_history_kind == 1) {
             command_history.clear();
+            config.command_history.clear();
             command_input.history.clear();
             command_input.history_index = 0;
         } else {
             editor_history.clear();
+            config.editor_history.clear();
             config.viewer_history.clear();
             local_history_files.clear();
         }
@@ -6278,9 +6228,12 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
         }
         install_viewer_session(std::move(next), replace);
         const auto location = archives.format(provider, path);
-        std::erase(config.viewer_history, location);
-        config.viewer_history.insert(config.viewer_history.begin(), location);
-        if (config.viewer_history.size() > 20U) config.viewer_history.resize(20U);
+        const auto limit = config.history_limit(20U);
+        if (limit != 0U) {
+            std::erase(config.viewer_history, location);
+            config.viewer_history.insert(config.viewer_history.begin(), location);
+            if (config.viewer_history.size() > limit) config.viewer_history.resize(limit);
+        }
     }
 
     bool refresh_viewer() {
@@ -6316,9 +6269,12 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
         const auto result = run_process(command, false, provider->parent(path));
         mode = return_mode;
         if (result != 0) throw std::runtime_error("external viewer exited " + std::to_string(result));
-        std::erase(config.viewer_history, path);
-        config.viewer_history.insert(config.viewer_history.begin(), path);
-        if (config.viewer_history.size() > 20U) config.viewer_history.resize(20U);
+        const auto limit = config.history_limit(20U);
+        if (limit != 0U) {
+            std::erase(config.viewer_history, path);
+            config.viewer_history.insert(config.viewer_history.begin(), path);
+            if (config.viewer_history.size() > limit) config.viewer_history.resize(limit);
+        }
         status = "Viewer closed";
     }
 
@@ -7772,8 +7728,7 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
     }
 
     ftxui::Element paint(ftxui::Element element, const SkinPair& colors) const {
-        if (colors.explicit_style) return std::make_shared<SkinPaint>(std::move(element), colors);
-        return std::move(element) | ftxui::color(colors.foreground) | ftxui::bgcolor(colors.background);
+        return detail::paint_skin_style(std::move(element), colors);
     }
 
     ftxui::Element title_label(
@@ -9646,11 +9601,13 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
         if (!input.history_id.empty()) {
             input_histories.remember(input.history_id, value);
             input.history = input_histories.history(input.history_id);
-        } else if (!value.empty() &&
+        } else if (config.history_limit(100U) != 0U && !value.empty() &&
             (input.history.empty() || input.history.back() != value)) {
             input.history.push_back(value);
-            if (input.history.size() > 100U) {
-                input.history.erase(input.history.begin());
+            const auto limit = config.history_limit(100U);
+            if (input.history.size() > limit) {
+                input.history.erase(input.history.begin(),
+                    input.history.begin() + static_cast<std::ptrdiff_t>(input.history.size() - limit));
             }
         }
         input.history_index = input.history.size();
@@ -10522,7 +10479,14 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
             return;
         }
         const auto command = command_line;
-        command_history.push_back(command);
+        const auto history_limit = config.history_limit(std::numeric_limits<std::size_t>::max());
+        if (history_limit != 0U) {
+            command_history.push_back(command);
+            if (command_history.size() > history_limit) {
+                command_history.erase(command_history.begin(),
+                    command_history.begin() + static_cast<std::ptrdiff_t>(command_history.size() - history_limit));
+            }
+        }
         command_input.history = command_history;
         command_line.clear();
         command_input.reset(command_line);
@@ -10703,11 +10667,11 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
                     run_viewer_search(true, false);
                     return;
                 case PromptAction::select_pattern:
-                    active().select_pattern(prompt_value, true);
+                    select_panel_pattern(prompt_value, true);
                     status = "Selection updated";
                     break;
                 case PromptAction::unselect_pattern:
-                    active().select_pattern(prompt_value, false);
+                    select_panel_pattern(prompt_value, false);
                     status = "Selection updated";
                     break;
                 case PromptAction::editor_open:
@@ -11198,7 +11162,8 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
                 line = hbox(std::move(parts));
             }
             if (!viewer.hex()) {
-                line = render_viewer_text(row, viewer.text_highlight(index), viewer.text_styles(index));
+                line = detail::render_viewer_text(
+                    palette(), row, viewer.text_highlight(index), viewer.text_styles(index));
             }
             if (!line) {
                 line = text(
@@ -12645,7 +12610,10 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
             if (first + row < lines.size()) {
                 const auto& source = lines[first + row];
                 line = text(source.text);
-                if (source.heading) line = std::move(line) | bold;
+                if (source.heading && !source.link) {
+                    line = detail::help_text_style(
+                        std::move(line), palette(), detail::HelpTextStyle::bold);
+                }
                 if (source.link) {
                     help_row_links[row] = source.link;
                     const auto selected = source.link == help_browser->selected_link();
@@ -12660,11 +12628,11 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
         }
         const auto last = std::min(lines.size(), first + rows);
         body.push_back(separator());
-        body.push_back(text(help_message.empty() ?
+        body.push_back(detail::help_text_style(text(help_message.empty() ?
             " Lines " + std::to_string(first + 1U) + "-" + std::to_string(last) +
             "/" + std::to_string(lines.size()) + "   " +
             (help_browser->can_go_back() ? "F3: previous page" : "Tab: links") :
-            " " + display_text(help_message)) | xflex);
+            " " + display_text(help_message)), palette(), detail::HelpTextStyle::italic) | xflex);
         body.push_back(separator());
         Elements keys;
         static const std::array<std::string, 4> labels{"1 Help", "2 Index", "3 Prev", "10 Quit"};
@@ -12673,7 +12641,9 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
                                 reflect(help_key_boxes[index]), palette().key_label));
         }
         body.push_back(hbox(std::move(keys)));
-        return paint(window(text(" mcpp help: " + std::string(help_page(help_browser->topic()).title) + " ") | bold,
+        return paint(window(detail::help_text_style(
+                                text(" mcpp help: " + std::string(help_page(help_browser->topic()).title) + " "),
+                                palette(), detail::HelpTextStyle::bold),
                             vbox(std::move(body))), palette().normal) |
                size(WIDTH, EQUAL, width) | size(HEIGHT, EQUAL, height);
     }
@@ -14164,8 +14134,9 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
         Elements rows;
         const auto lines = quick_viewer.lines(content_width, content_height);
         for (std::size_t index = 0; index < lines.size(); ++index) {
-            rows.push_back(render_viewer_text(
-                lines[index], quick_viewer.text_highlight(index), quick_viewer.text_styles(index)
+            rows.push_back(detail::render_viewer_text(
+                active_palette->viewer, lines[index],
+                quick_viewer.text_highlight(index), quick_viewer.text_styles(index)
             ));
         }
         auto title =
@@ -15454,6 +15425,7 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
 
     void show_viewer_history() {
         std::vector<std::string> paths = config.viewer_history;
+        if (config.history_limit(1U) == 0U) paths.clear();
         show_local_list("History", paths, [this, paths](const std::size_t selected) {
             const auto location = resolve_location(paths.at(selected));
             viewer_navigation_provider = location.provider;
@@ -15944,10 +15916,12 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
         if (path.empty()) {
             return;
         }
+        const auto limit = config.history_limit(20U);
+        if (limit == 0U) return;
         std::erase(editor_history, path);
         editor_history.insert(editor_history.begin(), path);
-        if (editor_history.size() > 20U) {
-            editor_history.resize(20U);
+        if (editor_history.size() > limit) {
+            editor_history.resize(limit);
         }
     }
 
@@ -16182,6 +16156,7 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
             : provider->parent(path);
         next.set_tab_width(editor.tab_width());
         next.set_behavior(editor_behavior());
+        if (config.editor_filesize_threshold) next.set_file_size_threshold(*config.editor_filesize_threshold);
         if (editor.open()) {
             next.fullscreen = editor.fullscreen;
             next.window_x = editor.window_x;

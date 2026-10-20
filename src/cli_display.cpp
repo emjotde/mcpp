@@ -24,6 +24,7 @@ struct ColorRole {
     bool foreground_only{false};
     SkinPair Skin::*fallback{&Skin::normal};
     ftxui::Color Skin::*fallback_foreground{nullptr};
+    unsigned fallback_attributes{0};
 };
 
 constexpr std::array roles{
@@ -59,8 +60,16 @@ constexpr std::array roles{
     ColorRole{"editlinestate", "editor", "editlinestate", CliPaletteContext::editor,
               nullptr, nullptr, false, &Skin::normal, &Skin::dim},
     ColorRole{"viewnormal", "viewer", "_default_", CliPaletteContext::viewer, &Skin::normal},
+    ColorRole{"viewbold", "viewer", "viewbold", CliPaletteContext::viewer,
+              nullptr, nullptr, false, &Skin::normal, nullptr, SkinPair::bold},
+    ColorRole{"viewunderline", "viewer", "viewunderline", CliPaletteContext::viewer,
+              nullptr, nullptr, false, &Skin::normal, nullptr, SkinPair::underline},
     ColorRole{"viewselected", "viewer", "viewselected", CliPaletteContext::viewer, &Skin::viewer_cursor},
     ColorRole{"helpnormal", "help", "_default_", CliPaletteContext::help, &Skin::normal},
+    ColorRole{"helpbold", "help", "helpbold", CliPaletteContext::help,
+              nullptr, nullptr, false, &Skin::normal, nullptr, SkinPair::bold},
+    ColorRole{"helpitalic", "help", "helpitalic", CliPaletteContext::help,
+              nullptr, nullptr, false, &Skin::normal, nullptr, SkinPair::italic},
     ColorRole{"helplink", "help", "helplink", CliPaletteContext::help},
     ColorRole{"helpslink", "help", "helpslink", CliPaletteContext::help, &Skin::selected},
 };
@@ -198,6 +207,7 @@ void apply_cli_colors(
                 pair = *found;
             } else if (!role.pair && !role.foreground) {
                 pair = skin_color(skin, role.section, role.key, pair);
+                pair.attributes |= role.fallback_attributes;
             }
             apply_pair(pair, override);
             skin.colors[std::string(role.section)][std::string(role.key)] = pair;

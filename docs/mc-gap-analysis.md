@@ -328,8 +328,12 @@ Four further keys now affect the real controls: double-click milliseconds,
 tagged-directory F3 confirmation, `file`-based type guessing and the copy/move
 attribute-preservation default. Native controls established their meanings;
 absent keys retain legacy behavior and invalid values preserve prior settings.
-History limits, editor size thresholds, selection flags and `[Colors]` remain
-pending.
+History limits, editor size thresholds and selection flags now reach their
+actual history, editor-candidate and selection controls. Zero history disables
+use/recording without erasing disk data; `1K` means 1024 bytes and zero threshold
+warns for nonempty files. Absent keys keep the prior limits and 64 MiB approval
+behavior; declining or stale approval retains the current draft. Native
+selection-mask choices apply to real matches. `[Colors]` remains pending.
 
 Local user/editor menus now load native conditions, command blocks, prompts,
 pane/editor macros and view/cd directives, while retaining legacy menu rows.
@@ -338,8 +342,11 @@ quotes, arithmetic and heredocs. Ordinary values remain literal rather than
 becoming shell source. Named homes and CDPATH use a captured provider/directory;
 relative archive paths do not search the host filesystem. **L20 remains partial**
 against the original complete-expansion target: ordinary arithmetic values are
-decimal or hexadecimal literals only, nested old-style backticks and `case`
-substitutions remain unsupported, and unsafe or unsupported heredoc forms fail explicitly.
+decimal or hexadecimal literals only, nested old-style backticks and extended
+case patterns remain unsupported, and unsafe or unsupported heredoc forms fail
+explicitly. Standard `case` lists inside modern command substitutions now
+balance patterns, alternatives, nested cases and Bash fallthrough while keeping
+ordinary macro values literal. Requirements and expansion use the same scanner.
 
 External `Syntax` registries and definitions now feed the actual editor chooser
 and color renderer, with transactional reload, saved selections and legacy-file
@@ -400,8 +407,12 @@ dialog/error title and error-focus pairs. Inactive menus accept their complete
 pair while omitted fields preserve the current background and disabled contrast.
 Native skins and CLI overrides share color/attribute parsing, including hex RGB
 and `inverse`. The earlier `errdhotfocus` alias still paints the whole focus;
-independent mnemonic/input/window/viewer/help roles without widget consumers
-remain explicit errors. Native INI `[Colors]` is separate pending work.
+independent mnemonic/input/editor-window roles without widget consumers remain
+explicit errors. Formatted viewer/Quick view text now consumes `viewbold` and
+`viewunderline`, and original help headings/title/navigation use `helpbold` and
+`helpitalic`. Full pairs and explicit attributes are respected; missing roles
+retain prior emphasis, search colors win over nroff styles, and selected help
+links keep their styling. Native INI `[Colors]` is separate pending work.
 
 PCRE2 is an explicitly approved dependency. Native menu conditions, extension
 rules, syntax-registry expressions and filename highlighting now use its Unicode,

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <filesystem>
 #include <map>
 #include <string>
@@ -10,7 +11,8 @@ namespace mcpp {
 
 class InputHistories {
 public:
-    explicit InputHistories(std::filesystem::path path);
+    static constexpr std::size_t default_limit = 100U;
+    explicit InputHistories(std::filesystem::path path, std::size_t limit = default_limit);
 
     void load();
     [[nodiscard]] const std::vector<std::string>& history(std::string_view id) const;
@@ -25,6 +27,7 @@ private:
     void update(std::string_view id, std::string_view value, Change change);
 
     std::filesystem::path path_;
+    std::size_t limit_;
     Histories histories_;
 };
 

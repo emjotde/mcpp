@@ -379,6 +379,211 @@ struct CommandMacros {
     std::vector<HereDocument> heredocs;
 };
 
+class SubstitutionCases {
+public:
+    explicit SubstitutionCases(const bool enabled) : enabled_(enabled) {}
+
+    [[nodiscard]] bool enabled() const { return enabled_; }
+    [[nodiscard]] bool word_started() const { return word_started_; }
+
+    void literal(const char character) {
+        if (!enabled_) return;
+        word_started_ = true;
+        word_ += character;
+    }
+
+    void quoted() {
+        if (!enabled_) return;
+        word_started_ = true;
+        literal_word_ = false;
+    }
+
+    void finish_word(const bool redirection = false) {
+        if (!enabled_ || !word_started_) return;
+        const auto word = std::move(word_);
+        word_.clear();
+        const bool literal_word = literal_word_;
+        word_started_ = false;
+        literal_word_ = true;
+        if (redirection_word_) {
+            redirection_word_ = false;
+            return;
+        }
+        if (conditional_) {
+            if (literal_word && word == "]]") conditional_ = false;
+            command_start_ = false;
+            return;
+        }
+        if (!cases_.empty()) {
+            auto& current = cases_.back();
+            if (current.phase == Phase::subject) {
+                current.phase = Phase::in;
+                return;
+            }
+            if (current.phase == Phase::in) {
+                if (!literal_word || word != "in") {
+                    throw std::invalid_argument("a menu substitution case needs a literal in keyword");
+                }
+                current.phase = Phase::pattern;
+                return;
+            }
+            if (current.phase == Phase::pattern) {
+                if (literal_word && word == "esac" && !current.pattern &&
+                    !current.opening && !current.alternative) {
+                    cases_.pop_back();
+                    command_start_ = true;
+                } else {
+                    if (current.pattern) {
+                        throw std::invalid_argument("a menu substitution case pattern needs | or )");
+                    }
+                    current.pattern = true;
+                }
+                return;
+            }
+        }
+        if (redirection && literal_word && std::ranges::all_of(word, [](const unsigned char character) {
+                return character >= '0' && character <= '9';
+            })) return;
+        if (function_name_) {
+            function_name_ = false;
+            command_start_ = true;
+            return;
+        }
+        if (time_option_) {
+            time_option_ = false;
+            if (literal_word && word == "-p") {
+                command_start_ = true;
+                return;
+            }
+        }
+        if (coproc_name_) {
+            coproc_name_ = false;
+            if (!literal_word || (word != "case" && word != "if" && word != "while" &&
+                                 word != "until" && word != "for" && word != "select" &&
+                                 word != "function" && word != "coproc" && word != "time" &&
+                                 word != "!" && word != "{" && word != "[[")) {
+                command_start_ = true;
+                return;
+            }
+        }
+        if (!command_start_) return;
+        if (literal_word && word == "case") {
+            cases_.push_back({Phase::subject, groups_});
+            command_start_ = false;
+        } else if (literal_word && word == "esac" && !cases_.empty() &&
+                   cases_.back().groups == groups_) {
+            cases_.pop_back();
+            command_start_ = true;
+        } else {
+            function_name_ = literal_word && word == "function";
+            coproc_name_ = literal_word && word == "coproc";
+            time_option_ = literal_word && word == "time";
+            conditional_ = literal_word && word == "[[";
+            command_start_ = literal_word &&
+                (word == "if" || word == "then" || word == "elif" || word == "else" ||
+                 word == "while" || word == "until" || word == "do" ||
+                 word == "!" || word == "time" || word == "{" ||
+                 word == "}" || word == "fi" || word == "done" ||
+                 word == "function" || word == "coproc");
+        }
+    }
+
+    std::size_t operation(const std::string_view remaining) {
+        if (!enabled_) return 0U;
+        const auto character = remaining.front();
+        if (character == '\n') {
+            if (!conditional_ && (cases_.empty() || cases_.back().phase == Phase::body)) {
+                command_start_ = true;
+            }
+            return 0U;
+        }
+        if (std::string_view(";&|()<>").find(character) == std::string_view::npos) return 0U;
+        function_name_ = false;
+        coproc_name_ = false;
+        time_option_ = false;
+        if (conditional_ && character != '(' && character != ')') return 1U;
+        if (!cases_.empty()) {
+            auto& current = cases_.back();
+            if (current.phase == Phase::subject || current.phase == Phase::in) unfinished();
+            if (current.phase == Phase::pattern) {
+                if (character == '(' && !current.pattern && !current.opening && !current.alternative) {
+                    current.opening = true;
+                } else if (character == '|' && current.pattern) {
+                    current.pattern = false;
+                    current.alternative = true;
+                } else if (character == ')' && current.pattern) {
+                    current.phase = Phase::body;
+                    command_start_ = true;
+                } else {
+                    throw std::invalid_argument("invalid or unsupported menu substitution case pattern");
+                }
+                return 1U;
+            }
+            if (character == ';' && (remaining.starts_with(";;") || remaining.starts_with(";&"))) {
+                if (current.groups != groups_) unfinished();
+                current.phase = Phase::pattern;
+                current.pattern = false;
+                current.opening = false;
+                current.alternative = false;
+                return remaining.starts_with(";;&") ? 3U : 2U;
+            }
+        }
+        if (character == '(') {
+            command_start_ = !remaining.starts_with("((");
+            redirection_word_ = false;
+            if (command_start_) ++groups_;
+        } else if (character == ')') {
+            if (!cases_.empty() && cases_.back().groups == groups_) unfinished();
+            if (groups_ != 0U) --groups_;
+            command_start_ = true;
+            redirection_word_ = false;
+        } else if (character == '<' || character == '>') {
+            redirection_word_ = !remaining.starts_with("<<") || remaining.starts_with("<<<");
+            if (remaining.starts_with("<<")) return 0U;
+            return remaining.starts_with(">>") || remaining.starts_with("<&") ||
+                remaining.starts_with(">&") || remaining.starts_with("<>") ||
+                remaining.starts_with(">|") ? 2U : 1U;
+        } else {
+            command_start_ = true;
+            redirection_word_ = false;
+            return 1U;
+        }
+        return 0U;
+    }
+
+    void finish() {
+        finish_word();
+        if (!cases_.empty()) unfinished();
+    }
+
+private:
+    enum class Phase { subject, in, pattern, body };
+    struct Case {
+        Phase phase;
+        std::size_t groups;
+        bool pattern{false};
+        bool opening{false};
+        bool alternative{false};
+    };
+
+    bool enabled_;
+    bool command_start_{true};
+    bool redirection_word_{false};
+    bool function_name_{false};
+    bool coproc_name_{false};
+    bool time_option_{false};
+    bool conditional_{false};
+    bool word_started_{false};
+    bool literal_word_{true};
+    std::size_t groups_{0};
+    std::string word_;
+    std::vector<Case> cases_;
+
+    [[noreturn]] static void unfinished() {
+        throw std::invalid_argument("unfinished case statement in menu command substitution");
+    }
+};
+
 class MacroScanner {
 public:
     explicit MacroScanner(const std::string_view command) : command_(command) {}
@@ -494,11 +699,13 @@ private:
         ShellQuote quote = ShellQuote::none;
         std::size_t parentheses = closing == ')' ? (arithmetic ? 2U : 1U) : closing == ']' ? 1U : 0U;
         std::vector<HereDocument> pending;
+        SubstitutionCases cases(closing == ')' && !arithmetic);
         while (index_ < command_.size()) {
             const auto character = command_[index_];
             if (character == '\\' && quote != ShellQuote::single) {
                 ++index_;
                 if (index_ == command_.size()) throw std::invalid_argument("unfinished shell escape in user-menu command");
+                if (command_[index_] != '\n') cases.quoted();
                 if (backticks != 0U && command_[index_] == '`') {
                     throw std::invalid_argument("nested escaped menu backticks are unavailable; use $(...) instead");
                 }
@@ -508,6 +715,7 @@ private:
             }
             if (character == '`' && (backticks != 0U ||
                                     (quote != ShellQuote::single && quote != ShellQuote::ansi))) {
+                cases.quoted();
                 ++index_;
                 if (closing == '`') {
                     if (quote != ShellQuote::none || !pending.empty()) {
@@ -522,17 +730,20 @@ private:
             if (character == '$' && quote != ShellQuote::single && quote != ShellQuote::ansi &&
                 index_ + 1U < command_.size()) {
                 if (command_[index_ + 1U] == '(') {
+                    cases.quoted();
                     const bool nested_arithmetic = index_ + 2U < command_.size() && command_[index_ + 2U] == '(';
                     index_ += nested_arithmetic ? 3U : 2U;
                     shell(')', nested_arithmetic, backticks, depth + 1U);
                     continue;
                 }
                 if (command_[index_ + 1U] == '[') {
+                    cases.quoted();
                     index_ += 2U;
                     shell(']', true, backticks, depth + 1U);
                     continue;
                 }
                 if (command_[index_ + 1U] == '\'' && quote == ShellQuote::none) {
+                    cases.quoted();
                     quote = ShellQuote::ansi;
                     index_ += 2U;
                     continue;
@@ -540,17 +751,26 @@ private:
             }
             if ((character == '\'' && (quote == ShellQuote::none || quote == ShellQuote::single || quote == ShellQuote::ansi)) ||
                 (character == '"' && (quote == ShellQuote::none || quote == ShellQuote::double_quote))) {
+                cases.quoted();
                 quote = quote == ShellQuote::none
                     ? (character == '\'' ? ShellQuote::single : ShellQuote::double_quote) : ShellQuote::none;
                 ++index_;
                 continue;
             }
             if (quote == ShellQuote::none) {
+                if (blank(character) || std::string_view(";&|()<>").find(character) != std::string_view::npos) {
+                    cases.finish_word(character == '<' || character == '>');
+                }
                 if (character == '#' && !arithmetic &&
-                    (index_ == 0U || blank(command_[index_ - 1U]) ||
-                     std::string_view(";|&()").find(command_[index_ - 1U]) != std::string_view::npos)) {
+                    (cases.enabled() ? !cases.word_started() :
+                     (index_ == 0U || blank(command_[index_ - 1U]) ||
+                      std::string_view(";|&()").find(command_[index_ - 1U]) != std::string_view::npos))) {
                     const auto newline = command_.find('\n', index_);
                     index_ = newline == std::string_view::npos ? command_.size() : newline;
+                    continue;
+                }
+                if (const auto length = cases.operation(command_.substr(index_)); length != 0U) {
+                    index_ += length;
                     continue;
                 }
                 if (character == '\n' && !pending.empty()) {
@@ -572,11 +792,6 @@ private:
                     shell(')', true, backticks, depth + 1U);
                     continue;
                 }
-                if (closing == ')' && !arithmetic && command_.substr(index_).starts_with("case") &&
-                    (index_ == 0U || blank(command_[index_ - 1U]) || command_[index_ - 1U] == '(') &&
-                    index_ + 4U < command_.size() && blank(command_[index_ + 4U])) {
-                    throw std::invalid_argument("case inside a menu command substitution is unavailable; use a separate command block");
-                }
                 if (closing == ')') {
                     if (character == '(') ++parentheses;
                     else if (character == ')' && --parentheses == 0U) {
@@ -592,9 +807,18 @@ private:
                     }
                 }
             }
-            if (character == '%') macro(quote, arithmetic, backticks);
-            else ++index_;
+            if (character == '%') {
+                cases.quoted();
+                macro(quote, arithmetic, backticks);
+            } else {
+                if (quote == ShellQuote::none && !blank(character) &&
+                    std::string_view(";&|()<>").find(character) == std::string_view::npos) {
+                    cases.literal(character);
+                }
+                ++index_;
+            }
         }
+        cases.finish();
         if (closing != '\0' || quote != ShellQuote::none || !pending.empty()) {
             throw std::invalid_argument("unfinished shell quoting or here-document in user-menu command");
         }
@@ -618,8 +842,12 @@ std::string arithmetic_value(const std::string_view value) {
         throw std::invalid_argument("a menu macro in arithmetic must be a decimal or hexadecimal integer; use %0 for a trusted expression");
     }
     const bool negative = value.front() == '-';
+    if (!hexadecimal) {
+        const auto first = number.find_first_not_of('0');
+        number.remove_prefix(first == std::string_view::npos ? number.size() - 1U : first);
+    }
     return "(" + std::string(negative ? "-" : "") +
-        (hexadecimal ? "16#" : "10#") + std::string(number) + ")";
+        (hexadecimal ? "0x" : "") + std::string(number) + ")";
 }
 
 std::string macro_value(const std::string_view value, const LocatedMacro& location) {

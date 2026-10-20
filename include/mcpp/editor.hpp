@@ -80,6 +80,8 @@ public:
     void set_display_position(std::size_t row, std::size_t column);
     void set_behavior(EditorBehavior behavior);
     [[nodiscard]] const EditorBehavior& behavior() const noexcept { return behavior_; }
+    void set_file_size_threshold(std::uint64_t bytes) noexcept { file_size_threshold_ = bytes; }
+    [[nodiscard]] std::uint64_t file_size_threshold() const noexcept { return file_size_threshold_; }
     [[nodiscard]] std::optional<std::pair<std::size_t, std::size_t>> paragraph_rows() const;
     void break_undo_group() noexcept;
     [[nodiscard]] std::size_t byte_size() const noexcept;
@@ -352,6 +354,7 @@ private:
     void restore(Snapshot snapshot);
 
     ProviderPtr provider_;
+    std::uint64_t file_size_threshold_{large_file_threshold};
     std::string path_;
     std::string storage_path_;
     std::string revision_;

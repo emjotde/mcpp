@@ -1,5 +1,6 @@
 #include "mcpp/config.hpp"
 #include "mcpp/config_ini.hpp"
+#include "mcpp/editor_search.hpp"
 #include "mcpp/listing.hpp"
 #include "mcpp/spelling.hpp"
 #include "mcpp/syntax.hpp"
@@ -60,6 +61,25 @@ std::size_t parse_width(
         throw std::runtime_error(std::string(key) + " must be 1 through 32");
     }
     return parsed;
+}
+
+std::uint64_t parse_editor_threshold(std::string_view value) {
+    std::uint64_t multiplier = 1U;
+    if (!value.empty()) {
+        switch (value.back()) {
+            case 'K': multiplier = 1024U; value.remove_suffix(1U); break;
+            case 'M': multiplier = 1024U * 1024U; value.remove_suffix(1U); break;
+            case 'G': multiplier = 1024ULL * 1024ULL * 1024ULL; value.remove_suffix(1U); break;
+            default: break;
+        }
+    }
+    std::uint64_t bytes = 0;
+    const auto parsed = std::from_chars(value.data(), value.data() + value.size(), bytes);
+    if (value.empty() || parsed.ec != std::errc{} || parsed.ptr != value.data() + value.size() ||
+        bytes > std::numeric_limits<std::uint64_t>::max() / multiplier) {
+        throw std::runtime_error("editor_filesize_threshold needs nonnegative bytes or an uppercase K/M/G suffix");
+    }
+    return bytes * multiplier;
 }
 
 std::string sort_name(const SortField field) {
@@ -418,6 +438,13 @@ Config Config::load(const std::filesystem::path& path) {
                 throw std::runtime_error("invalid quick search mode");
             }
             result.quick_search_mode = mode;
+        } else if (key == "select_flags") {
+            unsigned flags = 0;
+            const auto parsed = std::from_chars(value.data(), value.data() + value.size(), flags);
+            if (parsed.ec != std::errc{} || parsed.ptr != value.data() + value.size() || flags > 7U) {
+                throw std::runtime_error("select_flags supports bits 1 (files only), 2 (case sensitive), and 4 (shell patterns)");
+            }
+            result.select_flags = flags;
         } else if (key == "saved_left_path") {
             result.saved_left_path = decode_value(value);
         } else if (key == "saved_right_path") {
@@ -448,14 +475,15 @@ Config Config::load(const std::filesystem::path& path) {
             time.tm_mday = 1;
             static_cast<void>(format_panel_date(format, time));
             (key == "timeformat_recent" ? result.timeformat_recent : result.timeformat_old) = std::move(format);
-        } else if (key == "max_saved_positions") {
+        } else if (key == "max_saved_positions" || key == "num_history_items_recorded") {
             std::size_t limit = 0;
             const auto parsed = std::from_chars(value.data(), value.data() + value.size(), limit);
             if (parsed.ec != std::errc{} || parsed.ptr != value.data() + value.size() ||
                 limit > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
-                throw std::runtime_error("filepos_max_saved_entries must be a nonnegative integer");
+                throw std::runtime_error(key + " must be a nonnegative integer");
             }
-            result.max_saved_positions = limit;
+            if (key == "max_saved_positions") result.max_saved_positions = limit;
+            else result.num_history_items_recorded = limit;
         } else if (key == "escape_timeout" || key == "pause_after_run") {
             int number = 0;
             const auto parsed = std::from_chars(value.data(), value.data() + value.size(), number);
@@ -537,6 +565,8 @@ Config Config::load(const std::filesystem::path& path) {
                 value,
                 key
             );
+        } else if (key == "editor_filesize_threshold") {
+            result.editor_filesize_threshold = parse_editor_threshold(value);
         } else if (key == "editor_indent_width") {
             result.editor_indent_width = parse_width(
                 value,
@@ -684,6 +714,7 @@ Config Config::load(const std::filesystem::path& path) {
         }
         result.editor_wrap_mode = typewriter_wrap ? 2U : paragraph_wrap ? 1U : 0U;
     }
+    result.limit_histories();
     result.source = std::move(loaded);
     return result;
 }
@@ -748,9 +779,11 @@ void Config::save(const std::filesystem::path& path) const {
         output << "copymove_persistent_attr=" << (*copymove_persistent_attr ? "true" : "false") << '\n';
     }
     if (double_click_speed) output << "double_click_speed=" << *double_click_speed << '\n';
+    if (num_history_items_recorded) output << "num_history_items_recorded=" << *num_history_items_recorded << '\n';
     output << "quick_search_mode=" << quick_search_mode << '\n'
            << "saved_left_path=" << encode_value(saved_left_path) << '\n'
            << "saved_right_path=" << encode_value(saved_right_path) << '\n';
+    if (select_flags) output << "select_flags=" << *select_flags << '\n';
     if (current_is_left) output << "current_is_left=" << (*current_is_left ? "true" : "false") << '\n';
     if (other_directory) output << "other_directory=" << encode_value(*other_directory) << '\n';
     output << "viewer_wrap=" << (viewer_wrap ? "true" : "false") << '\n';
@@ -764,6 +797,7 @@ void Config::save(const std::filesystem::path& path) const {
     if (max_saved_positions) output << "max_saved_positions=" << *max_saved_positions << '\n';
     output << "editor_backup_extension=" << encode_value(editor_backup_extension) << '\n'
            << "editor_check_newline=" << (editor_check_newline ? "true" : "false") << '\n';
+    if (editor_filesize_threshold) output << "editor_filesize_threshold=" << *editor_filesize_threshold << '\n';
     output << "reverse_files_only=" << (reverse_files_only ? "true" : "false") << '\n';
     output << "editor_syntax_language=" << editor_syntax_language << '\n';
     output << "editor_spelling_language=" << encode_value(editor_spelling_language) << '\n';
@@ -811,12 +845,20 @@ void Config::save(const std::filesystem::path& path) const {
     for (const auto& bookmark : bookmarks) {
         output << "bookmark=" << encode_value(bookmark) << '\n';
     }
-    for (const auto& history_path : editor_history) {
-        output << "editor_history="
-               << encode_value(history_path) << '\n';
+    const auto saved_history_count = [this](const std::size_t size) {
+        return num_history_items_recorded && *num_history_items_recorded != 0U
+            ? std::min(size, *num_history_items_recorded) : size;
+    };
+    for (std::size_t index = 0; index < saved_history_count(editor_history.size()); ++index) {
+        output << "editor_history=" << encode_value(editor_history[index]) << '\n';
     }
-    for (const auto& file : viewer_history) output << "viewer_history=" << encode_value(file) << '\n';
-    for (const auto& command : command_history) output << "command_history=" << encode_value(command) << '\n';
+    for (std::size_t index = 0; index < saved_history_count(viewer_history.size()); ++index) {
+        output << "viewer_history=" << encode_value(viewer_history[index]) << '\n';
+    }
+    for (auto index = command_history.size() - saved_history_count(command_history.size());
+         index < command_history.size(); ++index) {
+        output << "command_history=" << encode_value(command_history[index]) << '\n';
+    }
     output << "panelize_commands_saved=true\n";
     for (const auto& [label, command] : panelize_commands) {
         output << "panelize_command=" << std::quoted(encode_value(label)) << ' '
@@ -961,6 +1003,32 @@ void Config::set_split_equal(const bool value) {
 std::chrono::milliseconds Config::double_click_timeout() const {
     return std::chrono::milliseconds(
         static_cast<std::chrono::milliseconds::rep>(double_click_speed.value_or(400U)));
+}
+
+std::size_t Config::history_limit(const std::size_t fallback) const noexcept {
+    return num_history_items_recorded.value_or(fallback);
+}
+
+void Config::limit_histories() {
+    // Disabling new records must not erase previously saved history.
+    if (!num_history_items_recorded || *num_history_items_recorded == 0U) return;
+    const auto limit = *num_history_items_recorded;
+    if (editor_history.size() > limit) editor_history.resize(limit);
+    if (viewer_history.size() > limit) viewer_history.resize(limit);
+    if (command_history.size() > limit) {
+        command_history.erase(command_history.begin(),
+            command_history.begin() + static_cast<std::ptrdiff_t>(command_history.size() - limit));
+    }
+}
+
+bool Config::selection_matches(const Entry& entry, const std::string_view pattern) const {
+    if (entry.name == ".." || entry.revision == "mcpp:parent") return false;
+    const auto flags = select_flags.value_or((shell_patterns ? 4U : 0U) | 2U);
+    if ((flags & 1U) != 0U && entry.kind == EntryKind::directory) return false;
+    const bool case_sensitive = (flags & 2U) != 0U;
+    if ((flags & 4U) != 0U) return EditorSearch::filename_matches(entry.name, pattern, case_sensitive);
+    return EditorSearch::find(entry.name, pattern, 0U, 0U, entry.name.size(),
+        {.mode=EditorSearchMode::regular_expression, .case_sensitive=case_sensitive}, false, false).has_value();
 }
 
 std::string Config::format_panel_time(

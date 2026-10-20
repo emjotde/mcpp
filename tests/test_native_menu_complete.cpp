@@ -59,10 +59,12 @@ void output(
     const std::string_view command,
     const mcpp::NativeMenuContext& captured,
     const std::string& expected,
-    const std::vector<std::string>& answers = {}
+    const std::vector<std::string>& answers = {},
+    const std::string_view executable = "/bin/bash"
 ) {
     const auto expanded = mcpp::expand_native_menu(command, captured, answers);
-    const auto result = mcpp::capture_shell(expanded.command, captured.active.directory);
+    const auto result = mcpp::capture_command(
+        {std::string(executable), "-c", expanded.command}, captured.active.directory);
     check(result.status == 0, "expanded shell command failed: " + result.error + "\n" + expanded.command);
     check(result.output == expected, "menu argument bytes changed\n" + expanded.command);
 }
@@ -130,15 +132,18 @@ void contexts(const std::filesystem::path& root) {
 
 void numbers(const std::filesystem::path& root) {
     auto captured = context(root);
-    for (const auto& [value, expected] : std::vector<std::pair<std::string, std::string>>{
-             {"008", "10"}, {"-007", "-5"}, {"0x2a", "44"},
-             {"0Xf", "17"}, {"+0x00Af", "177"}, {"-0Xf", "-13"}}) {
-        captured.active.file = file(value);
-        output("printf '%%s' $((%f+2))", captured, expected);
-        output("printf '%%s' $((%{Integer}+2))", captured, expected, {value});
+    for (const auto* executable : {"/bin/bash", "/bin/dash"}) {
+        for (const auto& [value, expected] : std::vector<std::pair<std::string, std::string>>{
+                 {"008", "10"}, {"-007", "-5"}, {"000", "2"}, {"-000", "2"},
+                 {"+0009", "11"}, {"0x2a", "44"}, {"0Xf", "17"},
+                 {"+0x00Af", "177"}, {"-0Xf", "-13"}}) {
+            captured.active.file = file(value);
+            output("printf '%%s' $((%f+2))", captured, expected, {}, executable);
+            output("printf '%%s' $((%{Integer}+2))", captured, expected, {value}, executable);
+        }
+        captured.active.tagged = {file("0x2a")};
+        output("printf '%%s' $((%t+2))", captured, "44", {}, executable);
     }
-    captured.active.tagged = {file("0x2a")};
-    output("printf '%%s' $((%t+2))", captured, "44");
     for (const auto value : {"0x", "-0x", "0x1g", "0x1+2", "0x$(printf BAD)", "16#f", "3+4"}) {
         captured.active.file = file(value);
         rejects([&] { static_cast<void>(mcpp::expand_native_menu("printf '%%s' $((%f))", captured)); },
@@ -146,6 +151,71 @@ void numbers(const std::filesystem::path& root) {
     }
     captured.active.file = file("3+4");
     output("printf '%%s' $((%0f))", captured, "7");
+}
+
+void cases(const std::filesystem::path& root) {
+    auto captured = context(root);
+    const auto name = captured.active.file->name;
+    output("printf '%%s\\0' \"$(case %f in (%f|other) printf '%%s' %f;; "
+           "(*) printf miss;; esac)\" \"%f\" "
+           "\"$( (case x in x) printf '%%s' %f;; esac); printf '%%s' \"%f\")\" "
+           "\"$(time -p case x in x) printf '%%s' %f;; esac)\" "
+           "\"$(function l20_case { case x in x) printf '%%s' %f;; esac; }; l20_case)\" "
+           "\"$(coproc l20_case case x in x) printf '%%s' %f > case-coproc;; esac; "
+           "wait; cat case-coproc)\" "
+           "\"$(coproc printf '%%s' case; wait; printf '%%s' ordinary)\" "
+           "\"$(if [[ literal == other ||\ncase == other ]]; then printf miss; else "
+           "case x in x) printf '%%s' %f;; esac; fi)\"",
+           captured, nul_values({name, name, name + name, name, name, name, "ordinary", name}));
+    output("printf '%%s\\0' \"$(case ')' in ([\\)]|\\)|'case in esac)') "
+           "printf '%%s' %f;; *) printf miss;; esac)\" "
+           "\"$(printf '%%s' case in esac)\" "
+           "\"$(printf '%%s' 'case in esac ) ;; ;& ;;&')\"",
+           captured, nul_values({name, "caseinesac", "case in esac ) ;; ;& ;;&"}));
+
+    const std::string nested =
+        "printf '%%s\\0' \"$(case \"$(printf '%%s' %f)\"\nin\n"
+        "# case ignored in ) ;; esac %{ignored}\n"
+        "%f) case x in (x) printf '%%s' case in esac "
+        "\"$(case inner in inner) printf '%%s' '%{Pick}';;esac)\";; "
+        "esac;; *) printf '%%s' %b %e %{Other};; esac)\" \"%t\"";
+    const std::string answer = "prompt ' \" ) ;; ;& ;;& esac\n$(printf literal)`literal`\\tail";
+    const auto joined = captured.active.tagged[0].name + " " + captured.active.tagged[1].name + " ";
+    captured.editor = true;
+    captured.block_file = "/captured/block ) esac";
+    captured.error_file = "/captured/error ;;";
+    const auto requirements = mcpp::native_menu_requirements(nested, true);
+    check(requirements.prompts == std::vector<std::string>{"Pick", "Other"} &&
+              requirements.block_file && requirements.error_file,
+          "case requirements must share the expansion scanner and ignore comments");
+    output(nested, captured, nul_values({"caseinesac" + answer, joined}), {answer, "unused"});
+
+    captured.active.file = file("3+4");
+    output("printf '%%s\\0' \"$(case chosen in chosen) printf A ;& "
+           "ignored) printf '%%s' $((%0f)) ;;& chosen) printf C ;; "
+           "*) printf miss ;; esac)\" \"%f$(case empty in esac)%f\" "
+           "\"$(> case; ca\\\nse x i\\\nn x) printf '%%s' %f;; es\\\nac)\" "
+           "\"$(case x in x) cat <<'L20_CASE_LITERAL'\n%f\n"
+           "esac ) ;; ;& ;;&\nL20_CASE_LITERAL\n;; esac)\"",
+           captured, nul_values({"A7C", "3+43+4", "3+4", "3+4\nesac ) ;; ;& ;;&"}));
+
+    for (const auto command : {
+             "printf '%%s' \"$(case x in x) printf %f;;)\"",
+             "printf '%%s' \"$(case x x) printf %f;; esac)\"",
+             "printf '%%s' \"$(case x in (x|) printf %f;; esac)\"",
+             "printf '%%s' \"$(case x in x) case y in y) printf %f;; esac)\"",
+             "printf '%%s' \"$(case x in (x printf %f;; esac)\"",
+             "printf '%%s' \"$(case x in x) printf 'esac';)\"",
+             "printf '%%s' \"$(case x in @(x|y)) printf %f;; esac)\""}) {
+        rejects([&] { static_cast<void>(mcpp::expand_native_menu(command, captured)); },
+                "malformed or unsupported case grammar must fail during expansion");
+        rejects([&] { static_cast<void>(mcpp::native_menu_requirements(command, true)); },
+                "requirements must reject the same malformed case grammar");
+    }
+    rejects([&] {
+        static_cast<void>(mcpp::expand_native_menu(
+            "printf '%%s' \"$(case x in x) printf '%%s' $((%f));; esac)\"", captured));
+    }, "case scanning must not turn ordinary arithmetic macro data into an expression");
 }
 
 void directories(const std::filesystem::path& root) {
@@ -201,7 +271,7 @@ int main(int argc, char** argv) {
         return 1;
     }
     try {
-        check(argc == 3, "usage: native-menu-complete words|contexts|numbers|directories /review/cases/menu-complete-*");
+        check(argc == 3, "usage: native-menu-complete words|contexts|numbers|cases|directories /review/cases/menu-complete-*");
         const auto root = std::filesystem::path(argv[2]).lexically_normal();
         check(root.string().starts_with("/review/cases/menu-complete-"), "invalid disposable menu fixture root");
         std::filesystem::create_directories(root);
@@ -209,6 +279,7 @@ int main(int argc, char** argv) {
         if (selected == "words") words(root);
         else if (selected == "contexts") contexts(root);
         else if (selected == "numbers") numbers(root);
+        else if (selected == "cases") cases(root);
         else if (selected == "directories") directories(root);
         else throw std::invalid_argument("unknown focused menu case");
         std::cout << "PASS native menu " << selected << '\n';

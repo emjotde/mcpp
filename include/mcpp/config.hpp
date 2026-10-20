@@ -11,6 +11,7 @@
 #include <optional>
 #include <map>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -83,6 +84,7 @@ struct Config {
     bool highlight_file_types{true};
     bool highlight_permissions{false};
     std::size_t quick_search_mode{2};
+    std::optional<unsigned> select_flags;
     std::string saved_left_path;
     std::string saved_right_path;
     std::optional<bool> current_is_left;
@@ -97,6 +99,7 @@ struct Config {
     int escape_timeout{1000000};
     std::size_t pause_after_run{1};
     std::optional<std::size_t> double_click_speed;
+    std::optional<std::size_t> num_history_items_recorded;
     bool use_subshell{true};
     std::optional<bool> subshell_override;
     std::string keymap_file;
@@ -132,6 +135,7 @@ struct Config {
     std::size_t editor_tab_width{8};
     std::size_t editor_indent_width{4};
     std::size_t editor_wrap_length{72};
+    std::optional<std::uint64_t> editor_filesize_threshold;
     bool editor_auto_indent{false};
     bool editor_show_whitespace{false};
     bool editor_cursor_after_inserted_block{false};
@@ -186,6 +190,9 @@ struct Config {
     [[nodiscard]] bool split_is_equal() const;
     void set_split_equal(bool value);
     [[nodiscard]] std::chrono::milliseconds double_click_timeout() const;
+    [[nodiscard]] std::size_t history_limit(std::size_t fallback) const noexcept;
+    void limit_histories();
+    [[nodiscard]] bool selection_matches(const Entry& entry, std::string_view pattern) const;
     [[nodiscard]] std::string format_panel_time(
         std::chrono::system_clock::time_point point,
         std::chrono::system_clock::time_point reference = std::chrono::system_clock::now()) const;

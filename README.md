@@ -162,7 +162,9 @@ F3/Left to go back. Arrow/Page keys, Home/End, the wheel, and link clicks naviga
 the page; F10 or Escape returns to the original screen. Key-learning and raw
 key-capture prompts continue to receive F1 rather than opening help.
 The English help is independently written; MC `.hlp` import and full-text
-help search are not implemented.
+help search are not implemented. Native `helpbold` colors style its title and
+headings; `helpitalic` styles its navigation hint. Selected links retain their
+own colors. Explicit native attributes are respected without forcing emphasis.
 
 `Ctrl-X j` lists file-operation jobs. Pause/Resume, Show, and Abort affect only
 the selected job. Inputs, options, conflict answers, and cancellation belong to
@@ -354,6 +356,12 @@ controls confirmation before F3 changes a tagged directory, and
 `use_file_to_guess_type` controls `file`-based extension matching.
 `copymove_persistent_attr` sets the attribute-preservation checkbox default;
 turning it off does not preserve source permissions or timestamps by default.
+`num_history_items_recorded` limits stored histories; zero disables recall and
+recording without erasing existing history data. `editor_filesize_threshold`
+sets the large-file approval size (`1K` is 1024 bytes; zero warns for any nonempty
+file). Without that key, the earlier 64 MiB approval threshold remains.
+`select_flags` initializes the native shell-pattern, case-sensitive and
+files-only selection choices; for example, `6` enables the first two.
 Absent optional native keys retain the earlier mcpp behavior.
 
 Compatibility is partial: unsupported settings are diagnosed and preserved,
@@ -439,9 +447,14 @@ CDPATH. Relative paths use the provider and directory captured before prompts;
 archive-relative paths never search host CDPATH directories.
 Ordinary arithmetic values must be signed decimal or `0x`/`0X` hexadecimal
 integers. Bare digits remain decimal even with leading zeroes; other trusted
-expressions require `%0`. Nested old-style backticks, `case` inside command
-substitutions, unsupported heredoc delimiters, and values that would terminate a heredoc or
-lose tabs with `<<-` fail explicitly. Modern `$(...)` substitutions are supported.
+expressions require `%0`. Literal expansion uses portable decimal/hex syntax,
+not Bash-only base prefixes, so it also works with `sh`/dash.
+Modern `$(...)` substitutions support standard `case`
+lists, alternatives, optional pattern parentheses, nested cases and Bash
+fallthrough (`;&`/`;;&`). Quoted words and ordinary arguments do not become
+structural keywords. Extended-glob case patterns, nested old-style backticks,
+unsupported heredoc delimiters, and values that would terminate a heredoc or
+lose tabs with `<<-` fail explicitly.
 
 ## External syntax definitions
 
@@ -823,6 +836,9 @@ the corresponding installed standard command; missing/failed tools are explicit
 errors. Parsed data is read-only, so hex Save cannot replace a compressed file
 with decompressed bytes. F9 toggles nroff overstrike formatting, including bold
 and underlined text. Formatting and codepages never convert the file on disk.
+Native `viewbold` and `viewunderline` pairs style formatted text in both the
+viewer and Quick view; search highlights take precedence. Missing native roles
+retain the earlier emphasis, while explicit attributes replace that fallback.
 Parsed/formatted data uses private seekable storage instead of the former
 64 MiB memory-buffer limit. Mapping uses owned immutable snapshots, not live
 files that could be truncated underneath it. Advanced searches retain the

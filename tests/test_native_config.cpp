@@ -1,5 +1,8 @@
 #include "mcpp/config.hpp"
+#include "mcpp/editor.hpp"
 #include "mcpp/extension.hpp"
+#include "mcpp/input_history.hpp"
+#include "mcpp/local_provider.hpp"
 
 #include <cstdlib>
 #include <chrono>
@@ -261,6 +264,136 @@ void remaining_four_invalid(const fs::path& root) {
     std::cout << "remaining-four invalid: passed\n";
 }
 
+void remaining_three_native(const fs::path& root) {
+    write(root / "ini", "[Midnight-Commander]\nnum_history_items_recorded=2\n"
+        "editor_filesize_threshold=1K\n[Panels]\nselect_flags=7\n[mcpp]\n"
+        "command_history=one\ncommand_history=two\ncommand_history=three\n"
+        "editor_history=/new\neditor_history=/middle\neditor_history=/old\n"
+        "viewer_history=/view-new\nviewer_history=/view-middle\nviewer_history=/view-old\n");
+    auto config = mcpp::Config::load(root / "ini");
+    require(config.history_limit(100U) == 2U &&
+        config.command_history == std::vector<std::string>{"two", "three"} &&
+        config.editor_history == std::vector<std::string>{"/new", "/middle"} &&
+        config.viewer_history == std::vector<std::string>{"/view-new", "/view-middle"},
+        "native history limit keeps each history's newest records");
+    require(config.editor_filesize_threshold == 1024U && config.select_flags == 7U,
+        "native threshold bytes and verified selection bits are loaded");
+    mcpp::Entry file;
+    file.kind = mcpp::EntryKind::file;
+    file.name = "match-alpha.DAT";
+    mcpp::Entry folder = file;
+    folder.kind = mcpp::EntryKind::directory;
+    require(config.selection_matches(file, "match-*.DAT") &&
+        !config.selection_matches(folder, "match-*.DAT") &&
+        !config.selection_matches(file, "MATCH-*.DAT"), "files, case and glob selection bits apply");
+    config.select_flags = 5U;
+    require(config.selection_matches(file, "MATCH-*.DAT"), "clearing the case bit changes matching");
+    config.select_flags = 2U;
+    require(config.selection_matches(folder, "^match-alpha[.]DAT$") &&
+        !config.selection_matches(file, "^MATCH"), "clearing files/glob bits enables directory regex matching");
+    config.select_flags = 0U;
+    require(config.selection_matches(folder, "^MATCH"), "zero selection flags retain case-insensitive regex matching");
+    config.select_flags = 7U;
+    config.save();
+    const auto restored = mcpp::Config::load(root / "ini");
+    require(restored.select_flags == 7U && restored.editor_filesize_threshold == 1024U &&
+        restored.command_history == config.command_history, "three native settings survive saving");
+    mcpp::InputHistories histories(root / "input-history", config.history_limit(100U));
+    histories.load();
+    for (const auto* value : {"one", "two", "three"}) histories.remember("test", value);
+    require(histories.history("test") == std::vector<std::string>{"two", "three"},
+        "history model records only the configured newest entries");
+    const auto saved = read(root / "input-history");
+    mcpp::InputHistories disabled(root / "input-history", 0U);
+    disabled.load();
+    disabled.remember("test", "not-recorded");
+    require(disabled.history("test").empty() && read(root / "input-history") == saved,
+        "zero disables history use and recording without erasing existing disk data");
+    auto provider = std::make_shared<mcpp::LocalProvider>();
+    write(root / "small", std::string(17U, 'x'));
+    mcpp::EditorModel editor;
+    editor.set_file_size_threshold(16U);
+    std::optional<mcpp::Entry> approval;
+    try {
+        editor.open(provider, (root / "small").string());
+    } catch (const mcpp::EditorLargeFileConfirmationRequired& required) {
+        approval = required.file();
+    }
+    require(approval && approval->size == 17U && !editor.open(), "small configured threshold requires approval");
+    editor.open(provider, (root / "small").string(), {}, approval);
+    require(editor.text() == std::string(17U, 'x'), "matching approval permits the small file");
+    std::cout << "remaining-three native: passed\n";
+}
+
+void remaining_three_legacy(const fs::path& root) {
+    write(root / "config", "theme=forest\ncommand_history=one\ncommand_history=two\n"
+        "command_history=three\neditor_history=/new\neditor_history=/middle\neditor_history=/old\n"
+        "future_flat=literal\\q\n");
+    auto config = mcpp::Config::load(root / "config");
+    require(!config.num_history_items_recorded && !config.editor_filesize_threshold && !config.select_flags &&
+        config.history_limit(20U) == 20U && config.command_history.size() == 3U &&
+        config.editor_history.size() == 3U, "absent keys preserve legacy history and selection behavior");
+    mcpp::EditorModel editor;
+    require(editor.file_size_threshold() == 64U * 1024U * 1024U,
+        "absent threshold preserves the 64 MiB approval policy");
+    config.save();
+    const auto raw = read(root / "config");
+    require(raw.find("num_history_items_recorded=") == std::string::npos &&
+        raw.find("editor_filesize_threshold=") == std::string::npos &&
+        raw.find("select_flags=") == std::string::npos &&
+        raw.find("future_flat=literal\\q") != std::string::npos, "legacy saving preserves absence and unknown data");
+    const auto restored = mcpp::Config::load(root / "config");
+    require(restored.command_history == config.command_history &&
+        restored.editor_history == config.editor_history, "legacy histories are neither capped nor duplicated implicitly");
+    std::cout << "remaining-three legacy: passed\n";
+}
+
+void remaining_three_invalid(const fs::path& root) {
+    write(root / "good", "theme=forest\nnum_history_items_recorded=2\n"
+        "editor_filesize_threshold=16\nselect_flags=7\n");
+    auto retained = mcpp::Config::load(root / "good");
+    for (const auto& [key, value] : {
+             std::pair{"num_history_items_recorded", "-1"},
+             std::pair{"editor_filesize_threshold", "1X"}, std::pair{"select_flags", "8"}}) {
+        const auto section = std::string(key) == "select_flags" ? "Panels" : "Midnight-Commander";
+        const auto invalid = std::string("[") + section + "]\n" + key + '=' + value + '\n';
+        write(root / "ini", invalid);
+        std::string diagnostic;
+        try {
+            retained = mcpp::Config::load(root / "ini");
+        } catch (const std::exception& error) {
+            diagnostic = error.what();
+        }
+        require(diagnostic.find(std::string("ini:2: [") + section + "] " + key) != std::string::npos,
+            "invalid three-key values identify the resource and option");
+        require(retained.theme == "forest" && retained.history_limit(100U) == 2U &&
+            retained.editor_filesize_threshold == 16U && retained.select_flags == 7U &&
+            read(root / "ini") == invalid, "invalid values change neither accepted preferences nor source bytes");
+    }
+    auto provider = std::make_shared<mcpp::LocalProvider>();
+    write(root / "small", std::string(17U, 'x'));
+    mcpp::EditorModel editor;
+    editor.create(provider, "");
+    editor.insert("retained");
+    editor.set_file_size_threshold(16U);
+    std::optional<mcpp::Entry> approval;
+    try {
+        editor.open(provider, (root / "small").string());
+    } catch (const mcpp::EditorLargeFileConfirmationRequired& required) {
+        approval = required.file();
+    }
+    require(approval && editor.text() == "retained", "confirmation retains the previous editor buffer");
+    write(root / "small", std::string(18U, 'y'));
+    bool rejected = false;
+    try {
+        editor.open(provider, (root / "small").string(), {}, approval);
+    } catch (const mcpp::EditorLargeFileConfirmationRequired&) {
+        rejected = true;
+    }
+    require(rejected && editor.text() == "retained", "configured thresholds do not bypass stale approval checks");
+    std::cout << "remaining-three invalid: passed\n";
+}
+
 }  // namespace
 
 int main(const int argc, char** argv) {
@@ -275,6 +408,10 @@ int main(const int argc, char** argv) {
             remaining_four_native(root / "native");
             remaining_four_legacy(root / "legacy");
             remaining_four_invalid(root / "invalid");
+        } else if (selected == "remaining-three") {
+            remaining_three_native(root / "native");
+            remaining_three_legacy(root / "legacy");
+            remaining_three_invalid(root / "invalid");
         }
         else throw std::runtime_error("unknown native configuration case");
         std::cout << selected << ": passed\n";

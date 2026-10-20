@@ -163,7 +163,7 @@ void EditorModel::open(
     if (entry.kind != EntryKind::file) {
         throw std::runtime_error("editor requires a regular file");
     }
-    if (entry.size > large_file_threshold &&
+    if (entry.size > file_size_threshold_ &&
         (!large_file_approval || large_file_approval->path != entry.path ||
          large_file_approval->revision != entry.revision || large_file_approval->size != entry.size)) {
         throw EditorLargeFileConfirmationRequired(entry);

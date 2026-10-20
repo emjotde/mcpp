@@ -42,6 +42,56 @@ def numbers(root):
     print(json.dumps(results, indent=2))
 
 
+def cases(root):
+    left, right, ui = root / "left", root / "right", root / "ui"
+    left.mkdir()
+    right.mkdir()
+    (left / "chosen").write_text("case fixture\n")
+    commands = {
+        "basic": ("$(case %f in (chosen|other) printf basic;; "
+                  "(*) printf miss;; esac)", b"basic\0"),
+        "patterns": ("$(case ')' in [\\)]|\\)|'case in esac)') printf patterns;; "
+                     "*) printf miss;; esac)", b"patterns\0"),
+        "nested": ("$(case \"$(printf '%%s' %f)\" in chosen) "
+                   "case x in (x) printf '%%s' case in esac "
+                   "\"$(case inner in inner) printf nested;;esac)\";; "
+                   "esac;; esac)", b"caseinesacnested\0"),
+        "fallthrough": ("$(case %f in chosen) printf A ;& "
+                        "ignored) printf B ;;& chosen) printf C ;; "
+                        "*) printf miss ;; esac)", b"ABC\0"),
+    }
+    menu = "c Record command substitution cases\n    /bin/bash <<'L20_CASE_BASH'\n"
+    for name, (command, _) in commands.items():
+        menu += "    printf '%%s\\0' \"" + command + "\" > " + str(root / (name + ".bin")) + "\n"
+    menu += "    printf done > " + str(root / "done") + "\n    L20_CASE_BASH\n"
+    (left / ".mc.menu").write_text(menu)
+    config = ui / "config/mc"
+    config.mkdir(parents=True)
+    (config / "ini").write_text(
+        "[Midnight-Commander]\npause_after_run=0\nconfirm_exit=0\n"
+        "show_dot_files=0\n"
+    )
+    os.environ["LD_LIBRARY_PATH"] = "/review/control/lib"
+    with TerminalSession("/review/control/mc", "/usr/bin/tmux", ui,
+                         ["-u", left, right]) as terminal:
+        terminal.record_output()
+        terminal.wait_for("chosen")
+        terminal.press("End", "F2")
+        terminal.wait_for("Record command substitution cases")
+        terminal.press("c")
+        terminal.wait_file(root / "done", b"done")
+        for name, (_, expected) in commands.items():
+            terminal.wait_file(root / (name + ".bin"), expected)
+        terminal.wait_idle()
+        terminal.save("native-case-substitutions")
+    results = {
+        name: (root / (name + ".bin")).read_bytes().decode()
+        for name in commands
+    }
+    (root / "observations.json").write_text(json.dumps(results, indent=2) + "\n")
+    print(json.dumps(results, indent=2))
+
+
 def main():
     if (os.geteuid() != 1001 or not Path("/.dockerenv").is_file() or
             not Path("/review/.operation-regressions-disposable").is_file()):
@@ -51,9 +101,12 @@ def main():
         raise SystemExit("Menu reference fixtures must use /review/cases/menu-complete-*")
     root.mkdir(parents=True)
     if len(sys.argv) > 2:
-        if sys.argv[2] != "numbers":
+        if sys.argv[2] == "numbers":
+            numbers(root)
+        elif sys.argv[2] == "cases":
+            cases(root)
+        else:
             raise SystemExit("unknown native menu reference selector")
-        numbers(root)
         return
     left, right = root / "left", root / "right"
     left.mkdir()

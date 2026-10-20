@@ -18,7 +18,6 @@ namespace mcpp {
 namespace {
 
 constexpr std::string_view signature = "mcpp-input-history-v1\n";
-constexpr std::size_t history_limit = 100U;
 constexpr std::size_t purpose_limit = 128U;
 constexpr std::size_t value_limit = 16U * 1024U;
 constexpr std::size_t file_limit = 8U * 1024U * 1024U;
@@ -152,9 +151,7 @@ Loaded read_history(const int directory, const std::string& name, const bool wri
         }
         check_value(value);
         auto& history = result.histories[id];
-        if (history.size() >= history_limit || result.histories.size() > purpose_limit) {
-            throw std::runtime_error("input history has too many entries or names");
-        }
+        if (result.histories.size() > purpose_limit) throw std::runtime_error("input history has too many names");
         history.push_back(std::move(value));
         offset = end + 1U;
     }
@@ -178,6 +175,18 @@ std::string serialize(const Histories& histories) {
         }
     }
     return content;
+}
+
+void trim_histories(Histories& histories, const std::size_t limit) {
+    for (auto item = histories.begin(); item != histories.end();) {
+        auto& values = item->second;
+        if (values.size() > limit) {
+            values.erase(values.begin(),
+                values.begin() + static_cast<std::ptrdiff_t>(values.size() - limit));
+        }
+        if (values.empty()) item = histories.erase(item);
+        else ++item;
+    }
 }
 
 void check_revision(const int directory, const std::string& name, const std::optional<struct stat>& expected) {
@@ -232,12 +241,17 @@ void write_history(const int directory, const std::string& name, const Loaded& l
 
 }  // namespace
 
-InputHistories::InputHistories(std::filesystem::path path)
-    : path_(std::filesystem::absolute(std::move(path)).lexically_normal()) {}
+InputHistories::InputHistories(std::filesystem::path path, const std::size_t limit)
+    : path_(std::filesystem::absolute(std::move(path)).lexically_normal()), limit_(limit) {}
 
 void InputHistories::load() {
+    if (limit_ == 0U) {
+        histories_.clear();
+        return;
+    }
     const auto directory = open_directory(path_.parent_path(), false);
     auto loaded = read_history(directory.get(), path_.filename().string(), false);
+    trim_histories(loaded.histories, limit_);
     histories_ = std::move(loaded.histories);
 }
 
@@ -248,7 +262,7 @@ const std::vector<std::string>& InputHistories::history(const std::string_view i
 }
 
 void InputHistories::remember(const std::string_view id, const std::string_view value) {
-    if (!value.empty()) update(id, value, Change::remember);
+    if (limit_ != 0U && !value.empty()) update(id, value, Change::remember);
 }
 
 void InputHistories::remove(const std::string_view id, const std::string_view value) {
@@ -283,13 +297,14 @@ void InputHistories::update(const std::string_view id, const std::string_view va
         std::erase(values, value);
         if (change == Change::remember) {
             values.emplace_back(value);
-            if (values.size() > history_limit) values.erase(values.begin());
         }
         if (values.empty()) loaded.histories.erase(std::string(id));
     }
+    if (change == Change::remember) trim_histories(loaded.histories, limit_);
     if (loaded.histories.size() > purpose_limit) throw std::runtime_error("input history has too many names");
     if (loaded.histories != before) write_history(directory.get(), name, loaded);
     histories_ = std::move(loaded.histories);
+    trim_histories(histories_, limit_);
 }
 
 }  // namespace mcpp
