@@ -319,15 +319,24 @@ Skin parse_skin(const std::filesystem::path& path) {
         if (const auto* setting = core->find("_default_")) base = resolver.pair(*setting, base, base);
     }
     std::size_t count = 0;
-    bool widget_glyphs = false;
+    const auto glyph_setting = [&](const ColorSection& group, const ColorSetting& setting) {
+        SkinGlyphSetting result{};
+        try {
+            result = set_skin_glyph(skin.glyphs, group.name, setting.key, setting.value);
+        } catch (const std::invalid_argument& error) {
+            color_resource_error(path, setting.line, error.what());
+        }
+        if (result == SkinGlyphSetting::unsupported) {
+            if (skin.warning.empty()) skin.warning = "unsupported skin glyph roles: ";
+            else skin.warning += ", ";
+            skin.warning += "[" + group.name + "] " + setting.key;
+        }
+        return result != SkinGlyphSetting::color;
+    };
     for (const auto& group : document) {
         if (group.name == "skin" || group.name == "aliases") continue;
-        if (group.name == "Lines") {
-            if (!group.settings.empty()) skin.warning = "custom [Lines] glyphs are not supported";
-            continue;
-        }
-        if (group.name.starts_with("widget-")) {
-            widget_glyphs = widget_glyphs || !group.settings.empty();
+        if (group.name == "Lines" || group.name.starts_with("widget-")) {
+            for (const auto& setting : group.settings) static_cast<void>(glyph_setting(group, setting));
             continue;
         }
         auto fallback = base;
@@ -335,17 +344,12 @@ Skin parse_skin(const std::filesystem::path& path) {
         auto& colors = skin.colors[group.name];
         colors["_default_"] = fallback;
         for (const auto& setting : group.settings) {
-            if (group.name == "editor" &&
-                (setting.key == "window-state-char" || setting.key == "window-close-char")) {
-                widget_glyphs = true;
-                continue;
-            }
+            if (glyph_setting(group, setting)) continue;
             colors[setting.key] = resolver.pair(setting, fallback, base);
             ++count;
         }
     }
     if (count == 0U) color_resource_error(path, 0, "skin has no color definitions");
-    if (widget_glyphs) skin.warning = "custom line/widget glyphs are not supported";
     skin.normal = base;
     const auto role = [&](const std::string_view group, const std::string_view key,
                           const SkinPair& fallback) -> SkinPair {

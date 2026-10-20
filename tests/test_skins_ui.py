@@ -54,20 +54,24 @@ def color256(index):
     return levels[index // 36], levels[index // 6 % 6], levels[index % 6]
 
 
-def cells(terminal, include_dim=False):
+def cells(terminal, include_dim=False, include_style=False):
     foreground = background = None
     inverted = False
     faint = False
+    bold = underlined = False
     rows = []
     for line in terminal.text(ansi=True).splitlines():
         row = []
         for token in SGR.split(line):
             if not token.startswith("\x1b["):
                 pair = (background, foreground) if inverted else (foreground, background)
-                attributes = (*pair, faint) if include_dim else pair
+                style = {"dim": faint, "bold": bold, "underlined": underlined}
+                attributes = (*pair, style) if include_style else (*pair, faint) if include_dim else pair
                 row.extend((character, *attributes) for character in token)
                 continue
             faint = style_sgr(faint, token, 2, 22)
+            bold = style_sgr(bold, token, 1, 22)
+            underlined = style_sgr(underlined, token, 4, 24)
             parameters = token[2:-1].replace(":", ";").split(";")
             index = 0
             while index < len(parameters):
@@ -152,8 +156,8 @@ class SkinsUI(unittest.TestCase):
         self.assertIsNotNone(pair[1])
         self.assertGreaterEqual(contrast(*pair), 4.5)
 
-    def text_cell(self, terminal, value, include_dim=False):
-        for row in cells(terminal, include_dim):
+    def text_cell(self, terminal, value, include_dim=False, include_style=False):
+        for row in cells(terminal, include_dim, include_style):
             column = "".join(cell[0] for cell in row).find(value)
             if column >= 0:
                 return row[column]
@@ -229,6 +233,60 @@ class SkinsUI(unittest.TestCase):
             self.assertEqual(self.text_cell(terminal, "User menu")[1:],
                              (rgb("9fe0c2"), rgb("182f2a")))
             terminal.save("native-popup-roles")
+
+    def test_native_editor_gutter_uses_line_state_role(self):
+        root, left, _ = self.fixture("native-gutter")
+        path = root / "gutter.ini"
+        path.write_text(
+            "[core]\n_default_=white;#102030;none\ndisabled=#ff00ff\n"
+            "[editor]\n_default_=white;#1b2030;none\n"
+            "editwhitespace=#ff00ff;;none\neditlinestate=#f2e3cb;#4b3158;bold\n")
+        config = root / "ui/config/mcpp/config"
+        config.write_text(config.read_text() + "editor_line_numbers=true\n")
+        with TerminalSession(EDITOR, TMUX, root / "ui", ["--skin", path, left / "sample.cpp"],
+                             width=110, height=32) as terminal:
+            terminal.wait_editor(offset=0)
+            row = next(row for row in cells(terminal)
+                       if "const int answer" in "".join(cell[0] for cell in row))
+            code = "".join(cell[0] for cell in row).index("const int answer")
+            gutter = row[:code]
+            self.assertEqual(len(gutter), 6)
+            self.assertEqual("".join(cell[0] for cell in gutter).strip(), "1")
+            self.assertTrue(all(cell[1:] == (rgb("f2e3cb"), rgb("4b3158")) for cell in gutter))
+            terminal.save("native-editor-gutter")
+
+    def test_native_dialog_titles_use_their_own_roles(self):
+        root, left, right = self.fixture("native-titles")
+        path = root / "titles.ini"
+        path.write_text(
+            "[core]\n_default_=white;#102030;none\n"
+            "[dialog]\n_default_=#dddddd;#253544;none\ndtitle=#e0a040;;underline\n"
+            "[error]\n_default_=#fff0e0;#5b2030;none\nerrdtitle=#90d0ff;;bold\n")
+        with TerminalSession(MANAGER, TMUX, root / "ui", ["--skin", path, left, right],
+                             width=110, height=32) as terminal:
+            self.panels(terminal)
+            click(terminal, "Options", row=0)
+            terminal.wait_for("Configuration...")
+            click(terminal, "Configuration...")
+            terminal.wait_for("Configure options")
+            title = self.text_cell(terminal, "Configure options", include_style=True)
+            self.assertEqual(title[1:3], (rgb("e0a040"), rgb("253544")))
+            self.assertTrue(title[3]["underlined"])
+            self.assertFalse(title[3]["bold"], "explicit title attributes must not gain forced bold")
+            terminal.save("native-dialog-title")
+        with TerminalSession(EDITOR, TMUX, root / "ui",
+                             ["--skin", path, left / "sample.cpp"], width=110, height=32) as terminal:
+            terminal.wait_editor(offset=0)
+            terminal.press("F7")
+            terminal.wait_for("Search for:")
+            terminal.press("C-u")
+            terminal.type("[")
+            terminal.press("Tab", "Right", "Enter")
+            terminal.wait_for("Editor error")
+            title = self.text_cell(terminal, "Editor error", include_style=True)
+            self.assertEqual(title[1:3], (rgb("90d0ff"), rgb("5b2030")))
+            self.assertTrue(title[3]["bold"])
+            terminal.save("native-error-title")
 
     def appearance(self, terminal):
         click(terminal, "Options", row=0)

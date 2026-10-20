@@ -293,7 +293,9 @@ Native skin selection, color aliases/attributes/inheritance and filename/type
 highlighting now affect the real UI, with Appearance preview/cancel/persistence
 and transactional reload. Original palettes and legacy aliases remain intact;
 unmatched native groups preserve builtin type colors. **L23 remains partial**
-for custom line/widget glyphs and some auxiliary native widget-color roles.
+for remaining widget glyphs and some auxiliary native widget-color roles.
+Single/double border, sort and editor window glyphs are now supported without
+rewriting file text or overriding explicit CLI ASCII frames.
 Filename expressions now use PCRE2. Four focused cases passed; final preservation
 guards were recompiled and the small model rechecked, without another UI sweep.
 
@@ -356,19 +358,34 @@ forced faint text, with readable Default/Grayscale fallback colors. Four focused
 terminal situations verify exact search colors on changed/unchanged rows and
 inactive-label contrast of at least 4.5:1 without faint styling. A related CLI
 override check preserves menu backgrounds. Other terminal sizes/capabilities
-were not swept again. External skins are under a separate follow-up inspection.
+were not swept again. External skins received the follow-up inspection below.
 
 That follow-up reproduced startup failures for all 36 installed external skin
 paths on `0ce334f`: glyph metadata was parsed as colors and the native `inverse`
 attribute was rejected. The loader now separates that metadata and accepts the
-attribute; unsupported custom glyphs remain explicitly warned. F2 uses native
+attribute; remaining unsupported widget keys are explicitly warned. F2 uses native
 `popupmenu` normal/title/selection roles separately from main/editor dropdowns,
 and fallback syntax colors follow the actual editor background. The shared
 Release/Werror build, original native-resource model and a real popup-role
 workflow pass. All 36 external paths now start and complete Appearance preview,
 Cancel and saved-selection restart on the exact shared Release binaries, with
-no application stderr. Their existing captures are being visually reviewed in
-three disjoint groups; that inspection is not yet complete.
+no application stderr. Their existing captures were visually reviewed in three
+disjoint groups without repeating completed checks.
+
+The parallel review found two additional role-use defects: editor gutters used
+generic whitespace/dim colors instead of `editlinestate`, and dialog/error
+captions ignored `dtitle`/`errdtitle`. Both are corrected, including backgrounds
+and explicit attributes. Original regressions and focused real-skin checks
+confirm `modarin256-thin`'s full gutter and `nicedark`'s non-bold captions.
+Weak contrast authored in external files was not silently recolored.
+
+Native border/sort/window glyph support also passes three model groups and a
+small actual-App workflow covering preview/Cancel, generated controls, literal
+Unicode preservation and CLI ASCII precedence. All 36 installed skin files still
+load with glyph-aware parsing. History/hidden-file/scrollbar and other unrendered
+glyph roles remain explicitly warned; L23 is not claimed complete. The visual
+results apply to the captured 110x32 truecolor environment, not every terminal
+mode or unknown user-provided skin.
 
 ### Additional compatibility gaps
 

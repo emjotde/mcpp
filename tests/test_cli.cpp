@@ -1,6 +1,7 @@
 #include "mcpp/cli_display.hpp"
 #include "mcpp/command_line.hpp"
 #include "mcpp/skin.hpp"
+#include "mcpp/skin_glyphs_ui.hpp"
 
 #include <ftxui/dom/elements.hpp>
 #include <ftxui/screen/screen.hpp>
@@ -79,8 +80,8 @@ void options_and_display() {
             "CLI popup selection overrides use the native popup menu key");
     const std::array<const mcpp::Skin*, 1> palettes{&skin};
     auto screen = ftxui::Screen::Create(ftxui::Dimension::Fixed(12), ftxui::Dimension::Fixed(3));
-    const auto content = ftxui::text("┌ café") | ftxui::color(skin.normal.foreground) |
-        ftxui::bgcolor(skin.normal.background) | ftxui::borderStyled(ftxui::LIGHT);
+    const auto content = mcpp::glyph_border(mcpp::glyph_text("┌ café") | ftxui::color(skin.normal.foreground) |
+        ftxui::bgcolor(skin.normal.background) | ftxui::borderStyled(ftxui::LIGHT));
     ftxui::Render(screen, mcpp::cli_display(content, true, true, palettes));
     require(screen.at(0, 0) == "+" && screen.at(1, 0) == "-" && screen.at(0, 1) == "|" &&
             screen.at(1, 1) == "┌" && screen.at(6, 1) == "é",
@@ -93,8 +94,8 @@ void options_and_display() {
         }
     }
     auto titled = ftxui::Screen::Create(ftxui::Dimension::Fixed(32), ftxui::Dimension::Fixed(4));
-    const auto help = ftxui::window(ftxui::text(" mcpp help: Text editor "),
-                                    ftxui::text("╭ file │"), ftxui::ROUNDED);
+    const auto help = mcpp::glyph_border(ftxui::window(mcpp::glyph_text(" mcpp help: Text editor "),
+                                    mcpp::glyph_text("╭ file │"), ftxui::ROUNDED));
     ftxui::Render(titled, mcpp::cli_display(help, false, true, palettes));
     require(titled.at(0, 0) == "+" && titled.at(31, 0) == "+" &&
             titled.at(0, 3) == "+" && titled.at(31, 3) == "+" &&

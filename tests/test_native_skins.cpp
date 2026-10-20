@@ -158,8 +158,11 @@ window-close-char=x
           skin.popup_selected.background == ftxui::Color::RGB(98, 0, 82) &&
           skin.popup_selected.attributes == mcpp::SkinPair::bold,
           "native popup selection is independent of the main menu selection");
-    check(skin.warning.find("glyphs") != std::string::npos && !skin.colors.contains("widget-panel"),
-          "unsupported widget glyphs are reported instead of silently becoming color roles");
+    check(skin.glyphs.has(mcpp::SkinGlyph::vert) && skin.glyphs.has(mcpp::SkinGlyph::sort_up) &&
+          skin.glyphs.has(mcpp::SkinGlyph::window_close) &&
+          skin.warning.find("[widget-scrollbar] current-char") != std::string::npos &&
+          !skin.colors.contains("widget-panel"),
+          "supported glyphs load and unrendered roles are reported instead of becoming colors");
     check(skin.light && skin.syntax[1] == mcpp::find_skin("paper").syntax[1] &&
           skin.syntax[2] == mcpp::find_skin("paper").syntax[2] &&
           skin.syntax[5] == mcpp::find_skin("paper").syntax[5],
@@ -184,13 +187,26 @@ window-close-char=x
 
 int main(int argc, char** argv) {
     try {
-        if (argc != 2 || ::geteuid() != 1001U || !std::filesystem::exists("/.dockerenv") ||
+        if ((argc != 2 && argc != 3) || ::geteuid() != 1001U || !std::filesystem::exists("/.dockerenv") ||
             !std::filesystem::exists("/review/.operation-regressions-disposable")) {
             throw std::runtime_error("native skin check requires the existing UID1001 isolated review container and a case directory");
         }
         const auto root = std::filesystem::absolute(argv[1]).lexically_normal();
         check(root.string().starts_with("/review/cases/native-skins/"), "use the owned native-skins case directory");
         std::filesystem::create_directories(root);
+        if (argc == 3) {
+            ftxui::Terminal::SetColorSupport(ftxui::Terminal::TrueColor);
+            std::size_t count = 0;
+            for (const auto& entry : std::filesystem::directory_iterator(argv[2])) {
+                if (!entry.is_regular_file() || entry.path().extension() != ".ini") continue;
+                const auto skin = mcpp::load_skin(entry.path().string(), root);
+                check(!skin.resource.empty(), "an explicit external path must not resolve to a builtin");
+                ++count;
+            }
+            check(count != 0U, "external skin directory contains no skin files");
+            std::cout << "external skin loading passed: " << count << '\n';
+            return 0;
+        }
         native_colors_and_rules(root);
         native_widget_metadata_and_syntax(root);
         std::cout << "native skin colors and filename rules passed\n";

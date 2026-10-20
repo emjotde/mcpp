@@ -623,15 +623,22 @@ settings are recognized as metadata rather than mistaken for color names.
 F2 popup normal, title and selected colors are independent of main-menu colors.
 Fallback editor syntax colors follow the editor background, including light
 editors in otherwise dark skins.
+Editor line-number margins use `editlinestate`; dialog and error captions use
+their own `dtitle` and `errdtitle` colors and attributes.
+
+Native single/double border characters, sort indicators and editor window
+state/close symbols are applied only to generated UI. Unicode filenames and
+file content are not rewritten. `--stickchars` takes precedence over custom
+border glyphs.
 
 Native `filehighlight.ini` filename/type rules and the legacy `highlighting`
 file feed the selected skin's file-colour groups. Rules that do not supply a
 matching group leave builtin type colours intact. Search includes mcpp's config
 and installed resource directories; no MC skins or rules are bundled.
-Native filename expressions use PCRE2. Compatibility remains partial for custom
-line/widget glyphs and some auxiliary widget-colour roles.
-Unsupported glyph customization produces a warning without preventing the skin's
-colors from loading.
+Native filename expressions use PCRE2. Compatibility remains partial for other
+widget glyphs, including history/hidden-file/scrollbar symbols, and some
+auxiliary widget-colour roles. Unsupported keys produce specific warnings
+without preventing the skin's colors from loading.
 
 ## Modal Tree and diff/merge
 

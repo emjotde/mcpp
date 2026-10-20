@@ -89,6 +89,7 @@ add_library(
     src/search.cpp
     src/shell.cpp
     src/skin.cpp
+    src/skin_glyphs.cpp
     src/skin_file.cpp
     src/spelling.cpp
     src/syntax.cpp
@@ -107,7 +108,7 @@ target_link_libraries(mcpp_core PUBLIC Threads::Threads screen PkgConfig::PCRE2)
 target_compile_definitions(mcpp_core PUBLIC MCPP_VERSION="${PROJECT_VERSION}")
 mcpp_target_defaults(mcpp_core)
 
-add_library(mcpp_ui src/app.cpp src/keymap_input.cpp src/cli_display.cpp)
+add_library(mcpp_ui src/app.cpp src/keymap_input.cpp src/cli_display.cpp src/skin_glyphs_ui.cpp)
 target_include_directories(mcpp_ui PUBLIC include)
 target_link_libraries(mcpp_ui PUBLIC mcpp_core ftxui::ftxui)
 mcpp_target_defaults(mcpp_ui)
@@ -198,6 +199,9 @@ if(MCPP_BUILD_TESTS)
     add_executable(mcpp_native_skin_tests tests/test_native_skins.cpp)
     target_link_libraries(mcpp_native_skin_tests PRIVATE mcpp_core)
     mcpp_target_defaults(mcpp_native_skin_tests)
+    add_executable(mcpp_skin_glyph_tests tests/test_skin_glyphs.cpp)
+    target_link_libraries(mcpp_skin_glyph_tests PRIVATE mcpp_ui)
+    mcpp_target_defaults(mcpp_skin_glyph_tests)
     add_executable(mcpp_editor_codepage_tests tests/test_editor_codepages.cpp)
     target_link_libraries(mcpp_editor_codepage_tests PRIVATE mcpp_core)
     mcpp_target_defaults(mcpp_editor_codepage_tests)
@@ -324,6 +328,10 @@ if(MCPP_BUILD_TESTS)
         add_test(
             NAME mcpp_native_skin_tests
             COMMAND mcpp_native_skin_tests /review/cases/native-skins/model
+        )
+        add_test(
+            NAME mcpp_skin_glyph_tests
+            COMMAND mcpp_skin_glyph_tests /review/cases/native-skin-glyphs-ctest
         )
         add_test(
             NAME mcpp_viewer_source_growing
@@ -620,8 +628,21 @@ if(MCPP_BUILD_TESTS)
                     SkinsUI.test_diff_search_uses_skin_colors_on_changed_rows
                     SkinsUI.test_disabled_dropdown_labels_stay_readable
                     SkinsUI.test_native_popup_menu_uses_its_own_roles
+                    SkinsUI.test_native_editor_gutter_uses_line_state_role
+                    SkinsUI.test_native_dialog_titles_use_their_own_roles
             )
             set_tests_properties(mcpp_skin_visual_fixes_ui PROPERTIES TIMEOUT 90)
+            add_test(
+                NAME mcpp_skin_glyphs_ui
+                COMMAND
+                    ${MCPP_PYTHON_EXECUTABLE}
+                    -B
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_skin_glyphs_ui.py
+                    $<TARGET_FILE:mcpp>
+                    ${MCPP_TMUX_EXECUTABLE}
+                    /review/cases/native-skin-glyphs-ui
+            )
+            set_tests_properties(mcpp_skin_glyphs_ui PROPERTIES TIMEOUT 90)
             add_test(
                 NAME mcpp_concurrent_jobs_ui
                 COMMAND

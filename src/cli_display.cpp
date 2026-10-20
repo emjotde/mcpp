@@ -1,4 +1,5 @@
 #include "mcpp/cli_display.hpp"
+#include "mcpp/skin_glyphs_ui.hpp"
 
 #include <ftxui/screen/screen.hpp>
 #include <ftxui/screen/terminal.hpp>
@@ -129,28 +130,13 @@ void apply_pair(SkinPair& pair, const CliColorOverride& override) {
     pair.explicit_style = true;
 }
 
-unsigned line_connections(const std::string_view character) {
-    constexpr unsigned left = 1U, right = 2U, up = 4U, down = 8U;
-    if (character == "─" || character == "━" || character == "═" || character == "╍") return left | right;
-    if (character == "│" || character == "┃" || character == "║" || character == "╏") return up | down;
-    if (character == "┌" || character == "┏" || character == "╔" || character == "╭") return right | down;
-    if (character == "┐" || character == "┓" || character == "╗" || character == "╮") return left | down;
-    if (character == "└" || character == "┗" || character == "╚" || character == "╰") return right | up;
-    if (character == "┘" || character == "┛" || character == "╝" || character == "╯") return left | up;
-    if (character == "├" || character == "┣" || character == "╠") return right | up | down;
-    if (character == "┤" || character == "┫" || character == "╣") return left | up | down;
-    if (character == "┬" || character == "┳" || character == "╦") return left | right | down;
-    if (character == "┴" || character == "┻" || character == "╩") return left | right | up;
-    if (character == "┼" || character == "╋" || character == "╬") return left | right | up | down;
-    return 0;
-}
-
 class CliDisplay final : public ftxui::Node {
 public:
     CliDisplay(
         ftxui::Element element, const bool monochrome, const bool stickchars,
         const std::span<const Skin* const> palettes
     ) : Node({std::move(element)}), monochrome_(monochrome), stickchars_(stickchars) {
+        if (!palettes.empty() && palettes.front()) glyphs_ = palettes.front()->glyphs;
         for (const auto* skin : palettes) {
             if (skin == nullptr) continue;
             for (const auto* pair : {
@@ -175,54 +161,20 @@ public:
 
     void Render(ftxui::Screen& screen) override {
         Node::Render(screen);
-        std::vector<unsigned> lines;
-        if (stickchars_) {
-            lines.resize(static_cast<std::size_t>(screen.dimx()) * static_cast<std::size_t>(screen.dimy()));
-            for (int y = 0; y < screen.dimy(); ++y) {
-                for (int x = 0; x < screen.dimx(); ++x) {
-                    const auto& cell = screen.CellAt(x, y);
-                    if (cell.automerge) {
-                        lines[static_cast<std::size_t>(y) * static_cast<std::size_t>(screen.dimx()) +
-                              static_cast<std::size_t>(x)] = line_connections(cell.character);
-                    }
-                }
-            }
-        }
-        const auto connects = [&](const int x, const int y, const unsigned direction) {
-            return x >= 0 && x < screen.dimx() && y >= 0 && y < screen.dimy() &&
-                (lines[static_cast<std::size_t>(y) * static_cast<std::size_t>(screen.dimx()) +
-                       static_cast<std::size_t>(x)] & direction) != 0U;
-        };
+        apply_skin_lines(screen, glyphs_, stickchars_);
+        if (!monochrome_) return;
         for (int y = 0; y < screen.dimy(); ++y) {
             for (int x = 0; x < screen.dimx(); ++x) {
                 auto& cell = screen.CellAt(x, y);
-                if (stickchars_) {
-                    const auto connections = line_connections(cell.character);
-                    const bool horizontal = connections == 3U;
-                    const bool vertical = connections == 12U;
-                    // FTXUI marks border edges, but not its corner cells.
-                    // A title can overwrite one of the corner's adjacent edges.
-                    const bool corner = !horizontal && !vertical && connections != 0U &&
-                        (((connections & 1U) != 0U && connects(x - 1, y, 2U)) ||
-                         ((connections & 2U) != 0U && connects(x + 1, y, 1U)) ||
-                         ((connections & 4U) != 0U && connects(x, y - 1, 8U)) ||
-                         ((connections & 8U) != 0U && connects(x, y + 1, 4U)));
-                    if (connections != 0U && (cell.automerge || corner)) {
-                        cell.character = horizontal ? "-" : vertical ? "|" : "+";
-                        cell.automerge = false;
-                    }
-                }
-                if (monochrome_) {
-                    const auto foreground = cell.inverted ? cell.background_color : cell.foreground_color;
-                    const auto background = cell.inverted ? cell.foreground_color : cell.background_color;
-                    const auto matches = [&](const SkinPair& pair) {
-                        return foreground == pair.foreground && background == pair.background;
-                    };
-                    if (std::ranges::any_of(emphasis_, matches)) cell.inverted = true;
-                    else if (std::ranges::any_of(normal_, matches)) cell.inverted = false;
-                    cell.foreground_color = {};
-                    cell.background_color = {};
-                }
+                const auto foreground = cell.inverted ? cell.background_color : cell.foreground_color;
+                const auto background = cell.inverted ? cell.foreground_color : cell.background_color;
+                const auto matches = [&](const SkinPair& pair) {
+                    return foreground == pair.foreground && background == pair.background;
+                };
+                if (std::ranges::any_of(emphasis_, matches)) cell.inverted = true;
+                else if (std::ranges::any_of(normal_, matches)) cell.inverted = false;
+                cell.foreground_color = {};
+                cell.background_color = {};
             }
         }
     }
@@ -230,6 +182,7 @@ public:
 private:
     bool monochrome_;
     bool stickchars_;
+    SkinGlyphs glyphs_;
     std::vector<SkinPair> emphasis_;
     std::vector<SkinPair> normal_;
 };
@@ -322,7 +275,8 @@ ftxui::Element cli_display(
     ftxui::Element element, const bool monochrome, const bool stickchars,
     const std::span<const Skin* const> palettes
 ) {
-    if (!monochrome && !stickchars) return element;
+    const bool custom_lines = !palettes.empty() && palettes.front() && palettes.front()->glyphs.has_lines();
+    if (!monochrome && !stickchars && !custom_lines) return element;
     return std::make_shared<CliDisplay>(std::move(element), monochrome, stickchars, palettes);
 }
 

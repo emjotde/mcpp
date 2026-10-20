@@ -1,5 +1,7 @@
 #pragma once
 
+#include "mcpp/skin_glyphs.hpp"
+
 #include <ftxui/screen/color.hpp>
 
 #include <array>
@@ -30,6 +32,7 @@ struct Skin {
     bool light{false};
     std::filesystem::path resource;
     std::string warning;
+    SkinGlyphs glyphs;
     std::map<std::string, std::map<std::string, SkinPair, std::less<>>, std::less<>> colors;
     SkinPair normal{ftxui::Color::Grey85, ftxui::Color::Grey3};
     SkinPair menu{ftxui::Color::Grey11, ftxui::Color::Grey78};

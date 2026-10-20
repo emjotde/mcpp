@@ -20,6 +20,7 @@
 #include "mcpp/search.hpp"
 #include "mcpp/shell.hpp"
 #include "mcpp/skin.hpp"
+#include "mcpp/skin_glyphs_ui.hpp"
 #include "mcpp/spelling.hpp"
 #include "mcpp/syntax.hpp"
 #include "mcpp/terminal_input.hpp"
@@ -1301,7 +1302,7 @@ ftxui::Element dialog_button(
     const bool focused,
     ftxui::Box& box
 ) {
-    auto element = ftxui::text("[ " + label + " ]");
+    auto element = glyph_text("[ " + label + " ]");
     if (focused) {
         element = element | ftxui::inverted | ftxui::focus;
     }
@@ -1311,22 +1312,24 @@ ftxui::Element dialog_button(
 ftxui::Element native_button(
     const std::string& label, const bool primary, const bool focused, ftxui::Box& box
 ) {
-    auto element = ftxui::text(primary ? "[< " + label + " >]" : "[ " + label + " ]");
+    auto element = glyph_text(primary ? "[< " + label + " >]" : "[ " + label + " ]");
     if (focused) element = element | ftxui::inverted | ftxui::focus;
     return element | ftxui::reflect(box);
 }
 
-ftxui::Element native_window(const std::string& title, ftxui::Element body, const int width) {
+ftxui::Element native_window(
+    ftxui::Element title, ftxui::Element body, const int width, const bool double_lines
+) {
     using namespace ftxui;
     const auto border_width = std::min(width, std::max(1, Terminal::Size().dimx - 2));
     auto framed = dbox({
-        std::move(body) | borderStyled(LIGHT),
-        vbox({hbox({filler(), text(" " + title + " ") | bold, filler()}), filler()}),
+        std::move(body) | borderStyled(double_lines ? DOUBLE : LIGHT) | glyph_border,
+        vbox({hbox({filler(), std::move(title), filler()}), filler()}),
     }) | size(WIDTH, EQUAL, border_width);
     return vbox({
-        text(" "),
-        hbox({text(" "), std::move(framed), text(" ")}),
-        text(" "),
+        glyph_text(" "),
+        hbox({glyph_text(" "), std::move(framed), glyph_text(" ")}),
+        glyph_text(" "),
     }) | size(WIDTH, EQUAL, border_width + 2);
 }
 
@@ -1411,14 +1414,14 @@ ftxui::Element mnemonic_label(
 ) {
     using namespace ftxui;
     if (index >= label.size()) {
-        return text(label);
+        return glyph_text(label);
     }
-    auto mnemonic = text(label.substr(index, 1U)) | underlined | bold;
+    auto mnemonic = glyph_text(label.substr(index, 1U)) | underlined | bold;
     if (foreground) mnemonic = mnemonic | color(*foreground);
     return hbox({
-        text(label.substr(0, index)),
+        glyph_text(label.substr(0, index)),
         std::move(mnemonic),
-        text(label.substr(index + 1U)),
+        glyph_text(label.substr(index + 1U)),
     });
 }
 
@@ -1439,7 +1442,7 @@ ftxui::Element render_viewer_text(
 ) {
     using namespace ftxui;
     if (!highlight && styles.empty()) {
-        return text(row);
+        return glyph_text(row);
     }
     auto aligned = highlight;
     std::size_t offset = 0;
@@ -1468,7 +1471,7 @@ ftxui::Element render_viewer_text(
     for (std::size_t index = 1; index < boundaries.size(); ++index) {
         const auto begin = boundaries[index - 1U], end = boundaries[index];
         if (end <= begin) continue;
-        auto segment = text(row.substr(begin, end - begin));
+        auto segment = glyph_text(row.substr(begin, end - begin));
         if (aligned && begin >= aligned->first && begin < aligned->second) segment = segment | inverted | bold;
         for (const auto& style : styles) {
             if (begin < style.begin || begin >= style.end) continue;
@@ -1541,7 +1544,7 @@ ftxui::Element menu_row_label(const MenuRow& row, const std::optional<ftxui::Col
             }
         }
     }
-    return ftxui::hbox({ftxui::text(" "), mnemonic_label(row.label, index, foreground)});
+    return ftxui::hbox({glyph_text(" "), mnemonic_label(row.label, index, foreground)});
 }
 
 struct TreeNode {
@@ -1974,6 +1977,8 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
     FileHighlightRules highlight_rules;
     std::vector<ftxui::Box> editor_line_boxes;
     ftxui::Box editor_header_box;
+    std::array<ftxui::Box, 2> editor_window_widget_boxes{};
+    bool editor_window_widgets_visible{false};
     int editor_window_action{0};
     std::array<int, 4> editor_window_previous{};
     bool editor_window_mouse_drag{false};
@@ -7559,9 +7564,43 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
         return active_palette->panels;
     }
 
+    ftxui::Element text(const std::string_view value) const {
+        return glyph_text(value);
+    }
+
+    ftxui::Decorator borderStyled(const ftxui::BorderStyle style) const {
+        return [style](ftxui::Element element) {
+            return glyph_border(ftxui::borderStyled(style)(std::move(element)));
+        };
+    }
+
+    ftxui::Element window(
+        ftxui::Element title, ftxui::Element body, const ftxui::BorderStyle style = ftxui::ROUNDED
+    ) const {
+        return glyph_border(ftxui::window(std::move(title), std::move(body), style));
+    }
+
+    ftxui::Element native_window(
+        const std::string& title, ftxui::Element body, const int width
+    ) const {
+        return ::mcpp::native_window(
+            title_label(" " + title + " ", "dialog", "dtitle", palette().dialog),
+            std::move(body), width, palette().glyphs.has_double_lines());
+    }
+
     ftxui::Element paint(ftxui::Element element, const SkinPair& colors) const {
         if (colors.explicit_style) return std::make_shared<SkinPaint>(std::move(element), colors);
         return std::move(element) | ftxui::color(colors.foreground) | ftxui::bgcolor(colors.background);
+    }
+
+    ftxui::Element title_label(
+        const std::string& title, const std::string_view section,
+        const std::string_view key, const SkinPair& fallback
+    ) const {
+        const auto& style = skin_color(palette(), section, key, fallback);
+        auto label = glyph_text(title);
+        if (!style.explicit_style) label = label | ftxui::bold;
+        return paint(std::move(label), style);
     }
 
     ftxui::Element highlight(ftxui::Element element, const SkinPair& colors) const {
@@ -10687,6 +10726,25 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
     ) const {
         using namespace ftxui;
         const auto widths = listing_field_widths(spec, width);
+        const auto sorted_field = [&]() -> std::string_view {
+            switch (pane.sort_field()) {
+                case SortField::name: return "name";
+                case SortField::version: return "version";
+                case SortField::extension: return "extension";
+                case SortField::size: return "size";
+                case SortField::modified: return "mtime";
+                case SortField::accessed: return "atime";
+                case SortField::changed: return "ctime";
+                case SortField::inode: return "inode";
+                case SortField::unsorted: return {};
+            }
+            return {};
+        }();
+        const bool sort_name_fallback = (pane.sort_field() == SortField::version ||
+                                        pane.sort_field() == SortField::extension) &&
+            std::ranges::none_of(spec.fields, [&](const auto& field) { return field.name == sorted_field; });
+        const bool sort_symbols = palette().glyphs.has(SkinGlyph::sort_up) ||
+                                  palette().glyphs.has(SkinGlyph::sort_down);
         Elements fields;
         for (std::size_t index = 0; index < spec.fields.size(); ++index) {
             if (widths[index] == 0) continue;
@@ -10694,8 +10752,15 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
             if (field.name == "|") {
                 fields.push_back(separator() | size(WIDTH, EQUAL, widths[index]));
             } else {
-                const auto value = header ? field.title
-                                 : entry == nullptr ? std::string{} : listing_value(pane, *entry, field.name);
+                auto value = header ? field.title
+                           : entry == nullptr ? std::string{} : listing_value(pane, *entry, field.name);
+                if (header && sort_symbols && (field.name == sorted_field ||
+                    (sort_name_fallback && field.name == "name") ||
+                    (pane.sort_field() == SortField::size && field.name == "bsize"))) {
+                    value = std::string(skin_glyph(palette().glyphs,
+                        pane.descending() ? SkinGlyph::sort_down : SkinGlyph::sort_up,
+                        pane.descending() ? "v" : "^", launch_options.stickchars)) + " " + value;
+                }
                 const auto fitted = fit_listing_text(value, widths[index],
                     header ? ListingAlignment::center : field.alignment);
                 if (!header && entry != nullptr && config.highlight_permissions &&
@@ -11407,10 +11472,11 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
         if (!editor_line_numbers) {
             return content;
         }
+        auto gutter_style = palette().normal;
+        gutter_style.foreground = palette().dim;
         return hbox({
-            text(std::to_string(index + 1U)) |
-                color(palette().dim) |
-                size(WIDTH, EQUAL, 6),
+            paint(text(std::to_string(index + 1U)) | size(WIDTH, EQUAL, 6),
+                  skin_color(palette(), "editor", "editlinestate", gutter_style)),
             std::move(content),
         });
     }
@@ -11422,6 +11488,9 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
         const auto dimensions = editor_dimensions();
         terminal_size.dimx = dimensions.first;
         terminal_size.dimy = dimensions.second;
+        editor_window_widgets_visible = !editor.fullscreen && terminal_size.dimx >= 8 &&
+            (palette().glyphs.has(SkinGlyph::window_state) || palette().glyphs.has(SkinGlyph::window_close));
+        const auto header_width = terminal_size.dimx - (editor_window_widgets_visible ? 6 : 0);
         const auto visible_rows = editor_visible_rows();
         const auto& lines = editor.lines();
         if (editor_syntax && syntax_buffer_path != editor.path()) {
@@ -11546,14 +11615,14 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
         };
         auto position_status = editor_status.str();
         if (static_cast<int>(editor_flags.size() + position_status.size()) + 18 >
-            terminal_size.dimx) {
+            header_width) {
             position_status =
                 " " + std::to_string(editor.row() + 1U) + ":" +
                 std::to_string(cursor_width + 1U) + "/" +
                 std::to_string(editor.lines().size());
         }
         const auto filename_width = static_cast<std::size_t>(std::max(
-            1, terminal_size.dimx -
+            1, header_width -
                    static_cast<int>(editor_flags.size() + position_status.size())
         ));
         auto status_header = hbox({
@@ -11564,7 +11633,7 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
                       text(position_status),
                   });
         status_header = gray_menu(std::move(status_header)) |
-                        size(WIDTH, EQUAL, terminal_size.dimx);
+                        size(WIDTH, EQUAL, header_width);
         auto menubar = gray_menu(hbox(std::move(menu))) | reflect(editor_header_box);
         auto header = mode == Mode::editor_menu ? menubar : status_header | reflect(editor_header_box);
         const auto key = [this](
@@ -11592,10 +11661,21 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
         auto body = vbox(std::move(elements)) | flex;
         if (editor.fullscreen) return vbox({header, std::move(body), keybar});
         const auto bounds = editor_window_bounds();
+        Elements caption{filler() | size(WIDTH, EQUAL, 1), status_header};
+        if (editor_window_widgets_visible) {
+            caption.push_back(gray_menu(hbox({
+                text("[" + std::string(skin_glyph(palette().glyphs, SkinGlyph::window_state,
+                                                 "*", launch_options.stickchars)) + "]") |
+                    reflect(editor_window_widget_boxes[0]),
+                text("[" + std::string(skin_glyph(palette().glyphs, SkinGlyph::window_close,
+                                                 "X", launch_options.stickchars)) + "]") |
+                    reflect(editor_window_widget_boxes[1]),
+            })));
+        }
+        caption.push_back(filler() | size(WIDTH, EQUAL, 1));
         auto framed = dbox({
             std::move(body) | borderStyled(LIGHT),
-            vbox({hbox({filler() | size(WIDTH, EQUAL, 1), status_header,
-                         filler() | size(WIDTH, EQUAL, 1)}), filler()}),
+            vbox({hbox(std::move(caption)), filler()}),
         }) | size(WIDTH, EQUAL, bounds[2]) | size(HEIGHT, EQUAL, bounds[3]);
         return vbox({
             menubar,
@@ -11889,7 +11969,7 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
     ftxui::Element render_editor_error() {
         using namespace ftxui;
         return paint(vbox({
-                   text(editor_message_title) | bold | center,
+                   title_label(editor_message_title, "error", "errdtitle", palette().error) | center,
                    separator(),
                    paragraph(display_text(editor_error_message)),
                    separator(),
@@ -12401,8 +12481,7 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
         const auto& skin = palette();
         const auto& normal = skin_color(skin, "popupmenu", "_default_", skin.menu);
         Elements header{
-            paint(text("User menu") | bold | center,
-                  skin_color(skin, "popupmenu", "menutitle", normal)),
+            title_label("User menu", "popupmenu", "menutitle", normal) | center,
             separator(),
         };
         Elements rows;
@@ -14066,13 +14145,18 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
                 }
                 connector += is_last_sibling(ancestor)
                                  ? "   "
-                                 : launch_options.stickchars ? "|  " : "│  ";
+                                 : launch_options.stickchars ? "|  "
+                                   : std::string(skin_glyph(palette().glyphs, SkinGlyph::vert, "│")) + "  ";
             }
             if (node.depth > 0U) {
-                connector +=
-                    is_last_sibling(index)
-                        ? (launch_options.stickchars ? "`- " : "└─ ")
-                        : (launch_options.stickchars ? "|- " : "├─ ");
+                if (launch_options.stickchars) {
+                    connector += is_last_sibling(index) ? "`- " : "|- ";
+                } else {
+                    connector += std::string(skin_glyph(palette().glyphs,
+                        is_last_sibling(index) ? SkinGlyph::leftbottom : SkinGlyph::leftmiddle,
+                        is_last_sibling(index) ? "└" : "├")) +
+                        std::string(skin_glyph(palette().glyphs, SkinGlyph::horiz, "─")) + " ";
+                }
             }
             if (node.inaccessible) {
                 connector += "! ";
@@ -17523,6 +17607,16 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
             if (mouse.button == ftxui::Mouse::Left &&
                 mouse.motion == ftxui::Mouse::Pressed) {
                 const auto bounds = editor_window_bounds();
+                if (!editor.fullscreen && editor_window_widgets_visible) {
+                    if (editor_window_widget_boxes[0].Contain(mouse.x, mouse.y)) {
+                        show_editor_window(5);
+                        return true;
+                    }
+                    if (editor_window_widget_boxes[1].Contain(mouse.x, mouse.y)) {
+                        request_editor_close();
+                        return true;
+                    }
+                }
                 if (!editor.fullscreen && mouse.y == bounds[1] &&
                     mouse.x >= bounds[0] && mouse.x < bounds[0] + bounds[2]) {
                     show_editor_window(3);
