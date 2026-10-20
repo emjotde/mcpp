@@ -265,6 +265,17 @@ if(MCPP_BUILD_TESTS)
     add_executable(mcpp_editor_clipboard_commands tests/test_editor_clipboard_commands.cpp)
     target_link_libraries(mcpp_editor_clipboard_commands PRIVATE mcpp_core)
     mcpp_target_defaults(mcpp_editor_clipboard_commands)
+    add_executable(mcpp_panel_selection_tests tests/test_panel_selection_preferences.cpp)
+    target_include_directories(mcpp_panel_selection_tests PRIVATE src)
+    target_link_libraries(mcpp_panel_selection_tests PRIVATE mcpp_ui)
+    mcpp_target_defaults(mcpp_panel_selection_tests)
+    add_executable(mcpp_shell_display_tests tests/test_shell_display_preferences.cpp)
+    target_include_directories(mcpp_shell_display_tests PRIVATE src)
+    target_link_libraries(mcpp_shell_display_tests PRIVATE ftxui::ftxui)
+    mcpp_target_defaults(mcpp_shell_display_tests)
+    add_executable(mcpp_panel_torben_preferences tests/test_panel_torben_preferences.cpp)
+    target_link_libraries(mcpp_panel_torben_preferences PRIVATE mcpp_core)
+    mcpp_target_defaults(mcpp_panel_torben_preferences)
     add_executable(mcpp_translation_tests tests/test_translation.cpp)
     target_link_libraries(mcpp_translation_tests PRIVATE mcpp_core)
     mcpp_target_defaults(mcpp_translation_tests)
@@ -347,6 +358,13 @@ if(MCPP_BUILD_TESTS)
             )
             set_tests_properties(mcpp_editor_clipboard_${clipboard_command_case} PROPERTIES TIMEOUT 15)
         endforeach()
+        add_test(
+            NAME mcpp_panel_selection_preferences
+            COMMAND mcpp_panel_selection_tests /review/cases/selection-0d2d/model/ctest
+        )
+        add_test(NAME mcpp_shell_display_preferences COMMAND mcpp_shell_display_tests model)
+        add_test(NAME mcpp_panel_torben_preferences COMMAND mcpp_panel_torben_preferences)
+        set_tests_properties(mcpp_panel_torben_preferences PROPERTIES WORKING_DIRECTORY /review/cases)
         add_test(
             NAME mcpp_archive_tests
             COMMAND mcpp_archive_tests /review/cases/agent-archives

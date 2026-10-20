@@ -482,6 +482,14 @@ Config Config::load(const std::filesystem::path& path) {
                 throw std::runtime_error("select_flags supports bits 1 (files only), 2 (case sensitive), and 4 (shell patterns)");
             }
             result.select_flags = flags;
+        } else if (key == "torben_fj_mode") {
+            result.torben_fj_mode = parse_bool(value, key);
+        } else if (key == "alternate_plus_minus" || key == "only_leading_plus_minus") {
+            const auto setting = parse_bool(value, key);
+            (key == "alternate_plus_minus" ? result.alternate_plus_minus : result.only_leading_plus_minus) = setting;
+        } else if (key == "clear_before_exec" || key == "show_output_starts_shell") {
+            const auto setting = parse_bool(value, key);
+            (key == "clear_before_exec" ? result.clear_before_exec : result.show_output_starts_shell) = setting;
         } else if (key == "saved_left_path") {
             result.saved_left_path = decode_value(value);
         } else if (key == "saved_right_path") {
@@ -837,6 +845,12 @@ void Config::save(const std::filesystem::path& path) const {
     }
     output << "escape_timeout=" << escape_timeout << '\n'
            << "pause_after_run=" << pause_after_run << '\n';
+    if (clear_before_exec) {
+        output << "clear_before_exec=" << (*clear_before_exec ? "true" : "false") << '\n';
+    }
+    if (show_output_starts_shell) {
+        output << "show_output_starts_shell=" << (*show_output_starts_shell ? "true" : "false") << '\n';
+    }
     if (confirm_view_dir) output << "confirm_view_dir=" << (*confirm_view_dir ? "true" : "false") << '\n';
     if (copymove_persistent_attr) {
         output << "copymove_persistent_attr=" << (*copymove_persistent_attr ? "true" : "false") << '\n';
@@ -847,6 +861,13 @@ void Config::save(const std::filesystem::path& path) const {
            << "saved_left_path=" << encode_value(saved_left_path) << '\n'
            << "saved_right_path=" << encode_value(saved_right_path) << '\n';
     if (select_flags) output << "select_flags=" << *select_flags << '\n';
+    if (torben_fj_mode) output << "torben_fj_mode=" << (*torben_fj_mode ? "true" : "false") << '\n';
+    if (alternate_plus_minus) {
+        output << "alternate_plus_minus=" << (*alternate_plus_minus ? "true" : "false") << '\n';
+    }
+    if (only_leading_plus_minus) {
+        output << "only_leading_plus_minus=" << (*only_leading_plus_minus ? "true" : "false") << '\n';
+    }
     if (current_is_left) output << "current_is_left=" << (*current_is_left ? "true" : "false") << '\n';
     if (other_directory) output << "other_directory=" << encode_value(*other_directory) << '\n';
     output << "viewer_wrap=" << (viewer_wrap ? "true" : "false") << '\n';

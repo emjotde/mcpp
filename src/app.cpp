@@ -31,6 +31,8 @@
 #include "editor_display.hpp"
 #include "input_styles.hpp"
 #include "local_tools_stream.hpp"
+#include "shell_display.hpp"
+#include "panel_selection_keys.hpp"
 #include "viewer_help_styles.hpp"
 
 #include <algorithm>
@@ -2200,6 +2202,8 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
         right.set_fast_reload(config.fast_reload);
         left.set_navigation(config.scroll_pages, config.scroll_center);
         right.set_navigation(config.scroll_pages, config.scroll_center);
+        left.set_torben_fj_mode(config.torben_fj_mode.value_or(false));
+        right.set_torben_fj_mode(config.torben_fj_mode.value_or(false));
         left.set_shell_patterns(config.shell_patterns);
         right.set_shell_patterns(config.shell_patterns);
         left.set_follow_links(config.cd_follows_links);
@@ -8820,6 +8824,7 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
             pane->set_reverse_files_only(config.reverse_files_only);
             pane->set_fast_reload(config.fast_reload);
             pane->set_navigation(config.scroll_pages, config.scroll_center);
+            pane->set_torben_fj_mode(config.torben_fj_mode.value_or(false));
         }
         store_panel_options_in_config();
         mode = Mode::panels;
@@ -10402,8 +10407,10 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
     int run_process(
         const std::string& command,
         const bool interactive,
-        const std::string& directory = {}
+        const std::string& directory = {},
+        bool* const viewed_output = nullptr
     ) {
+        if (viewed_output != nullptr) *viewed_output = false;
         if (traversal_running.load(std::memory_order_acquire)) {
             throw std::runtime_error(
                 "cannot launch a command while search is running"
@@ -10434,13 +10441,24 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
             explicit ShellForegroundGuard(bool& value) : flag(value), previous(std::exchange(value, true)) {}
             ~ShellForegroundGuard() { flag = previous; }
         } foreground(shell_foreground);
+        const auto preparation = detail::shell_display_plan(
+            config.clear_before_exec, config.show_output_starts_shell, persistent, shell.running(), interactive
+        );
+        if (preparation.clear_panels) std::cout << "\033[H\033[2J" << std::flush;
         terminal->WithRestoredIO([&] {
             try {
+                const auto display = detail::shell_display_plan(
+                    config.clear_before_exec, config.show_output_starts_shell, persistent, shell.running(), interactive
+                );
+                if (display.clear_output) std::cout << "\033[H\033[2J" << std::flush;
+                if (viewed_output != nullptr) *viewed_output = display.output_only;
                 if (persistent) {
-                    if (!shell.running()) std::cout << "\033[H\033[2J" << std::flush;
                     result = shell.show(execution_directory, command);
+                } else if (display.output_only) {
+                    detail::wait_for_output_key(STDIN_FILENO, std::chrono::microseconds(
+                        config.single_escape ? config.escape_timeout : 50000
+                    ));
                 } else {
-                    if (interactive) std::cout << "\033[H\033[2J" << std::flush;
                     const auto child = fork();
                     if (child < 0) throw std::runtime_error("failed to fork shell");
                     if (child == 0) {
@@ -10508,6 +10526,14 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
         return WIFSIGNALED(child_status)
                    ? 128 + WTERMSIG(child_status)
                    : 1;
+    }
+
+    void show_output() {
+        bool viewed_output = false;
+        const auto result = run_process("", true, {}, &viewed_output);
+        status = viewed_output ? "Output hidden; Ctrl-O shows it"
+            : shell.running() ? "Shell hidden; Ctrl-O resumes it"
+            : "Subshell exited " + std::to_string(result);
     }
 
     void execute_command() {
@@ -13206,9 +13232,7 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
                     );
                     return;
                 case 3: {
-                    const auto result = run_process("", true);
-                    status = shell.running() ? "Shell hidden; Ctrl-O resumes it"
-                                             : "Subshell exited " + std::to_string(result);
+                    show_output();
                     break;
                 }
                 case 4:
@@ -19045,9 +19069,7 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
         } else if (event == ftxui::Event::CtrlO) {
             background();
             try {
-                const auto result = run_process("", true);
-                status = shell.running() ? "Shell hidden; Ctrl-O resumes it"
-                    : "Subshell exited " + std::to_string(result);
+                show_output();
             } catch (const std::exception& error) { set_error(error); }
         } else {
             return false;
@@ -19352,13 +19374,13 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
             status = "C-x";
             return true;
         }
+        const auto selection_key = keymap_event_name(event);
+        const auto group_selection = detail::panel_group_selection_key(
+            selection_key ? std::string_view(*selection_key) : std::string_view{},
+            command_line, config.alternate_plus_minus, config.only_leading_plus_minus);
         const bool selection_shortcut =
-            command_line.empty() &&
-            (
-                event == ftxui::Event::Character('+') ||
-                event == ftxui::Event::Character('-') ||
-                event == ftxui::Event::Character('*')
-            );
+            group_selection != detail::PanelGroupSelection::none ||
+            (command_line.empty() && event == ftxui::Event::Character('*'));
         const bool panel_shortcut =
             event.is_mouse() ||
             selection_shortcut ||
@@ -20076,13 +20098,9 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
                     -static_cast<int>(panel_page_rows(active()))
                 );
             } else if (event == ftxui::Event::Home) {
-                active().move_cursor(
-                    -static_cast<int>(active().cursor())
-                );
+                active().home_cursor();
             } else if (event == ftxui::Event::End) {
-                active().move_cursor(
-                    static_cast<int>(active().entries().size())
-                );
+                active().end_cursor();
             } else if (event == ftxui::Event::Return) {
                 if (panel_search_confirmed) static_cast<void>(enter_panel_entry(false));
                 else activate_file_association();
@@ -20144,9 +20162,7 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
                 traversal_cancellation.request();
                 status = "Cancelling search";
             } else if (event == ftxui::Event::CtrlO) {
-                const auto result = run_process("", true);
-                status = shell.running() ? "Shell hidden; Ctrl-O resumes it"
-                                         : "Subshell exited " + std::to_string(result);
+                show_output();
             } else if (event == ftxui::Event::F2) {
                 open_user_menu(Mode::panels);
             } else if (event == ftxui::Event::F3 ||
@@ -20207,17 +20223,11 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
                     return true;
                 }
                 request_app_exit();
-            } else if (
-                selection_shortcut &&
-                event == ftxui::Event::Character('+')
-            ) {
-                command_mode = false;
+            } else if (group_selection == detail::PanelGroupSelection::select) {
+                if (command_line.empty()) command_mode = false;
                 execute_pulldown_action(1U, 15);
-            } else if (
-                selection_shortcut &&
-                event == ftxui::Event::Character('-')
-            ) {
-                command_mode = false;
+            } else if (group_selection == detail::PanelGroupSelection::unselect) {
+                if (command_line.empty()) command_mode = false;
                 execute_pulldown_action(1U, 16);
             } else if (
                 selection_shortcut &&
@@ -20412,6 +20422,14 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
         if (action == "Cancel") {
             static_cast<void>(handle(ftxui::Event::Escape));
             return;
+        }
+        if (mode == Mode::panels) {
+            const auto selection = detail::panel_group_selection_action(action);
+            if (selection != detail::PanelGroupSelection::none) {
+                execute_pulldown_action(
+                    1U, selection == detail::PanelGroupSelection::select ? 15 : 16);
+                return;
+            }
         }
         auto targets = std::vector{context};
         if (context == filemanager || context == filemanager_xmap || context == panel) {

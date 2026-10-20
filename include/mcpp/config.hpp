@@ -85,11 +85,14 @@ struct Config {
     bool navigate_with_arrows{false};
     bool scroll_pages{true};
     bool scroll_center{false};
+    std::optional<bool> torben_fj_mode;
     bool mouse_page_scrolling{true};
     bool highlight_file_types{true};
     bool highlight_permissions{false};
     std::size_t quick_search_mode{2};
     std::optional<unsigned> select_flags;
+    std::optional<bool> alternate_plus_minus;
+    std::optional<bool> only_leading_plus_minus;
     std::string saved_left_path;
     std::string saved_right_path;
     std::optional<bool> current_is_left;
@@ -106,6 +109,8 @@ struct Config {
     std::optional<std::size_t> double_click_speed;
     std::optional<std::size_t> num_history_items_recorded;
     bool use_subshell{true};
+    std::optional<bool> clear_before_exec;
+    std::optional<bool> show_output_starts_shell;
     std::optional<bool> subshell_override;
     std::string keymap_file;
     std::optional<std::string> keymap_override;

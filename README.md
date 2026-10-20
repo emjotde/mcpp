@@ -368,6 +368,13 @@ sets the large-file approval size (`1K` is 1024 bytes; zero warns for any nonemp
 file). Without that key, the earlier 64 MiB approval threshold remains.
 `select_flags` initializes the native shell-pattern, case-sensitive and
 files-only selection choices; for example, `6` enables the first two.
+With explicit `alternate_plus_minus`, plain `+/-` can remain literal command
+input; `only_leading_plus_minus` restricts selection shortcuts to an entirely
+empty command draft, not the cursor's position. Keypad/Alt selection actions
+remain available regardless of the draft; explicit user key bindings win.
+Native `torben_fj_mode` makes Home/End visit the visible midpoint, then the
+visible edge, then the directory edge. It does not change ordinary arrow/page
+scrolling. Missing keys retain the earlier routing and navigation.
 `editor_simple_statusbar` selects compact flags, visual column, row/total,
 byte position/size, character/EOF and percentage fields.
 `editor_show_right_margin` shades cells from the configured
@@ -729,6 +736,12 @@ Exiting the shell quits mcpp through its existing confirmation and dirty-editor
 guards. Shell startup and transport errors restore the UI and report the
 failure. Pause-after-run displays the completed command's output before waiting
 for a key; hiding a still-running command does not trigger that pause.
+Explicit `clear_before_exec` clears the panel screen before restoring terminal
+output, not the saved output afterward. With no usable persistent subshell,
+`show_output_starts_shell=false` shows output until one logical key;
+true starts the selected temporary interactive shell until its normal exit.
+An existing persistent shell resumes with either value. Absent keys preserve
+the previous mcpp behavior, including draft, cwd and running-command handling.
 
 `mcpp -u` / `--nosubshell` selects the earlier one-shot behavior for that run;
 `-U` / `--subshell` enables persistent shell integration. These overrides do not

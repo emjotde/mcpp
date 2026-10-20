@@ -20,6 +20,8 @@ public:
     void refresh(const Cancellation& cancellation = {}, bool force = false);
     void move_cursor(int amount);
     void page_cursor(int amount);
+    void home_cursor();
+    void end_cursor();
     void set_viewport_rows(std::size_t rows);
     [[nodiscard]] std::size_t first_row() const noexcept;
     bool enter(const Cancellation& cancellation = {});
@@ -61,6 +63,7 @@ public:
     void set_show_backups(bool value);
     void set_fast_reload(bool value);
     void set_navigation(bool page_scrolling, bool center_scrolling);
+    void set_torben_fj_mode(bool value) noexcept;
     void set_shell_patterns(bool value);
     void set_follow_links(bool value) noexcept { follow_links_ = value; }
     [[nodiscard]] std::string navigation_path() const;
@@ -104,6 +107,7 @@ private:
     bool fast_reload_{false};
     bool page_scrolling_{false};
     bool center_scrolling_{false};
+    bool torben_fj_mode_{false};
     bool shell_patterns_{true};
     bool follow_links_{true};
     std::optional<std::string> directory_revision_;

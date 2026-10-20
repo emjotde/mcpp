@@ -86,6 +86,7 @@ Pane::Pane(
         fast_reload_ = preferences->fast_reload_;
         page_scrolling_ = preferences->page_scrolling_;
         center_scrolling_ = preferences->center_scrolling_;
+        torben_fj_mode_ = preferences->torben_fj_mode_;
         shell_patterns_ = preferences->shell_patterns_;
         follow_links_ = preferences->follow_links_;
         directories_first_ = preferences->directories_first_;
@@ -295,6 +296,46 @@ void Pane::page_cursor(const int amount) {
         static_cast<long long>(maximum)
     ));
     move_cursor(amount);
+}
+
+void Pane::home_cursor() {
+    if (!torben_fj_mode_ || entries_.empty()) {
+        cursor_ = 0;
+    } else {
+        const auto offset = cursor_ - first_row_;
+        if (offset > viewport_rows_ / 2U) {
+            cursor_ = first_row_ + viewport_rows_ / 2U;
+        } else if (offset > 0U) {
+            cursor_ = first_row_;
+        } else {
+            cursor_ = 0;
+        }
+    }
+    keep_cursor_visible();
+}
+
+void Pane::end_cursor() {
+    if (entries_.empty()) {
+        cursor_ = 0;
+        first_row_ = 0;
+        return;
+    }
+    const auto last = entries_.size() - 1U;
+    if (!torben_fj_mode_) {
+        cursor_ = last;
+    } else {
+        const auto offset = cursor_ - first_row_;
+        const auto middle = viewport_rows_ / 2U;
+        const auto bottom = viewport_rows_ - 1U;
+        if (offset < middle) {
+            cursor_ = first_row_ + std::min(middle, last - first_row_);
+        } else if (offset < bottom) {
+            cursor_ = first_row_ + std::min(bottom, last - first_row_);
+        } else {
+            cursor_ = last;
+        }
+    }
+    keep_cursor_visible();
 }
 
 void Pane::set_directory_sizes(const std::map<std::string, std::uint64_t>& sizes) {
@@ -674,6 +715,10 @@ void Pane::set_fast_reload(const bool value) {
 void Pane::set_navigation(const bool page_scrolling, const bool center_scrolling) {
     page_scrolling_ = page_scrolling;
     center_scrolling_ = center_scrolling;
+}
+
+void Pane::set_torben_fj_mode(const bool value) noexcept {
+    torben_fj_mode_ = value;
 }
 
 std::string Pane::navigation_path() const {

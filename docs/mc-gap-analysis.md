@@ -348,6 +348,15 @@ fallback, configured failures surface before editor mutation. Commands use
 closed stdin and a two-second watchdog, with the existing clipboard size cap.
 Other unmapped local options, including output lines and display-codepage
 settings, remain diagnosed and preserved.
+Native selection-key preferences now distinguish literal `+/-` from group
+selection using the whole command draft; keypad/Alt actions remain independent
+of that draft. Explicit mcpp keymaps retain precedence over the observed native
+override quirk. Native Home/End mode visits visible midpoint/edge before the
+directory edge without changing arrow/page algorithms.
+Shell-display preferences clear the alternate panel buffer before restored IO,
+not the saved primary output. Output-only mode without a subshell consumes one
+logical key and restores terminal state; supported existing shells keep their
+state and resume regardless of the output-start flag.
 
 Local user/editor menus now load native conditions, command blocks, prompts,
 pane/editor macros and view/cd directives, while retaining legacy menu rows.
