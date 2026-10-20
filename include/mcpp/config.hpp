@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <array>
 #include <filesystem>
+#include <memory>
 #include <optional>
 #include <map>
 #include <string>
@@ -12,6 +13,8 @@
 #include <vector>
 
 namespace mcpp {
+
+struct ConfigSource;
 
 struct SavedEditorPosition {
     std::size_t row{0};
@@ -50,6 +53,8 @@ struct Config {
     bool reverse_files_only{true};
     bool layout_horizontal{false};
     bool equal_split{true};
+    std::optional<bool> layout_vertical_equal;
+    std::optional<bool> layout_horizontal_equal;
     int panel_left_size{0};
     int panel_top_size{0};
     bool menubar_visible{true};
@@ -74,6 +79,8 @@ struct Config {
     std::size_t quick_search_mode{2};
     std::string saved_left_path;
     std::string saved_right_path;
+    std::optional<bool> current_is_left;
+    std::optional<std::string> other_directory;
     bool verbose_operation{true};
     bool compute_totals{true};
     bool classic_progressbar{true};
@@ -90,6 +97,8 @@ struct Config {
     std::size_t vfs_timeout{60};
     bool use_internal_edit{true};
     bool use_internal_view{true};
+    bool viewer_wrap{true};
+    std::optional<bool> viewer_mouse_page_scrolling;
     bool ask_new_filename{false};
     bool auto_menus{false};
     bool drop_menus{false};
@@ -124,6 +133,7 @@ struct Config {
     bool editor_group_undo{true};
     std::size_t editor_wrap_mode{0};
     std::size_t diff_quality{0};
+    std::size_t diff_tab_size{8};
     bool diff_ignore_case{false};
     bool diff_ignore_tab_expansion{false};
     bool diff_ignore_space_change{false};
@@ -149,9 +159,14 @@ struct Config {
     std::map<std::string, SavedEditorPosition> editor_positions;
     std::map<std::string, std::string> learned_keys;
     std::map<std::string, std::string> editor_macros;
+    std::vector<std::string> diagnostics;
+    std::shared_ptr<const ConfigSource> source;
 
     static Config load(const std::filesystem::path& path);
     void save(const std::filesystem::path& path) const;
+    void save() const;
+    [[nodiscard]] bool split_is_equal() const;
+    void set_split_equal(bool value);
 };
 
 [[nodiscard]] std::filesystem::path default_config_path();

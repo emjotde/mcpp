@@ -17,11 +17,13 @@ archives. Remote work, including Azure Blob Storage and SSH/SFTP, is paused.
 - Selection, masks, inversion, and recursive search results
 - F2 user menu, F3 range/hex viewer, and F4 conflict-aware editor
 - F5 copy, F6 move, F7 mkdir, F8 delete, F9 menu, and F10 quit
-- Asynchronous copy/move/delete progress and cancellation
+- Concurrent copy/move/delete jobs with independent progress and cancellation
 - Per-file overwrite, skip, all/none and newer-source-only choices
 - Retry, skip, ignore-all or abort on transfer/removal errors
 - `Ctrl-X j` background jobs view with recent results and pause/resume/show/abort
 - Background completion preserves the current editor, viewer, or prompt
+- Independent viewer and diff screens alongside editor buffers
+- Context-sensitive help with topics, links, and back navigation
 - Background failures remain visible on return to panels; `Esc` dismisses the notice
 - Copy/move destinations accept directories or single-file exact names;
   relative destinations use the active pane and a trailing slash requests a directory
@@ -110,6 +112,28 @@ Quit exits the process rather than returning to the file manager. Staged hex
 edits and merged changes retain the same Save/Discard/Cancel, revision,
 read-only, and linked-file protections. Editing from a standalone diff returns
 to that comparison before quitting the process.
+
+## Screens and help
+
+`Alt-Backtick` opens the screen list from the manager, editor, viewer, or diff.
+`Alt-}` and `Alt-{` select the next and previous screen. Multiple viewers and
+comparisons retain their own positions, search settings, bookmarks, staged edits,
+and source lifetimes. Returning from the editor goes back to the comparison that
+opened it. Closing one screen does not discard another screen's edits.
+
+`F1` opens help for the current screen or dialog without dismissing it.
+Use Tab/Shift-Tab to select links, Enter/Right to follow, F2 for the index, and
+F3/Left to go back. Arrow/Page keys, Home/End, the wheel, and link clicks navigate
+the page; F10 or Escape returns to the original screen. Key-learning and raw
+key-capture prompts continue to receive F1 rather than opening help.
+The English help is independently written; MC `.hlp` import and full-text
+help search are not implemented.
+
+`Ctrl-X j` lists file-operation jobs. Pause/Resume, Show, and Abort affect only
+the selected job. Inputs, options, conflict answers, and cancellation belong to
+that job, not whichever pane is active later. Background questions wait for
+Show (F3); they do not replace an editor, help page, or unfinished dialog.
+Commands can run while jobs continue. Exiting cancels and joins remaining jobs.
 
 ## Testing
 
@@ -270,6 +294,25 @@ The supported syntax choices and mcpp's rule/configuration file formats are
 not MC's complete syntax database or configuration-file compatibility layer.
 Remote providers remain explicitly paused. Local archive/VFS and remaining
 shell-compatibility work are tracked separately from these local menu controls.
+
+## Configuration files
+
+New setups use `$XDG_CONFIG_HOME/mcpp/ini` and `panels.ini` (normally
+`~/.config/mcpp/`). Existing flat `mcpp/config` setups still load and save in
+their original format unless a native `ini` is supplied. Native settings overlay
+existing legacy preferences on first use without duplicating histories.
+No files in MC's own configuration directory are changed.
+
+The native format applies supported local manager, layout, confirmation, panel,
+editor, viewer, and diff settings. Save Setup preserves comments and unknown
+settings, and saves each file privately and atomically. The two-file update is
+not crash-atomic as a pair. Command-line skin and keymap overrides remain
+launch-only unless explicitly changed in the UI.
+
+Compatibility is partial: unsupported settings are diagnosed and preserved,
+not silently applied or removed. Saved non-listing panel displays, legacy
+terminal/codepage options, remote options, and other unmapped MC settings are
+not implemented.
 
 ## Keymaps
 

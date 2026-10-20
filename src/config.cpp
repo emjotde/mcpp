@@ -1,4 +1,6 @@
 #include "mcpp/config.hpp"
+#include "mcpp/config_ini.hpp"
+#include "mcpp/listing.hpp"
 #include "mcpp/spelling.hpp"
 #include "mcpp/syntax.hpp"
 #include "mcpp/local_tools.hpp"
@@ -40,7 +42,7 @@ bool parse_bool(const std::string& value, const std::string& key) {
 
 std::size_t parse_width(
     const std::string_view value,
-    const std::size_t fallback
+    const std::string_view key
 ) {
     std::size_t parsed = 0;
     const auto result = std::from_chars(
@@ -52,7 +54,7 @@ std::size_t parse_width(
         result.ptr != value.data() + value.size() ||
         parsed < 1U ||
         parsed > 32U) {
-        return fallback;
+        throw std::runtime_error(std::string(key) + " must be 1 through 32");
     }
     return parsed;
 }
@@ -215,28 +217,55 @@ auto diff_bool_settings(Configuration& config) {
 
 Config Config::load(const std::filesystem::path& path) {
     Config result;
-    std::ifstream input(path);
-    if (!input) {
-        std::error_code error;
-        const bool present = std::filesystem::exists(path, error);
-        if (error || present) {
-            throw std::runtime_error("cannot read configuration: " + path.string());
+    auto loaded = std::make_shared<ConfigSource>();
+    loaded->primary = read_config_document(path);
+    if (loaded->primary.native && path.filename() == "ini") {
+        bool preferences_saved = false;
+        for (const auto& line : loaded->primary.lines) {
+            if (line.section == "mcpp" && line.key == "preferences_saved") {
+                try {
+                    preferences_saved = parse_bool(line.value, line.key);
+                } catch (const std::exception& error) {
+                    throw std::runtime_error(config_setting_location(loaded->primary, line) + ": " + error.what());
+                }
+            }
         }
-        return result;
+        if (!preferences_saved) {
+            const auto legacy = path.parent_path() / "config";
+            const auto legacy_document = read_config_document(legacy);
+            if (legacy_document.present) result = Config::load(legacy);
+        }
+        loaded->panels = read_config_document(path.parent_path() / "panels.ini");
     }
     bool visible_tabs_seen = false;
     bool visible_trailing_seen = false;
-    std::string line;
-    while (std::getline(input, line)) {
-        if (line.empty() || line.starts_with('#')) {
+    bool native_wrap_seen = false;
+    bool typewriter_wrap = false;
+    bool paragraph_wrap = false;
+    std::string wrap_location;
+    const auto apply_document = [&](ConfigIniDocument& document, const bool panels_only) {
+      bool panelize_seen = false;
+      for (auto& line : document.lines) {
+        if (line.key.empty()) continue;
+        try {
+        const auto translated = panels_only && line.section != "New Left Panel" && line.section != "New Right Panel" &&
+            line.section != "Dirs"
+            ? std::nullopt : translate_config_setting(line, document.native);
+        if (!translated) {
+            result.diagnostics.push_back(config_setting_location(document, line) +
+                ": not supported by mcpp; preserved without applying it");
             continue;
         }
-        const auto equals = line.find('=');
-        if (equals == std::string::npos) {
-            continue;
+        const auto& [key, value] = *translated;
+        line.applied = true;
+        if (document.native && line.section == "Panels") {
+            if (key == "show_hidden") result.panel_hidden = {};
+            if (key == "directories_first") result.panel_directories_first = {};
         }
-        const auto key = line.substr(0, equals);
-        const auto value = line.substr(equals + 1U);
+        if (line.section == "Panelize" && !panelize_seen) {
+            result.panelize_commands.clear();
+            panelize_seen = true;
+        }
         const auto panel_settings = panel_bool_settings(result);
         const auto panel_boolean = std::ranges::find(panel_settings, key,
             &std::pair<std::string_view, bool*>::first);
@@ -266,7 +295,9 @@ Config Config::load(const std::filesystem::path& path) {
             *diff_boolean->second = parse_bool(value, key);
             continue;
         }
-        if (key == "show_hidden") {
+        if (key == "preferences_saved" && line.section == "mcpp") {
+            static_cast<void>(parse_bool(value, key));
+        } else if (key == "show_hidden") {
             result.show_hidden = parse_bool(value, key);
         } else if (key == "confirm_delete") {
             result.confirm_delete = parse_bool(value, key);
@@ -292,6 +323,10 @@ Config Config::load(const std::filesystem::path& path) {
             result.layout_horizontal = parse_bool(value, key);
         } else if (key == "equal_split") {
             result.equal_split = parse_bool(value, key);
+        } else if (key == "layout_vertical_equal") {
+            result.layout_vertical_equal = parse_bool(value, key);
+        } else if (key == "layout_horizontal_equal") {
+            result.layout_horizontal_equal = parse_bool(value, key);
         } else if (key == "menubar_visible") {
             result.menubar_visible = parse_bool(value, key);
         } else if (key == "command_prompt") {
@@ -315,6 +350,15 @@ Config Config::load(const std::filesystem::path& path) {
             result.saved_left_path = decode_value(value);
         } else if (key == "saved_right_path") {
             result.saved_right_path = decode_value(value);
+        } else if (key == "current_is_left") {
+            result.current_is_left = parse_bool(value, key);
+        } else if (key == "other_directory") {
+            result.other_directory = decode_value(value);
+            if (result.other_directory->empty()) throw std::runtime_error("other_dir needs a directory path");
+        } else if (key == "viewer_wrap") {
+            result.viewer_wrap = parse_bool(value, key);
+        } else if (key == "viewer_mouse_page_scrolling") {
+            result.viewer_mouse_page_scrolling = parse_bool(value, key);
         } else if (key == "escape_timeout" || key == "pause_after_run") {
             int number = 0;
             const auto parsed = std::from_chars(value.data(), value.data() + value.size(), number);
@@ -338,6 +382,7 @@ Config Config::load(const std::filesystem::path& path) {
                 result.panel_listing[index] = parse_listing(value);
             } else if (field == "columns") {
                 result.panel_columns[index] = decode_value(value);
+                static_cast<void>(parse_listing_format(result.panel_columns[index]));
             } else if (field == "brief_columns") {
                 std::size_t columns = 0;
                 const auto parsed = std::from_chars(value.data(), value.data() + value.size(), columns);
@@ -349,6 +394,8 @@ Config Config::load(const std::filesystem::path& path) {
             } else if (field.starts_with("status_") && field.size() == 8U &&
                        field.back() >= '0' && field.back() <= '3') {
                 result.panel_status_formats[index][static_cast<std::size_t>(field.back() - '0')] = decode_value(value);
+                static_cast<void>(parse_listing_format(
+                    result.panel_status_formats[index][static_cast<std::size_t>(field.back() - '0')]));
             } else if (field == "encoding") {
                 if (!value.empty() &&
                     std::ranges::find(supported_codepages(), value, &Codepage::id) == supported_codepages().end()) {
@@ -367,6 +414,8 @@ Config Config::load(const std::filesystem::path& path) {
                 result.panel_case_sensitive[index] = parse_bool(value, key);
             } else if (field == "executable_first") {
                 result.panel_executable_first[index] = parse_bool(value, key);
+            } else {
+                line.applied = false;
             }
         } else if (key == "theme") {
             result.theme = decode_value(value);
@@ -387,12 +436,12 @@ Config Config::load(const std::filesystem::path& path) {
         } else if (key == "editor_tab_width") {
             result.editor_tab_width = parse_width(
                 value,
-                result.editor_tab_width
+                key
             );
         } else if (key == "editor_indent_width") {
             result.editor_indent_width = parse_width(
                 value,
-                result.editor_indent_width
+                key
             );
         } else if (key == "editor_wrap_length") {
             std::size_t width = 0;
@@ -412,6 +461,18 @@ Config Config::load(const std::filesystem::path& path) {
             else if (value == "dynamic") result.editor_wrap_mode = 1;
             else if (value == "typewriter") result.editor_wrap_mode = 2;
             else throw std::runtime_error("invalid editor wrap mode");
+            if (native_wrap_seen) {
+                typewriter_wrap = result.editor_wrap_mode == 2U;
+                paragraph_wrap = result.editor_wrap_mode == 1U;
+            }
+        } else if (key == "native_typewriter_wrap" || key == "native_paragraph_wrap") {
+            native_wrap_seen = true;
+            (key == "native_typewriter_wrap" ? typewriter_wrap : paragraph_wrap) = parse_bool(value, key);
+            wrap_location = config_setting_location(document, line);
+        } else if (key == "native_panel_display") {
+            if (value != "listing") throw std::runtime_error("unsupported saved panel display: " + value);
+        } else if (key == "diff_tab_size") {
+            result.diff_tab_size = parse_width(value, key);
         } else if (key == "diff_quality") {
             const auto parsed = std::from_chars(value.data(), value.data() + value.size(), result.diff_quality);
             if (parsed.ec != std::errc{} || parsed.ptr != value.data() + value.size() || result.diff_quality > 2U) {
@@ -487,20 +548,29 @@ Config Config::load(const std::filesystem::path& path) {
             result.editor_positions[decode_value(value.substr(colon + 1U))] = {
                 positions[0], positions[1], {positions.begin() + 2, positions.end()}
             };
+        } else {
+            line.applied = false;
         }
+        if (!line.applied) result.diagnostics.push_back(config_setting_location(document, line) +
+            ": not supported by mcpp; preserved without applying it");
+        } catch (const std::exception& error) {
+            throw std::runtime_error(config_setting_location(document, line) + ": " + error.what());
+        }
+      }
+    };
+    apply_document(loaded->primary, false);
+    if (loaded->panels) apply_document(*loaded->panels, true);
+    if (native_wrap_seen) {
+        if (typewriter_wrap && paragraph_wrap) {
+            throw std::runtime_error(wrap_location + ": typewriter wrap and automatic paragraph formatting cannot both be enabled");
+        }
+        result.editor_wrap_mode = typewriter_wrap ? 2U : paragraph_wrap ? 1U : 0U;
     }
-    if (input.bad()) {
-        throw std::runtime_error("failed while reading configuration: " + path.string());
-    }
+    result.source = std::move(loaded);
     return result;
 }
 
 void Config::save(const std::filesystem::path& path) const {
-    const auto created =
-        std::filesystem::create_directories(path.parent_path());
-    if (created) {
-        static_cast<void>(chmod(path.parent_path().c_str(), 0700));
-    }
     std::ostringstream output;
     output << "show_hidden=" << (show_hidden ? "true" : "false")
            << '\n'
@@ -537,6 +607,7 @@ void Config::save(const std::filesystem::path& path) const {
         output << key << '=' << (*value ? "true" : "false") << '\n';
     }
     output << "diff_quality=" << diff_quality << '\n';
+    output << "diff_tab_size=" << diff_tab_size << '\n';
     for (const auto& [key, value] : editor_bool_settings(*this)) {
         output << key << '=' << (*value ? "true" : "false") << '\n';
     }
@@ -554,6 +625,12 @@ void Config::save(const std::filesystem::path& path) const {
     output << "quick_search_mode=" << quick_search_mode << '\n'
            << "saved_left_path=" << encode_value(saved_left_path) << '\n'
            << "saved_right_path=" << encode_value(saved_right_path) << '\n';
+    if (current_is_left) output << "current_is_left=" << (*current_is_left ? "true" : "false") << '\n';
+    if (other_directory) output << "other_directory=" << encode_value(*other_directory) << '\n';
+    output << "viewer_wrap=" << (viewer_wrap ? "true" : "false") << '\n';
+    if (viewer_mouse_page_scrolling) {
+        output << "viewer_mouse_page_scrolling=" << (*viewer_mouse_page_scrolling ? "true" : "false") << '\n';
+    }
     output << "editor_backup_extension=" << encode_value(editor_backup_extension) << '\n'
            << "editor_check_newline=" << (editor_check_newline ? "true" : "false") << '\n';
     output << "reverse_files_only=" << (reverse_files_only ? "true" : "false") << '\n';
@@ -569,6 +646,8 @@ void Config::save(const std::filesystem::path& path) const {
            << "hintbar_visible=" << (hintbar_visible ? "true" : "false") << '\n'
            << "xterm_title=" << (xterm_title ? "true" : "false") << '\n'
            << "show_free_space=" << (show_free_space ? "true" : "false") << '\n';
+    if (layout_vertical_equal) output << "layout_vertical_equal=" << (*layout_vertical_equal ? "true" : "false") << '\n';
+    if (layout_horizontal_equal) output << "layout_horizontal_equal=" << (*layout_horizontal_equal ? "true" : "false") << '\n';
     for (std::size_t index = 0; index < 2U; ++index) {
         const auto prefix = index == 0U ? "left_" : "right_";
         output << prefix << "listing=" << listing_name(panel_listing[index]) << '\n'
@@ -626,9 +705,39 @@ void Config::save(const std::filesystem::path& path) const {
     if (!output) {
         throw std::runtime_error("cannot serialize configuration");
     }
-    const auto content = std::move(output).str();
+    const auto flat = std::move(output).str();
+    ConfigIniDocument primary;
+    if (source && source->primary.path == path) primary = source->primary;
+    else primary.native = path.filename() == "ini" || path.extension() == ".ini";
+    primary.path = path;
+    const bool separate_panels = primary.native && path.filename() == "ini";
+    std::vector<std::pair<std::filesystem::path, std::string>> files;
+    if (separate_panels) {
+        ConfigIniDocument panels;
+        if (source && source->panels && source->panels->path == path.parent_path() / "panels.ini") {
+            panels = *source->panels;
+        }
+        panels.path = path.parent_path() / "panels.ini";
+        panels.native = true;
+        files.emplace_back(panels.path, serialize_config_document(panels, flat, true));
+    }
+    files.emplace_back(path, serialize_config_document(primary, flat, false, separate_panels));
+    for (const auto& file : files) {
+        std::error_code error;
+        const auto status = std::filesystem::symlink_status(file.first, error);
+        if (error == std::errc::no_such_file_or_directory) continue;
+        if (error) throw std::filesystem::filesystem_error("inspect configuration destination", file.first, error);
+        if (!std::filesystem::is_regular_file(status) && !std::filesystem::is_symlink(status)) {
+            throw std::runtime_error("configuration destination is not a regular file: " + file.first.string());
+        }
+    }
+    const auto directory = path.has_parent_path() ? path.parent_path() : std::filesystem::path(".");
+    if (std::filesystem::create_directories(directory) && chmod(directory.c_str(), 0700) != 0) {
+        throw std::runtime_error("cannot protect configuration directory: " + directory.string());
+    }
+    const auto stage = [](const std::filesystem::path& destination, const std::string& content) {
     auto pattern =
-        (path.parent_path() / ".mcpp-config-XXXXXX").string();
+        (destination.parent_path() / ".mcpp-config-XXXXXX").string();
     std::vector<char> buffer(pattern.begin(), pattern.end());
     buffer.push_back('\0');
     int descriptor = mkostemp(buffer.data(), O_CLOEXEC);
@@ -674,7 +783,7 @@ void Config::save(const std::filesystem::path& path) const {
             );
         }
         descriptor = -1;
-        std::filesystem::rename(temporary, path);
+        return temporary;
     } catch (...) {
         if (descriptor >= 0) {
             static_cast<void>(close(descriptor));
@@ -683,19 +792,57 @@ void Config::save(const std::filesystem::path& path) const {
         std::filesystem::remove(temporary, ignored);
         throw;
     }
+    };
+    std::vector<std::pair<std::filesystem::path, std::filesystem::path>> staged;
+    try {
+        for (const auto& [destination, content] : files) staged.emplace_back(stage(destination, content), destination);
+        for (const auto& [temporary, destination] : staged) std::filesystem::rename(temporary, destination);
+    } catch (...) {
+        for (const auto& [temporary, destination] : staged) {
+            static_cast<void>(destination);
+            std::error_code ignored;
+            std::filesystem::remove(temporary, ignored);
+        }
+        throw;
+    }
+}
+
+void Config::save() const {
+    save(source ? source->primary.path : default_config_path());
+}
+
+bool Config::split_is_equal() const {
+    return (layout_horizontal ? layout_horizontal_equal : layout_vertical_equal).value_or(equal_split);
+}
+
+void Config::set_split_equal(const bool value) {
+    equal_split = value;
+    (layout_horizontal ? layout_horizontal_equal : layout_vertical_equal) = value;
 }
 
 std::filesystem::path default_config_path() {
+    std::filesystem::path directory;
     if (const auto* value = std::getenv("XDG_CONFIG_HOME");
         value != nullptr && *value != '\0') {
-        return std::filesystem::path(value) / "mcpp" / "config";
+        directory = std::filesystem::path(value) / "mcpp";
+    } else if (const auto* home = std::getenv("HOME");
+        home != nullptr && *home != '\0') {
+        directory = std::filesystem::path(home) / ".config" / "mcpp";
+    } else {
+        return std::filesystem::path(".mcpp-config");
     }
-    if (const auto* value = std::getenv("HOME");
-        value != nullptr && *value != '\0') {
-        return std::filesystem::path(value) /
-               ".config" / "mcpp" / "config";
-    }
-    return std::filesystem::path(".mcpp-config");
+    const auto present = [](const std::filesystem::path& candidate) {
+        std::error_code error;
+        const auto status = std::filesystem::symlink_status(candidate, error);
+        if (error == std::errc::no_such_file_or_directory) return false;
+        if (error) throw std::filesystem::filesystem_error("inspect configuration", candidate, error);
+        return std::filesystem::exists(status);
+    };
+    const auto native = directory / "ini";
+    const auto legacy = directory / "config";
+    if (present(native)) return native;
+    if (present(legacy)) return legacy;
+    return native;
 }
 
 }  // namespace mcpp

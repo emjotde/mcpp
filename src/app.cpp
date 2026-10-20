@@ -7,6 +7,7 @@
 #include "mcpp/editor_lock.hpp"
 #include "mcpp/extension.hpp"
 #include "mcpp/file_highlight.hpp"
+#include "mcpp/help.hpp"
 #include "mcpp/hotlist.hpp"
 #include "mcpp/input_history.hpp"
 #include "mcpp/keymap.hpp"
@@ -15,6 +16,7 @@
 #include "mcpp/local_tools.hpp"
 #include "mcpp/location.hpp"
 #include "mcpp/listing.hpp"
+#include "mcpp/operation_job.hpp"
 #include "mcpp/search.hpp"
 #include "mcpp/shell.hpp"
 #include "mcpp/skin.hpp"
@@ -137,6 +139,8 @@ struct EditorEditBlocked {
 };
 
 struct EditorBuffer : EditorModel {
+    std::uint64_t screen_id{0};
+    std::optional<std::pair<std::uint64_t, std::size_t>> diff_screen_return;
     EditorLock file_lock;
     std::function<void(EditorBuffer&)> before_change;
     bool changed_once{false};
@@ -292,7 +296,6 @@ enum class Mode {
     viewer_wrap_dialog,
     editor,
     editor_menu,
-    editor_help,
     editor_error,
     editor_search_dialog,
     editor_replace_dialog,
@@ -332,7 +335,6 @@ enum class Mode {
     local_command,
     learn_key,
     learn_keys_dialog,
-    help,
     user_menu,
     pulldown,
     search_results,
@@ -363,19 +365,6 @@ enum class EditorSavePurpose {
     diff_save,
 };
 
-enum class OperationChoice {
-    overwrite,
-    append,
-    reget,
-    skip,
-    overwrite_all,
-    skip_all,
-    older,
-    retry,
-    ignore_all,
-    cancel,
-};
-
 struct OperationChoiceButton {
     OperationChoice choice;
     std::string_view label;
@@ -389,10 +378,27 @@ struct OperationPolicy {
 };
 
 struct OperationJob {
+    enum class Kind { copy, move, remove };
     std::uint64_t id{0};
+    Kind kind{Kind::copy};
     std::string label;
     std::string destination;
     std::string status;
+    ProviderPtr source_provider;
+    ProviderPtr destination_provider;
+    std::vector<Entry> sources;
+    OperationOptions options;
+    int source_pane_id{0};
+    int source_side{0};
+    std::string source_directory;
+    std::string source_base_directory;
+    bool exact{false};
+    bool compute_totals{true};
+    bool background{false};
+    bool finished{false};
+    std::chrono::steady_clock::time_point started{std::chrono::steady_clock::now()};
+    OperationJobControl control;
+    std::jthread worker;
 };
 
 enum class PromptAction {
@@ -999,9 +1005,13 @@ ftxui::Event named_event(const std::string& name) {
 std::optional<Keymap> load_configured_keymap(const Config& config) {
     if (config.keymap_disabled) return std::nullopt;
     auto requested = config.keymap_override.value_or(config.keymap_file);
-    if (!config.keymap_override && requested.empty()) {
-        const auto* environment = std::getenv("MCPP_KEYMAP");
-        if (environment != nullptr) requested = environment;
+    if (!config.keymap_override) {
+        for (const auto* name : {"MCPP_KEYMAP", "MC_KEYMAP"}) {
+            if (const auto* environment = std::getenv(name); environment && *environment) {
+                requested = environment;
+                break;
+            }
+        }
     }
     const auto configuration = default_config_path().parent_path();
     const auto present = [](const std::filesystem::path& path) {
@@ -1013,15 +1023,25 @@ std::optional<Keymap> load_configured_keymap(const Config& config) {
     };
     if (!requested.empty()) {
         const std::filesystem::path path(requested);
-        if (!path.has_parent_path() && !present(path)) {
-            for (const auto& directory : {configuration, std::filesystem::path("/etc/mcpp")}) {
-                if (present(directory / path)) return Keymap::load(directory / path);
+        if (config.keymap_override && present(path)) return Keymap::load(path);
+        const std::array candidates{path, std::filesystem::path(requested + ".keymap")};
+        if (!path.has_parent_path()) {
+            for (const auto& directory : {configuration, std::filesystem::path("/etc/mcpp"),
+                                           std::filesystem::path("/usr/share/mcpp")}) {
+                for (const auto& candidate : candidates) {
+                    if (present(directory / candidate)) return Keymap::load(directory / candidate);
+                }
             }
         }
+        for (const auto& candidate : candidates) if (present(candidate)) return Keymap::load(candidate);
         return Keymap::load(path);
     }
     for (const auto& path : {configuration / "mcpp.keymap",
-                             std::filesystem::path("/etc/mcpp/mcpp.keymap")}) {
+                             configuration / "mc.keymap",
+                             std::filesystem::path("/etc/mcpp/mcpp.keymap"),
+                             std::filesystem::path("/etc/mcpp/mc.keymap"),
+                             std::filesystem::path("/usr/share/mcpp/mcpp.keymap"),
+                             std::filesystem::path("/usr/share/mcpp/mc.keymap")}) {
         if (present(path)) return Keymap::load(path);
     }
     return std::nullopt;
@@ -1048,6 +1068,7 @@ std::span<const OriginalKeyBinding> original_keymap_bindings() {
         {filemanager, "ExtendedKeyMap", "ctrl-x"}, {filemanager, "History", "alt-h"},
         {filemanager, "SelectCodepage", "alt-e"}, {filemanager, "EditorViewerHistory", "alt-E"},
         {filemanager, "ViewFiltered", "alt-exclamation"}, {filemanager, "ScreenList", "alt-`"},
+        {filemanager, "ScreenNext", "alt-rbrace"}, {filemanager, "ScreenPrev", "alt-lbrace"},
         {filemanager_xmap, "PanelQuickView", "q"}, {filemanager_xmap, "PanelInfo", "i"},
         {filemanager_xmap, "ChangeMode", "c"}, {filemanager_xmap, "Link", "l"},
         {filemanager_xmap, "LinkSymbolic", "s"}, {filemanager_xmap, "LinkSymbolicRelative", "v"},
@@ -1121,7 +1142,10 @@ std::span<const OriginalKeyBinding> original_keymap_bindings() {
         {editor, "SpellCheckCurrentWord", "ctrl-p"}, {editor, "MacroStartStopRecord", "ctrl-r"},
         {editor, "InsertLiteral", "ctrl-q"}, {editor, "ParagraphFormat", "alt-p"},
         {editor, "ExternalCommand", "alt-u"}, {editor, "ScreenList", "alt-`"},
+        {editor, "ScreenNext", "alt-rbrace"}, {editor, "ScreenPrev", "alt-lbrace"},
         {viewer, "Quit", "f10;f3;esc;q"}, {viewer, "Help", "f1"},
+        {viewer, "ScreenList", "alt-`"}, {viewer, "ScreenNext", "alt-rbrace"},
+        {viewer, "ScreenPrev", "alt-lbrace"},
         {viewer, "WrapMode", "f2"}, {viewer, "HexMode", "f4"},
         {viewer, "Goto", "f5"}, {viewer, "Search", "f7"},
         {viewer, "SearchForward", "slash"}, {viewer, "SearchBackward", "question"},
@@ -1147,6 +1171,8 @@ std::span<const OriginalKeyBinding> original_keymap_bindings() {
         {viewer_hex, "Right", "right;f"}, {viewer_hex, "PageUp", "pgup;alt-v"},
         {viewer_hex, "PageDown", "pgdn;ctrl-v"},
         {diffviewer, "Help", "f1"}, {diffviewer, "Save", "f2"},
+        {diffviewer, "ScreenList", "alt-`"}, {diffviewer, "ScreenNext", "alt-rbrace"},
+        {diffviewer, "ScreenPrev", "alt-lbrace"},
         {diffviewer, "Edit", "f4"}, {diffviewer, "EditOther", "f14"},
         {diffviewer, "Merge", "f5"}, {diffviewer, "MergeOther", "f15"},
         {diffviewer, "Search", "f7"}, {diffviewer, "SearchContinue", "f17"},
@@ -1176,7 +1202,7 @@ std::span<const OriginalKeyBinding> original_keymap_bindings() {
         {input, "Yank", "ctrl-y;shift-insert"}, {input, "Store", "ctrl-insert"},
         {input, "Cut", "shift-delete"}, {input, "HistoryPrev", "alt-p;up"},
         {input, "HistoryNext", "alt-n;down"}, {input, "Complete", "alt-tab"},
-        {dialog, "Ok", "enter"}, {dialog, "Cancel", "esc"},
+        {dialog, "Help", "f1"}, {dialog, "Ok", "enter"}, {dialog, "Cancel", "esc"},
         {dialog, "Left", "left"}, {dialog, "Right", "right"},
         {dialog, "Up", "up"}, {dialog, "Down", "down"},
         {dialog, "Select", "space"}, {dialog, "Tab", "tab"},
@@ -1189,7 +1215,13 @@ std::span<const OriginalKeyBinding> original_keymap_bindings() {
         {listbox, "PageUp", "pgup"}, {listbox, "PageDown", "pgdn"},
         {listbox, "Enter", "enter"}, {listbox, "Delete", "delete"},
         {radio, "Up", "up"}, {radio, "Down", "down"},
-        {radio, "Select", "space"}, {help, "Quit", "esc;f1"},
+        {radio, "Select", "space"},
+        {help, "Help", "f1"}, {help, "Index", "f2"}, {help, "Back", "f3;left"},
+        {help, "Quit", "f10;esc"}, {help, "Up", "up"}, {help, "Down", "down"},
+        {help, "PageUp", "pgup;b"}, {help, "PageDown", "pgdn;space"},
+        {help, "Top", "home;ctrl-home"}, {help, "Bottom", "end;ctrl-end"},
+        {help, "LinkNext", "tab"}, {help, "LinkPrev", "shift-tab;alt-tab"},
+        {help, "Enter", "enter;right"},
         {chattr, "Up", "up"}, {chattr, "Down", "down"},
         {chattr, "PageUp", "pgup"}, {chattr, "PageDown", "pgdn"},
         {chattr, "Mark", "space"},
@@ -1575,9 +1607,78 @@ struct TextInputState {
     }
 };
 
+struct ScreenTarget {
+    Mode mode{Mode::panels};
+    std::uint64_t id{0};
+};
+
+struct ViewerSessionState {
+    std::uint64_t viewer_screen_id{0};
+    ViewerModel viewer;
+    std::shared_ptr<TemporaryFile> viewer_temporary_file;
+    std::string viewer_display_name;
+    std::string viewer_search_needle;
+    std::string viewer_search_pattern;
+    bool viewer_search_hex{false};
+    EditorSearchOptions viewer_search_options;
+    bool viewer_search_all_charsets{false};
+    ProviderPtr viewer_navigation_provider;
+    std::vector<std::string> viewer_navigation_files;
+    std::optional<std::string> viewer_switch_pending;
+    bool viewer_switch_preserve_list{false};
+    unsigned int viewer_ruler{0};
+    std::string viewer_message_title{"Viewer"};
+    std::string viewer_message;
+    Mode viewer_return_mode{Mode::panels};
+    ScreenTarget viewer_return_screen;
+    bool viewer_save_closes{false};
+    bool viewer_quit_after_close{false};
+    std::size_t viewer_choice{0};
+    std::array<ftxui::Box, 3> viewer_choice_boxes{};
+    std::array<ftxui::Box, 2> viewer_wrap_boxes{};
+    bool viewer_search_quick{false};
+    std::size_t viewer_hex_first_column{0};
+    ViewerGotoMode viewer_goto_mode{ViewerGotoMode::line};
+    bool viewer_goto_quick{false};
+    std::vector<ViewerRow> viewer_rows;
+    std::string viewer_rendered_path;
+};
+
+struct DiffSessionState {
+    std::uint64_t diff_screen_id{0};
+    std::array<EditorBuffer, 2> diff_files;
+    DiffModel file_diff;
+    DiffOptions diff_options;
+    DiffOptions diff_draft;
+    std::size_t diff_top{0};
+    std::size_t diff_hunk{0};
+    std::size_t diff_horizontal{0};
+    std::size_t diff_order{0};
+    std::size_t diff_tab_size{8};
+    int diff_split{0};
+    bool diff_full{false};
+    bool diff_saving{false};
+    bool diff_closing{false};
+    bool diff_quit_after_close{false};
+    bool diff_show_symbols{true};
+    bool diff_show_numbers{false};
+    ScreenTarget diff_return_screen;
+    std::size_t diff_save_index{0};
+    std::optional<std::size_t> diff_edit_side;
+    std::optional<std::size_t> diff_last_merged_side;
+    std::array<ftxui::Box, 2> diff_pane_boxes{};
+    std::size_t diff_options_focus{0};
+    std::array<ftxui::Box, 10> diff_options_boxes{};
+    std::string diff_search_query;
+    EditorSearchOptions diff_search_options;
+    bool diff_search_all_charsets{false};
+    std::optional<std::pair<std::size_t, std::size_t>> diff_search_cursor;
+    std::optional<std::pair<std::size_t, std::pair<std::size_t, std::size_t>>> diff_search_match;
+};
+
 }  // namespace
 
-struct App::Impl {
+struct App::Impl : ViewerSessionState, DiffSessionState {
     Config config;
     struct PaletteSet {
         Skin panels;
@@ -1595,6 +1696,11 @@ struct App::Impl {
     std::optional<KeymapContext> keymap_prefix;
     Mode keymap_prefix_mode{Mode::panels};
     bool keymap_dispatching{false};
+    std::optional<HelpBrowser> help_browser;
+    std::string help_message;
+    std::vector<ftxui::Box> help_row_boxes;
+    std::vector<std::optional<std::size_t>> help_row_links;
+    std::array<ftxui::Box, 4> help_key_boxes{};
     ProviderPtr local;
     ArchiveCache archives;
     Location left_location;
@@ -1702,29 +1808,10 @@ struct App::Impl {
     std::array<ftxui::Box, 5> ownership_boxes{};
     std::vector<ftxui::Box> ownership_buttons;
     std::string ownership_error;
-    std::array<EditorBuffer, 2> diff_files;
-    DiffModel file_diff;
-    DiffOptions diff_options;
-    DiffOptions diff_draft;
-    std::size_t diff_top{0};
-    std::size_t diff_hunk{0};
-    std::size_t diff_horizontal{0};
-    std::size_t diff_order{0};
-    std::size_t diff_tab_size{8};
-    int diff_split{0};
-    bool diff_full{false};
-    bool diff_saving{false};
-    bool diff_closing{false};
     bool exit_after_diff{false};
-    std::size_t diff_save_index{0};
-    std::optional<std::size_t> diff_edit_side;
-    std::optional<std::size_t> diff_last_merged_side;
-    std::array<ftxui::Box, 2> diff_pane_boxes{};
-    std::size_t diff_options_focus{0};
-    std::array<ftxui::Box, 10> diff_options_boxes{};
-    std::string diff_search_query;
-    std::optional<std::pair<std::size_t, std::size_t>> diff_search_cursor;
-    std::optional<std::pair<std::size_t, std::pair<std::size_t, std::size_t>>> diff_search_match;
+    std::uint64_t next_screen_id{1};
+    std::vector<ViewerSessionState> inactive_viewers;
+    std::vector<DiffSessionState> inactive_diffs;
     std::array<std::string, 3> mail_values;
     std::array<TextInputState, 3> mail_inputs;
     std::array<ftxui::Box, 5> mail_boxes{};
@@ -1791,8 +1878,6 @@ struct App::Impl {
     Mode local_command_return{Mode::panels};
     std::string local_command_title;
     ftxui::Box local_command_cancel_box;
-    std::shared_ptr<TemporaryFile> viewer_temporary_file;
-    std::string viewer_display_name;
     Mode user_menu_return{Mode::panels};
     std::filesystem::path user_menu_source;
     std::size_t user_menu_cursor{0};
@@ -1838,37 +1923,9 @@ struct App::Impl {
     std::string status{"Ready"};
     std::optional<std::string> pending_operation_notice;
     OperationEngine operations;
-    Cancellation operation_cancellation;
-    TransferProgress progress;
-    int operation_source_side{0};
-    bool operation_finish_tree{false};
-    ViewerModel viewer;
     std::unique_ptr<ViewerStdin> viewer_stdin;
-    std::string viewer_search_needle;
-    std::string viewer_search_pattern;
-    bool viewer_search_hex{false};
-    EditorSearchOptions viewer_search_options;
-    bool viewer_search_all_charsets{false};
-    ProviderPtr viewer_navigation_provider;
-    std::vector<std::string> viewer_navigation_files;
-    std::optional<std::string> viewer_switch_pending;
-    bool viewer_switch_preserve_list{false};
-    unsigned int viewer_ruler{0};
-    std::string viewer_message_title{"Viewer"};
-    std::string viewer_message;
     ftxui::Box message_button_box;
-    Mode viewer_return_mode{Mode::panels};
     bool exit_after_viewer{false};
-    bool viewer_save_closes{false};
-    std::size_t viewer_choice{0};
-    std::array<ftxui::Box, 3> viewer_choice_boxes{};
-    std::array<ftxui::Box, 2> viewer_wrap_boxes{};
-    bool viewer_search_quick{false};
-    std::size_t viewer_hex_first_column{0};
-    ViewerGotoMode viewer_goto_mode{ViewerGotoMode::line};
-    bool viewer_goto_quick{false};
-    std::vector<ViewerRow> viewer_rows;
-    std::string viewer_rendered_path;
     EditorBuffer editor;
     std::vector<EditorBuffer> editor_buffers;
     std::vector<std::string> editor_history;
@@ -1994,12 +2051,9 @@ struct App::Impl {
     std::string editor_message_title{"Editor error"};
     std::string editor_error_message;
     ftxui::App* terminal{nullptr};
-    std::jthread operation_thread;
-    std::atomic_bool operation_running{false};
-    std::chrono::steady_clock::time_point operation_started{};
-    std::mutex operation_mutex;
     std::string command_line;
     ShellSession shell;
+    bool shell_foreground{false};
     bool shell_exit_requested{false};
     std::optional<int> shell_panel_id;
     std::string shell_expected_directory;
@@ -2077,8 +2131,6 @@ struct App::Impl {
     TextInputState file_search_input;
     std::array<ftxui::Box, 11> file_search_boxes{};
     std::string file_search_error;
-    EditorSearchOptions diff_search_options;
-    bool diff_search_all_charsets{false};
     std::string quick_view_path;
     ftxui::Box quick_view_box;
     ftxui::Box information_panel_box;
@@ -2113,14 +2165,6 @@ struct App::Impl {
     std::array<ftxui::Box, 2> delete_button_boxes{};
     std::size_t compare_choice{0};
     std::array<ftxui::Box, 4> compare_boxes{};
-    std::atomic_bool operation_paused{false};
-    std::atomic_bool operation_skip{false};
-    std::mutex operation_pause_mutex;
-    std::condition_variable operation_pause_condition;
-    std::mutex operation_prompt_mutex;
-    std::condition_variable operation_prompt_condition;
-    std::optional<OperationChoice> operation_answer;
-    std::atomic_bool operation_prompt_pending{false};
     std::optional<Entry> operation_prompt_source;
     std::optional<Entry> operation_prompt_destination;
     CollisionOptions operation_prompt_collision_options;
@@ -2128,8 +2172,15 @@ struct App::Impl {
     Mode operation_return_mode{Mode::panels};
     std::size_t operation_return_focus{0};
     std::array<ftxui::Box, 8> operation_choice_boxes{};
-    std::vector<OperationJob> jobs;
-    std::optional<std::size_t> active_job;
+    std::vector<std::shared_ptr<OperationJob>> jobs;
+    std::shared_ptr<OperationJob> operation_draft;
+    std::shared_ptr<OperationJob> progress_job;
+    std::shared_ptr<OperationJob> prompt_job;
+    std::vector<std::pair<std::shared_ptr<OperationJob>, std::uint64_t>> operation_questions;
+    std::uint64_t operation_prompt_sequence{0};
+    Mode progress_return_mode{Mode::panels};
+    std::array<ftxui::Box, 4> operation_progress_boxes{};
+    std::size_t operation_progress_focus{0};
     std::size_t job_cursor{0};
     std::uint64_t next_job_id{1};
     std::array<ftxui::Box, 4> job_button_boxes{};
@@ -2145,7 +2196,6 @@ struct App::Impl {
     std::optional<std::string> tree_refresh_pending;
     bool tree_refresh_notify_pending{false};
     bool tree_surroundings_pending{false};
-    std::string operation_label{"File operation"};
     int rendered_width{0};
     int rendered_height{0};
     std::optional<Entry> tree_operation_source;
@@ -2169,7 +2219,12 @@ struct App::Impl {
                dynamic_cast<const ArchiveProvider*>(left_location.provider.get()) != nullptr),
           right(right_location.provider, right_location.path, nullptr,
                 dynamic_cast<const ArchiveProvider*>(right_location.provider.get()) != nullptr) {
+        for (const auto& diagnostic : config.diagnostics) std::cerr << "mcpp: configuration: " << diagnostic << '\n';
         initialize_palette();
+        active_index = config.current_is_left.value_or(true) ? 0 : 1;
+        viewer.set_wrap(config.viewer_wrap);
+        quick_viewer.set_wrap(config.viewer_wrap);
+        diff_tab_size = config.diff_tab_size;
         try {
             known_tree_directories = load_tree_cache(tree_cache_path());
         } catch (const std::exception& error) {
@@ -2473,7 +2528,7 @@ struct App::Impl {
     int split_top_height() const {
         const auto height = file_manager_body_height();
         const auto minimum = std::min(6, std::max(1, height / 2));
-        const auto wanted = config.equal_split || config.panel_top_size == 0
+        const auto wanted = config.layout_horizontal_equal.value_or(config.equal_split) || config.panel_top_size == 0
                                 ? height / 2 : config.panel_top_size;
         return std::clamp(wanted, minimum, std::max(minimum, height - minimum));
     }
@@ -2493,7 +2548,7 @@ struct App::Impl {
     int split_left_width() const {
         const auto width = std::max(2, ftxui::Terminal::Size().dimx);
         return std::clamp(
-            config.equal_split || config.panel_left_size == 0 ? width / 2 : config.panel_left_size,
+            config.layout_vertical_equal.value_or(config.equal_split) || config.panel_left_size == 0 ? width / 2 : config.panel_left_size,
             1, width - 1
         );
     }
@@ -3075,7 +3130,7 @@ struct App::Impl {
                 }
                 complete_user_menu(invocation, expansion, [this, invocation, expansion, provider, path] {
                     load_viewer(provider, path);
-                    viewer_return_mode = invocation->return_mode;
+                    set_viewer_return_mode(invocation->return_mode);
                     mode = Mode::viewer;
                     set_user_menu_view_options(expansion);
                 });
@@ -3089,7 +3144,7 @@ struct App::Impl {
                         require_command_success(result);
                         complete_user_menu(invocation, expansion, [this, invocation, expansion, result] {
                             open_output_viewer(invocation->entry.label, result.output);
-                            viewer_return_mode = invocation->return_mode;
+                            set_viewer_return_mode(invocation->return_mode);
                             set_user_menu_view_options(expansion);
                             show_command_warnings(result.error);
                         });
@@ -3727,7 +3782,7 @@ struct App::Impl {
             }
             load_viewer(invocation->provider, invocation->path);
             complete_extension_action(invocation, expansion);
-            viewer_return_mode = invocation->return_mode;
+            set_viewer_return_mode(invocation->return_mode);
             viewer_search_needle.clear();
             mode = Mode::viewer;
             set_user_menu_view_options(expansion);
@@ -3736,7 +3791,6 @@ struct App::Impl {
         guard_extension_editor(invocation);
         const auto command = extension_shell_command(*invocation, expansion.command);
         if (expansion.action == NativeMenuAction::view) {
-            if (viewer.dirty()) throw std::runtime_error("save or discard the current viewer edits first");
             const auto directory = invocation->context.active.directory;
             start_local_task("Extension " + extension_action_name(invocation->action),
                 [command, directory](const Cancellation& cancellation) {
@@ -3745,7 +3799,7 @@ struct App::Impl {
                     if (result.status != 0) throw std::runtime_error(extension_failure(*invocation, result.status, result.error));
                     complete_extension_action(invocation, expansion);
                     open_output_viewer("Extension " + extension_action_name(invocation->action), result.output);
-                    viewer_return_mode = invocation->return_mode;
+                    set_viewer_return_mode(invocation->return_mode);
                     set_user_menu_view_options(expansion);
                     show_command_warnings(result.error);
                 }, invocation->return_mode);
@@ -4414,6 +4468,10 @@ struct App::Impl {
     }
 
     void show_spelling(const bool whole_file) {
+        if (config.editor_spelling_language == "NONE") {
+            show_native_message("Spell check", "Spell checking is disabled by spell_language=NONE.", Mode::editor);
+            return;
+        }
         const auto text = editor.text();
         const auto path = editor.path();
         const auto change = editor.change_id();
@@ -5237,12 +5295,27 @@ struct App::Impl {
     }
 
     std::vector<Entry> current_operation_sources() const {
+        if (operation_draft) return operation_draft->sources;
         if (tree_operation_source) {
             return {*tree_operation_source};
         }
         return active_index == 0
                    ? left.selected_entries()
                    : right.selected_entries();
+    }
+
+    std::shared_ptr<OperationJob> capture_operation_job() const {
+        auto job = std::make_shared<OperationJob>();
+        job->sources = current_operation_sources();
+        job->source_side = tree_operation_source ? tree_operation_source_index : active_index;
+        const auto& pane = job->source_side == 0 ? left : right;
+        job->source_provider = tree_operation_source ? tree_operation_source_provider : pane.provider();
+        job->source_pane_id = pane_ids[job->source_side];
+        job->source_directory = pane.path();
+        job->source_base_directory = pane.navigation_path();
+        job->destination_provider = tree_operation_source
+            ? tree_operation_destination_provider : (active_index == 0 ? right : left).provider();
+        return job;
     }
 
     std::vector<Entry> matching_operation_sources() const {
@@ -5258,6 +5331,7 @@ struct App::Impl {
     }
 
     void clear_tree_operation_context() {
+        operation_draft.reset();
         tree_operation_source.reset();
         tree_operation_source_provider.reset();
         tree_operation_destination_provider.reset();
@@ -5283,6 +5357,8 @@ struct App::Impl {
         tree_operation_source_provider = pane.provider();
         tree_operation_destination_provider = modal_tree_snapshot ? passive().provider() : active().provider();
         tree_operation_source_index = panel_index;
+        operation_draft.reset();
+        operation_draft = capture_operation_job();
         if (remove_operation) {
             dialog_focus = config.safe_delete ? 1U : 0U;
             mode = Mode::delete_dialog;
@@ -5384,6 +5460,10 @@ struct App::Impl {
         if (config.auto_save_panels_setup) {
             config.saved_left_path = pane_location(left);
             config.saved_right_path = pane_location(right);
+        }
+        if (config.current_is_left || config.other_directory) {
+            config.current_is_left = active_index == 0;
+            config.other_directory = pane_location(active_index == 0 ? right : left);
         }
     }
 
@@ -5641,13 +5721,6 @@ struct App::Impl {
         }
         if (modal_cancel(event)) { close_directory_chooser(false); return true; }
         if (event == Event::Return) { close_directory_chooser(true); return true; }
-        if (event == Event::F1) {
-            show_native_message("Directory tree",
-                "Arrows navigate directories. Right expands or enters a branch; Left collapses or selects its parent. "
-                "Enter chooses the selected directory. Escape cancels. Ctrl-S searches, F2 rescans, F3 forgets cached entries, "
-                "and F4 switches linear/sibling navigation.", Mode::directory_tree_dialog);
-            return true;
-        }
         if (event == Event::F2 || event == Event::CtrlR) { refresh_tree(true); return true; }
         if (event == Event::F3) { forget_tree_branch(tree_cursor); return true; }
         if (event == Event::F4) { tree_dynamic = !tree_dynamic; return true; }
@@ -5796,7 +5869,7 @@ struct App::Impl {
                 } else {
                     const auto location = resolve_location(path);
                     load_viewer(location.provider, location.path);
-                    viewer_return_mode = Mode::panels;
+                    set_viewer_return_mode(Mode::panels);
                     mode = Mode::viewer;
                 }
             });
@@ -5866,76 +5939,208 @@ struct App::Impl {
         local_list_cursor = 0;
     }
 
-    void show_screens(const Mode return_mode) {
-        std::vector<std::string> labels{"File manager"};
-        std::vector<std::function<void()>> activate{[this] {
-            exit_after_viewer = false;
-            exit_after_editor = false;
-            mode = Mode::panels;
-        }};
-        const auto viewer_slot = viewer.open() ? std::optional<std::size_t>{1U} : std::nullopt;
-        if (viewer.open()) {
-            labels.push_back("[View] " + viewer.path());
-            activate.push_back([this] { mode = Mode::viewer; });
+    ViewerSessionState& viewer_session() { return *this; }
+    DiffSessionState& diff_session() { return *this; }
+
+    ScreenTarget screen_target(const Mode target_mode) {
+        if (target_mode == Mode::viewer) return {target_mode, viewer_screen_id};
+        if (target_mode == Mode::diff) return {target_mode, diff_screen_id};
+        if (target_mode == Mode::editor) {
+            if (editor.open() && editor.screen_id == 0U) editor.screen_id = next_screen_id++;
+            return {target_mode, editor.screen_id};
         }
-        if (editor.open()) {
-            labels.push_back(std::string(editor.dirty() ? "[Edit*] " : "[Edit] ") + editor.path());
-            activate.push_back([this] {
-                editor_session_base = 0;
-                editor_return_mode = Mode::panels;
-                exit_after_editor = false;
-                mode = Mode::editor;
-            });
+        return {target_mode, 0};
+    }
+
+    void set_viewer_return_mode(const Mode return_mode) {
+        viewer_return_mode = return_mode;
+        viewer_return_screen = screen_target(return_mode);
+    }
+
+    std::vector<ScreenTarget> screen_targets() {
+        std::vector<ScreenTarget> result{{Mode::panels, 0}};
+        if (viewer.open()) result.push_back(screen_target(Mode::viewer));
+        for (const auto& session : inactive_viewers) result.push_back({Mode::viewer, session.viewer_screen_id});
+        if (diff_screen_id != 0U) result.push_back(screen_target(Mode::diff));
+        for (const auto& session : inactive_diffs) result.push_back({Mode::diff, session.diff_screen_id});
+        if (editor.open()) result.push_back(screen_target(Mode::editor));
+        for (auto& buffer : editor_buffers) {
+            if (!buffer.open()) continue;
+            if (buffer.screen_id == 0U) buffer.screen_id = next_screen_id++;
+            result.push_back({Mode::editor, buffer.screen_id});
         }
-        for (std::size_t index = 0; index < editor_buffers.size(); ++index) {
-            labels.push_back(std::string(editor_buffers[index].dirty() ? "[Edit*] " : "[Edit] ") +
-                             editor_buffers[index].path());
-            activate.push_back([this, index] {
-                std::swap(editor, editor_buffers.at(index));
+        std::ranges::sort(result, {}, &ScreenTarget::id);
+        return result;
+    }
+
+    bool activate_screen(const ScreenTarget target) {
+        if (target.mode == Mode::viewer) {
+            if (target.id == 0U) return false;
+            if (target.id != viewer_screen_id) {
+                const auto found = std::ranges::find(inactive_viewers, target.id, &ViewerSessionState::viewer_screen_id);
+                if (found == inactive_viewers.end()) return false;
+                std::swap(viewer_session(), *found);
+                if (!found->viewer.open()) inactive_viewers.erase(found);
+            }
+            if (!viewer.open()) return false;
+        } else if (target.mode == Mode::diff) {
+            if (target.id == 0U) return false;
+            if (target.id != diff_screen_id) {
+                const auto found = std::ranges::find(inactive_diffs, target.id, &DiffSessionState::diff_screen_id);
+                if (found == inactive_diffs.end()) return false;
+                std::swap(diff_session(), *found);
+                if (found->diff_screen_id == 0U) inactive_diffs.erase(found);
+            }
+        } else if (target.mode == Mode::editor) {
+            if (target.id == 0U) return false;
+            if (target.id != editor.screen_id) {
+                const auto found = std::ranges::find(editor_buffers, target.id, &EditorBuffer::screen_id);
+                if (found == editor_buffers.end()) return false;
+                std::swap(editor, *found);
+                remember_editor_path(editor_location(editor));
                 reset_editor_view_state();
-                editor_session_base = 0;
-                editor_return_mode = Mode::panels;
-                exit_after_editor = false;
-                mode = Mode::editor;
-            });
+            }
+            if (!editor.open()) return false;
+            editor_session_base = 0;
+            editor_return_mode = Mode::panels;
+            exit_after_editor = false;
         }
-        show_local_list("Screen list", std::move(labels),
-            [this, return_mode, activate, viewer_slot](const std::size_t index) {
-                if (return_mode == Mode::viewer && viewer.dirty() &&
-                    (!viewer_slot || index != *viewer_slot)) {
-                    viewer_message_title = "Unsaved viewer";
-                    viewer_message = "Save or discard the staged hex edits before leaving this viewer.";
-                    mode = Mode::viewer_message;
-                    return;
-                }
-                activate.at(index)();
-            }, return_mode);
+        mode = target.mode;
+        return true;
     }
 
-    void cleanup_viewer_temporary() {
-        viewer_temporary_file.reset();
-        viewer_display_name.clear();
+    void switch_screen(const bool forward) {
+        const auto current = screen_target(mode);
+        const auto targets = screen_targets();
+        const auto found = std::ranges::find_if(targets, [&](const ScreenTarget target) {
+            return target.mode == current.mode && target.id == current.id;
+        });
+        const auto index = found == targets.end() ? 0U : static_cast<std::size_t>(found - targets.begin());
+        const auto next = forward ? (index + 1U) % targets.size() : (index + targets.size() - 1U) % targets.size();
+        static_cast<void>(activate_screen(targets[next]));
     }
 
-    void load_viewer(const ProviderPtr& provider, const std::string& path) {
-        if (viewer.dirty()) throw std::runtime_error("save or discard the current viewer edits first");
+    void show_screens(const Mode return_mode) {
+        const auto current = screen_target(return_mode);
+        const auto targets = screen_targets();
+        std::vector<std::string> labels;
+        std::size_t selected = 0;
+        const auto label_width = static_cast<std::size_t>(std::max(1, std::min(42, ftxui::Terminal::Size().dimx - 4)));
+        const auto label = [label_width](const std::string& prefix, const std::string& path) {
+            return prefix + path_label(path, label_width > prefix.size() ? label_width - prefix.size() : 1U);
+        };
+        for (const auto target : targets) {
+            if (target.mode == current.mode && target.id == current.id) selected = labels.size();
+            if (target.mode == Mode::viewer) {
+                const auto& session = target.id == viewer_screen_id ? viewer_session()
+                    : *std::ranges::find(inactive_viewers, target.id, &ViewerSessionState::viewer_screen_id);
+                const auto title = session.viewer_display_name.empty()
+                    ? archives.format(session.viewer.provider(), session.viewer.path()) : session.viewer_display_name;
+                labels.push_back(label(session.viewer.dirty() ? "[View*] " : "[View] ", title));
+            } else if (target.mode == Mode::diff) {
+                const auto& session = target.id == diff_screen_id ? diff_session()
+                    : *std::ranges::find(inactive_diffs, target.id, &DiffSessionState::diff_screen_id);
+                const auto dirty = session.diff_files[0].dirty() || session.diff_files[1].dirty();
+                const std::string prefix = dirty ? "[Diff*] " : "[Diff] ";
+                const auto paths_width = label_width > prefix.size() + 3U ? label_width - prefix.size() - 3U : 2U;
+                labels.push_back(prefix + path_label(session.diff_files[0].path(), paths_width / 2U) + " : " +
+                    path_label(session.diff_files[1].path(), paths_width - paths_width / 2U));
+            } else if (target.mode == Mode::editor) {
+                const auto& buffer = target.id == editor.screen_id ? editor
+                    : *std::ranges::find(editor_buffers, target.id, &EditorBuffer::screen_id);
+                labels.push_back(label(buffer.dirty() ? "[Edit*] " : "[Edit] ", buffer.path()));
+            } else labels.push_back("File manager");
+        }
+        show_local_list("Screen list", std::move(labels), [this, targets](const std::size_t index) {
+            static_cast<void>(activate_screen(targets.at(index)));
+        }, return_mode);
+        local_list_cursor = selected;
+        local_list_native = true;
+    }
+
+    void install_viewer_session(ViewerSessionState next, const bool replace = false) {
+        next.viewer_screen_id = replace && viewer.open() ? viewer_screen_id : next_screen_id++;
+        if (!replace && viewer.open()) inactive_viewers.push_back(std::move(viewer_session()));
+        viewer_session() = std::move(next);
+    }
+
+    void restore_screen_after_close(const ScreenTarget return_screen, const bool quitting = false) {
+        if (quitting) {
+            exit_terminal();
+            return;
+        }
+        const auto targets = screen_targets();
+        if (exit_after_viewer || exit_after_diff) {
+            if (targets.size() == 1U) {
+                exit_terminal();
+                return;
+            }
+            if (return_screen.mode == Mode::panels) {
+                static_cast<void>(activate_screen(targets.back()));
+                return;
+            }
+        }
+        if (!activate_screen(return_screen)) mode = Mode::panels;
+    }
+
+    bool close_dirty_screen_for_exit() {
+        if (viewer.dirty()) {
+            mode = Mode::viewer;
+            request_viewer_close(true);
+            return true;
+        }
+        for (const auto& session : inactive_viewers) {
+            if (!session.viewer.dirty()) continue;
+            const auto target = ScreenTarget{Mode::viewer, session.viewer_screen_id};
+            static_cast<void>(activate_screen(target));
+            request_viewer_close(true);
+            return true;
+        }
+        if (diff_files[0].dirty() || diff_files[1].dirty()) {
+            mode = Mode::diff;
+            request_diff_close(true);
+            return true;
+        }
+        for (const auto& session : inactive_diffs) {
+            if (!session.diff_files[0].dirty() && !session.diff_files[1].dirty()) continue;
+            const auto target = ScreenTarget{Mode::diff, session.diff_screen_id};
+            static_cast<void>(activate_screen(target));
+            request_diff_close(true);
+            return true;
+        }
+        return false;
+    }
+
+    void load_viewer(const ProviderPtr& provider, const std::string& path, const bool replace = false) {
+        ViewerSessionState next;
+        if (replace) next = viewer_session();
+        else next.viewer = viewer;
+        if (!viewer.open()) next.viewer.set_wrap(config.viewer_wrap);
+        next.viewer.open(provider, path);
+        next.viewer_temporary_file.reset();
+        next.viewer_display_name.clear();
         if (viewer_temporary_file && provider == local &&
-            local->normalize(path) == local->normalize(viewer_temporary_file->path().string())) return;
-        viewer.open(provider, path);
-        cleanup_viewer_temporary();
-        viewer_navigation_provider = provider;
-        viewer_navigation_files.clear();
-        if (viewer.streamed()) return;
+            local->normalize(path) == local->normalize(viewer_temporary_file->path().string())) {
+            next.viewer_temporary_file = viewer_temporary_file;
+            next.viewer_display_name = viewer_display_name;
+        }
+        next.viewer_navigation_provider = provider;
+        next.viewer_navigation_files.clear();
+        if (next.viewer.streamed()) {
+            install_viewer_session(std::move(next), replace);
+            return;
+        }
         const auto directory = provider->parent(path);
         try {
             const auto candidates = provider->list(directory, {.show_hidden=true, .directories_first=true}, {});
             for (const auto& entry : candidates) {
-                if (can_open_file(entry)) viewer_navigation_files.push_back(entry.path);
+                if (can_open_file(entry)) next.viewer_navigation_files.push_back(entry.path);
             }
         } catch (const std::exception& error) {
             std::cerr << "mcpp: viewer file navigation unavailable: " << error.what() << '\n';
-            viewer_navigation_files.push_back(path);
+            next.viewer_navigation_files.push_back(path);
         }
+        install_viewer_session(std::move(next), replace);
         const auto location = archives.format(provider, path);
         std::erase(config.viewer_history, location);
         config.viewer_history.insert(config.viewer_history.begin(), location);
@@ -5956,7 +6161,7 @@ struct App::Impl {
         if (config.use_internal_view) {
             load_viewer(provider, path);
             viewer_search_needle.clear();
-            viewer_return_mode = return_mode;
+            set_viewer_return_mode(return_mode);
             if (return_mode == Mode::search_results) {
                 viewer_navigation_files.clear();
                 for (const auto& entry : search_results) {
@@ -5987,9 +6192,12 @@ struct App::Impl {
     ) {
         if (config.use_internal_edit) {
             const auto retained = editor_buffers.size() + (editor.open() ? 1U : 0U);
-            open_editor_buffer(provider, path, false, require_existing, [this, retained, return_mode] {
+            const auto diff_return = return_mode == Mode::diff && diff_edit_side
+                ? std::optional{std::pair{diff_screen_id, *diff_edit_side}} : std::nullopt;
+            open_editor_buffer(provider, path, false, require_existing, [this, retained, return_mode, diff_return] {
                 editor_session_base = return_mode == Mode::search_results || return_mode == Mode::diff ? retained : 0U;
                 editor_return_mode = return_mode;
+                editor.diff_screen_return = diff_return;
             });
             return;
         }
@@ -6034,13 +6242,15 @@ struct App::Impl {
     }
 
     void open_output_viewer(const std::string& label, const std::string& value) {
-        if (viewer.dirty()) throw std::runtime_error("save or discard the current viewer edits first");
         auto temporary = std::make_shared<TemporaryFile>(value);
-        viewer.open(local, temporary->path().string());
-        cleanup_viewer_temporary();
+        ViewerSessionState next;
+        next.viewer = viewer;
+        if (!viewer.open()) next.viewer.set_wrap(config.viewer_wrap);
+        next.viewer.open(local, temporary->path().string());
+        install_viewer_session(std::move(next));
         viewer_temporary_file = std::move(temporary);
         viewer_display_name = label;
-        viewer_return_mode = Mode::panels;
+        set_viewer_return_mode(Mode::panels);
         viewer_search_needle.clear();
         viewer_navigation_provider = local;
         viewer_navigation_files.clear();
@@ -6103,30 +6313,33 @@ struct App::Impl {
     }
 
     void open_file_comparison(const std::string& first_path, const std::string& second_path) {
-        diff_files[0].open(local, first_path);
-        diff_files[1].open(local, second_path);
-        diff_options = {config.diff_quality, config.diff_ignore_case, config.diff_ignore_tab_expansion,
+        auto next = std::make_shared<DiffSessionState>();
+        next->diff_files[0].open(local, first_path);
+        next->diff_files[1].open(local, second_path);
+        next->diff_options = {config.diff_quality, config.diff_ignore_case, config.diff_ignore_tab_expansion,
                         config.diff_ignore_space_change, config.diff_ignore_all_space, config.diff_strip_trailing_cr};
-        diff_top = diff_hunk = diff_horizontal = diff_order = 0;
-        diff_split = ftxui::Terminal::Size().dimx / 2;
-        diff_full = diff_saving = diff_closing = false;
-        diff_edit_side.reset();
-        diff_last_merged_side.reset();
-        diff_search_cursor.reset();
-        diff_search_match.reset();
+        next->diff_split = ftxui::Terminal::Size().dimx / 2;
+        next->diff_tab_size = config.diff_tab_size;
+        next->diff_show_symbols = config.diff_show_symbols;
+        next->diff_show_numbers = config.diff_show_numbers;
         if (terminal == nullptr) {
-            file_diff.compare(diff_files[0], diff_files[1], diff_options);
-            mode = Mode::diff;
+            next->file_diff.compare(next->diff_files[0], next->diff_files[1], next->diff_options);
+            install_diff_session(std::move(*next));
             return;
         }
-        auto compared = std::make_shared<DiffModel>();
-        start_local_task("Comparing files", [this, compared](const Cancellation& cancellation) {
-            compared->compare(diff_files[0], diff_files[1], diff_options, cancellation);
+        start_local_task("Comparing files", [next](const Cancellation& cancellation) {
+            next->file_diff.compare(next->diff_files[0], next->diff_files[1], next->diff_options, cancellation);
             return CommandOutput{};
-        }, [this, compared](CommandOutput) {
-            file_diff = std::move(*compared);
-            mode = Mode::diff;
+        }, [this, next](CommandOutput) {
+            install_diff_session(std::move(*next));
         });
+    }
+
+    void install_diff_session(DiffSessionState next) {
+        next.diff_screen_id = next_screen_id++;
+        if (diff_screen_id != 0U) inactive_diffs.push_back(std::move(diff_session()));
+        diff_session() = std::move(next);
+        mode = Mode::diff;
     }
 
     std::size_t diff_visible_rows() const {
@@ -6184,8 +6397,8 @@ struct App::Impl {
                 const auto& aligned = file_diff.rows()[row];
                 const auto line = side == 0U ? aligned.left : aligned.right;
                 std::string prefix;
-                if (config.diff_show_symbols) prefix = aligned.hunk ? (line ? "|" : "-") : " ";
-                if (config.diff_show_numbers) {
+                if (diff_show_symbols) prefix = aligned.hunk ? (line ? "|" : "-") : " ";
+                if (diff_show_numbers) {
                     std::ostringstream number;
                     if (line) number << std::setw(5) << *line + 1U << ' ';
                     else number << "      ";
@@ -6219,15 +6432,13 @@ struct App::Impl {
     }
 
     void close_diff() {
+        const auto return_screen = diff_return_screen;
+        const auto quitting = diff_quit_after_close;
         diff_files[0].close();
         diff_files[1].close();
-        file_diff = {};
-        diff_saving = diff_closing = false;
-        if (exit_after_diff) {
-            exit_terminal();
-            return;
-        }
-        mode = Mode::panels;
+        diff_session() = {};
+        restore_screen_after_close(return_screen, quitting);
+        if (exiting || mode != Mode::panels) return;
         refresh(false, true);
     }
 
@@ -6251,6 +6462,12 @@ struct App::Impl {
     void resume_diff_after_edit(const std::optional<Entry>& large_file_approval = std::nullopt) {
         if (diff_edit_side) {
             auto& buffer = diff_files[*diff_edit_side];
+            if (buffer.dirty()) {
+                diff_edit_side.reset();
+                show_native_message("Diff viewer",
+                    "The compared file has staged merges. Editor changes were not reloaded.", Mode::diff);
+                return;
+            }
             const auto path = buffer.path();
             try {
                 buffer.open(local, path, {}, large_file_approval);
@@ -6270,7 +6487,8 @@ struct App::Impl {
         mode = Mode::diff;
     }
 
-    void request_diff_close() {
+    void request_diff_close(const bool quitting = false) {
+        diff_quit_after_close = quitting;
         if (!diff_files[0].dirty() && !diff_files[1].dirty()) { close_diff(); return; }
         show_native_query("Confirm", "File(s) was modified. Save with exit?", {"Yes","No","Cancel"},
             [this](const std::size_t selected) {
@@ -6534,11 +6752,7 @@ struct App::Impl {
             request_diff_close();
             return true;
         }
-        if (event == Event::F1) {
-            show_native_message("Diff viewer", "N/P navigate differences. F5 copies the displayed left hunk to the right; "
-                "Shift-F5 copies right to left. F2 saves staged merges. Ctrl-Z undoes a merge. F4 edits the displayed left file. "
-                "F7 searches, F9 changes diff options, Ctrl-U swaps sides, and F10 checks unsaved changes.", Mode::diff);
-        } else if (event == Event::F2) save_diff();
+        if (event == Event::F2) save_diff();
         else if (event == Event::F9) { diff_draft = diff_options; diff_options_focus = 0; mode = Mode::diff_options; }
         else if (event == Event::F4 || event == Event::Special("\x1b[26~")) {
             const auto side = event == Event::F4 ? diff_order : diff_order ^ 1U;
@@ -6606,10 +6820,12 @@ struct App::Impl {
         else if (event == Event::Character('=')) diff_split = Terminal::Size().dimx / 2;
         else if (event == Event::Character('<')) --diff_split;
         else if (event == Event::Character('>')) ++diff_split;
-        else if (event == Event::Character('s') || event == Event::AltS) config.diff_show_symbols = !config.diff_show_symbols;
-        else if (event == Event::Character('l') || event == Event::AltN) config.diff_show_numbers = !config.diff_show_numbers;
+        else if (event == Event::Character('s') || event == Event::AltS) config.diff_show_symbols = diff_show_symbols = !diff_show_symbols;
+        else if (event == Event::Character('l') || event == Event::AltN) config.diff_show_numbers = diff_show_numbers = !diff_show_numbers;
         else if (event == Event::Character('2') || event == Event::Character('3') ||
-                 event == Event::Character('4') || event == Event::Character('8')) diff_tab_size = static_cast<std::size_t>(event.character()[0] - '0');
+                 event == Event::Character('4') || event == Event::Character('8')) {
+            config.diff_tab_size = diff_tab_size = static_cast<std::size_t>(event.character()[0] - '0');
+        }
         else if (event == Event::Character('g') || event == Event::Character('G')) {
             show_native_input("Goto line (right)", "Enter line:", "", [this](const std::string& value) {
                 std::size_t line = 0;
@@ -7196,8 +7412,7 @@ struct App::Impl {
         std::function<void(CommandOutput)> complete,
         const Mode return_mode = Mode::panels
     ) {
-        if (local_command_running || operation_running.load(std::memory_order_acquire) ||
-            traversal_running.load(std::memory_order_acquire)) {
+        if (local_command_running || traversal_running.load(std::memory_order_acquire)) {
             throw std::runtime_error("another operation is still running");
         }
         if (local_command_thread.joinable()) local_command_thread.join();
@@ -8022,7 +8237,7 @@ struct App::Impl {
             mode = Mode::configure_dialog;
         } else if (action == 21) {
             layout_horizontal = config.layout_horizontal;
-            layout_equal = config.equal_split;
+            layout_equal = config.split_is_equal();
             layout_left_size = split_left_width();
             layout_top_size = split_top_height();
             layout_visible = {config.menubar_visible, config.command_prompt, config.keybar_visible,
@@ -8536,7 +8751,7 @@ struct App::Impl {
 
     void apply_layout() {
         config.layout_horizontal = layout_horizontal;
-        config.equal_split = layout_equal;
+        config.set_split_equal(layout_equal);
         config.panel_left_size = layout_left_size;
         config.panel_top_size = layout_top_size;
         config.menubar_visible = layout_visible[0];
@@ -8694,10 +8909,12 @@ struct App::Impl {
         }
         auto* app = terminal;
         app->Post([
+            this,
             app,
             task = std::move(task)
         ]() mutable {
             task();
+            service_operation_prompts();
             app->RequestAnimationFrame();
         });
     }
@@ -8711,7 +8928,7 @@ struct App::Impl {
                 "a recursive search is already running"
             );
         }
-        if (operation_running.load(std::memory_order_acquire)) {
+        if (has_running_jobs()) {
             throw std::runtime_error(
                 "cannot search during a file operation"
             );
@@ -8860,79 +9077,114 @@ struct App::Impl {
         }
     }
 
-    void request_operation_cancel() {
-        {
-            std::lock_guard lock(operation_pause_mutex);
-            operation_cancellation.request();
-            operation_paused.store(
-                false,
-                std::memory_order_release
-            );
+    bool has_running_jobs() const {
+        return std::ranges::any_of(jobs, [](const auto& job) { return !job->finished; });
+    }
+
+    void restore_operation_prompt() {
+        mode = operation_return_mode;
+        dialog_focus = operation_return_focus;
+        prompt_job.reset();
+        operation_prompt_source.reset();
+        operation_prompt_destination.reset();
+        operation_prompt_error.clear();
+    }
+
+    void service_operation_prompts() {
+        if (exiting || shell_foreground || help_browser || prompt_job) return;
+        std::erase_if(operation_questions, [](const auto& pending) {
+            const auto question = pending.first->control.question();
+            return !question || question->sequence != pending.second;
+        });
+        if (mode != Mode::panels && mode != Mode::jobs && mode != Mode::operation_progress) return;
+        if (mode == Mode::panels &&
+            (command_mode || panel_search_mode || tree_search_mode || panel_ctrl_x)) return;
+        const auto found = std::ranges::find_if(operation_questions, [this](const auto& pending) {
+            const auto& job = pending.first;
+            return mode == Mode::operation_progress
+                ? progress_job == job : !job->background;
+        });
+        if (found == operation_questions.end()) return;
+        auto job = found->first;
+        const auto question = job->control.question();
+        operation_questions.erase(found);
+        if (!question) return;
+        operation_return_mode = mode;
+        operation_return_focus = dialog_focus;
+        prompt_job = std::move(job);
+        operation_prompt_sequence = question->sequence;
+        operation_prompt_source = question->source;
+        operation_prompt_destination = question->destination;
+        operation_prompt_collision_options = question->collision_options;
+        operation_prompt_error = question->error;
+        dialog_focus = question->recursive_delete ? (config.safe_delete ? 1U : 0U)
+            : question->destination && config.safe_overwrite ? 1U : 0U;
+        mode = question->recursive_delete ? Mode::recursive_delete_dialog
+            : question->destination ? Mode::conflict_dialog : Mode::operation_error_dialog;
+    }
+
+    void request_operation_cancel(const std::shared_ptr<OperationJob>& job) {
+        if (!job || job->finished) return;
+        job->control.cancel();
+        if (prompt_job == job) restore_operation_prompt();
+    }
+
+    void cancel_operations() {
+        for (const auto& job : jobs) {
+            if (!job->finished) job->control.cancel();
         }
-        operation_pause_condition.notify_all();
-        operation_prompt_condition.notify_all();
+    }
+
+    void shutdown_operations() {
+        cancel_operations();
+        for (const auto& job : jobs) {
+            if (job->worker.joinable()) job->worker.join();
+            job->control.finish();
+            job->finished = true;
+        }
+        operation_questions.clear();
+        prompt_job.reset();
     }
 
     OperationChoice ask_operation(
+        const std::shared_ptr<OperationJob>& job,
         Entry source,
         std::optional<Entry> destination,
         std::string error = {},
         const CollisionOptions collision_options = {},
         const bool recursive_delete = false
     ) {
-        {
-            std::lock_guard lock(operation_prompt_mutex);
-            operation_answer.reset();
-            operation_prompt_pending.store(true, std::memory_order_release);
-        }
-        post_ui([
-            this, source = std::move(source),
-            destination = std::move(destination), error = std::move(error),
+        const auto sequence = job->control.begin_question({
+            0, std::move(source), std::move(destination), std::move(error),
             collision_options, recursive_delete
-        ]() mutable {
-            if (!operation_prompt_pending.load(std::memory_order_acquire) ||
-                operation_cancellation.requested()) {
-                return;
-            }
-            operation_return_mode = mode;
-            operation_return_focus = dialog_focus;
-            operation_prompt_source = std::move(source);
-            operation_prompt_destination = std::move(destination);
-            operation_prompt_collision_options = collision_options;
-            operation_prompt_error = std::move(error);
-            dialog_focus = recursive_delete ? (config.safe_delete ? 1U : 0U)
-                : operation_prompt_destination && config.safe_overwrite ? 1U : 0U;
-            mode = recursive_delete ? Mode::recursive_delete_dialog : operation_prompt_destination
-                       ? Mode::conflict_dialog
-                       : Mode::operation_error_dialog;
         });
-        std::unique_lock lock(operation_prompt_mutex);
-        while (!operation_answer && !operation_cancellation.requested()) {
-            operation_prompt_condition.wait_for(lock, std::chrono::milliseconds(100));
-        }
-        operation_prompt_pending.store(false, std::memory_order_release);
-        operation_cancellation.throw_if_requested();
-        return *operation_answer;
+        post_ui([this, job, sequence] {
+            operation_questions.emplace_back(job, sequence);
+            if (job->background && mode == Mode::panels && !command_mode) {
+                status = job->label + " waiting for a decision; C-x j opens Background jobs";
+            }
+            service_operation_prompts();
+        });
+        return job->control.wait_for_answer(sequence);
     }
 
     void answer_operation(const OperationChoice answer) {
-        mode = operation_return_mode;
-        dialog_focus = operation_return_focus;
-        {
-            std::lock_guard lock(operation_prompt_mutex);
-            operation_answer = answer;
-        }
-        operation_prompt_condition.notify_all();
+        const auto job = prompt_job;
+        const auto sequence = operation_prompt_sequence;
+        if (!job) return;
+        restore_operation_prompt();
+        static_cast<void>(job->control.answer(sequence, answer));
     }
 
     OperationErrorResolver error_handler(
+        const std::shared_ptr<OperationJob>& job,
         const std::shared_ptr<OperationPolicy>& policy
     ) {
-        return [this, policy](const Entry& source, const std::string& message) {
+        return [this, job, policy](const Entry& source, const std::string& message) {
             if (policy->ignore_errors) {
                 return OperationErrorDecision::skip;
             }
-            switch (ask_operation(source, std::nullopt, message)) {
+            switch (ask_operation(job, source, std::nullopt, message)) {
                 case OperationChoice::retry:
                     return OperationErrorDecision::retry;
                 case OperationChoice::ignore_all:
@@ -8946,17 +9198,37 @@ struct App::Impl {
         };
     }
 
-    void start_job(const std::string& destination) {
-        if (jobs.size() >= 20U) {
-            jobs.erase(jobs.begin());
+    void start_job(const std::shared_ptr<OperationJob>& job, const Mode return_mode) {
+        while (jobs.size() >= 20U) {
+            const auto completed = std::ranges::find_if(jobs, [](const auto& value) {
+                return value->finished;
+            });
+            if (completed == jobs.end()) break;
+            jobs.erase(completed);
         }
-        jobs.push_back({next_job_id++, operation_label, destination, "Running"});
-        active_job = jobs.size() - 1U;
-        job_cursor = *active_job;
+        job->id = next_job_id++;
+        job->started = std::chrono::steady_clock::now();
+        jobs.push_back(job);
+        progress_job = job;
+        job_cursor = jobs.size() - 1U;
+        progress_return_mode = return_mode;
+        operation_progress_focus = 0;
+        mode = config.verbose_operation && !job->background ? Mode::operation_progress : return_mode;
+        status = job->label + (job->background ? " running in background" : " starting");
+        try {
+            job->worker = std::jthread([this, job] { run_job(job); });
+        } catch (const std::exception& error) {
+            job->status = "Error: " + std::string(error.what());
+            job->finished = true;
+            job->control.finish();
+            mode = return_mode;
+            throw;
+        }
     }
 
     void exit_terminal() {
         if (!exiting) {
+            if (close_dirty_screen_for_exit()) return;
             if (editor.dirty() ||
                 std::ranges::any_of(
                     editor_buffers,
@@ -8993,43 +9265,36 @@ struct App::Impl {
     }
 
     void finish_operation(
+        const std::shared_ptr<OperationJob>& job,
         std::string message,
-        const std::optional<int> source_id = std::nullopt,
         const std::vector<std::string>& completed_sources = {},
-        bool notify = false
+        const bool notify = false
     ) {
-        if (mode == Mode::conflict_dialog || mode == Mode::operation_error_dialog ||
-            mode == Mode::recursive_delete_dialog) {
-            mode = operation_return_mode;
-            dialog_focus = operation_return_focus;
+        if (job->worker.joinable()) job->worker.join();
+        job->finished = true;
+        job->control.finish();
+        if (prompt_job == job) restore_operation_prompt();
+        const bool visible = mode == Mode::operation_progress && progress_job == job;
+        if (visible) {
+            mode = progress_return_mode == Mode::directory_tree_dialog && !modal_tree_snapshot
+                ? Mode::panels : progress_return_mode;
         }
-        const bool background =
-            mode != Mode::panels && mode != Mode::operation_progress && mode != Mode::directory_tree_dialog;
-        if (mode == Mode::operation_progress) {
-            mode = operation_finish_tree && modal_tree_snapshot ? Mode::directory_tree_dialog : Mode::panels;
-        }
-        operation_running.store(false, std::memory_order_release);
         try {
-            if (source_id == pane_ids[0]) {
-                left.unmark_paths(completed_sources);
-            } else if (source_id == pane_ids[1]) {
-                right.unmark_paths(completed_sources);
+            auto& pane = job->source_pane_id == pane_ids[0] ? left : right;
+            if (pane.provider() == job->source_provider && pane.path() == job->source_directory) {
+                pane.unmark_paths(completed_sources);
             }
             refresh();
-            status = std::move(message);
         } catch (const std::exception& error) {
-            // A refresh error must not dismiss the foreground editor or dialog.
-            status =
-                std::move(message) +
-                "; refresh failed: " + error.what();
-            notify = true;
+            message += "; refresh failed: " + std::string(error.what());
+            pending_operation_notice = message;
         }
-        if (background && notify) {
-            pending_operation_notice = status;
+        job->status = message;
+        status = message;
+        if (!visible && notify) {
+            pending_operation_notice = "Job " + std::to_string(job->id) + ": " + message;
         }
-        if (active_job) {
-            jobs[*active_job].status = status;
-        }
+        service_operation_prompts();
     }
 
     void bind_input_history(TextInputState& input, const std::string_view id) {
@@ -9546,6 +9811,7 @@ struct App::Impl {
         if (sources.empty()) {
             throw std::runtime_error("no source selected");
         }
+        operation_draft = capture_operation_job();
         dialog_move = move_operation;
         dialog_exact = exact && sources.size() == 1U;
         dialog_destination = pane_location(passive());
@@ -9597,7 +9863,12 @@ struct App::Impl {
             destination_value = CopyMask::unescape_path(directory);
             destination_value += CopyMask::unescape_path(name);
         }
-        const auto destination = resolve_pane_location(source_pane, destination_value);
+        const auto destination = operation_draft
+            ? resolve_relative_location(
+                  {operation_draft->source_provider, operation_draft->source_base_directory},
+                  destination_value
+              )
+            : resolve_pane_location(source_pane, destination_value);
         const auto& destination_provider = destination.provider;
         if (!has_capability(destination_provider->capabilities(), ProviderCapability::write)) {
             throw std::runtime_error("the destination filesystem is read-only");
@@ -9624,8 +9895,8 @@ struct App::Impl {
         }
         dialog_exact = sources.size() == 1U &&
                        !destination_directory;
-        const auto source_provider = tree_operation_source
-            ? tree_operation_source_provider : source_pane.provider();
+        const auto source_provider = operation_draft ? operation_draft->source_provider
+            : tree_operation_source ? tree_operation_source_provider : source_pane.provider();
         if (dialog_stable_symlinks &&
             (dynamic_cast<LocalProvider*>(source_provider.get()) == nullptr ||
              dynamic_cast<LocalProvider*>(destination_provider.get()) == nullptr)) {
@@ -9638,10 +9909,6 @@ struct App::Impl {
             dialog_exact,
             destination_provider
         );
-        if (dialog_background) {
-            mode = modal_tree_snapshot ? Mode::directory_tree_dialog : Mode::panels;
-            status = operation_label + " running in background";
-        }
     }
 
     void start_delete_dialog() {
@@ -9649,6 +9916,7 @@ struct App::Impl {
         if (active().selected_entries().empty()) {
             throw std::runtime_error("no source selected");
         }
+        operation_draft = capture_operation_job();
         dialog_focus = config.safe_delete ? 1U : 0U;
         mode = Mode::delete_dialog;
     }
@@ -9660,87 +9928,30 @@ struct App::Impl {
         const bool exact = false,
         ProviderPtr destination_override = {}
     ) {
-        if (operation_running.load(std::memory_order_acquire)) {
-            throw std::runtime_error("an operation is already running");
-        }
         if (traversal_running.load(std::memory_order_acquire)) {
             throw std::runtime_error(
                 "cannot start an operation while search is running"
             );
         }
-        const auto sources = matching_operation_sources();
-        if (sources.empty()) {
+        auto job = operation_draft ? operation_draft : capture_operation_job();
+        job->sources = matching_operation_sources();
+        if (job->sources.empty()) {
             throw std::runtime_error(
                 "source mask matches no selected entries"
             );
         }
-        if (operation_thread.joinable()) {
-            operation_thread.join();
-        }
-        operation_cancellation = Cancellation{};
-        progress = {};
-        const auto source_provider =
-            tree_operation_source
-                ? tree_operation_source_provider
-                : active().provider();
-        const auto destination_provider = destination_override ? std::move(destination_override) :
-            tree_operation_source
-                ? tree_operation_destination_provider
-                : passive().provider();
-        const auto source_id = pane_ids[
-            tree_operation_source
-                ? tree_operation_source_index
-                : active_index
-        ];
-        operation_source_side = tree_operation_source ? tree_operation_source_index : active_index;
-        operation_finish_tree = tree_operation_source.has_value() && modal_tree_snapshot.has_value();
-        const auto policy = std::make_shared<OperationPolicy>();
-        const OperationOptions options{
+        job->kind = move_operation ? OperationJob::Kind::move : OperationJob::Kind::copy;
+        job->label = move_operation ? "Move" : "Copy";
+        job->destination = destination;
+        job->exact = exact;
+        job->background = dialog_background;
+        if (destination_override) job->destination_provider = std::move(destination_override);
+        job->options = OperationOptions{
             .overwrite = overwrite,
             .preserve_permissions = dialog_preserve_attributes,
             .preserve_symlinks = dialog_preserve_symlinks,
-            .collision =
-                [this, policy, source_provider, destination_provider](const Entry& source, const Entry& target) {
-                    if (policy->collisions) {
-                        return *policy->collisions;
-                    }
-                    if (policy->older) {
-                        return source.kind == EntryKind::directory ||
-                                       source.modified > target.modified
-                                   ? CollisionDecision::overwrite
-                                   : CollisionDecision::skip;
-                    }
-                    switch (ask_operation(
-                        source, target, {},
-                        OperationEngine::collision_options(
-                            *source_provider, source, *destination_provider, target
-                        )
-                    )) {
-                        case OperationChoice::overwrite:
-                            return CollisionDecision::overwrite;
-                        case OperationChoice::append:
-                            return CollisionDecision::append;
-                        case OperationChoice::reget:
-                            return CollisionDecision::reget;
-                        case OperationChoice::skip:
-                            return CollisionDecision::skip;
-                        case OperationChoice::overwrite_all:
-                            policy->collisions = CollisionDecision::overwrite;
-                            return CollisionDecision::overwrite;
-                        case OperationChoice::skip_all:
-                            policy->collisions = CollisionDecision::skip;
-                            return CollisionDecision::skip;
-                        case OperationChoice::older:
-                            policy->older = true;
-                            return source.kind == EntryKind::directory ||
-                                           source.modified > target.modified
-                                       ? CollisionDecision::overwrite
-                                       : CollisionDecision::skip;
-                        default:
-                            return CollisionDecision::cancel;
-                    }
-                },
-            .error = error_handler(policy),
+            .collision = {},
+            .error = {},
             .compute_totals = config.compute_totals,
             .source_mask = dialog_source_mask,
             .destination_mask = dialog_destination_mask,
@@ -9748,352 +9959,137 @@ struct App::Impl {
             .stable_symlinks = dialog_stable_symlinks,
             .dive_into_subdirectories = dialog_dive_into_subdirectories,
         };
+        const auto return_mode = tree_operation_source && modal_tree_snapshot
+            ? Mode::directory_tree_dialog : Mode::panels;
         clear_tree_operation_context();
-        operation_running.store(true, std::memory_order_release);
-        operation_started = std::chrono::steady_clock::now();
-        operation_paused.store(false, std::memory_order_release);
-        operation_skip.store(false, std::memory_order_release);
-        mode = config.verbose_operation ? Mode::operation_progress
-                                       : operation_finish_tree ? Mode::directory_tree_dialog : Mode::panels;
-        operation_label = move_operation ? "Move" : "Copy";
-        start_job(destination);
-        status = move_operation ? "Starting move" : "Starting copy";
-        try {
-            operation_thread = std::jthread(
-            [
-                this,
-                move_operation,
-                sources,
-                source_provider,
-                destination_provider,
-                destination,
-                options,
-                source_id,
-                exact
-            ]() {
-                OperationResult result;
-                try {
-                    const auto callback =
-                        [this, move_operation](
-                            const TransferProgress& value
-                        ) {
-                            {
-                                std::unique_lock lock(
-                                    operation_pause_mutex
-                                );
-                                operation_pause_condition.wait(
-                                    lock,
-                                    [&] {
-                                        return !operation_paused.load(
-                                                   std::memory_order_acquire
-                                               ) ||
-                                               Cancellation{}
-                                                   .requested();
-                                    }
-                                );
-                            }
-                            operation_cancellation.throw_if_requested();
-                            if (operation_skip.exchange(
-                                    false,
-                                    std::memory_order_acq_rel
-                                )) {
-                                throw SkipCurrent{};
-                            }
-                            if (terminal == nullptr) {
-                                return;
-                            }
-                            post_ui([
-                                this,
-                                move_operation,
-                                value
-                            ] {
-                                std::lock_guard lock(operation_mutex);
-                                progress = value;
-                                status =
-                                    (move_operation
-                                         ? "Moving "
-                                         : "Copying ") +
-                                    display_text(value.current_path) +
-                                    " (" +
-                                    std::to_string(value.files_done) +
-                                    "/" +
-                                    std::to_string(value.files_total) +
-                                    ")";
-                            });
-                        };
-                    if (move_operation && exact) {
-                        if (sources.size() != 1U) {
-                            throw std::runtime_error(
-                                "exact move requires one source"
-                            );
-                        }
-                        operations.move_exact(
-                            *source_provider,
-                            sources.front(),
-                            *destination_provider,
-                            destination,
-                            options,
-                            operation_cancellation,
-                            callback,
-                            &result
-                        );
-                    } else if (move_operation) {
-                        operations.move(
-                            *source_provider,
-                            sources,
-                            *destination_provider,
-                            destination,
-                            options,
-                            operation_cancellation,
-                            callback,
-                            &result
-                        );
-                    } else if (exact) {
-                        operations.copy_exact(
-                            *source_provider,
-                            sources.front(),
-                            *destination_provider,
-                            destination,
-                            options,
-                            operation_cancellation,
-                            callback,
-                            &result
-                        );
-                    } else {
-                        operations.copy(
-                            *source_provider,
-                            sources,
-                            *destination_provider,
-                            destination,
-                            options,
-                            operation_cancellation,
-                            callback,
-                            &result
-                        );
-                    }
-                    post_ui([
-                        this,
-                        move_operation,
-                        source_id,
-                        result = std::move(result)
-                    ] {
-                        const std::string label =
-                            move_operation ? "Move" : "Copy";
-                        auto message = label + " complete";
-                        if (!result.skipped.empty()) {
-                            message =
-                                label + " incomplete: " +
-                                std::to_string(result.skipped.size()) +
-                                " skipped (" +
-                                display_text(result.skipped.front().reason) +
-                                "; " +
-                                display_text(result.skipped.front().path) +
-                                ")";
-                        }
-                        finish_operation(
-                            std::move(message),
-                            source_id,
-                            result.completed_sources,
-                            !result.skipped.empty()
-                        );
-                    });
-                } catch (const OperationCancelled&) {
-                    post_ui([
-                        this,
-                        source_id,
-                        completed = std::move(result.completed_sources)
-                    ] {
-                        finish_operation(
-                            "Operation cancelled",
-                            source_id,
-                            completed,
-                            true
-                        );
-                    });
-                } catch (const std::exception& error) {
-                    const auto message = std::string(error.what());
-                    post_ui([
-                        this,
-                        message,
-                        source_id,
-                        completed = std::move(result.completed_sources)
-                    ] {
-                        finish_operation(
-                            "Error: " + message,
-                            source_id,
-                            completed,
-                            true
-                        );
-                    });
-                }
-            });
-        } catch (const std::exception& error) {
-            operation_running.store(
-                false,
-                std::memory_order_release
-            );
-            if (active_job) {
-                jobs[*active_job].status = "Error: " + std::string(error.what());
-            }
-            mode = Mode::panels;
-            throw;
-        }
+        start_job(job, return_mode);
     }
 
     void run_remove_operation() {
-        if (operation_running.load(std::memory_order_acquire)) {
-            throw std::runtime_error("an operation is already running");
-        }
         if (traversal_running.load(std::memory_order_acquire)) {
             throw std::runtime_error(
                 "cannot delete while search is running"
             );
         }
-        const auto entries = current_operation_sources();
-        if (entries.empty()) {
+        auto job = operation_draft ? operation_draft : capture_operation_job();
+        job->sources = current_operation_sources();
+        if (job->sources.empty()) {
             throw std::runtime_error("no source selected");
         }
-        if (operation_thread.joinable()) {
-            operation_thread.join();
-        }
-        const auto provider =
-            tree_operation_source
-                ? tree_operation_source_provider
-                : active().provider();
-        const auto source_id = pane_ids[
-            tree_operation_source
-                ? tree_operation_source_index
-                : active_index
-        ];
-        operation_source_side = tree_operation_source ? tree_operation_source_index : active_index;
-        operation_finish_tree = tree_operation_source.has_value() && modal_tree_snapshot.has_value();
+        job->kind = OperationJob::Kind::remove;
+        job->label = "Delete";
+        job->compute_totals = config.compute_totals;
+        const auto return_mode = tree_operation_source && modal_tree_snapshot
+            ? Mode::directory_tree_dialog : Mode::panels;
         clear_tree_operation_context();
-        operation_cancellation = Cancellation{};
-        progress = {};
-        operation_running.store(true, std::memory_order_release);
-        operation_started = std::chrono::steady_clock::now();
-        operation_paused.store(false, std::memory_order_release);
-        operation_skip.store(false, std::memory_order_release);
-        mode = config.verbose_operation ? Mode::operation_progress
-                                       : operation_finish_tree ? Mode::directory_tree_dialog : Mode::panels;
-        operation_label = "Delete";
-        start_job({});
-        const auto resolve_error = error_handler(std::make_shared<OperationPolicy>());
-        const auto compute_totals = config.compute_totals;
-        status = "Starting delete";
+        start_job(job, return_mode);
+    }
+
+    void run_job(const std::shared_ptr<OperationJob>& job) {
+        OperationResult result;
         try {
-            operation_thread = std::jthread(
-            [this, provider, entries, source_id, resolve_error, compute_totals] {
-                OperationResult result;
-                try {
-                    operations.remove(
-                        *provider,
-                        entries,
-                        operation_cancellation,
-                        [this](const TransferProgress& value) {
-                            {
-                                std::unique_lock lock(
-                                    operation_pause_mutex
-                                );
-                                operation_pause_condition.wait(
-                                    lock,
-                                    [&] {
-                                        return !operation_paused.load(
-                                                   std::memory_order_acquire
-                                               ) ||
-                                               Cancellation{}
-                                                   .requested();
-                                    }
-                                );
-                            }
-                            operation_cancellation.throw_if_requested();
-                            post_ui([this, value] {
-                                std::lock_guard lock(operation_mutex);
-                                progress = value;
-                                status =
-                                    "Deleting " +
-                                    display_text(value.current_path) +
-                                    " (" +
-                                    std::to_string(value.files_done) +
-                                    "/" +
-                                    std::to_string(value.files_total) +
-                                    ")";
-                            });
-                        },
-                        &result,
-                        resolve_error,
-                        compute_totals,
-                        [this](const Entry& directory) {
-                            switch (ask_operation(directory, std::nullopt, {}, {}, true)) {
-                                case OperationChoice::overwrite:
-                                    return RecursiveDeleteDecision::yes;
-                                case OperationChoice::skip:
-                                    return RecursiveDeleteDecision::no;
-                                case OperationChoice::overwrite_all:
-                                    return RecursiveDeleteDecision::all;
-                                case OperationChoice::skip_all:
-                                    return RecursiveDeleteDecision::none;
-                                default:
-                                    return RecursiveDeleteDecision::cancel;
-                            }
-                        }
-                    );
-                    post_ui([
-                        this,
-                        source_id,
-                        result = std::move(result)
-                    ] {
-                        finish_operation(
-                            result.skipped.empty()
-                                ? "Delete complete"
-                                : "Delete incomplete: " +
-                                      std::to_string(result.skipped.size()) +
-                                      " skipped",
-                            source_id,
-                            result.completed_sources,
-                            !result.skipped.empty()
-                        );
-                    });
-                } catch (const OperationCancelled&) {
-                    post_ui([
-                        this,
-                        source_id,
-                        completed = std::move(result.completed_sources)
-                    ] {
-                        finish_operation(
-                            "Delete cancelled",
-                            source_id,
-                            completed,
-                            true
-                        );
-                    });
-                } catch (const std::exception& error) {
-                    const auto message = std::string(error.what());
-                    post_ui([
-                        this,
-                        message,
-                        source_id,
-                        completed = std::move(result.completed_sources)
-                    ] {
-                        finish_operation(
-                            "Error: " + message,
-                            source_id,
-                            completed,
-                            true
-                        );
-                    });
+            job->control.wait_until_resumed();
+            const auto policy = std::make_shared<OperationPolicy>();
+            auto options = job->options;
+            options.error = error_handler(job, policy);
+            options.collision = [this, job, policy](const Entry& source, const Entry& target) {
+                if (policy->collisions) return *policy->collisions;
+                const auto older = [&] {
+                    return source.kind == EntryKind::directory || source.modified > target.modified
+                        ? CollisionDecision::overwrite : CollisionDecision::skip;
+                };
+                if (policy->older) return older();
+                switch (ask_operation(
+                    job, source, target, {}, OperationEngine::collision_options(
+                        *job->source_provider, source, *job->destination_provider, target
+                    )
+                )) {
+                    case OperationChoice::overwrite: return CollisionDecision::overwrite;
+                    case OperationChoice::append: return CollisionDecision::append;
+                    case OperationChoice::reget: return CollisionDecision::reget;
+                    case OperationChoice::skip: return CollisionDecision::skip;
+                    case OperationChoice::overwrite_all:
+                        policy->collisions = CollisionDecision::overwrite;
+                        return CollisionDecision::overwrite;
+                    case OperationChoice::skip_all:
+                        policy->collisions = CollisionDecision::skip;
+                        return CollisionDecision::skip;
+                    case OperationChoice::older:
+                        policy->older = true;
+                        return older();
+                    default: return CollisionDecision::cancel;
                 }
+            };
+            const auto callback = [this, job](const TransferProgress& value) {
+                if (!job->control.checkpoint(value, job->kind != OperationJob::Kind::remove)) return;
+                post_ui([this, job] {
+                    const auto current = job->control.consume_progress();
+                    if (job->finished) return;
+                    if (mode == Mode::operation_progress && progress_job == job) {
+                        status = job->label + " " + display_text(current.current_path) +
+                            " (" + std::to_string(current.files_done) +
+                            "/" + std::to_string(current.files_total) + ")";
+                    }
+                });
+            };
+            const auto& cancellation = job->control.cancellation();
+            if (job->kind == OperationJob::Kind::remove) {
+                operations.remove(
+                    *job->source_provider, job->sources, cancellation, callback, &result,
+                    options.error, job->compute_totals,
+                    [this, job](const Entry& directory) {
+                        switch (ask_operation(job, directory, std::nullopt, {}, {}, true)) {
+                            case OperationChoice::overwrite: return RecursiveDeleteDecision::yes;
+                            case OperationChoice::skip: return RecursiveDeleteDecision::no;
+                            case OperationChoice::overwrite_all: return RecursiveDeleteDecision::all;
+                            case OperationChoice::skip_all: return RecursiveDeleteDecision::none;
+                            default: return RecursiveDeleteDecision::cancel;
+                        }
+                    }
+                );
+            } else if (job->kind == OperationJob::Kind::move && job->exact) {
+                if (job->sources.size() != 1U) throw std::runtime_error("exact move requires one source");
+                operations.move_exact(
+                    *job->source_provider, job->sources.front(), *job->destination_provider,
+                    job->destination, options, cancellation, callback, &result
+                );
+            } else if (job->kind == OperationJob::Kind::move) {
+                operations.move(
+                    *job->source_provider, job->sources, *job->destination_provider,
+                    job->destination, options, cancellation, callback, &result
+                );
+            } else if (job->exact) {
+                operations.copy_exact(
+                    *job->source_provider, job->sources.front(), *job->destination_provider,
+                    job->destination, options, cancellation, callback, &result
+                );
+            } else {
+                operations.copy(
+                    *job->source_provider, job->sources, *job->destination_provider,
+                    job->destination, options, cancellation, callback, &result
+                );
+            }
+            post_ui([this, job, result = std::move(result)] {
+                auto message = job->label + " complete";
+                if (!result.skipped.empty()) {
+                    message = job->label + " incomplete: " + std::to_string(result.skipped.size()) + " skipped";
+                    if (job->kind != OperationJob::Kind::remove) {
+                        message += " (" + display_text(result.skipped.front().reason) +
+                            "; " + display_text(result.skipped.front().path) + ")";
+                    }
+                }
+                finish_operation(job, std::move(message), result.completed_sources, !result.skipped.empty());
+            });
+        } catch (const OperationCancelled&) {
+            post_ui([this, job, completed = std::move(result.completed_sources)] {
+                finish_operation(job, job->kind == OperationJob::Kind::remove
+                    ? "Delete cancelled" : "Operation cancelled", completed, true);
             });
         } catch (const std::exception& error) {
-            operation_running.store(
-                false,
-                std::memory_order_release
-            );
-            if (active_job) {
-                jobs[*active_job].status = "Error: " + std::string(error.what());
-            }
-            mode = Mode::panels;
-            throw;
+            post_ui([this, job, message = std::string(error.what()),
+                     completed = std::move(result.completed_sources)] {
+                finish_operation(job, "Error: " + message, completed, true);
+            });
         }
     }
 
@@ -10170,6 +10166,12 @@ struct App::Impl {
         ShellResult result;
         std::exception_ptr failure;
         int child_status = 0;
+        struct ShellForegroundGuard {
+            bool& flag;
+            bool previous;
+            explicit ShellForegroundGuard(bool& value) : flag(value), previous(std::exchange(value, true)) {}
+            ~ShellForegroundGuard() { flag = previous; }
+        } foreground(shell_foreground);
         terminal->WithRestoredIO([&] {
             try {
                 if (persistent) {
@@ -11849,34 +11851,6 @@ struct App::Impl {
                size(WIDTH, LESS_THAN, 72);
     }
 
-    ftxui::Element render_editor_help() const {
-        using namespace ftxui;
-        return vbox({
-                   text("mcpp editor") | bold | center,
-                   separator(),
-                   text("F2        Save"),
-                   text("F3        Start or finish marking"),
-                   text("F4        Replace next match"),
-                   text("F5/F6     Copy/move marked block"),
-                   text("F7        Search"),
-                   text("F8        Delete marked block or current line"),
-                   text("F9        Pull-down menu"),
-                   text("F10/Esc   Quit editor (all buffers)"),
-                   text("F12       Save as"),
-                   text("Ctrl-U/M-R Undo/redo"),
-                   text("Alt-L      Go to line"),
-                   text("Insert     Insert/overwrite"),
-                   text("Shift-arrow Mark text"),
-                   text("C-Ins/S-Del Copy/cut block"),
-                   text("S-Ins      Paste clipboard"),
-                   text("Ctrl-S     Syntax highlighting"),
-                   text("Alt-N      Line numbers"),
-                   separator(),
-                   text("Press F1 or Esc") | center,
-               }) |
-               borderStyled(LIGHT);
-    }
-
     ftxui::Element render_editor_error() {
         using namespace ftxui;
         return paint(vbox({
@@ -12171,26 +12145,220 @@ struct App::Impl {
                size(WIDTH, LESS_THAN, 78);
     }
 
-    ftxui::Element render_help() const {
+    bool help_key_capture() const {
+        return mode == Mode::native_key_query || mode == Mode::learn_key ||
+               mode == Mode::learn_keys_dialog ||
+               (mode == Mode::editor && editor_window_action != 0);
+    }
+
+    HelpTopic help_topic_for_mode(const Mode context, const unsigned depth = 0) const {
+        if (depth > 6U) return HelpTopic::dialogs;
+        switch (context) {
+            case Mode::panels:
+                if (tree_panel && tree_panel_focused) return HelpTopic::tree;
+                if (quick_view_panel && quick_view_focused) return HelpTopic::quick_view;
+                return command_mode ? HelpTopic::command_line : HelpTopic::manager;
+            case Mode::viewer: return HelpTopic::viewer;
+            case Mode::viewer_message:
+            case Mode::viewer_close_dialog:
+            case Mode::viewer_link_dialog: return HelpTopic::viewer_edit;
+            case Mode::viewer_wrap_dialog: return HelpTopic::viewer_search;
+            case Mode::editor:
+            case Mode::editor_menu:
+            case Mode::editor_mail_dialog:
+            case Mode::editor_spelling_dialog: return HelpTopic::editor;
+            case Mode::editor_error:
+            case Mode::editor_save_dialog:
+            case Mode::editor_save_mode_dialog:
+            case Mode::editor_newline_warning:
+            case Mode::editor_close_dialog:
+            case Mode::editor_link_dialog:
+            case Mode::editor_overwrite_dialog: return HelpTopic::editor_save;
+            case Mode::editor_search_dialog:
+            case Mode::editor_replace_dialog:
+            case Mode::editor_replace_confirm: return HelpTopic::editor_search;
+            case Mode::editor_history:
+            case Mode::editor_buffer_list: return HelpTopic::editor_windows;
+            case Mode::diff:
+            case Mode::diff_options: return HelpTopic::diff;
+            case Mode::file_search_dialog:
+                return file_search_target == FileSearchTarget::diff ? HelpTopic::diff
+                                                                    : HelpTopic::viewer_search;
+            case Mode::prompt:
+                switch (prompt_action) {
+                    case PromptAction::editor_save_as: return HelpTopic::editor_save;
+                    case PromptAction::editor_open:
+                    case PromptAction::editor_new: return HelpTopic::editor_windows;
+                    case PromptAction::editor_goto: return HelpTopic::editor;
+                    case PromptAction::viewer_find:
+                    case PromptAction::viewer_goto:
+                    case PromptAction::quick_viewer_find: return HelpTopic::viewer_search;
+                    case PromptAction::viewer_path:
+                    case PromptAction::view_file: return HelpTopic::viewer;
+                    case PromptAction::select_pattern:
+                    case PromptAction::unselect_pattern: return HelpTopic::selection;
+                    case PromptAction::recursive_search:
+                    case PromptAction::panelize_search: return HelpTopic::find_files;
+                    case PromptAction::chmod:
+                    case PromptAction::chown:
+                    case PromptAction::hardlink:
+                    case PromptAction::symlink:
+                    case PromptAction::relative_symlink: return HelpTopic::permissions;
+                    case PromptAction::panel_filter:
+                    case PromptAction::quick_cd: return HelpTopic::panels;
+                    default: return HelpTopic::dialogs;
+                }
+            case Mode::operation_dialog:
+            case Mode::conflict_dialog:
+            case Mode::operation_error_dialog: return HelpTopic::copy_move;
+            case Mode::delete_dialog:
+            case Mode::recursive_delete_dialog: return HelpTopic::delete_files;
+            case Mode::operation_progress:
+            case Mode::jobs: return HelpTopic::jobs;
+            case Mode::search_results:
+            case Mode::external_panelize_dialog: return HelpTopic::find_files;
+            case Mode::directory_tree_dialog: return HelpTopic::tree;
+            case Mode::bookmarks: return HelpTopic::hotlist;
+            case Mode::chattr_dialog:
+            case Mode::advanced_chown_dialog:
+            case Mode::information: return HelpTopic::permissions;
+            case Mode::listing_dialog:
+            case Mode::sort_dialog: return HelpTopic::panels;
+            case Mode::configure_dialog:
+            case Mode::confirmation_dialog:
+            case Mode::layout_dialog:
+            case Mode::panel_options_dialog:
+            case Mode::appearance_dialog:
+            case Mode::display_bits_dialog:
+            case Mode::editor_options_dialog: return HelpTopic::settings;
+            case Mode::native_input: return help_topic_for_mode(native_input_return, depth + 1U);
+            case Mode::native_message: return help_topic_for_mode(native_message_return, depth + 1U);
+            case Mode::native_query: return help_topic_for_mode(native_query_return, depth + 1U);
+            case Mode::local_list: return help_topic_for_mode(local_list_return, depth + 1U);
+            case Mode::local_command: return help_topic_for_mode(local_command_return, depth + 1U);
+            case Mode::user_menu:
+                return user_menu_return == Mode::editor ? HelpTopic::editor : HelpTopic::command_line;
+            case Mode::pulldown: return HelpTopic::command_line;
+            case Mode::compare_dialog: return HelpTopic::panels;
+            case Mode::learn_key:
+            case Mode::learn_keys_dialog:
+            case Mode::native_key_query: return HelpTopic::keymaps;
+        }
+        return HelpTopic::dialogs;
+    }
+
+    void open_context_help() {
+        if (!help_key_capture() && !help_browser) {
+            help_message.clear();
+            help_browser.emplace(help_topic_for_mode(mode));
+        }
+    }
+
+    bool handle_help_action(const std::string_view action) {
+        if (!help_browser) return false;
+        help_message.clear();
+        if (action == "Quit" || action == "Cancel" || action == "Close" || action == "QuitQuiet") {
+            help_browser.reset();
+        } else if (action == "Help") help_browser->open(HelpTopic::browser);
+        else if (action == "Index") help_browser->open(HelpTopic::index);
+        else if (action == "Back" || action == "Left") static_cast<void>(help_browser->back());
+        else if (action == "Enter" || action == "Right" || action == "Ok" || action == "Select") {
+            static_cast<void>(help_browser->follow());
+        } else if (action == "Up" || action == "ScrollUp") help_browser->scroll(-1);
+        else if (action == "Down" || action == "ScrollDown") help_browser->scroll(1);
+        else if (action == "PageUp") help_browser->page(-1);
+        else if (action == "PageDown") help_browser->page(1);
+        else if (action == "HalfPageUp" || action == "HalfPageDown") {
+            help_browser->scroll(action == "HalfPageUp" ? -1 : 1,
+                                 std::max<std::size_t>(1U, help_browser->page_rows() / 2U));
+        } else if (action == "Top" || action == "Home") help_browser->top();
+        else if (action == "Bottom" || action == "End") help_browser->bottom();
+        else if (action == "LinkNext") help_browser->next_link();
+        else if (action == "LinkPrev") help_browser->next_link(true);
+        else return false;
+        return true;
+    }
+
+    bool handle_help(const ftxui::Event& event) {
+        if (event.is_mouse()) {
+            auto copy = event;
+            const auto& mouse = copy.mouse();
+            if (mouse.button == ftxui::Mouse::WheelUp || mouse.button == ftxui::Mouse::WheelDown) {
+                help_browser->scroll(mouse.button == ftxui::Mouse::WheelUp ? -1 : 1, 3U);
+            } else if (mouse.button == ftxui::Mouse::Left && mouse.motion == ftxui::Mouse::Pressed) {
+                static constexpr std::array<std::string_view, 4> actions{"Help", "Index", "Back", "Quit"};
+                for (std::size_t index = 0; index < help_key_boxes.size(); ++index) {
+                    if (help_key_boxes[index].Contain(mouse.x, mouse.y)) {
+                        return handle_help_action(actions[index]);
+                    }
+                }
+                for (std::size_t row = 0; row < help_row_boxes.size(); ++row) {
+                    if (help_row_links[row] && help_row_boxes[row].Contain(mouse.x, mouse.y)) {
+                        static_cast<void>(help_browser->follow_link(*help_row_links[row]));
+                        return true;
+                    }
+                }
+            }
+            return true;
+        }
+        if (const auto key = keymap_event_name(event)) {
+            for (const auto& binding : original_keymap_bindings()) {
+                if (binding.context == KeymapContext::help && binding_has_key(binding.keys, *key)) {
+                    return handle_help_action(binding.action);
+                }
+            }
+        }
+        return true;
+    }
+
+    ftxui::Element render_help() {
         using namespace ftxui;
-        return vbox({
-                   text("mcpp help") | bold | center,
-                   separator(),
-                   text("Tab       Switch pane"),
-                   text("Arrows    Move selection"),
-                   text("Enter     Enter directory"),
-                   text("Backspace Parent directory"),
-                   text("Insert    Toggle selection"),
-                   text("F2        User menu"),
-                   text("F3        View"),
-                   text("F4        Edit"),
-                   text("F5/F6     Copy/Rename or move"),
-                   text("F7/F8     Mkdir/Delete"),
-                   text("F9/F10    Pull-down menu/Quit"),
-                   separator(),
-                   text("Press Esc or F1"),
-               }) |
-               borderStyled(LIGHT) | size(WIDTH, EQUAL, 50);
+        const auto dimensions = Terminal::Size();
+        const auto width = std::max(5, std::min(88, dimensions.dimx - 4));
+        const auto height = std::max(7, std::min(30, dimensions.dimy - 2));
+        const auto rows = static_cast<std::size_t>(height - 6);
+        help_browser->resize(static_cast<std::size_t>(width - 4), rows);
+        help_row_boxes.assign(rows, {});
+        help_row_links.assign(rows, std::nullopt);
+        const auto lines = help_browser->lines();
+        const auto first = help_browser->first_line();
+        Elements body;
+        for (std::size_t row = 0; row < rows; ++row) {
+            auto line = text("");
+            if (first + row < lines.size()) {
+                const auto& source = lines[first + row];
+                line = text(source.text);
+                if (source.heading) line = std::move(line) | bold;
+                if (source.link) {
+                    help_row_links[row] = source.link;
+                    const auto selected = source.link == help_browser->selected_link();
+                    line = paint(std::move(line), skin_color(palette(), "help",
+                        selected ? "helpslink" : "helplink", selected ? palette().selected : palette().normal));
+                    line = std::move(line) | underlined;
+                    if (selected) line = std::move(line) | bold | focus;
+                }
+            }
+            body.push_back(hbox({text(" "), std::move(line) | xflex, text(" ")}) |
+                           reflect(help_row_boxes[row]));
+        }
+        const auto last = std::min(lines.size(), first + rows);
+        body.push_back(separator());
+        body.push_back(text(help_message.empty() ?
+            " Lines " + std::to_string(first + 1U) + "-" + std::to_string(last) +
+            "/" + std::to_string(lines.size()) + "   " +
+            (help_browser->can_go_back() ? "F3: previous page" : "Tab: links") :
+            " " + display_text(help_message)) | xflex);
+        body.push_back(separator());
+        Elements keys;
+        static const std::array<std::string, 4> labels{"1 Help", "2 Index", "3 Prev", "10 Quit"};
+        for (std::size_t index = 0; index < labels.size(); ++index) {
+            keys.push_back(paint(text(" " + labels[index] + " ") | center | xflex |
+                                reflect(help_key_boxes[index]), palette().key_label));
+        }
+        body.push_back(hbox(std::move(keys)));
+        return paint(window(text(" mcpp help: " + std::string(help_page(help_browser->topic()).title) + " ") | bold,
+                            vbox(std::move(body))), palette().normal) |
+               size(WIDTH, EQUAL, width) | size(HEIGHT, EQUAL, height);
     }
 
     ftxui::Element render_menu() {
@@ -12748,7 +12916,7 @@ struct App::Impl {
                 case 3:
                     store_panel_options_in_config();
                     store_editor_options_in_config();
-                    config.save(default_config_path());
+                    config.save();
                     status = "Setup saved";
                     break;
                 default:
@@ -13237,11 +13405,10 @@ struct App::Impl {
 
     ftxui::Element render_operation_progress() {
         using namespace ftxui;
-        TransferProgress current;
-        {
-            std::lock_guard lock(operation_mutex);
-            current = progress;
-        }
+        const auto job = progress_job;
+        if (!job) return text("No file-operation job selected");
+        const auto snapshot = job->control.snapshot();
+        const auto& current = snapshot.progress;
         const auto byte_ratio =
             current.bytes_total == 0U
                 ? 0.0F
@@ -13253,7 +13420,7 @@ struct App::Impl {
                 : static_cast<float>(current.files_done) /
                       static_cast<float>(current.files_total);
         const auto elapsed = std::chrono::duration<double>(
-            std::chrono::steady_clock::now() - operation_started
+            std::chrono::steady_clock::now() - job->started
         ).count();
         const auto bytes_per_second =
             elapsed > 0.0
@@ -13263,7 +13430,7 @@ struct App::Impl {
                   )
                 : 0U;
         const auto progress_bar = [&](const float ratio) {
-            return !config.classic_progressbar && operation_source_side == 1
+            return !config.classic_progressbar && job->source_side == 1
                        ? gaugeLeft(std::clamp(ratio, 0.0F, 1.0F))
                        : gauge(std::clamp(ratio, 0.0F, 1.0F));
         };
@@ -13277,11 +13444,29 @@ struct App::Impl {
                 std::to_string(seconds / 60U) + "m " +
                 std::to_string(seconds % 60U) + "s";
         }
+        Elements buttons;
+        const std::array<std::string, 4> labels{
+            snapshot.paused ? "Continue" : "Pause", "Skip", "Abort",
+            job->finished ? "Close" : "Background"
+        };
+        for (std::size_t index = 0; index < labels.size(); ++index) {
+            auto button = text(" [ " + labels[index] + " ] ") |
+                reflect(operation_progress_boxes[index]);
+            if ((job->finished && index != 3U) ||
+                (index == 1U && job->kind == OperationJob::Kind::remove)) {
+                button = std::move(button) | dim;
+            } else if (operation_progress_focus == index) {
+                button = focus_dialog(std::move(button));
+            }
+            buttons.push_back(std::move(button));
+        }
         return vbox({
-                   text(
-                       operation_label + " progress"
-                   ) | bold | center,
+                   text(job->label + " progress") | bold | center,
                    separator(),
+                   text("Job " + std::to_string(job->id) + ": " +
+                        (job->finished ? job->status : snapshot.paused ? "Paused" :
+                         snapshot.waiting ? "Waiting for decision" : "Running")),
+                   text("To: " + display_text(job->destination)),
                    text(display_text(current.current_path)),
                    text(
                        "File bytes: " +
@@ -13301,18 +13486,7 @@ struct App::Impl {
                        "/s   ETA: " + eta
                    ),
                    separator(),
-                   hbox({
-                       text(
-                           operation_paused.load(
-                               std::memory_order_acquire
-                           )
-                               ? " [ Continue ] "
-                               : " [ Pause ] "
-                       ) |
-                           inverted,
-                       text("  [ Skip ] ") | inverted,
-                       text("  [ Abort ] ") | inverted,
-                   }) | center,
+                   hbox(std::move(buttons)) | center,
                }) |
                borderStyled(LIGHT) | size(WIDTH, EQUAL, 72);
     }
@@ -13368,6 +13542,7 @@ struct App::Impl {
             return vbox({
                 text("Delete") | bold | center,
                 separator(),
+                text(prompt_job ? "Job " + std::to_string(prompt_job->id) : ""),
                 text("Directory \"" + path_label(
                     operation_prompt_source ? display_text(operation_prompt_source->path) : "",
                     static_cast<std::size_t>(std::max(1, width - 25))
@@ -13382,6 +13557,7 @@ struct App::Impl {
         Elements rows{
             text(error ? "File operation error" : "Destination exists") | bold | center,
             separator(),
+            text(prompt_job ? "Job " + std::to_string(prompt_job->id) + ": " + prompt_job->label : ""),
         };
         if (operation_prompt_source) {
             rows.push_back(paragraph(
@@ -13444,8 +13620,9 @@ struct App::Impl {
     }
 
     void open_jobs() {
-        if (active_job) {
-            job_cursor = *active_job;
+        const auto selected = std::ranges::find(jobs, progress_job);
+        if (selected != jobs.end()) {
+            job_cursor = static_cast<std::size_t>(std::distance(jobs.begin(), selected));
         } else if (!jobs.empty()) {
             job_cursor = jobs.size() - 1U;
         }
@@ -13517,18 +13694,25 @@ struct App::Impl {
         Elements rows;
         job_row_boxes.assign(jobs.size(), {});
         for (std::size_t index = 0; index < jobs.size(); ++index) {
-            auto state = jobs[index].status;
-            if (active_job == index &&
-                operation_running.load(std::memory_order_acquire)) {
-                state = operation_prompt_pending.load(std::memory_order_acquire)
-                            ? "Waiting for decision"
-                            : operation_paused.load(std::memory_order_acquire)
-                                  ? "Paused"
-                                  : "Running";
+            const auto& job = jobs[index];
+            const auto snapshot = job->control.snapshot();
+            auto state = job->status;
+            if (!job->finished) {
+                state = snapshot.paused ? "Paused" :
+                    snapshot.waiting ? "Waiting for decision" :
+                    job->control.cancellation().requested() ? "Cancelling" : "Running";
+                if (snapshot.progress.files_total != 0U) {
+                    state += "  " + std::to_string(snapshot.progress.files_done) +
+                        "/" + std::to_string(snapshot.progress.files_total);
+                }
+                if (snapshot.progress.bytes_total != 0U) {
+                    state += "  " + format_size(snapshot.progress.bytes_done) +
+                        "/" + format_size(snapshot.progress.bytes_total);
+                }
             }
             auto row = text(
-                std::to_string(jobs[index].id) + "  " +
-                jobs[index].label + "  " +
+                std::to_string(job->id) + "  " +
+                job->label + "  " +
                 middle_truncate(
                     display_text(state),
                     std::max(1, std::min(68, Terminal::Size().dimx - 12))
@@ -13561,7 +13745,7 @@ struct App::Impl {
                    text(
                        job_cursor < jobs.size()
                            ? middle_truncate(
-                                 display_text(jobs[job_cursor].destination),
+                                 display_text(jobs[job_cursor]->destination),
                                  std::max(1, Terminal::Size().dimx - 8)
                              )
                            : ""
@@ -13994,7 +14178,6 @@ struct App::Impl {
         const bool editor_context =
             !diff_context && (display_mode == Mode::editor ||
             display_mode == Mode::editor_menu ||
-            display_mode == Mode::editor_help ||
             display_mode == Mode::editor_error ||
             display_mode == Mode::editor_search_dialog ||
             display_mode == Mode::editor_replace_dialog ||
@@ -14024,8 +14207,7 @@ struct App::Impl {
                 display_mode == Mode::prompt &&
                 mode_before_prompt == Mode::viewer
             );
-        palette_context = display_mode == Mode::help || display_mode == Mode::editor_help
-            ? PaletteContext::help : editor_context ? PaletteContext::editor
+        palette_context = editor_context ? PaletteContext::editor
             : viewer_context ? PaletteContext::viewer : diff_context ? PaletteContext::diff : PaletteContext::panels;
         Element body;
         const auto left_width = panel_width(0);
@@ -14132,14 +14314,16 @@ struct App::Impl {
             body = render_search_results();
         }
         std::string progress_text;
-        {
-            std::lock_guard lock(operation_mutex);
-            progress_text =
-                progress.files_total == 0U
-                    ? std::string{}
-                    : " [" + std::to_string(progress.files_done) +
-                          "/" +
-                          std::to_string(progress.files_total) + "]";
+        TransferProgress combined_progress;
+        for (const auto& job : jobs) {
+            if (job->finished) continue;
+            const auto current = job->control.snapshot().progress;
+            combined_progress.files_done += current.files_done;
+            combined_progress.files_total += current.files_total;
+        }
+        if (combined_progress.files_total != 0U) {
+            progress_text = " [" + std::to_string(combined_progress.files_done) +
+                "/" + std::to_string(combined_progress.files_total) + "]";
         }
         const auto key = [this](
                              const std::string& number,
@@ -14191,9 +14375,10 @@ struct App::Impl {
             );
         }
         menu_elements.push_back(filler());
-        if (config.rotating_dash && operation_running.load(std::memory_order_acquire)) {
+        if (config.rotating_dash && has_running_jobs()) {
+            const auto running = std::ranges::find_if(jobs, [](const auto& job) { return !job->finished; });
             const auto ticks = std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::steady_clock::now() - operation_started).count() / 125;
+                std::chrono::steady_clock::now() - (*running)->started).count() / 125;
             menu_elements.push_back(text(std::string(1, "-\\|/"[static_cast<std::size_t>(ticks) % 4U])));
         } else menu_elements.push_back(text(" "));
         const auto* selected_file = active().current();
@@ -14555,11 +14740,6 @@ struct App::Impl {
                 document,
                 centered_modal(std::move(prompt_dialog)),
             });
-        } else if (mode == Mode::editor_help) {
-            document = dbox({
-                document,
-                centered_modal(render_editor_help()),
-            });
         } else if (mode == Mode::editor_error) {
             document = dbox({
                 document,
@@ -14668,11 +14848,6 @@ struct App::Impl {
                 document,
                 positioned_menu,
             });
-        } else if (mode == Mode::help) {
-            document = dbox({
-                document,
-                centered_modal(render_help()),
-            });
         } else if (mode == Mode::user_menu) {
             document = dbox({
                 document,
@@ -14746,7 +14921,15 @@ struct App::Impl {
                 positioned_menu,
             });
         }
-        return paint(std::move(document), palette().normal);
+        document = paint(std::move(document), palette().normal);
+        if (help_browser) {
+            const auto previous_context = palette_context;
+            palette_context = PaletteContext::help;
+            auto help = with_dialog_shadow(render_help() | clear_under);
+            palette_context = previous_context;
+            document = dbox({std::move(document), std::move(help) | center});
+        }
+        return document;
     }
 
     bool handle_prompt(const ftxui::Event& event) {
@@ -14888,24 +15071,21 @@ struct App::Impl {
             viewer_switch_pending.reset();
             const auto provider = viewer_navigation_provider;
             const auto files = viewer_navigation_files;
-            load_viewer(provider, path);
+            load_viewer(provider, path, true);
             if (viewer_switch_preserve_list) viewer_navigation_files = files;
             viewer_switch_preserve_list = false;
             mode = Mode::viewer;
             return;
         }
+        const auto return_screen = viewer_return_screen;
+        const auto quitting = viewer_quit_after_close;
         viewer.close();
-        viewer_navigation_files.clear();
-        cleanup_viewer_temporary();
-        mode = viewer_return_mode;
-        viewer_return_mode = Mode::panels;
-        viewer_hex_first_column = 0;
-        if (exit_after_viewer) {
-            exit_terminal();
-        }
+        viewer_session() = {};
+        restore_screen_after_close(return_screen, quitting);
     }
 
-    void request_viewer_close() {
+    void request_viewer_close(const bool quitting = false) {
+        viewer_quit_after_close = quitting;
         if (viewer.dirty()) {
             viewer_choice = 0;
             mode = Mode::viewer_close_dialog;
@@ -14964,6 +15144,7 @@ struct App::Impl {
         if (input == ButtonInput::cancel ||
             (input == ButtonInput::activate && viewer_choice == 2U)) {
             viewer_save_closes = false;
+            viewer_quit_after_close = false;
             viewer_switch_pending.reset();
             mode = Mode::viewer;
         } else if (input == ButtonInput::activate) {
@@ -14995,6 +15176,7 @@ struct App::Impl {
         if (input == ButtonInput::cancel ||
             (input == ButtonInput::activate && viewer_choice == 2U)) {
             viewer_switch_pending.reset();
+            viewer_quit_after_close = false;
             mode = Mode::viewer;
         } else if (input == ButtonInput::activate) {
             try {
@@ -15104,8 +15286,11 @@ struct App::Impl {
                 }
                 if (mouse.button == ftxui::Mouse::WheelUp ||
                     mouse.button == ftxui::Mouse::WheelDown) {
-                    const auto amount = mouse.button == ftxui::Mouse::WheelUp ? -3 : 3;
-                    if (viewer.hex()) {
+                    const auto direction = mouse.button == ftxui::Mouse::WheelUp ? -1 : 1;
+                    const auto amount = direction * (config.viewer_mouse_page_scrolling ? 1 : 3);
+                    if (config.viewer_mouse_page_scrolling.value_or(false)) {
+                        viewer.page(direction, width, height);
+                    } else if (viewer.hex()) {
                         viewer.scroll_hex_lines(amount);
                     } else {
                         viewer.scroll_lines(amount, width);
@@ -15136,17 +15321,6 @@ struct App::Impl {
                 }
                 return false;
             }
-            if (event == Event::F1) {
-                viewer_message_title = "Viewer";
-                viewer_message =
-                    "File: " + viewer.path() +
-                    ". F2 wrap/hex edit, F4 text/hex, F5 line/percent/offset, F6 save hex edits, "
-                    "F7 search, n repeat, q quit. Wheel and paging scroll. "
-                    "End/Down observes new data; Ctrl-L refreshes. "
-                    "Click a hex/ASCII byte to place the cursor, or the header for the full filename.";
-                mode = Mode::viewer_message;
-                return true;
-            }
             if (event == Event::F2) {
                 if (viewer.hex()) {
                     if (viewer_temporary_file) {
@@ -15155,6 +15329,7 @@ struct App::Impl {
                     viewer.toggle_hex_editing();
                 } else {
                     viewer.set_wrap(!viewer.wrap());
+                    config.viewer_wrap = viewer.wrap();
                 }
                 return true;
             }
@@ -16022,10 +16197,24 @@ struct App::Impl {
     }
 
     void close_editor() {
+        const auto diff_return = std::exchange(editor.diff_screen_return, std::nullopt);
         remember_editor_position(editor);
         reset_editor_view_state();
         editor.close();
         editor.search = {};
+        if (diff_return) {
+            if (!editor_buffers.empty()) {
+                editor = std::move(editor_buffers.back());
+                editor_buffers.pop_back();
+            }
+            editor_return_mode = Mode::panels;
+            editor_session_base = 0;
+            if (activate_screen({Mode::diff, diff_return->first})) {
+                diff_edit_side = diff_return->second;
+                resume_diff_after_edit();
+            } else restore_screen_after_close({});
+            return;
+        }
         if (editor_buffers.size() > editor_session_base) {
             editor = std::move(editor_buffers.back());
             editor_buffers.pop_back();
@@ -16042,6 +16231,10 @@ struct App::Impl {
             editor_buffers.pop_back();
         }
         mode = return_mode;
+        if ((exit_after_viewer || exit_after_diff) && screen_targets().size() == 1U) {
+            exit_terminal();
+            return;
+        }
         if (return_mode == Mode::diff) { resume_diff_after_edit(); return; }
         if (exit_after_editor && return_mode == Mode::panels) {
             exit_terminal();
@@ -16418,7 +16611,7 @@ struct App::Impl {
             try {
                 store_panel_options_in_config();
                 store_editor_options_in_config();
-                config.save(default_config_path());
+                config.save();
                 status = "Setup saved";
             } catch (const std::exception& error) {
                 show_editor_error(error);
@@ -17549,10 +17742,6 @@ struct App::Impl {
                          : "Column block marked";
             return true;
         }
-        if (event == ftxui::Event::F1) {
-            mode = Mode::editor_help;
-            return true;
-        }
         if (event == ftxui::Event::F2) {
             save_editor();
             return true;
@@ -18378,50 +18567,69 @@ struct App::Impl {
     }
 
     bool handle_operation_progress(const ftxui::Event& event) {
-        if (modal_cancel(event) ||
-            event == ftxui::Event::CtrlC ||
-            event == ftxui::Event::Character('a')) {
-            request_operation_cancel();
-            status = "Cancelling operation";
+        const auto job = progress_job;
+        if (!job) { mode = Mode::panels; return true; }
+        const auto background = [&] {
+            job->background = true;
+            mode = progress_return_mode == Mode::directory_tree_dialog && !modal_tree_snapshot
+                ? Mode::panels : progress_return_mode;
+        };
+        const auto activate = [&](const std::size_t action) {
+            if (job->finished || action == 3U) background();
+            else if (action == 0U) {
+                status = job->control.toggle_pause() ? "Operation paused" : "Operation resumed";
+            } else if (action == 1U && job->kind != OperationJob::Kind::remove) {
+                job->control.skip();
+                status = "Skipping current entry";
+            } else if (action == 2U) {
+                request_operation_cancel(job);
+                status = "Cancelling operation";
+            }
+        };
+        if (event.is_mouse()) {
+            auto copy = event;
+            const auto& mouse = copy.mouse();
+            if (mouse.button == ftxui::Mouse::Left && mouse.motion == ftxui::Mouse::Pressed) {
+                for (std::size_t index = 0; index < operation_progress_boxes.size(); ++index) {
+                    if (operation_progress_boxes[index].Contain(mouse.x, mouse.y)) {
+                        operation_progress_focus = index;
+                        activate(index);
+                        break;
+                    }
+                }
+            }
             return true;
         }
-        if (event == ftxui::Event::Character(' ') ||
-            event == ftxui::Event::Character('p')) {
-            bool paused = false;
-            {
-                std::lock_guard lock(operation_pause_mutex);
-                paused = !operation_paused.load(
-                    std::memory_order_acquire
-                );
-                operation_paused.store(
-                    paused,
-                    std::memory_order_release
-                );
-            }
-            if (!paused) {
-                operation_pause_condition.notify_all();
-            }
-            status = paused ? "Operation paused" : "Operation resumed";
-            return true;
+        if (event == ftxui::Event::Tab || event == ftxui::Event::TabReverse) {
+            do {
+                operation_progress_focus = event == ftxui::Event::Tab
+                    ? (operation_progress_focus + 1U) % 4U
+                    : (operation_progress_focus + 3U) % 4U;
+            } while ((job->finished && operation_progress_focus != 3U) ||
+                     (operation_progress_focus == 1U && job->kind == OperationJob::Kind::remove));
+        } else if (modal_cancel(event) || event == ftxui::Event::CtrlC ||
+                   event == ftxui::Event::Character('a') || event == ftxui::Event::F8) {
+            activate(job->finished ? 3U : 2U);
+        } else if (event == ftxui::Event::Character('p') || event == ftxui::Event::F2 ||
+                   event == ftxui::Event::Character(' ')) {
+            activate(0U);
+        } else if (event == ftxui::Event::Character('s')) {
+            activate(1U);
+        } else if (event == ftxui::Event::Character('b')) {
+            activate(3U);
+        } else if (event == ftxui::Event::Return) {
+            activate(operation_progress_focus);
+        } else if (event == ftxui::Event::CtrlO) {
+            background();
+            try {
+                const auto result = run_process("", true);
+                status = shell.running() ? "Shell hidden; Ctrl-O resumes it"
+                    : "Subshell exited " + std::to_string(result);
+            } catch (const std::exception& error) { set_error(error); }
+        } else {
+            return false;
         }
-        if (event == ftxui::Event::Character('s') &&
-            operation_label != "Delete") {
-            {
-                std::lock_guard lock(operation_pause_mutex);
-                operation_skip.store(
-                    true,
-                    std::memory_order_release
-                );
-                operation_paused.store(
-                    false,
-                    std::memory_order_release
-                );
-            }
-            operation_pause_condition.notify_all();
-            status = "Skipping current entry";
-            return true;
-        }
-        return false;
+        return true;
     }
 
     bool handle_conflict_dialog(const ftxui::Event& event) {
@@ -18484,21 +18692,23 @@ struct App::Impl {
             ++job_cursor;
         } else if (event == ftxui::Event::F2 || event == ftxui::Event::F3 ||
                    event == ftxui::Event::F8 || event == ftxui::Event::Return) {
-            if (active_job != job_cursor ||
-                !operation_running.load(std::memory_order_acquire)) {
-                status = "No running job selected";
+            if (job_cursor >= jobs.size()) {
+                status = "No job selected";
                 return true;
             }
+            const auto job = jobs[job_cursor];
             if (event == ftxui::Event::F2) {
-                operation_paused.store(
-                    !operation_paused.load(std::memory_order_acquire),
-                    std::memory_order_release
-                );
-                operation_pause_condition.notify_all();
+                if (job->finished) status = "No running job selected";
+                else status = job->control.toggle_pause() ? "Operation paused" : "Operation resumed";
             } else if (event == ftxui::Event::F8) {
-                request_operation_cancel();
+                request_operation_cancel(job);
             } else {
+                progress_job = job;
+                job->background = false;
+                progress_return_mode = Mode::jobs;
+                operation_progress_focus = job->finished ? 3U : 0U;
                 mode = Mode::operation_progress;
+                service_operation_prompts();
             }
         } else {
             return false;
@@ -18883,18 +19093,13 @@ struct App::Impl {
                     quick_view_box.Contain(mouse.x, mouse.y)) {
                     const auto viewport_width =
                         quick_view_dimensions().first;
-                    if (mouse.button == ftxui::Mouse::WheelUp) {
-                        quick_viewer.scroll_lines(
-                            -3,
-                            viewport_width
-                        );
-                    } else if (
-                        mouse.button == ftxui::Mouse::WheelDown
-                    ) {
-                        quick_viewer.scroll_lines(
-                            3,
-                            viewport_width
-                        );
+                    if (mouse.button == ftxui::Mouse::WheelUp || mouse.button == ftxui::Mouse::WheelDown) {
+                        const auto direction = mouse.button == ftxui::Mouse::WheelUp ? -1 : 1;
+                        if (config.viewer_mouse_page_scrolling.value_or(false)) {
+                            quick_viewer.page(direction, viewport_width, quick_view_dimensions().second);
+                        } else {
+                            quick_viewer.scroll_lines(direction * (config.viewer_mouse_page_scrolling ? 1 : 3), viewport_width);
+                        }
                     } else if (
                         mouse.button == ftxui::Mouse::Left &&
                         mouse.motion == ftxui::Mouse::Pressed
@@ -19111,11 +19316,6 @@ struct App::Impl {
             if (quick_view_panel && quick_view_focused) {
                 const auto [viewport_width, viewport_lines] =
                     quick_view_dimensions();
-                if (event == ftxui::Event::F1) {
-                    show_native_message("Quick view", "Quick view is read-only. F2 wraps text, F4 changes text/hex, F5 goes to a position, "
-                        "F7 searches, F8 switches parsing and Alt-E selects a data codepage. F3 opens the full viewer.", Mode::panels);
-                    return true;
-                }
                 if (event == ftxui::Event::F5) {
                     viewer_goto_quick = true;
                     viewer_goto_mode = quick_viewer.hex() ? ViewerGotoMode::hexadecimal : ViewerGotoMode::line;
@@ -19145,6 +19345,7 @@ struct App::Impl {
                 if (event == ftxui::Event::F2) {
                     if (!quick_viewer.hex()) {
                         quick_viewer.set_wrap(!quick_viewer.wrap());
+                        config.viewer_wrap = quick_viewer.wrap();
                     }
                     return true;
                 }
@@ -19500,12 +19701,16 @@ struct App::Impl {
                 active().set_show_hidden(
                     !active().show_hidden()
                 );
-            } else if (event == ftxui::Event::CtrlC &&
-                       operation_running.load(
-                           std::memory_order_acquire
-                       )) {
-                request_operation_cancel();
-                status = "Cancelling operation";
+            } else if (event == ftxui::Event::CtrlC && has_running_jobs()) {
+                const auto count = std::ranges::count_if(jobs, [](const auto& job) { return !job->finished; });
+                if (count == 1) {
+                    const auto running = std::ranges::find_if(jobs, [](const auto& job) { return !job->finished; });
+                    request_operation_cancel(*running);
+                    status = "Cancelling operation";
+                } else {
+                    open_jobs();
+                    status = "Select a job to abort with F8";
+                }
             } else if (event == ftxui::Event::CtrlC &&
                        traversal_running.load(
                            std::memory_order_acquire
@@ -19516,8 +19721,6 @@ struct App::Impl {
                 const auto result = run_process("", true);
                 status = shell.running() ? "Shell hidden; Ctrl-O resumes it"
                                          : "Subshell exited " + std::to_string(result);
-            } else if (event == ftxui::Event::F1) {
-                mode = Mode::help;
             } else if (event == ftxui::Event::F2) {
                 open_user_menu(Mode::panels);
             } else if (event == ftxui::Event::F3 ||
@@ -19572,13 +19775,6 @@ struct App::Impl {
                     )) {
                     traversal_cancellation.request();
                     status = "Cancel search before quitting";
-                    return true;
-                }
-                if (operation_running.load(
-                        std::memory_order_acquire
-                    )) {
-                    request_operation_cancel();
-                    status = "Cancel operation before quitting";
                     return true;
                 }
                 request_app_exit();
@@ -19655,6 +19851,7 @@ struct App::Impl {
 
     std::vector<KeymapContext> keymap_contexts() const {
         using enum KeymapContext;
+        if (help_browser) return {help};
         switch (mode) {
             case Mode::panels:
                 if (tree_panel && tree_panel_focused) return {tree, filemanager};
@@ -19672,8 +19869,6 @@ struct App::Impl {
             case Mode::editor_menu:
             case Mode::pulldown:
             case Mode::user_menu: return {menu, dialog};
-            case Mode::editor_help:
-            case Mode::help: return {help, dialog};
             case Mode::local_list:
             case Mode::editor_history:
             case Mode::editor_buffer_list:
@@ -19723,6 +19918,16 @@ struct App::Impl {
 
     void execute_keymap_action(const KeymapContext context, std::string_view action) {
         using enum KeymapContext;
+        if (help_browser) {
+            if (!handle_help_action(action)) {
+                throw std::runtime_error("keymap action " + std::string(action) + " is not available in help");
+            }
+            return;
+        }
+        if (action == "Help") {
+            open_context_help();
+            return;
+        }
         if (mode == Mode::panels && action == "ViewRaw") {
             const auto* entry = active().current();
             if (entry != nullptr && can_open_file(*entry)) {
@@ -19748,10 +19953,15 @@ struct App::Impl {
             explicit DispatchGuard(bool& value) : flag(value), previous(std::exchange(value, true)) {}
             ~DispatchGuard() { flag = previous; }
         } guard(keymap_dispatching);
+        if ((mode == Mode::panels || mode == Mode::viewer || mode == Mode::editor || mode == Mode::diff) &&
+            (action == "ScreenList" || action == "ScreenNext" || action == "ScreenPrev")) {
+            if (action == "ScreenList") show_screens(mode);
+            else switch_screen(action == "ScreenNext");
+            return;
+        }
         if (action == "Close" && mode == Mode::editor) { request_editor_close(); return; }
         if (action == "QuitQuiet" && mode == Mode::panels) {
-            if (operation_running.load(std::memory_order_acquire) ||
-                traversal_running.load(std::memory_order_acquire)) {
+            if (traversal_running.load(std::memory_order_acquire)) {
                 static_cast<void>(handle_panels(ftxui::Event::F10));
             } else request_app_exit(true);
             return;
@@ -19811,8 +20021,7 @@ struct App::Impl {
                 {"MacroDelete", 3, 10}, {"RepeatStartStopRecord", 3, 11}, {"Mail", 3, 12},
                 {"SpellCheck", 3, 13}, {"SpellCheckCurrentWord", 3, 14}, {"SpellCheckSelectLang", 3, 15},
                 {"InsertLiteral", 4, 0}, {"Date", 4, 1}, {"ParagraphFormat", 4, 2}, {"ExternalCommand", 4, 4},
-                {"WindowNext", 5, 0}, {"ScreenNext", 5, 0},
-                {"WindowPrev", 5, 1}, {"ScreenPrev", 5, 1},
+                {"WindowNext", 5, 0}, {"WindowPrev", 5, 1},
                 {"WindowList", 5, 2}, {"WindowMove", 5, 3}, {"WindowResize", 5, 4}, {"WindowFullscreen", 5, 5},
                 {"Options", 6, 0}, {"SaveSetup", 6, 1}, {"OptionsSaveMode", 6, 2},
                 {"LearnKeys", 6, 3}, {"SyntaxChoose", 6, 4},
@@ -19887,6 +20096,18 @@ struct App::Impl {
         if (!keymap || event.is_mouse()) return false;
         const auto key = keymap_event_name(event);
         if (!key) return false;
+        if (help_browser) {
+            if (const auto action = lookup_keymap_action(KeymapContext::help, event)) {
+                execute_keymap_action(KeymapContext::help, *action);
+                return true;
+            }
+            for (const auto& binding : original_keymap_bindings()) {
+                if (binding.context == KeymapContext::help && binding_has_key(binding.keys, *key)) {
+                    return keymap->contains_action(KeymapContext::help, binding.action);
+                }
+            }
+            return false;
+        }
         if (keymap_prefix && keymap_prefix_mode != mode) keymap_prefix.reset();
         if (keymap_prefix || (mode == Mode::panels && panel_ctrl_x)) {
             const auto context = keymap_prefix.value_or(KeymapContext::filemanager_xmap);
@@ -19952,7 +20173,7 @@ struct App::Impl {
             const auto mapping = config.learned_keys.find(encode_hex_bytes(event.input()));
             if (mapping != config.learned_keys.end()) translated = named_event(mapping->second);
         }
-        if (mode == Mode::editor && !macro_recording) {
+        if (!help_browser && mode == Mode::editor && !macro_recording) {
             const auto macro = config.editor_macros.find(encode_hex_bytes(translated.input()));
             if (macro != config.editor_macros.end()) {
                 start_macro(decode_macro(macro->second), 1);
@@ -19962,7 +20183,9 @@ struct App::Impl {
         if (dispatch_keymap(translated)) return true;
         return handle(translated);
     } catch (const std::exception& error) {
-        if (mode == Mode::editor || mode == Mode::editor_menu) {
+        if (help_browser) {
+            help_message = error.what();
+        } else if (mode == Mode::editor || mode == Mode::editor_menu) {
             show_editor_error(error);
         } else if (mode == Mode::viewer) {
             viewer_message_title = "Viewer error";
@@ -19975,6 +20198,11 @@ struct App::Impl {
     }
 
     bool handle(const ftxui::Event& event) {
+        if (help_browser) return handle_help(event);
+        if (event == ftxui::Event::F1 && !help_key_capture()) {
+            open_context_help();
+            return true;
+        }
         if (mode == Mode::editor_mail_dialog) return handle_editor_mail(event);
         if (mode == Mode::editor_spelling_dialog) return handle_spelling(event);
         if (mode == Mode::file_search_dialog) return handle_file_search(event);
@@ -19995,10 +20223,15 @@ struct App::Impl {
         if (mode == Mode::native_input) return handle_native_input(event);
         if (mode == Mode::native_key_query) return handle_key_query(event);
         if (mode == Mode::learn_key) return handle_learn_key(event);
-        if (event == ftxui::Event::Special("\x1B`") &&
-            (mode == Mode::panels || mode == Mode::viewer || mode == Mode::editor)) {
-            show_screens(mode);
-            return true;
+        if (mode == Mode::panels || mode == Mode::viewer || mode == Mode::editor || mode == Mode::diff) {
+            if (event == ftxui::Event::Special("\x1B`")) {
+                show_screens(mode);
+                return true;
+            }
+            if (event == ftxui::Event::Special("\x1B}") || event == ftxui::Event::Special("\x1B{")) {
+                switch_screen(event == ftxui::Event::Special("\x1B}"));
+                return true;
+            }
         }
         if (event.is_mouse() &&
             (config.keybar_visible || mode == Mode::editor || mode == Mode::viewer || mode == Mode::directory_tree_dialog || mode == Mode::diff) &&
@@ -20064,13 +20297,6 @@ struct App::Impl {
         if (mode == Mode::editor_menu) {
             return handle_editor_menu(event);
         }
-        if (mode == Mode::editor_help) {
-            if (modal_cancel(event) || event == ftxui::Event::F1) {
-                mode = Mode::editor;
-                return true;
-            }
-            return false;
-        }
         if (mode == Mode::editor_error) {
             std::size_t choice = 0;
             const auto input = handle_button_input(
@@ -20107,13 +20333,6 @@ struct App::Impl {
         if (mode == Mode::editor_history ||
             mode == Mode::editor_buffer_list) {
             return handle_editor_list(event);
-        }
-        if (mode == Mode::help) {
-            if (modal_cancel(event) || event == ftxui::Event::F1) {
-                mode = Mode::panels;
-                return true;
-            }
-            return false;
         }
         if (mode == Mode::user_menu) {
             return handle_menu(event);
@@ -20172,10 +20391,12 @@ App::~App() = default;
 
 void App::open_viewer(const std::string& path) {
     if (viewer_stdin_path(path)) {
-        if (impl_->viewer.dirty()) throw std::runtime_error("save or discard the current viewer edits first");
         auto input = std::make_unique<ViewerStdin>();
-        impl_->viewer.open_stream(impl_->local, input->data(), path);
-        impl_->cleanup_viewer_temporary();
+        ViewerSessionState next;
+        next.viewer = impl_->viewer;
+        if (!impl_->viewer.open()) next.viewer.set_wrap(impl_->config.viewer_wrap);
+        next.viewer.open_stream(impl_->local, input->data(), path);
+        impl_->install_viewer_session(std::move(next));
         impl_->viewer_stdin = std::move(input);
         impl_->viewer_display_name = "Standard input";
         impl_->viewer_navigation_provider.reset();
@@ -20184,6 +20405,7 @@ void App::open_viewer(const std::string& path) {
         const auto location = impl_->resolve_location(path);
         impl_->load_viewer(location.provider, location.path);
     }
+    impl_->set_viewer_return_mode(Mode::panels);
     impl_->viewer_search_needle.clear();
     impl_->exit_after_viewer = true;
     impl_->mode = Mode::viewer;
@@ -20278,18 +20500,12 @@ int App::run() {
                     return;
                 }
                 finished = true;
+                implementation->cancel_operations();
                 implementation->local_command_cancellation.request();
                 if (implementation->local_command_thread.joinable()) {
                     implementation->local_command_thread.join();
                 }
-                if (implementation->operation_running.load(
-                        std::memory_order_acquire
-                    )) {
-                    implementation->request_operation_cancel();
-                }
-                if (implementation->operation_thread.joinable()) {
-                    implementation->operation_thread.join();
-                }
+                implementation->shutdown_operations();
                 if (implementation->traversal_running.load(
                         std::memory_order_acquire
                     )) {
@@ -20329,6 +20545,7 @@ int App::run() {
                     return implementation->handle_input(event);
                 });
                 impl_->finish_editor_open_confirmation();
+                impl_->service_operation_prompts();
                 if (impl_->shell_exit_requested) {
                     impl_->shell_exit_requested = false;
                     impl_->request_app_exit();
@@ -20362,7 +20579,7 @@ int App::run() {
     impl_->store_editor_options_in_config();
     try {
         if (impl_->tree_cache_used) save_tree_cache(tree_cache_path(), impl_->known_tree_directories);
-        if (impl_->config.auto_save_setup) impl_->config.save(default_config_path());
+        if (impl_->config.auto_save_setup) impl_->config.save();
     } catch (const std::exception& error) {
         std::cerr << "mcpp: cannot save setup: " << error.what() << '\n';
         return 1;

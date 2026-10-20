@@ -65,6 +65,7 @@ add_library(
     src/color_resource.cpp
     src/completion.cpp
     src/config.cpp
+    src/config_ini.cpp
     src/entry.cpp
     src/extension.cpp
     src/file_highlight.cpp
@@ -72,6 +73,7 @@ add_library(
     src/compare.cpp
     src/diff.cpp
     src/hotlist.cpp
+    src/help.cpp
     src/input_history.cpp
     src/keymap.cpp
     src/location.cpp
@@ -185,6 +187,15 @@ if(MCPP_BUILD_TESTS)
     add_executable(mcpp_hotlist_tests tests/test_hotlist.cpp)
     target_link_libraries(mcpp_hotlist_tests PRIVATE mcpp_core)
     mcpp_target_defaults(mcpp_hotlist_tests)
+    add_executable(mcpp_help_tests tests/test_help.cpp)
+    target_link_libraries(mcpp_help_tests PRIVATE mcpp_core)
+    mcpp_target_defaults(mcpp_help_tests)
+    add_executable(mcpp_native_config_tests tests/test_native_config.cpp)
+    target_link_libraries(mcpp_native_config_tests PRIVATE mcpp_core)
+    mcpp_target_defaults(mcpp_native_config_tests)
+    add_executable(mcpp_operation_job_tests tests/test_operation_jobs.cpp)
+    target_link_libraries(mcpp_operation_job_tests PRIVATE mcpp_core)
+    mcpp_target_defaults(mcpp_operation_job_tests)
     add_executable(mcpp_input_history_tests tests/test_input_history.cpp)
     target_link_libraries(mcpp_input_history_tests PRIVATE mcpp_core)
     mcpp_target_defaults(mcpp_input_history_tests)
@@ -206,6 +217,8 @@ if(MCPP_BUILD_TESTS)
             /review/cases/input-histories
             /review/cases/append-resume
             /review/cases/copy-masks
+            /review/cases/concurrent-jobs
+            /review/cases/independent-screens
         )
         add_test(
             NAME mcpp_keymap_tests
@@ -274,6 +287,15 @@ if(MCPP_BUILD_TESTS)
             NAME mcpp_hotlist_tests
             COMMAND mcpp_hotlist_tests /review/cases/hierarchical-hotlists
         )
+        add_test(NAME mcpp_help_tests COMMAND mcpp_help_tests)
+        foreach(native_config_case IN ITEMS native legacy invalid)
+            add_test(
+                NAME mcpp_native_config_${native_config_case}
+                COMMAND mcpp_native_config_tests ${native_config_case}
+                        /review/cases/native-config/model/${native_config_case}
+            )
+        endforeach()
+        add_test(NAME mcpp_operation_job_tests COMMAND mcpp_operation_job_tests)
         add_test(
             NAME mcpp_input_history_tests
             COMMAND mcpp_input_history_tests /review/cases/input-histories
@@ -518,6 +540,32 @@ if(MCPP_BUILD_TESTS)
                     ${CMAKE_CURRENT_BINARY_DIR}/keymap-ui
             )
             set_tests_properties(mcpp_keymap_ui PROPERTIES TIMEOUT 150)
+            add_test(
+                NAME mcpp_concurrent_jobs_ui
+                COMMAND
+                    ${MCPP_PYTHON_EXECUTABLE}
+                    -B
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_concurrent_jobs_ui.py
+                    $<TARGET_FILE:mcpp>
+                    ${MCPP_TMUX_EXECUTABLE}
+            )
+            set_tests_properties(
+                mcpp_concurrent_jobs_ui
+                PROPERTIES TIMEOUT 90 WORKING_DIRECTORY /review/cases/concurrent-jobs
+            )
+            add_test(
+                NAME mcpp_independent_screens_ui
+                COMMAND
+                    ${MCPP_PYTHON_EXECUTABLE}
+                    -B
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_independent_screens_ui.py
+                    $<TARGET_FILE:mcpp>
+                    $<TARGET_FILE:mcppview>
+                    $<TARGET_FILE:mcppdiff>
+                    ${MCPP_TMUX_EXECUTABLE}
+                    /review/cases/independent-screens
+            )
+            set_tests_properties(mcpp_independent_screens_ui PROPERTIES TIMEOUT 120)
             add_test(
                 NAME mcpp_archives_ui
                 COMMAND

@@ -9,6 +9,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 int main(const int argc, char** argv) {
@@ -128,8 +129,11 @@ int main(const int argc, char** argv) {
             ).lexically_normal().string();
         };
         const auto saved_path = [&](const std::string& value, const char* panel) {
-            if (!config.auto_save_panels_setup || value.empty()) return current.string();
-            const auto path = pane_path(value);
+            const bool restore_other = config.other_directory &&
+                ((std::string_view(panel) == "left") != config.current_is_left.value_or(true));
+            const auto& requested = restore_other ? *config.other_directory : value;
+            if ((!config.auto_save_panels_setup && !restore_other) || requested.empty()) return current.string();
+            const auto path = pane_path(requested);
             if (mcpp::is_archive_location(path)) {
                 try {
                     const auto location = mcpp::open_location(path, std::make_shared<mcpp::LocalProvider>());

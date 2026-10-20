@@ -86,6 +86,7 @@ are retained; they are not bugs to remove in pursuit of default MC behavior.
 | L01 | Closed: separate `mcppview` and `mcppdiff` executables share the existing viewer and diff/merge code. Quit exits the process; dirty Save/Discard/Cancel and diff-to-editor return paths retain their guards. |
 | L02 | Closed: unnamed startup and New buffers, name-on-save including inactive-buffer Quit, `file:line` / `file:line:` notation, `+line`, existing literal colon filenames, and ordered multi-file `mcpp --edit`. CLI filename resolution and unnamed CLI startup use process cwd rather than restored pane paths. |
 | L04 | Closed for the explicitly listed Bash work: persistent shell state and cwd, Ctrl-O hide/resume including running commands and Bash builtins, guarded drafts, native shell-exit behavior, asynchronous completion, safe shutdown, and command execution alongside file operations. Other shell variants are tracked separately below. |
+| L05 | Closed: independent file-operation workers capture their own inputs, options, pane identity, progress, cancellation and answers. Background questions wait for Show; pause/abort affect only the selected job. Copies, the persistent shell and editing run alongside other jobs; exit cancels and joins paused/waiting workers. Exact bytes and concurrent UI outcomes are checked. |
 | L06 | Closed locally: native Append/Reget choices stage regular-file publication, validate revisions and resume prefixes, retain cancellation/progress and move fallback, and omit unsupported archive/remote/symlink/special append. Native reference, exact bytes, failure safety and actual collision UI are verified. |
 | L07 | Closed for local workflows: source filtering and destination transformation captures/case conversion, native directory Dive placement and revision-checked staged stable-symlink copying. Model and actual dialog outcomes preserve original files/referents. Regex is ECMAScript rather than full PCRE; stable links are local-only. |
 | L08 | Closed: guarded per-directory recursive decisions and native Yes/No/All/None/Abort controls, operation-wide All/None, safe No defaults and partial-result/selection retention. Model cases and two actual All/None workflows pass; skipped nonempty directories are neither entered nor removed. |
@@ -98,11 +99,13 @@ are retained; they are not bugs to remove in pursuit of default MC behavior.
 | L16 | Closed: purpose-separated dialog histories persist atomically in a private independent file, including filename/directory/copy and search/replace/goto inputs. Restart, draft/cursor restore, cleanup confirmation and failed-accept/retry behavior are verified. Arbitrary menu answers, secret inputs and key queries are not automatically enrolled. |
 | L17 | Closed: named entries/groups in the native hotlist format, hierarchical navigation, add/group/move/remove controls, safe persistence and flat-bookmark preservation. Cancels and failed writes retain data; canonical archive URIs, C-x h and configurable HotListAdd share the same flow. |
 | L19 | Closed for implemented commands: MC-format resources, overlays, key aliases/terminal decoding, all 16 contexts, manager/editor extended maps, action rebinding/removal, and actual dispatch across the four frontends and focused controls. `-K` / `--keymap` and `--nokeymap` are launch-only; unavailable commands fail explicitly rather than invoking another action. |
+| L25 | Closed: independently written contextual help has linked topics, an index, back navigation, scrolling and mouse controls. Manager/dialog drafts, editor/custom keys, raw key capture and dirty-viewer return are checked. MC `.hlp` import and full-text help search are not implemented. |
 | L27 | Closed: whole-document and current-word checking, dictionary selection, native suggestions/Add word/Replace/Skip/Cancel controls, and persisted personal dictionaries through standard `aspell(1)`. Byte offsets are validated, replacements are undoable, marks/search settings remain separate, and errors retain the draft and retryable dialog. |
 | L33 | Closed for the currently supported local providers: cached revisions, active-provider retention, unused timeout, private cache creation, native Active VFS list and timeout setting, and logical URI/alias preservation. Changed containers open a new snapshot; remote options stay outside the current scope. |
+| L34 | Closed: independent viewer/diff sessions appear alongside editor buffers in the native screen list and next/previous cycling. Dirty bytes, search/cursor/bookmarks, streams, comparison/editor return identity, save/link/conflict decisions and final standalone exits retain their own state. Labels fit the actual dialog content width without hiding filenames. |
 
-Standalone frontends are **4/4**. **Seventeen of the 34 baseline work packages are
-closed; 17 baseline packages remain open**. This is a feature backlog, not an
+Standalone frontends are **4/4**. **Twenty of the 34 baseline work packages are
+closed; 14 baseline packages remain open**. This is a feature backlog, not an
 overall parity percentage. Additional gaps discovered afterward are listed
 separately, rather than silently changing the baseline denominator.
 The broader command-line option set is still L03, not implicitly completed by
@@ -127,6 +130,32 @@ undoing subsequent manual navigation. A create-then-rescan regression checks
 the accepted directory, and the sidebar-selection/cache workflow passes.
 The container runners use Docker's init process to reap orphaned terminal-test
 children rather than exhausting their PID limit on a long sequence of sessions.
+
+### Concurrent jobs, independent screens and help
+
+File operations now run as separate jobs rather than sharing one worker and
+answer slot. The focused workflow checks simultaneous collision questions,
+isolated pause/abort/Show answers, another copy, shell commands and editing,
+then exact bytes and shutdown with a paused/waiting job. Background completion
+and questions leave foreground screens and dialog drafts intact.
+
+Viewer and diff sessions have stable identities in the screen list and native
+cycling. Their focused checks retain independent dirty state, bookmarks, cursor
+and search settings, stream input and temporary data. Editing returns to the
+comparison that opened it; stale-source and linked-save decisions keep their
+existing guards. The screen list now budgets its 42 content columns rather than
+counting the dialog borders as text space.
+
+F1 opens the current context without closing the underlying screen or dialog.
+Links, index/back navigation, scrolling and mouse actions use original English
+help. Raw key queries still receive F1. The manager/dialog and editor/keymap
+workflows pass; viewer-help return is covered inside the existing screen case
+rather than another separate test.
+
+The shared Release/Werror build passed. The bounded runtime checks passed as
+UID1001 in the existing no-host-mount disposable environment. Only cases blocked
+by selector clipping were repeated after its corrections; no full-suite rerun
+was added.
 
 ### Skin collection
 
@@ -226,6 +255,16 @@ their affected cases; no second full run is claimed or required for this batch.
 Future work uses a build and a few relevant checks, not broad repeated suites.
 
 ### Native resource work
+
+Native `mcpp/ini` and `panels.ini` now apply supported local options while
+preserving comments, unknown settings and existing flat-config preferences.
+New installations use the native files; existing flat setups retain their
+format unless a native `ini` is supplied. Launch overrides remain transient.
+Private saves are atomic per file, not crash-atomic across both files, and MC's
+own configuration directory is never changed. Three small model cases and
+configured startup/Save Setup/restart pass. **L18 remains partial** for saved
+non-listing panel displays and other unmapped options; unsupported options are
+diagnosed and preserved instead of silently accepted.
 
 Local user/editor menus now load native conditions, command blocks, prompts,
 pane/editor macros and view/cd directives, while retaining legacy menu rows.
