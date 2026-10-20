@@ -505,6 +505,12 @@ Config Config::load(const std::filesystem::path& path) {
                 throw std::runtime_error("unsupported file encoding: " + encoding);
             }
             result.source_codepage = std::move(encoding);
+        } else if (key == "clipboard_store" || key == "clipboard_paste") {
+            auto command = decode_value(value);
+            if (command.find('\0') != std::string::npos) {
+                throw std::runtime_error("NUL is not valid in " + key);
+            }
+            (key == "clipboard_store" ? result.clipboard_store : result.clipboard_paste) = std::move(command);
         } else if (key == "timeformat_recent" || key == "timeformat_old") {
             auto format = decode_value(value);
             std::tm time{};
@@ -613,6 +619,10 @@ Config Config::load(const std::filesystem::path& path) {
             result.editor_syntax = parse_bool(value, key);
         } else if (key == "editor_line_numbers") {
             result.editor_line_numbers = parse_bool(value, key);
+        } else if (key == "editor_simple_statusbar") {
+            result.editor_simple_statusbar = parse_bool(value, key);
+        } else if (key == "editor_show_right_margin") {
+            result.editor_show_right_margin = parse_bool(value, key);
         } else if (key == "editor_tab_width") {
             result.editor_tab_width = parse_width(
                 value,
@@ -845,12 +855,20 @@ void Config::save(const std::filesystem::path& path) const {
     }
     output << "viewer_remember_file_position=" << (viewer_remember_file_position ? "true" : "false") << '\n';
     if (source_codepage) output << "source_codepage=" << encode_value(*source_codepage) << '\n';
+    if (clipboard_store) output << "clipboard_store=" << encode_value(*clipboard_store) << '\n';
+    if (clipboard_paste) output << "clipboard_paste=" << encode_value(*clipboard_paste) << '\n';
     if (timeformat_recent) output << "timeformat_recent=" << encode_value(*timeformat_recent) << '\n';
     if (timeformat_old) output << "timeformat_old=" << encode_value(*timeformat_old) << '\n';
     if (max_saved_positions) output << "max_saved_positions=" << *max_saved_positions << '\n';
     output << "editor_backup_extension=" << encode_value(editor_backup_extension) << '\n'
            << "editor_check_newline=" << (editor_check_newline ? "true" : "false") << '\n';
     if (editor_filesize_threshold) output << "editor_filesize_threshold=" << *editor_filesize_threshold << '\n';
+    if (editor_simple_statusbar) {
+        output << "editor_simple_statusbar=" << (*editor_simple_statusbar ? "true" : "false") << '\n';
+    }
+    if (editor_show_right_margin) {
+        output << "editor_show_right_margin=" << (*editor_show_right_margin ? "true" : "false") << '\n';
+    }
     output << "reverse_files_only=" << (reverse_files_only ? "true" : "false") << '\n';
     output << "editor_syntax_language=" << editor_syntax_language << '\n';
     output << "editor_spelling_language=" << encode_value(editor_spelling_language) << '\n';

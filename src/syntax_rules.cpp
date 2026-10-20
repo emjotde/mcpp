@@ -130,6 +130,7 @@ enum class AtomKind { literal, any, word, set_one, set_many };
 struct Atom {
     AtomKind kind{AtomKind::literal};
     std::string characters;
+    bool terminal_wildcard{false};
 };
 
 struct Pattern {
@@ -137,7 +138,7 @@ struct Pattern {
     bool left{false};
     bool right{false};
     bool linestart{false};
-    bool starts_with_literal{false};
+    char first_byte{0};
     std::string left_characters;
     std::string right_characters;
 };
@@ -171,19 +172,31 @@ bool in_set(const char value, const std::string_view characters, const bool inse
     });
 }
 
+char first_pattern_byte(const std::string_view value) {
+    if (value.empty()) return '\0';
+    switch (value.front()) {
+        case '*': return '\x01';
+        case '+': return '\x02';
+        case '\\':
+            if (value.size() < 2U) return '\0';
+            if (value[1] == '[') return '\x03';
+            if (value[1] == '{') return '\x04';
+            return escaped_character(value[1]);
+        default: return value.front();
+    }
+}
+
 Pattern parse_pattern(
     const std::string_view value,
     const SourceLine& line,
-    Pattern pattern,
-    const bool delimiter
+    Pattern pattern
 ) {
-    // MC dispatches contexts by the first token, before empty repeat markers disappear.
-    pattern.starts_with_literal = !value.empty() && value.front() != '*' && value.front() != '+' &&
-        !value.starts_with("\\[") && !value.starts_with("\\{");
+    // Context dispatch uses the first source token, including its reserved marker byte.
+    pattern.first_byte = first_pattern_byte(value);
     for (std::size_t cursor = 0; cursor < value.size(); ++cursor) {
         const auto character = value[cursor];
         if (character == '*') {
-            pattern.atoms.push_back({AtomKind::any, {}});
+            pattern.atoms.push_back({AtomKind::any, {}, cursor + 1U == value.size()});
         } else if (character == '+') {
             pattern.atoms.push_back({AtomKind::word, {}});
         } else if (character != '\\') {
@@ -221,12 +234,7 @@ Pattern parse_pattern(
             });
         }
     }
-    if (pattern.atoms.empty() && !delimiter) fail(line, "syntax pattern must consume at least one character");
     if (pattern.atoms.size() > 512U) fail(line, "syntax pattern exceeds 512 elements");
-    if (delimiter && !pattern.atoms.empty() &&
-        (pattern.atoms.front().kind == AtomKind::any || pattern.atoms.back().kind == AtomKind::any)) {
-        fail(line, "context wildcard cannot be the first or last pattern element");
-    }
     return pattern;
 }
 
@@ -235,7 +243,8 @@ std::optional<std::size_t> match(
     const std::string_view text,
     const std::size_t begin,
     const bool insensitive,
-    const bool allow_empty = false
+    const bool allow_empty = false,
+    const bool delimiter = false
 ) {
     if (begin >= text.size() ||
         (pattern.linestart && begin != 0U && text[begin - 1U] != '\n') ||
@@ -259,6 +268,24 @@ std::optional<std::size_t> match(
             return accepts ? self(self, index + 1U, cursor + 1U) : std::optional<std::size_t>{};
         }
         if (failed.contains({index, cursor})) return {};
+        if (delimiter && atom.kind == AtomKind::any && index + 1U == pattern.atoms.size()) {
+            if (!atom.terminal_wildcard) return {};
+            auto end = cursor;
+            while (end < text.size()) {
+                const auto value = text[end];
+                if (value == '\0' || (pattern.right &&
+                    !in_set(value, pattern.right_characters, insensitive))) {
+                    return self(self, index + 1U, end + 1U);
+                }
+                if (value == '\n') return {};
+                ++end;
+            }
+            // The native buffer supplies a newline past EOF; never emit that virtual byte.
+            if (pattern.right && !in_set('\n', pattern.right_characters, insensitive)) {
+                return self(self, index + 1U, end);
+            }
+            return {};
+        }
         if (atom.kind == AtomKind::any && allow_empty) {
             if (auto found = self(self, index + 1U, cursor)) return found;
         }
@@ -295,8 +322,9 @@ std::optional<std::size_t> match_delimiter(
     const std::size_t begin,
     const bool insensitive
 ) {
-    if (!pattern.starts_with_literal || pattern.atoms.empty()) return {};
-    return match(pattern, text, begin, insensitive);
+    if (pattern.atoms.empty() || begin >= text.size() ||
+        !same_character(text[begin], pattern.first_byte, insensitive)) return {};
+    return match(pattern, text, begin, insensitive, false, true);
 }
 
 int parse_color(const std::string_view original, const SourceLine& line) {
@@ -481,14 +509,14 @@ private:
         }
         auto begin = options(line, cursor);
         if (cursor >= line.words.size()) fail(line, "context requires a start delimiter");
-        result.begin = parse_pattern(line.words[cursor++], line, begin, true);
+        result.begin = parse_pattern(line.words[cursor++], line, begin);
         begin.linestart = false;
         if (cursor < line.words.size() && line.words[cursor] == "linestart") {
             begin.linestart = true;
             ++cursor;
         }
         if (cursor >= line.words.size()) fail(line, "context requires an end delimiter");
-        result.end = parse_pattern(line.words[cursor++], line, begin, true);
+        result.end = parse_pattern(line.words[cursor++], line, begin);
         result.color = parse_colors(line, cursor, {});
         rules->contexts.push_back(std::move(result));
     }
@@ -498,7 +526,7 @@ private:
         std::size_t cursor = 1U;
         auto pattern = options(line, cursor);
         if (cursor >= line.words.size()) fail(line, "keyword requires a pattern");
-        pattern = parse_pattern(line.words[cursor++], line, std::move(pattern), false);
+        pattern = parse_pattern(line.words[cursor++], line, std::move(pattern));
         rules->contexts.back().keywords.push_back({
             std::move(pattern), parse_colors(line, cursor, rules->contexts.back().color)
         });
@@ -596,9 +624,14 @@ void scan_rules(const SyntaxRuleSet& rules, const std::string_view text, Emit em
         const auto& context = rules.contexts[active];
         bool consumed = false;
         for (const auto& keyword : context.keywords) {
+            if (keyword.pattern.atoms.empty() && cursor == 0U) continue;
             if (const auto end = match(keyword.pattern, text, cursor, rules.insensitive, true)) {
-                // MC colors the current byte even when a keyword matches no bytes.
-                const auto next = std::max(cursor + 1U, *end);
+                auto next = std::max(cursor + 1U, *end);
+                if (keyword.pattern.atoms.empty()) {
+                    // Once selected, an atom-empty keyword remains active through the newline.
+                    const auto newline = text.find('\n', cursor);
+                    next = newline == std::string_view::npos ? text.size() : newline + 1U;
+                }
                 emit(cursor, next, keyword.color, context.spellcheck);
                 cursor = next;
                 consumed = true;

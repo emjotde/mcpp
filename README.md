@@ -368,6 +368,12 @@ sets the large-file approval size (`1K` is 1024 bytes; zero warns for any nonemp
 file). Without that key, the earlier 64 MiB approval threshold remains.
 `select_flags` initializes the native shell-pattern, case-sensitive and
 files-only selection choices; for example, `6` enables the first two.
+`editor_simple_statusbar` selects compact flags, visual column, row/total,
+byte position/size, character/EOF and percentage fields.
+`editor_show_right_margin` shades cells from the configured
+`editor_word_wrap_line_length` onward, including blank space; it does not add a
+glyph or alter wrapping or file bytes. The native `editrightmargin` pair can be
+overridden by a skin, `[Colors]`, or CLI; cursor/selection/search styles win.
 Native `[Colors]` retains `base_color`, exact-`TERM` definitions and
 `color_terminals`. Effective color layers are base, exact terminal,
 `MC_COLOR_TABLE`, then CLI. A listed terminal can force color support, while an
@@ -380,6 +386,22 @@ Compatibility is partial: unsupported settings are diagnosed and preserved,
 not silently applied or removed. Two simultaneous auxiliary displays, missing
 editor modes, legacy terminal behavior, unsupported codepages, remote options,
 and other unmapped MC settings are not implemented.
+
+## Editor clipboard commands
+
+Native `[Misc]` `clipboard_store` and `clipboard_paste` select trusted local
+commands. Absent or empty settings keep the internal clipboard behavior.
+The store command receives one private raw-file argument, not mcpp's internal
+clipboard metadata. Paste receives no extra arguments and its stdout is data.
+Payload bytes are never interpolated into shell source.
+
+Commands run in the editor's captured local execution directory with closed
+stdin, rather than native MC's inherited terminal input. They must finish within
+two seconds; pasted data retains the existing 16 MiB limit. Empty paste output
+inserts nothing and preserves the internal clipboard. Configured failures are
+reported without silently falling back; failed commands do not cut selected
+text or mutate the editor draft. Successful data is cached privately and
+atomically. Other clipboard surfaces are unchanged.
 
 ## Keymaps
 
@@ -491,12 +513,12 @@ No further directive or flag omissions were found in the installed MC 4.8.30
 format. Definitions are bounded to 8 MiB combined input, 64 active includes,
 64 active macro names and 512 pattern atoms. Repetition-only keywords are
 supported; a zero-byte keyword match colors and advances at least one byte.
-Context delimiters keep their original leading-token classification:
-nonliteral-led and empty context delimiters are accepted but inert, while
-literal-led matches consume bytes, as in the native controls. Context patterns
-with `*` at a compiled edge remain rejected, although native MC loads the
-observed forms; atom-empty keyword behavior is still unverified and rejected.
-Complete syntax compatibility is not yet claimed. Keyword/context case
+Empty compiled keywords follow the native priority and line-tail behavior.
+Context matching retains original leading tokens and accepts edge-star patterns,
+including native marker-byte, NUL and right-word-boundary behavior. Applied
+context borders always consume bytes; empty context delimiters remain inactive.
+Native format support is implemented within the listed bounds, not a claim of
+unlimited inputs or every undocumented combination. Keyword/context case
 folding and byte-based pattern sets match MC 4.8.30, including byte offsets
 inside UTF-8 text; they are not Unicode word matching. Unknown directives fail
 explicitly. The editor keeps UTF-8 characters intact when byte-oriented syntax

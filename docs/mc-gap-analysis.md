@@ -100,6 +100,7 @@ are retained; they are not bugs to remove in pursuit of default MC behavior.
 | L16 | Closed: purpose-separated dialog histories persist atomically in a private independent file, including filename/directory/copy and search/replace/goto inputs. Restart, draft/cursor restore, cleanup confirmation and failed-accept/retry behavior are verified. Arbitrary menu answers, secret inputs and key queries are not automatically enrolled. |
 | L17 | Closed: named entries/groups in the native hotlist format, hierarchical navigation, add/group/move/remove controls, safe persistence and flat-bookmark preservation. Cancels and failed writes retain data; canonical archive URIs, C-x h and configurable HotListAdd share the same flow. |
 | L19 | Closed for implemented commands: MC-format resources, overlays, key aliases/terminal decoding, all 16 contexts, manager/editor extended maps, action rebinding/removal, and actual dispatch across the four frontends and focused controls. `-K` / `--keymap` and `--nokeymap` are launch-only; unavailable commands fail explicitly rather than invoking another action. |
+| L22 | Closed for the bounded native syntax format: external registry/definitions, PCRE2 registry matching, native byte patterns, contexts/keywords, color inheritance, include/define handling and transactional reload. Native empty-keyword and context-edge forms, literal byte offsets and actual rendering match focused MC 4.8.30 controls. Input, include/macro-depth and pattern-atom limits remain explicit; no resource collection or unlimited/undocumented-input equivalence is claimed. |
 | L25 | Closed: independently written contextual help has linked topics, an index, back navigation, scrolling and mouse controls. Manager/dialog drafts, editor/custom keys, raw key capture and dirty-viewer return are checked. MC `.hlp` import and full-text help search are not implemented. |
 | L27 | Closed: whole-document and current-word checking, dictionary selection, native suggestions/Add word/Replace/Skip/Cancel controls, and persisted personal dictionaries through standard `aspell(1)`. Byte offsets are validated, replacements are undoable, marks/search settings remain separate, and errors retain the draft and retryable dialog. |
 | L29 | Closed for standard local cpio formats: newc/CRC, odc and V7 binary little/big-endian indexing/publication, safe links and special kinds, nested snapshots, ordinary viewing/extraction and captured-parent return. Streamed data replaces the former byte caps; natural header field ranges and explicit metadata limits remain. Ambiguous PWB/vendor extensions are not claimed supported. |
@@ -107,8 +108,8 @@ are retained; they are not bugs to remove in pursuit of default MC behavior.
 | L33 | Closed for the currently supported local providers: cached revisions, active-provider retention, unused timeout, private cache creation, native Active VFS list and timeout setting, and logical URI/alias preservation. Changed containers open a new snapshot; remote options stay outside the current scope. |
 | L34 | Closed: independent viewer/diff sessions appear alongside editor buffers in the native screen list and next/previous cycling. Dirty bytes, search/cursor/bookmarks, streams, comparison/editor return identity, save/link/conflict decisions and final standalone exits retain their own state. Labels fit the actual dialog content width without hiding filenames. |
 
-Standalone frontends are **4/4**. **Twenty-three of the 34 baseline work packages are
-closed; 11 baseline packages remain open**. This is a feature backlog, not an
+Standalone frontends are **4/4**. **Twenty-four of the 34 baseline work packages are
+closed; 10 baseline packages remain open**. This is a feature backlog, not an
 overall parity percentage. Additional gaps discovered afterward are listed
 separately, rather than silently changing the baseline denominator.
 The broader command-line option set is still L03, not implicitly completed by
@@ -337,9 +338,16 @@ selection-mask choices apply to real matches. `[Colors]` now retains base and
 exact-terminal definitions and terminal forcing; effective order is base,
 exact `TERM`, environment, CLI, with transient overlays excluded from saving.
 This completes the enumerated eight-key follow-up, not all L18 compatibility.
-Other unmapped local options, including editor margin/status preferences,
-output lines, display-codepage and clipboard command settings, remain diagnosed
-and preserved.
+Compact editor status and the cell-only right-margin preference are now
+implemented with legacy-appearance defaults when absent. Margin paint preserves
+glyphs and cursor/selection/search styling and uses native `editrightmargin`.
+Native clipboard store/paste commands now use explicit local-directory,
+private raw-file/stdout contracts. Absent/empty settings retain internal
+behavior; empty paste output retains the cache. Unlike native MC's silent
+fallback, configured failures surface before editor mutation. Commands use
+closed stdin and a two-second watchdog, with the existing clipboard size cap.
+Other unmapped local options, including output lines and display-codepage
+settings, remain diagnosed and preserved.
 
 Local user/editor menus now load native conditions, command blocks, prompts,
 pane/editor macros and view/cd directives, while retaining legacy menu rows.
@@ -365,13 +373,12 @@ preservation. Colorless keywords inherit their context colors, and empty
 MC 4.8.30. Registry expressions now use PCRE2. No further directive or flag
 omissions were found in the installed format. Repetition-only keywords now
 match the cached native control, including zero-byte matches that color and
-advance at least one byte. **L22 is not yet counted closed**: truly empty
-keyword patterns remain rejected without a native acceptance control, and
-context wildcard-edge patterns are rejected although native MC loaded the
-observed forms without activating them on the supplied text.
-The context-boundary comparison now matches eight cached native controls:
-nonliteral-led and empty context delimiters are inert; literal-led neighbors
-match and consume bytes. No zero-length context transition is needed.
+advance at least one byte. **L22 is closed for the bounded native format**.
+Empty compiled keywords follow native absolute-offset, priority and line-tail
+behavior; edge-star contexts retain original marker dispatch and NUL/right-word
+boundary consumption. Empty context delimiters are inactive, and successful
+context borders always consume input. Native caches and matching actual UI
+cover the previously rejected forms without changing file bytes.
 Aggregate input/include/macro/atom bounds remain explicit. Native MC 4.8.30 controls
 confirm the existing ASCII-only case folding and byte-based sets, including
 partial UTF-8-byte matches; those are baseline behavior, not compatibility gaps.

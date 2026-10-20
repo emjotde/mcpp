@@ -133,7 +133,7 @@ std::string_view cli_color_roles() {
            "input, inputmark, inputunchanged,\n"
            "dnormal, dfocus, dtitle, errdtitle, errdfocus, errdhotfocus,\n"
            "menunormal, menusel, menuinactive, pmenunormal, pmenusel, pmenutitle,\n"
-           "bbarhotkey, bbarbutton, editnormal, editbold, editmarked, editlinestate,\n"
+           "bbarhotkey, bbarbutton, editnormal, editbold, editmarked, editlinestate, editrightmargin,\n"
            "viewnormal, viewbold, viewunderline, viewselected,\n"
            "helpnormal, helpbold, helpitalic, helplink, helpslink.\n"
            "Foreground-only roles: marked, disabled, header, menuhot, editwhitespace.\n"

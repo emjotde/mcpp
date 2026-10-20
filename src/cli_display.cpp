@@ -65,6 +65,8 @@ constexpr std::array roles{
     ColorRole{"editwhitespace", "editor", "editwhitespace", CliPaletteContext::editor, nullptr, &Skin::dim, true},
     ColorRole{"editlinestate", "editor", "editlinestate", CliPaletteContext::editor,
               nullptr, nullptr, false, &Skin::normal, &Skin::dim},
+    ColorRole{"editrightmargin", "editor", "editrightmargin", CliPaletteContext::editor,
+              nullptr, nullptr, false, &Skin::inactive_selected},
     ColorRole{"viewnormal", "viewer", "_default_", CliPaletteContext::viewer, &Skin::normal},
     ColorRole{"viewbold", "viewer", "viewbold", CliPaletteContext::viewer,
               nullptr, nullptr, false, &Skin::normal, nullptr, SkinPair::bold},

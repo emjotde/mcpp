@@ -28,6 +28,7 @@
 #include "mcpp/translation.hpp"
 #include "mcpp/diff.hpp"
 #include "mcpp/user_menu.hpp"
+#include "editor_display.hpp"
 #include "input_styles.hpp"
 #include "local_tools_stream.hpp"
 #include "viewer_help_styles.hpp"
@@ -11670,6 +11671,33 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
             segments.push_back(text(""));
         }
         auto content = hbox(std::move(segments));
+        if (config.editor_show_right_margin.value_or(false)) {
+            std::vector<std::pair<std::size_t, std::size_t>> protected_columns;
+            const auto protect_bytes = [&](const std::size_t begin, const std::size_t end) {
+                if (begin < end) {
+                    protected_columns.emplace_back(
+                        editor_display_width(line, begin, editor.tab_width()),
+                        editor_display_width(line, end, editor.tab_width()));
+                }
+            };
+            protect_bytes(selected_begin, selected_end);
+            protect_bytes(match_begin, match_end);
+            if (index == editor.row() && editor.column() < line.size()) {
+                const auto begin = editor.display_cursor_column();
+                const auto end = line[editor.column()] == '\t' ? begin + 1U :
+                    std::max(begin + 1U, editor_display_width(
+                        line, next_utf8(line, editor.column()), editor.tab_width()));
+                protected_columns.emplace_back(begin, end);
+            }
+            if (virtual_mark) protected_columns.push_back(*virtual_mark);
+            if (virtual_cursor) protected_columns.emplace_back(*virtual_cursor, *virtual_cursor + 1U);
+            content = detail::editor_right_margin(
+                std::move(content),
+                editor_first_visible_column(line, first_column, editor.tab_width()),
+                viewport_width, config.editor_wrap_length,
+                skin_color(palette(), "editor", "editrightmargin", palette().inactive_selected),
+                std::move(protected_columns));
+        }
         if (editor.bookmarks().contains(index)) content = content | underlined;
         if (!editor_line_numbers) {
             return content;
@@ -11761,6 +11789,15 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
                 reflect(editor_line_boxes[index - first])
             );
         }
+        if (config.editor_show_right_margin.value_or(false)) {
+            auto empty_rows = detail::editor_right_margin(
+                filler(), first_column, content_width, config.editor_wrap_length,
+                skin_color(palette(), "editor", "editrightmargin", palette().inactive_selected));
+            if (editor_line_numbers) {
+                empty_rows = hbox({filler() | size(WIDTH, EQUAL, 6), std::move(empty_rows)});
+            }
+            elements.push_back(std::move(empty_rows) | flex);
+        }
 
         Elements menu;
         for (std::size_t index = 0; index < editor_menu_names.size(); ++index) {
@@ -11803,7 +11840,7 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
             editor.selection().has_value()
                ? editor.column_selection() ? 'C' : 'B'
                : '-';
-        const std::string editor_flags{
+        std::string editor_flags{
             ' ',
             '[',
             block_flag,
@@ -11816,8 +11853,15 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
             ' ',
         };
         auto position_status = editor_status.str();
-        if (static_cast<int>(editor_flags.size() + position_status.size()) + 18 >
-            header_width) {
+        if (config.editor_simple_statusbar.value_or(false)) {
+            editor_flags = " " + editor_flags.substr(2U, 4U) + " ";
+            position_status = detail::editor_simple_position(
+                cursor_width, editor.row() + 1U, editor.lines().size(),
+                editor.storage_cursor_offset(), editor.storage_byte_size(), character, at_eof,
+                static_cast<std::size_t>(std::max(
+                    0, header_width - static_cast<int>(editor_flags.size()) - 18)));
+        } else if (static_cast<int>(editor_flags.size() + position_status.size()) + 18 >
+                   header_width) {
             position_status =
                 " " + std::to_string(editor.row() + 1U) + ":" +
                 std::to_string(cursor_width + 1U) + "/" +
@@ -16646,14 +16690,17 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
 
     void store_editor_clipboard(const bool cut) {
         if (const auto selected = editor.selected_text()) {
-            editor_clipboard = *selected;
-            editor_clipboard_column = editor.column_selection();
+            const auto column = editor.column_selection();
             try {
                 save_editor_clipboard(
                     editor_clipboard_path(),
-                    editor_clipboard,
-                    editor_clipboard_column
+                    *selected,
+                    column,
+                    config.clipboard_store,
+                    editor_directory(editor)
                 );
+                editor_clipboard = *selected;
+                editor_clipboard_column = column;
                 if (cut) {
                     static_cast<void>(editor.delete_selection());
                 } else if (config.editor_drop_selection_on_copy) editor.clear_selection();
@@ -16674,9 +16721,17 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
             bool persisted_column = false;
             const auto persisted = load_editor_clipboard(
                 path,
-                &persisted_column
+                &persisted_column,
+                config.clipboard_paste,
+                editor_directory(editor)
             );
-            if (std::filesystem::exists(path)) {
+            const bool configured =
+                config.clipboard_paste && !config.clipboard_paste->empty();
+            if (configured && persisted.empty()) {
+                status = "Clipboard is empty";
+                return;
+            }
+            if (configured || std::filesystem::exists(path)) {
                 editor_clipboard_column = persisted_column;
                 editor_clipboard = persisted;
             }

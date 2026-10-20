@@ -118,6 +118,8 @@ struct Config {
     std::optional<bool> viewer_mouse_page_scrolling;
     bool viewer_remember_file_position{false};
     std::optional<std::string> source_codepage;
+    std::optional<std::string> clipboard_store;
+    std::optional<std::string> clipboard_paste;
     std::optional<std::string> timeformat_recent;
     std::optional<std::string> timeformat_old;
     std::optional<std::size_t> max_saved_positions;
@@ -139,6 +141,8 @@ struct Config {
     bool shadows{true};
     bool editor_syntax{true};
     bool editor_line_numbers{false};
+    std::optional<bool> editor_simple_statusbar;
+    std::optional<bool> editor_show_right_margin;
     std::size_t editor_tab_width{8};
     std::size_t editor_indent_width{4};
     std::size_t editor_wrap_length{72};

@@ -258,6 +258,13 @@ if(MCPP_BUILD_TESTS)
     target_include_directories(mcpp_input_style_tests PRIVATE src)
     target_link_libraries(mcpp_input_style_tests PRIVATE mcpp_ui)
     mcpp_target_defaults(mcpp_input_style_tests)
+    add_executable(mcpp_editor_display_tests tests/test_editor_display_preferences.cpp)
+    target_include_directories(mcpp_editor_display_tests PRIVATE src)
+    target_link_libraries(mcpp_editor_display_tests PRIVATE mcpp_core ftxui::ftxui)
+    mcpp_target_defaults(mcpp_editor_display_tests)
+    add_executable(mcpp_editor_clipboard_commands tests/test_editor_clipboard_commands.cpp)
+    target_link_libraries(mcpp_editor_clipboard_commands PRIVATE mcpp_core)
+    mcpp_target_defaults(mcpp_editor_clipboard_commands)
     add_executable(mcpp_translation_tests tests/test_translation.cpp)
     target_link_libraries(mcpp_translation_tests PRIVATE mcpp_core)
     mcpp_target_defaults(mcpp_translation_tests)
@@ -326,6 +333,20 @@ if(MCPP_BUILD_TESTS)
             NAME mcpp_native_input_styles
             COMMAND mcpp_input_style_tests /review/cases/input-styles/model/ctest
         )
+        add_test(
+            NAME mcpp_editor_display_preferences
+            COMMAND mcpp_editor_display_tests
+                    /review/cases/mc-config/editor-display-500191ad/model/ctest
+        )
+        foreach(clipboard_command_case IN ITEMS success failure)
+            add_test(
+                NAME mcpp_editor_clipboard_${clipboard_command_case}
+                COMMAND mcpp_editor_clipboard_commands
+                        /review/cases/native-clipboard-commands/ctest-${clipboard_command_case}
+                        ${clipboard_command_case}
+            )
+            set_tests_properties(mcpp_editor_clipboard_${clipboard_command_case} PROPERTIES TIMEOUT 15)
+        endforeach()
         add_test(
             NAME mcpp_archive_tests
             COMMAND mcpp_archive_tests /review/cases/agent-archives
@@ -503,6 +524,10 @@ if(MCPP_BUILD_TESTS)
         add_test(
             NAME mcpp_syntax_native_context
             COMMAND mcpp_syntax_rules_tests /review/cases/mc-syntax/native-context native-context
+        )
+        add_test(
+            NAME mcpp_syntax_native_guards
+            COMMAND mcpp_syntax_rules_tests /review/cases/mc-syntax/native-guards native-guards
         )
         add_test(NAME mcpp_translation_tests COMMAND mcpp_translation_tests)
         add_test(
@@ -893,6 +918,17 @@ if(MCPP_BUILD_TESTS)
                     ExtensionsUI.test_streamed_view_lifetime_and_failure
             )
             set_tests_properties(mcpp_streamed_views_ui PROPERTIES TIMEOUT 90)
+            add_test(
+                NAME mcpp_editor_clipboard_ui
+                COMMAND
+                    ${MCPP_PYTHON_EXECUTABLE}
+                    -B
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_editor_clipboard_commands_ui.py
+                    $<TARGET_FILE:mcpp>
+                    ${MCPP_TMUX_EXECUTABLE}
+                    /review/cases/native-clipboard-commands/ctest-ui
+            )
+            set_tests_properties(mcpp_editor_clipboard_ui PROPERTIES TIMEOUT 40)
             add_test(
                 NAME mcpp_hex_cursor_ui
                 COMMAND
