@@ -296,6 +296,67 @@ Learned terminal sequences are decoded before action lookup. Invalid resources
 report their file, line and column. Binding an unavailable command reports an
 error rather than running a different action.
 
+## Dialog histories
+
+Named dialog histories persist in the private `mcpp/input-history` file,
+independently from Auto save setup. Filename/directory, copy destination,
+search/replace/goto and explicitly named native inputs retain their own history.
+History navigation preserves an unfinished draft and cursor when returning to
+it. Cleanup uses the existing confirmation setting. Failed writes/acceptance
+report an error without discarding the field; arbitrary menu prompt answers and
+key queries are not automatically persisted.
+
+## Directory hotlist
+
+`Ctrl-\` opens the named, hierarchical directory hotlist. Native controls add
+the current directory, create groups, move entries between groups and remove
+entries with the configured confirmation. `Ctrl-X h` adds the current location;
+the configurable `HotListAdd` action uses the same flow.
+
+The private `mcpp/hotlist` file uses MC's public `GROUP` / `ENTRY ... URL` /
+`ENDGROUP` format. Existing flat bookmarks are preserved when imported.
+Failed writes and cancelled forms retain the pending label and existing data.
+Archive entries store full native VFS locations, not ambiguous member paths.
+
+## User and editor menus
+
+Panel menus prefer a local `.mc.menu`, then `$XDG_CONFIG_HOME/mcpp/menu`.
+Editor menus use `mcpp/mcedit/menu`, with the shared menu as a compatibility
+fallback. Existing `key|label|command` rows keep their original macro rules.
+Native menus accept key/title rows with indented command blocks and
+condition/default-selection lines, for example:
+
+```text
+i Inspect selected file
+    stat -- %f
+```
+
+Native expansion supports active/other-pane context, tagged files, prompts,
+editor block/error scratch files and internal view/cd directives. Execution and
+editor block replacement retain terminal, draft, lock and command-error guards.
+Conditions do not execute shell commands. Unknown macros and unsupported quoting
+contexts fail explicitly: unquoted raw `%0` expansion, quoted tagged lists,
+and macros inside backticks, ANSI quotes, arithmetic or heredocs are not accepted.
+Named-home/CDPATH expansion in `%cd` remains unsupported.
+
+## External syntax definitions
+
+The editor can load a user-authored MC `Syntax` registry from its config
+directory and definitions from `syntax.d/`. Native patterns, contexts, keywords
+and explicit colors feed the existing renderer; available definitions appear
+in the syntax chooser. The lowercase legacy `syntax` override file and builtin
+languages remain available. Selected external IDs persist in saved setup.
+Loading is transactional: a malformed replacement reports an error while
+retaining the current definition and draft.
+
+This is not complete MC syntax compatibility yet. Registry expressions use
+POSIX extended regex, case folding is ASCII-oriented, and pattern sets are
+byte-based. Unsupported directives fail explicitly. Context `spellcheck` flags
+filter whole-document results and continuation checks independently of syntax
+colors; explicit word checks remain available outside those contexts. If a
+replacement changes delimiters and makes new text eligible, run another
+whole-document check to include it. No MC syntax database is bundled.
+
 ## Local archives and copying
 
 Enter opens recognized tar/cpio files; directories and `..` navigate inside,
@@ -467,6 +528,14 @@ attempts retain the visible location, and successful text searches reveal
 their hit through wrapping and horizontal scrolling.
 
 ## Editor buffers
+
+Writable local files acquire an MC-compatible `.#filename` lock on the first
+change, not merely when opened. A conflicting edit offers Grab lock or Ignore
+lock; Escape cancels without changing the draft. Pending edits, asynchronous
+results and macros resume after an accepted decision. Save As keeps source and
+destination decisions separate, and successful save/close releases owned locks.
+A session never deletes a lock that another session has taken over.
+Readonly archive members and temporary diff buffers do not create host locks.
 
 Files above 64 MiB require confirmation before their contents are read.
 Accept opens the file; declining retains the current draft and other queued

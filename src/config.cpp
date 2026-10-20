@@ -430,7 +430,8 @@ Config Config::load(const std::filesystem::path& path) {
             result.editor_check_newline = parse_bool(value, key);
         } else if (key == "editor_syntax_language") {
             const auto& languages = SyntaxHighlighter::languages();
-            if (std::ranges::find(languages, value) == languages.end()) {
+            if (std::ranges::find(languages, value) == languages.end() &&
+                !(value.starts_with("external:") && value.size() > 9U)) {
                 throw std::runtime_error("unknown syntax language: " + value);
             }
             result.editor_syntax_language = value;

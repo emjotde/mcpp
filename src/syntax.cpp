@@ -1,4 +1,5 @@
 #include "mcpp/syntax.hpp"
+#include "syntax_rules.hpp"
 
 #include <algorithm>
 #include <array>
@@ -29,6 +30,12 @@ constexpr std::array<std::pair<std::string_view, Language>, 10> named_languages{
     {"shell", Language::shell}, {"json", Language::json}, {"markdown", Language::markdown},
     {"config", Language::config}
 }};
+
+constexpr std::array<std::string_view, 10> language_names{
+    "unknown", "C/C++ Program", "Rust Program", "GoLang Program",
+    "JavaScript Program", "Python Program", "Shell Script", "JSON File",
+    "Markdown", "INI-based File"
+};
 
 using Words = std::span<const std::string_view>;
 
@@ -547,17 +554,95 @@ const std::vector<std::string>& SyntaxHighlighter::languages() {
     return result;
 }
 
+std::string SyntaxHighlighter::language_name(
+    const std::filesystem::path& path,
+    const std::vector<std::string>& lines,
+    const std::string_view requested_language
+) const {
+    if (const auto* external = external_definition(path, lines, requested_language)) {
+        return external->definition.name;
+    }
+    const auto selected = requested_language == "auto"
+        ? std::ranges::find(named_languages, language_for(path), &std::pair<std::string_view, Language>::second)
+        : std::ranges::find(named_languages, requested_language, &std::pair<std::string_view, Language>::first);
+    if (selected == named_languages.end()) throw std::runtime_error("unknown syntax language");
+    return std::string(language_names[static_cast<std::size_t>(selected->second)]);
+}
+
+void SyntaxHighlighter::load_registry(
+    const std::filesystem::path& registry,
+    const std::filesystem::path& definitions
+) {
+    if (registry_ && !registry_->definitions().empty() && !std::filesystem::exists(registry)) {
+        throw std::runtime_error("syntax registry is missing; keeping current rules: " + registry.string());
+    }
+    auto candidate = detail::SyntaxRegistry::load(registry, definitions);
+    registry_ = std::move(candidate);
+}
+
+std::vector<SyntaxDefinition> SyntaxHighlighter::definitions() const {
+    return registry_ ? registry_->definitions() : std::vector<SyntaxDefinition>{};
+}
+
+bool SyntaxHighlighter::supports_language(const std::string_view language) const {
+    if (std::ranges::find(languages(), language) != languages().end()) return true;
+    const auto available = definitions();
+    return std::ranges::any_of(available, [&](const auto& definition) {
+        return definition.id == language;
+    });
+}
+
+const detail::SyntaxRegistryEntry* SyntaxHighlighter::external_definition(
+    const std::filesystem::path& path,
+    const std::vector<std::string>& lines,
+    const std::string_view language
+) const {
+    if (registry_) return registry_->select(path, lines.empty() ? std::string_view{} : lines.front(), language);
+    if (language.starts_with("external:")) {
+        throw std::runtime_error("syntax definition is unavailable: " + std::string(language.substr(9)));
+    }
+    return nullptr;
+}
+
+std::filesystem::path SyntaxHighlighter::definition_path(
+    const std::filesystem::path& path,
+    const std::vector<std::string>& lines,
+    const std::string_view language
+) const {
+    const auto* external = external_definition(path, lines, language);
+    return external ? external->definition.path : std::filesystem::path{};
+}
+
+std::optional<std::vector<SyntaxSpellingRange>> SyntaxHighlighter::spelling_ranges(
+    const std::filesystem::path& path,
+    const std::vector<std::string>& lines,
+    const std::string_view requested_language
+) const {
+    if (const auto* external = external_definition(path, lines, requested_language)) {
+        return detail::spelling_ranges(*external->rules, lines);
+    }
+    if (!supports_language(requested_language)) {
+        throw std::runtime_error("unknown syntax language: " + std::string(requested_language));
+    }
+    return std::nullopt;
+}
+
 std::vector<std::vector<SyntaxSpan>> SyntaxHighlighter::highlight(
     const std::filesystem::path& path,
     const std::vector<std::string>& lines,
     const std::string_view requested_language
 ) const {
+    if (const auto* external = external_definition(path, lines, requested_language)) {
+        return detail::highlight_rules(*external->rules, lines);
+    }
     std::vector<std::vector<SyntaxSpan>> result(lines.size());
     auto language = language_for(path);
     if (requested_language != "auto") {
         const auto selected = std::ranges::find(named_languages, requested_language,
                                                &std::pair<std::string_view, Language>::first);
-        if (selected == named_languages.end()) throw std::runtime_error("unknown syntax language");
+        if (selected == named_languages.end()) {
+            throw std::runtime_error("unknown syntax language: " + std::string(requested_language));
+        }
         language = selected->second;
     }
     bool block_comment = false;

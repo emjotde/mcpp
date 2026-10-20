@@ -88,12 +88,15 @@ are retained; they are not bugs to remove in pursuit of default MC behavior.
 | L04 | Closed for the explicitly listed Bash work: persistent shell state and cwd, Ctrl-O hide/resume including running commands and Bash builtins, guarded drafts, native shell-exit behavior, asynchronous completion, safe shutdown, and command execution alongside file operations. Other shell variants are tracked separately below. |
 | L09 | Closed: local sparse copies retain logical bytes and supported holes; FIFOs and permitted device nodes are recreated without reading them as streams; sockets fail explicitly. Existing atomic publication, revision, metadata, hardlink, cancellation and error handling remain guarded. Non-root checks cover device permission failures; creating device nodes still requires normal Linux capabilities. |
 | L10 | Closed: files above 64 MiB require approval before contents are read, including queued CLI files, Open/history, manager and Find/Diff editing. Decline/failure retains drafts and other arguments. Exactly 64 MiB opens normally; large backups use streaming copies and revision checks instead of the former 16 MiB rejection. |
+| L11 | Closed: native first-change `.#filename` locks, owner/stale-lock handling, Grab/Ignore/Escape decisions, lock-safe deferred actions/macros, transactional Save As and owned-lock cleanup. Save/close release locks without removing another session's replacement. Readonly archives and transient diff buffers do not lock host paths. |
+| L16 | Closed: purpose-separated dialog histories persist atomically in a private independent file, including filename/directory/copy and search/replace/goto inputs. Restart, draft/cursor restore, cleanup confirmation and failed-accept/retry behavior are verified. Arbitrary menu answers, secret inputs and key queries are not automatically enrolled. |
+| L17 | Closed: named entries/groups in the native hotlist format, hierarchical navigation, add/group/move/remove controls, safe persistence and flat-bookmark preservation. Cancels and failed writes retain data; canonical archive URIs, C-x h and configurable HotListAdd share the same flow. |
 | L19 | Closed for implemented commands: MC-format resources, overlays, key aliases/terminal decoding, all 16 contexts, manager/editor extended maps, action rebinding/removal, and actual dispatch across the four frontends and focused controls. `-K` / `--keymap` and `--nokeymap` are launch-only; unavailable commands fail explicitly rather than invoking another action. |
 | L27 | Closed: whole-document and current-word checking, dictionary selection, native suggestions/Add word/Replace/Skip/Cancel controls, and persisted personal dictionaries through standard `aspell(1)`. Byte offsets are validated, replacements are undoable, marks/search settings remain separate, and errors retain the draft and retryable dialog. |
 | L33 | Closed for the currently supported local providers: cached revisions, active-provider retention, unused timeout, private cache creation, native Active VFS list and timeout setting, and logical URI/alias preservation. Changed containers open a new snapshot; remote options stay outside the current scope. |
 
-Standalone frontends are **4/4**. **Eight of the 34 baseline work packages are
-closed; 26 baseline packages remain open**. This is a feature backlog, not an
+Standalone frontends are **4/4**. **Eleven of the 34 baseline work packages are
+closed; 23 baseline packages remain open**. This is a feature backlog, not an
 overall parity percentage. Additional gaps discovered afterward are listed
 separately, rather than silently changing the baseline denominator.
 The broader command-line option set is still L03, not implicitly completed by
@@ -215,6 +218,24 @@ passed after correcting relative CLI paths, settings-action dispatch and
 controller expectations. Later archive namespace fixes were checked only in
 their affected cases; no second full run is claimed or required for this batch.
 Future work uses a build and a few relevant checks, not broad repeated suites.
+
+### Native resource work
+
+Local user/editor menus now load native conditions, command blocks, prompts,
+pane/editor macros and view/cd directives, while retaining legacy menu rows.
+F2/editor execution is checked. **L20 remains partial** against the original
+complete-expansion target: unsupported quoting contexts and unsafe raw forms
+produce explicit errors; named-home/CDPATH expansion in `%cd` is not supported.
+
+External `Syntax` registries and definitions now feed the actual editor chooser
+and color renderer, with transactional reload, saved selections and legacy-file
+preservation. **L22 remains partial**: registry regex is POSIX ERE and unsupported
+directives are rejected; case folding is ASCII-oriented and pattern sets are
+byte-based. Context `spellcheck` now emits color-independent eligible byte ranges
+and filters whole-document and continuation results. Its focused workflow
+preserves UTF-8 offsets, explicit word checking, marks, Undo and saved bytes.
+Delimiter changes that newly expose text require another whole-document check.
+No MC resource collection is copied or bundled.
 
 ### Additional compatibility gaps
 

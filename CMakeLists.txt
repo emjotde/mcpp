@@ -67,10 +67,13 @@ add_library(
     src/listing.cpp
     src/compare.cpp
     src/diff.cpp
+    src/hotlist.cpp
+    src/input_history.cpp
     src/keymap.cpp
     src/location.cpp
     src/local_provider.cpp
     src/local_tools.cpp
+    src/native_menu.cpp
     src/operations.cpp
     src/pane.cpp
     src/search.cpp
@@ -78,10 +81,12 @@ add_library(
     src/skin.cpp
     src/spelling.cpp
     src/syntax.cpp
+    src/syntax_rules.cpp
     src/user_menu.cpp
     src/tree_cache.cpp
     src/viewer.cpp
     src/editor.cpp
+    src/editor_lock.cpp
     src/editor_clipboard.cpp
     src/editor_search.cpp
 )
@@ -145,6 +150,21 @@ if(MCPP_BUILD_TESTS)
     add_executable(mcpp_editor_large_files tests/test_editor_large_files.cpp)
     target_link_libraries(mcpp_editor_large_files PRIVATE mcpp_core)
     mcpp_target_defaults(mcpp_editor_large_files)
+    add_executable(mcpp_editor_lock_tests tests/test_editor_locks.cpp)
+    target_link_libraries(mcpp_editor_lock_tests PRIVATE mcpp_core)
+    mcpp_target_defaults(mcpp_editor_lock_tests)
+    add_executable(mcpp_native_menu_tests tests/test_native_menu.cpp)
+    target_link_libraries(mcpp_native_menu_tests PRIVATE mcpp_core)
+    mcpp_target_defaults(mcpp_native_menu_tests)
+    add_executable(mcpp_hotlist_tests tests/test_hotlist.cpp)
+    target_link_libraries(mcpp_hotlist_tests PRIVATE mcpp_core)
+    mcpp_target_defaults(mcpp_hotlist_tests)
+    add_executable(mcpp_input_history_tests tests/test_input_history.cpp)
+    target_link_libraries(mcpp_input_history_tests PRIVATE mcpp_core)
+    mcpp_target_defaults(mcpp_input_history_tests)
+    add_executable(mcpp_syntax_rules_tests tests/test_syntax_rules.cpp)
+    target_link_libraries(mcpp_syntax_rules_tests PRIVATE mcpp_core)
+    mcpp_target_defaults(mcpp_syntax_rules_tests)
     add_executable(mcpp_sparse_special_tests tests/test_sparse_special.cpp)
     target_link_libraries(mcpp_sparse_special_tests PRIVATE mcpp_core)
     target_link_options(
@@ -157,6 +177,7 @@ if(MCPP_BUILD_TESTS)
             /review/cases/agent-archives
             /review/cases/agent-archive-operations
             /review/cases/sparse-special-files
+            /review/cases/input-histories
         )
         add_test(
             NAME mcpp_keymap_tests
@@ -178,6 +199,23 @@ if(MCPP_BUILD_TESTS)
         add_test(
             NAME mcpp_editor_large_files
             COMMAND mcpp_editor_large_files /review/cases/editor-large-files/model
+        )
+        add_test(
+            NAME mcpp_editor_lock_tests
+            COMMAND mcpp_editor_lock_tests /review/cases/editor-locks/model
+        )
+        add_test(NAME mcpp_native_menu_tests COMMAND mcpp_native_menu_tests)
+        add_test(
+            NAME mcpp_hotlist_tests
+            COMMAND mcpp_hotlist_tests /review/cases/hierarchical-hotlists
+        )
+        add_test(
+            NAME mcpp_input_history_tests
+            COMMAND mcpp_input_history_tests /review/cases/input-histories
+        )
+        add_test(
+            NAME mcpp_syntax_rules_tests
+            COMMAND mcpp_syntax_rules_tests /review/cases/mc-syntax/model
         )
         add_test(
             NAME mcpp_sparse_special_tests

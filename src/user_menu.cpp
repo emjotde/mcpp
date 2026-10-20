@@ -5,8 +5,8 @@
 #include <cstring>
 #include <cstdlib>
 #include <fcntl.h>
-#include <sstream>
 #include <stdexcept>
+#include <system_error>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -59,10 +59,18 @@ void validate_menu_file(
     }
 }
 
+bool menu_exists(const std::filesystem::path& path) {
+    struct stat status {};
+    if (lstat(path.c_str(), &status) == 0) return true;
+    if (errno == ENOENT) return false;
+    throw std::system_error(errno, std::generic_category(), "inspect user menu: " + path.string());
+}
+
 }  // namespace
 
 std::vector<UserMenuEntry> load_user_menu(
-    const std::filesystem::path& path
+    const std::filesystem::path& path,
+    const bool shell_patterns
 ) {
     const int descriptor = open(
         path.c_str(),
@@ -114,35 +122,17 @@ std::vector<UserMenuEntry> load_user_menu(
         if (count == 0) {
             break;
         }
+        if (content.size() + static_cast<std::size_t>(count) > 1024U * 1024U) {
+            close(descriptor);
+            throw std::runtime_error("user menu exceeds 1 MiB: " + path.string());
+        }
         content.append(
             buffer.data(),
             static_cast<std::size_t>(count)
         );
     }
     close(descriptor);
-    std::istringstream input(content);
-    std::vector<UserMenuEntry> result;
-    std::string line;
-    while (std::getline(input, line)) {
-        if (line.empty() || line.starts_with('#')) {
-            continue;
-        }
-        const auto first = line.find('|');
-        const auto second =
-            first == std::string::npos
-                ? std::string::npos
-                : line.find('|', first + 1U);
-        if (first != 1U || second == std::string::npos ||
-            second + 1U >= line.size()) {
-            continue;
-        }
-        result.push_back({
-            .key = line[0],
-            .label = line.substr(first + 1U, second - first - 1U),
-            .command = line.substr(second + 1U),
-        });
-    }
-    return result;
+    return parse_native_menu(content, path.string(), shell_patterns);
 }
 
 std::filesystem::path default_user_menu_path() {
@@ -156,6 +146,25 @@ std::filesystem::path default_user_menu_path() {
                ".config" / "mcpp" / "menu";
     }
     return std::filesystem::path(".mcpp-menu");
+}
+
+std::filesystem::path default_editor_user_menu_path() {
+    return default_user_menu_path().parent_path() / "mcedit" / "menu";
+}
+
+std::filesystem::path find_user_menu_path(
+    const std::filesystem::path& local_directory,
+    const bool editor
+) {
+    if (!editor && !local_directory.empty()) {
+        const auto local_menu = local_directory / ".mc.menu";
+        if (menu_exists(local_menu)) return local_menu;
+    }
+    if (editor) {
+        const auto editor_menu = default_editor_user_menu_path();
+        if (menu_exists(editor_menu)) return editor_menu;
+    }
+    return default_user_menu_path();
 }
 
 std::string expand_user_menu_command(
