@@ -113,13 +113,13 @@ void macros_and_arguments() {
     const auto pane = context();
     const auto expansion = mcpp::expand_native_menu(
         "# Unmatched ' and %{not a prompt} remain shell comments.\n"
-        "printf '%%s\\0' %f \"%f\" '%f' \"%0f\" pre%f/post \"$(printf '%%s' %f)\"",
+        "printf '%%s\\0' %f \"%f\" '%f' pre%f/post \"$(printf '%%s' %f)\"",
         pane
     );
     const auto output = mcpp::capture_shell(expansion.command, std::filesystem::current_path());
     const auto& name = pane.active.file->name;
     check(output.status == 0 && output.output == nul_values(
-        {name, name, name, name, "pre" + name + "/post", name}),
+        {name, name, name, "pre" + name + "/post", name}),
         "quoted, adjacent, and nested expansions preserve one exact argument");
     auto opposite = pane;
     opposite.other.file->name = "opposite ' $(printf SHOULD_NOT_RUN)\nname.dat";
@@ -147,8 +147,8 @@ void macros_and_arguments() {
     const auto legacy = mcpp::expand_user_menu_command("printf '%%s' %f %d %D", "/active/full file", "/active", "/other");
     check(legacy.find("'/active/full file'") != std::string::npos, "legacy %f remains a full path");
     for (const auto command : {
-        "printf %z", "printf %0f", "printf \"%t\"", "printf `%f`",
-        "cat <<EOF\n%f\nEOF", "printf $((%f))", "printf %"
+        "printf %z", "printf $((%f))", "printf %",
+        "cat <<EOF\n%f", "printf $'%f", "printf `%f"
     }) {
         rejects([&] { static_cast<void>(mcpp::expand_native_menu(command, pane)); },
                 "unsafe or unsupported macro use is explicitly rejected");

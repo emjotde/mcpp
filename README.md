@@ -58,6 +58,9 @@ documentation; no MC implementation is copied.
 
 ## Build
 
+Requires a C++20 compiler, CMake, `pkg-config`, and PCRE2 10.34 or newer.
+Debian/Ubuntu provide the PCRE2 headers and library in `libpcre2-dev`.
+
 ```bash
 cmake -S . -B build/release \
   -DCMAKE_BUILD_TYPE=Release \
@@ -68,6 +71,30 @@ ctest --test-dir build/release --output-on-failure
 
 The `mcpp`, `mcppedit`, `mcppview`, and `mcppdiff` binaries remain in the
 selected build directory; installation is not required.
+
+## Command-line controls
+
+All four frontends share option parsing. `--help-all`, `--help-terminal`, and
+`--help-color` describe the available controls. `--datadir`, `--datadir-info`,
+and `--configure-options` report resource directories and build features
+without starting the UI.
+
+`-d` / `--nomouse` disables mouse reporting and mouse actions. `-a` /
+`--stickchars` uses ASCII frames and Tree branches without changing file text.
+`-b` / `--nocolor` uses terminal-default colors with text emphasis; `-c` /
+`--color` enables at least the basic color palette. `-u` / `--nosubshell` and
+`-U` / `--subshell` override persistent Bash for the current run.
+
+```bash
+build/release/mcpp --nomouse --stickchars --nocolor --nosubshell
+build/release/mcppedit --colors 'editnormal=lightgray,blue:editmarked=black,cyan' file.txt
+```
+
+`-C` / `--colors` overrides supported color roles for this run without changing
+the saved skin. Unknown roles and unsupported fields are errors, not ignored
+settings. Native backend controls `-x/-X/-g/-t/-s/-k` remain unavailable;
+`--help-terminal` explains why. ASCII frames do not implement non-UTF-8 terminal
+output or 7-bit input.
 
 ## Standalone editor
 
@@ -382,10 +409,18 @@ i Inspect selected file
 Native expansion supports active/other-pane context, tagged files, prompts,
 editor block/error scratch files and internal view/cd directives. Execution and
 editor block replacement retain terminal, draft, lock and command-error guards.
-Conditions do not execute shell commands. Unknown macros and unsupported quoting
-contexts fail explicitly: unquoted raw `%0` expansion, quoted tagged lists,
-and macros inside backticks, ANSI quotes, arithmetic or heredocs are not accepted.
-Named-home/CDPATH expansion in `%cd` remains unsupported.
+Conditions do not execute shell commands. Ordinary macros keep values literal
+inside quoted words, tagged lists, command substitutions, ANSI quotes, arithmetic,
+and heredocs. `%0` explicitly inserts raw shell text instead; use it only when
+that behavior is intended and the value is trusted.
+
+`%cd` accepts one literal directory argument, menu macros, named homes, and
+CDPATH. Relative paths use the provider and directory captured before prompts;
+archive-relative paths never search host CDPATH directories.
+Ordinary arithmetic values must be signed decimal integers; trusted expressions
+require `%0`. Nested old-style backticks, `case` inside command substitutions,
+unsupported heredoc delimiters, and values that would terminate a heredoc or
+lose tabs with `<<-` fail explicitly. Modern `$(...)` substitutions are supported.
 
 ## External syntax definitions
 
@@ -395,11 +430,12 @@ and explicit colors feed the existing renderer; available definitions appear
 in the syntax chooser. The lowercase legacy `syntax` override file and builtin
 languages remain available. Selected external IDs persist in saved setup.
 Loading is transactional: a malformed replacement reports an error while
-retaining the current definition and draft.
+retaining the current definition and draft. Registry filename and first-line
+expressions use PCRE2, including lookarounds, Unicode properties and case folding.
 
-This is not complete MC syntax compatibility yet. Registry expressions use
-POSIX extended regex, case folding is ASCII-oriented, and pattern sets are
-byte-based. Unsupported directives fail explicitly. Context `spellcheck` flags
+This is not complete MC syntax compatibility yet. Keyword/context case folding
+is ASCII-oriented and pattern sets are byte-based. Unsupported directives fail
+explicitly. Context `spellcheck` flags
 filter whole-document results and continuation checks independently of syntax
 colors; explicit word checks remain available outside those contexts. If a
 replacement changes delimiters and makes new text eligible, run another
@@ -415,9 +451,42 @@ expansion. Internal View honors a matching View action; external View follows
 VIEWER/PAGER. Native Edit actions run with either editor preference.
 
 Invalid resources and missing helpers report explicit errors, without executing
-a legacy fallback. External archive commands require a local copy; internal
-`%view` reads the archive provider. Compatibility remains bounded by POSIX
-registry regex, documented macro restrictions and a 16 MiB buffered-filter limit.
+a legacy fallback. Native expressions use PCRE2. External archive commands
+require a local copy; internal `%view` reads the archive provider. Compatibility
+remains bounded by documented macro restrictions and a 16 MiB buffered-filter limit.
+
+## Single-file transformations
+
+Native single-file paths work with the viewer, editor and comparison frontends:
+
+```bash
+build/release/mcppview 'report.gz/ugz://'
+build/release/mcppdiff report.txt 'report.gz/ugz://'
+```
+
+The result is one read-only file, not a directory. A converter such as `gz`
+compresses its source; `ugz` decompresses it. The corresponding standard tools
+also support bz, bz2, lz, lz4, lzma, xz and zst converters when installed.
+Missing tools and failed conversions report errors. Parsed viewing recognizes
+compressed output without treating the provider's internal `/` as a host path.
+Editor Save As can create a writable local copy; saving back never runs a
+reverse conversion.
+
+F5's Source mask also accepts an explicit operand such as `report.gz/ugz://`.
+It resolves from the captured source pane; a relative destination still uses
+that pane's directory. Unrelated selection marks are retained. F6 rejects
+read-only transformed sources before creating a destination.
+
+Local `/1` commands in `sfs.ini` receive a private source copy as `%1`, the
+literal suffix parameter as `%2`, and a pre-created output file as `%3`.
+The registry comes from `MC_DATADIR/sfs.ini` when set, otherwise
+`/etc/mcpp/sfs.ini` or `/etc/mc/sfs.ini` when present. Commands are trusted user
+configuration, not sandboxed plugins. No MC helper rules are bundled.
+
+Inputs and outputs are currently limited to 64 MiB each. Helpers also have
+time/memory limits. Cached snapshots retain the source provider and revision;
+changed inputs or rules produce new results without changing open viewers.
+Non-local helper flags are rejected explicitly.
 
 ## Local archives and copying
 
@@ -551,8 +620,8 @@ Native `filehighlight.ini` filename/type rules and the legacy `highlighting`
 file feed the selected skin's file-colour groups. Rules that do not supply a
 matching group leave builtin type colours intact. Search includes mcpp's config
 and installed resource directories; no MC skins or rules are bundled.
-Compatibility remains partial for custom line/widget glyphs, PCRE-only patterns
-and some auxiliary widget-colour roles.
+Native filename expressions use PCRE2. Compatibility remains partial for custom
+line/widget glyphs and some auxiliary widget-colour roles.
 
 ## Modal Tree and diff/merge
 

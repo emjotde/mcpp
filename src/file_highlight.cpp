@@ -1,6 +1,7 @@
 #include "mcpp/file_highlight.hpp"
 
 #include "mcpp/editor.hpp"
+#include "mcpp/native_regex.hpp"
 
 #include "color_resource.hpp"
 
@@ -10,7 +11,7 @@
 #include <charconv>
 #include <cctype>
 #include <exception>
-#include <regex>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <sys/stat.h>
@@ -28,7 +29,7 @@ enum class HighlightType {
 struct FileHighlightRule {
     std::string group;
     std::optional<HighlightType> type;
-    std::optional<std::regex> expression;
+    std::optional<NativeRegex> expression;
     std::vector<std::string> extensions;
     bool case_sensitive{false};
     std::string pattern;
@@ -80,40 +81,13 @@ std::string regex_value(const std::string_view source) {
     return result;
 }
 
-std::regex compile_expression(
+NativeRegex compile_expression(
     const detail::ColorSetting& setting, const std::filesystem::path& path
 ) {
-    auto expression = regex_value(setting.value);
-    auto flags = std::regex::ECMAScript | std::regex::optimize;
-    if (expression.starts_with("(?i)")) {
-        expression.erase(0, 4);
-        flags |= std::regex::icase;
-    }
-    // Reject PCRE-only escapes that std::regex would otherwise silently treat as letters.
-    bool escaped = false;
-    bool character_class = false;
-    for (std::size_t index = 0; index < expression.size(); ++index) {
-        const auto character = expression[index];
-        if (escaped) {
-            if (std::string_view("AZzQEKRXpPhHVN").find(character) != std::string_view::npos) {
-                color_resource_error(path, setting.line, "unsupported PCRE escape in filename regexp");
-            }
-            escaped = false;
-        } else if (character == '\\') {
-            escaped = true;
-        } else if (character == '[') {
-            character_class = true;
-        } else if (character == ']') {
-            character_class = false;
-        } else if (!character_class && character == '+' && index != 0U &&
-                   std::string_view("*+?}").find(expression[index - 1U]) != std::string_view::npos) {
-            color_resource_error(path, setting.line, "possessive filename regexp quantifiers are not supported");
-        }
-    }
     try {
-        return std::regex(expression, flags);
-    } catch (const std::regex_error& error) {
-        color_resource_error(path, setting.line, "invalid or unsupported filename regexp: " +
+        return NativeRegex(regex_value(setting.value));
+    } catch (const std::invalid_argument& error) {
+        color_resource_error(path, setting.line, "invalid filename regexp: " +
                              std::string(error.what()));
     }
 }
@@ -284,7 +258,7 @@ std::optional<SkinPair> FileHighlightRules::color_for(
             }
             matches = type_matches(*rule.type, entry, stale.value_or(false));
         } else if (rule.expression) {
-            matches = std::regex_search(entry.name, *rule.expression);
+            matches = rule.expression->search(entry.name);
         } else {
             const auto name = rule.case_sensitive ? entry.name : lower(entry.name);
             matches = std::ranges::any_of(rule.extensions, [&](const std::string& extension) {

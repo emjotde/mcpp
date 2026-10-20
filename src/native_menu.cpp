@@ -1,11 +1,14 @@
 #include "mcpp/native_menu.hpp"
+#include "mcpp/native_regex.hpp"
 
 #include <algorithm>
+#include <cerrno>
 #include <cctype>
 #include <cstdlib>
 #include <fnmatch.h>
-#include <regex.h>
+#include <pwd.h>
 #include <stdexcept>
+#include <system_error>
 #include <sys/stat.h>
 #include <utility>
 
@@ -36,22 +39,14 @@ std::string_view trim(std::string_view value) {
 
 class Pattern {
 public:
-    explicit Pattern(const std::string& value) {
-        const auto error = regcomp(&expression_, value.c_str(), REG_EXTENDED | REG_NOSUB);
-        if (error != 0) {
-            std::vector<char> description(regerror(error, &expression_, nullptr, 0));
-            static_cast<void>(regerror(error, &expression_, description.data(), description.size()));
-            throw std::invalid_argument("invalid menu regular expression: " + std::string(description.data()));
-        }
-    }
-    ~Pattern() { regfree(&expression_); }
+    explicit Pattern(const std::string& value) : expression_(value) {}
     Pattern(const Pattern&) = delete;
     Pattern& operator=(const Pattern&) = delete;
     [[nodiscard]] bool matches(const std::string& value) const {
-        return regexec(&expression_, value.c_str(), 0, nullptr, 0) == 0;
+        return expression_.search(value);
     }
 private:
-    regex_t expression_{};
+    NativeRegex expression_;
 };
 
 std::string condition_operand(std::string_view value) {
@@ -361,109 +356,443 @@ void viewer_options(const std::string& argument, NativeMenuExpansion& result) {
     }
 }
 
-struct ShellNesting {
-    char quote;
-    std::size_t parentheses;
-    bool arithmetic;
-};
+enum class ShellQuote { none, single, double_quote, ansi, heredoc_literal, heredoc_expanding };
 
 struct LocatedMacro {
     Macro macro;
     std::size_t begin;
-    char quote;
+    ShellQuote quote;
+    bool arithmetic{false};
+    std::size_t backticks{0};
 };
 
-std::vector<LocatedMacro> command_macros(const std::string_view command) {
-    std::vector<LocatedMacro> result;
-    std::vector<ShellNesting> nesting;
-    char quote = '\0';
-    bool escaped = false;
-    bool ansi_quote = false;
-    bool heredoc = false;
-    for (std::size_t index = 0; index < command.size(); ++index) {
-        const auto character = command[index];
-        if (escaped && character != '%') {
-            escaped = false;
-            continue;
+struct HereDocument {
+    std::string delimiter;
+    bool literal{false};
+    bool strip_tabs{false};
+    std::size_t begin{0};
+    std::size_t end{0};
+};
+
+struct CommandMacros {
+    std::vector<LocatedMacro> macros;
+    std::vector<HereDocument> heredocs;
+};
+
+class MacroScanner {
+public:
+    explicit MacroScanner(const std::string_view command) : command_(command) {}
+
+    CommandMacros scan() {
+        shell('\0', false, 0U);
+        return std::move(result_);
+    }
+
+private:
+    std::string_view command_;
+    std::size_t index_{0};
+    CommandMacros result_;
+
+    void macro(const ShellQuote quote, const bool arithmetic, const std::size_t backticks,
+               const bool escaped = false) {
+        const auto value = read_macro(command_, index_);
+        if (escaped && value.kind != MacroKind::literal && !value.raw) {
+            throw std::invalid_argument("a quoted menu macro cannot follow a backslash; remove the backslash or use %0");
         }
-        if (character == '\\' && quote != '\'') {
-            escaped = true;
-            continue;
+        result_.macros.push_back({value, index_, quote, arithmetic, backticks});
+        index_ = value.end;
+    }
+
+    HereDocument delimiter() {
+        HereDocument result;
+        index_ += 2U;
+        if (index_ < command_.size() && command_[index_] == '-') {
+            result.strip_tabs = true;
+            ++index_;
         }
-        if (character == '#' && quote == '\0' &&
-            (index == 0U || blank(command[index - 1U]) ||
-             std::string_view(";|&()").find(command[index - 1U]) != std::string_view::npos)) {
-            const auto end = command.find('\n', index);
-            if (end == std::string_view::npos) break;
-            index = end;
-            continue;
-        }
-        if (character == '`' && quote != '\'') {
-            auto end = index + 1U;
-            for (; end < command.size(); ++end) {
-                if (command[end] == '\\' && end + 1U < command.size()) ++end;
-                else if (command[end] == '%') {
-                    throw std::invalid_argument("menu macros inside backticks are unavailable; use $(...) instead");
-                } else if (command[end] == '`') break;
+        while (index_ < command_.size() && (command_[index_] == ' ' || command_[index_] == '\t')) ++index_;
+        char quote = '\0';
+        bool started = false;
+        while (index_ < command_.size()) {
+            const auto character = command_[index_];
+            if (quote == '\0' && (blank(character) || std::string_view(";&|<>()").find(character) != std::string_view::npos)) break;
+            started = true;
+            if (character == '%') {
+                throw std::invalid_argument("menu macros in here-document delimiters are unavailable; use a literal delimiter");
             }
-            if (end == command.size()) throw std::invalid_argument("unfinished backticks in user-menu command");
-            index = end;
-            continue;
-        }
-        if (character == '$' && quote != '\'' && index + 1U < command.size() && command[index + 1U] == '(') {
-            nesting.push_back({quote, 1U, index + 2U < command.size() && command[index + 2U] == '('});
-            quote = '\0';
-            ++index;
-            continue;
-        }
-        if (character == '(' && quote == '\0' && index + 1U < command.size() && command[index + 1U] == '(') {
-            nesting.push_back({quote, 2U, true});
-            ++index;
-            continue;
-        }
-        if (!nesting.empty() && quote == '\0') {
-            if (command.substr(index).starts_with("case") &&
-                (index == 0U || blank(command[index - 1U]) || command[index - 1U] == '(') &&
-                index + 4U < command.size() && blank(command[index + 4U])) {
-                throw std::invalid_argument("case inside a menu command substitution is unavailable; use a separate command block");
+            if (character == '$' && quote == '\0' && index_ + 1U < command_.size() &&
+                (command_[index_ + 1U] == '\'' || command_[index_ + 1U] == '"')) {
+                throw std::invalid_argument("ANSI or locale quoted here-document delimiters are unavailable; use ordinary quotes");
             }
-            if (character == '(') ++nesting.back().parentheses;
-            else if (character == ')' && --nesting.back().parentheses == 0U) {
-                quote = nesting.back().quote;
-                nesting.pop_back();
+            if ((character == '\'' || character == '"') && (quote == '\0' || quote == character)) {
+                quote = quote == '\0' ? character : '\0';
+                result.literal = true;
+                ++index_;
+            } else if (character == '\\' && quote != '\'') {
+                result.literal = true;
+                if (++index_ == command_.size()) throw std::invalid_argument("unfinished here-document delimiter");
+                if (quote == '"' && std::string_view("$`\"\\\n").find(command_[index_]) == std::string_view::npos) {
+                    result.delimiter += '\\';
+                }
+                if (command_[index_] != '\n') result.delimiter += command_[index_];
+                ++index_;
+            } else {
+                result.delimiter += character;
+                ++index_;
+            }
+        }
+        if (!started || quote != '\0') throw std::invalid_argument("unfinished here-document delimiter");
+        return result;
+    }
+
+    void body(HereDocument document, const std::size_t backticks) {
+        document.begin = index_;
+        while (index_ < command_.size()) {
+            const auto line_begin = index_;
+            auto line_end = index_;
+            std::string logical_line;
+            bool continued;
+            do {
+                const auto newline = command_.find('\n', line_end);
+                const auto end = newline == std::string_view::npos ? command_.size() : newline;
+                auto line = command_.substr(line_end, end - line_end);
+                if (document.strip_tabs) {
+                    while (!line.empty() && line.front() == '\t') line.remove_prefix(1U);
+                }
+                std::size_t backslashes = 0;
+                while (backslashes < line.size() && line[line.size() - backslashes - 1U] == '\\') ++backslashes;
+                continued = !document.literal && newline != std::string_view::npos && backslashes % 2U != 0U;
+                if (continued) line.remove_suffix(1U);
+                logical_line += line;
+                line_end = newline == std::string_view::npos ? command_.size() : newline + 1U;
+            } while (continued && line_end < command_.size());
+            if (logical_line == document.delimiter) {
+                document.end = line_begin;
+                result_.heredocs.push_back(std::move(document));
+                index_ = line_end;
+                return;
+            }
+            const auto quote = document.literal ? ShellQuote::heredoc_literal : ShellQuote::heredoc_expanding;
+            bool escaped = false;
+            while (index_ < line_end) {
+                if (command_[index_] == '%') {
+                    macro(quote, false, backticks, escaped && !document.literal);
+                    if (index_ > line_end) throw std::invalid_argument("a here-document menu macro must end on the same logical line");
+                    escaped = false;
+                } else {
+                    escaped = !escaped && command_[index_] == '\\';
+                    ++index_;
+                }
+            }
+        }
+        throw std::invalid_argument("unfinished here-document in user-menu command");
+    }
+
+    void shell(const char closing, const bool arithmetic, const std::size_t backticks,
+               const std::size_t depth = 0U) {
+        if (depth > 128U) throw std::invalid_argument("user-menu shell substitutions are nested too deeply");
+        ShellQuote quote = ShellQuote::none;
+        std::size_t parentheses = closing == ')' ? (arithmetic ? 2U : 1U) : closing == ']' ? 1U : 0U;
+        std::vector<HereDocument> pending;
+        while (index_ < command_.size()) {
+            const auto character = command_[index_];
+            if (character == '\\' && quote != ShellQuote::single) {
+                ++index_;
+                if (index_ == command_.size()) throw std::invalid_argument("unfinished shell escape in user-menu command");
+                if (backticks != 0U && command_[index_] == '`') {
+                    throw std::invalid_argument("nested escaped menu backticks are unavailable; use $(...) instead");
+                }
+                if (command_[index_] == '%') macro(quote, arithmetic, backticks, true);
+                else ++index_;
                 continue;
             }
-        }
-        if ((character == '\'' || character == '"') && (quote == '\0' || quote == character)) {
-            if (quote == '\0') {
-                quote = character;
-                ansi_quote = character == '\'' && index != 0U && command[index - 1U] == '$';
-            } else {
-                quote = '\0';
-                ansi_quote = false;
+            if (character == '`' && (backticks != 0U ||
+                                    (quote != ShellQuote::single && quote != ShellQuote::ansi))) {
+                ++index_;
+                if (closing == '`') {
+                    if (quote != ShellQuote::none || !pending.empty()) {
+                        throw std::invalid_argument("unfinished quoting or here-document inside menu backticks");
+                    }
+                    return;
+                }
+                if (backticks != 0U) throw std::invalid_argument("nested menu backticks are unavailable; use $(...) instead");
+                shell('`', false, backticks + 1U, depth + 1U);
+                continue;
             }
-            continue;
+            if (character == '$' && quote != ShellQuote::single && quote != ShellQuote::ansi &&
+                index_ + 1U < command_.size()) {
+                if (command_[index_ + 1U] == '(') {
+                    const bool nested_arithmetic = index_ + 2U < command_.size() && command_[index_ + 2U] == '(';
+                    index_ += nested_arithmetic ? 3U : 2U;
+                    shell(')', nested_arithmetic, backticks, depth + 1U);
+                    continue;
+                }
+                if (command_[index_ + 1U] == '[') {
+                    index_ += 2U;
+                    shell(']', true, backticks, depth + 1U);
+                    continue;
+                }
+                if (command_[index_ + 1U] == '\'' && quote == ShellQuote::none) {
+                    quote = ShellQuote::ansi;
+                    index_ += 2U;
+                    continue;
+                }
+            }
+            if ((character == '\'' && (quote == ShellQuote::none || quote == ShellQuote::single || quote == ShellQuote::ansi)) ||
+                (character == '"' && (quote == ShellQuote::none || quote == ShellQuote::double_quote))) {
+                quote = quote == ShellQuote::none
+                    ? (character == '\'' ? ShellQuote::single : ShellQuote::double_quote) : ShellQuote::none;
+                ++index_;
+                continue;
+            }
+            if (quote == ShellQuote::none) {
+                if (character == '#' && !arithmetic &&
+                    (index_ == 0U || blank(command_[index_ - 1U]) ||
+                     std::string_view(";|&()").find(command_[index_ - 1U]) != std::string_view::npos)) {
+                    const auto newline = command_.find('\n', index_);
+                    index_ = newline == std::string_view::npos ? command_.size() : newline;
+                    continue;
+                }
+                if (character == '\n' && !pending.empty()) {
+                    ++index_;
+                    for (auto& document : pending) body(std::move(document), backticks);
+                    pending.clear();
+                    continue;
+                }
+                if (!arithmetic && character == '<' && command_.substr(index_).starts_with("<<<")) {
+                    index_ += 3U;
+                    continue;
+                }
+                if (!arithmetic && character == '<' && command_.substr(index_).starts_with("<<")) {
+                    pending.push_back(delimiter());
+                    continue;
+                }
+                if (!arithmetic && command_.substr(index_).starts_with("((")) {
+                    index_ += 2U;
+                    shell(')', true, backticks, depth + 1U);
+                    continue;
+                }
+                if (closing == ')' && !arithmetic && command_.substr(index_).starts_with("case") &&
+                    (index_ == 0U || blank(command_[index_ - 1U]) || command_[index_ - 1U] == '(') &&
+                    index_ + 4U < command_.size() && blank(command_[index_ + 4U])) {
+                    throw std::invalid_argument("case inside a menu command substitution is unavailable; use a separate command block");
+                }
+                if (closing == ')') {
+                    if (character == '(') ++parentheses;
+                    else if (character == ')' && --parentheses == 0U) {
+                        if (!pending.empty()) throw std::invalid_argument("unfinished here-document in menu substitution");
+                        ++index_;
+                        return;
+                    }
+                } else if (closing == ']') {
+                    if (character == '[') ++parentheses;
+                    else if (character == ']' && --parentheses == 0U) {
+                        ++index_;
+                        return;
+                    }
+                }
+            }
+            if (character == '%') macro(quote, arithmetic, backticks);
+            else ++index_;
         }
-        if (character == '<' && quote == '\0' && index + 1U < command.size() && command[index + 1U] == '<') {
-            heredoc = true;
+        if (closing != '\0' || quote != ShellQuote::none || !pending.empty()) {
+            throw std::invalid_argument("unfinished shell quoting or here-document in user-menu command");
         }
-        if (character != '%') continue;
-        const auto macro = read_macro(command, index);
-        const bool arithmetic = std::ranges::any_of(nesting, [](const ShellNesting& level) { return level.arithmetic; });
-        if (macro.kind != MacroKind::literal && (escaped || ansi_quote || heredoc || arithmetic)) {
-            throw std::invalid_argument(
-                "menu macros cannot follow a backslash or occur in ANSI quotes, arithmetic, or here-documents; "
-                "use ordinary quoted arguments"
-            );
-        }
-        result.push_back({macro, index, quote});
-        index = macro.end - 1U;
-        escaped = false;
     }
-    if (quote != '\0' || escaped || !nesting.empty()) {
-        throw std::invalid_argument("unfinished shell quoting in user-menu command");
+};
+
+CommandMacros command_macros(const std::string_view command) {
+    return MacroScanner(command).scan();
+}
+
+std::string arithmetic_value(const std::string_view value) {
+    auto number = value;
+    if (!number.empty() && (number.front() == '-' || number.front() == '+')) number.remove_prefix(1U);
+    if (number.empty() || !std::ranges::all_of(number, [](const unsigned char character) {
+            return character >= '0' && character <= '9';
+        })) {
+        throw std::invalid_argument("a menu macro in arithmetic must be a decimal integer; use %0 for a trusted expression");
+    }
+    const bool negative = value.front() == '-';
+    return "(" + std::string(negative ? "-" : "") + "10#" + std::string(number) + ")";
+}
+
+std::string macro_value(const std::string_view value, const LocatedMacro& location) {
+    if (value.find('\0') != std::string_view::npos) throw std::invalid_argument("NUL is not valid in a menu argument");
+    if (location.macro.raw) return std::string(value);
+    std::string result;
+    if (location.arithmetic) {
+        if (location.quote != ShellQuote::none) {
+            throw std::invalid_argument("quoted menu macros in arithmetic are unavailable; use an unquoted integer macro");
+        }
+        result = arithmetic_value(value);
+    } else if (location.quote == ShellQuote::none || location.quote == ShellQuote::single ||
+               location.quote == ShellQuote::double_quote) {
+        result = quoted_value(value, location.quote == ShellQuote::none ? '\0'
+            : location.quote == ShellQuote::single ? '\'' : '"');
+    } else {
+        for (const auto character : value) {
+            if ((location.quote == ShellQuote::ansi && (character == '\\' || character == '\'')) ||
+                (location.quote == ShellQuote::heredoc_expanding &&
+                 (character == '\\' || character == '$' || character == '`'))) result += '\\';
+            result += character;
+        }
+    }
+    for (std::size_t level = 0; level < location.backticks; ++level) {
+        std::string escaped;
+        for (const auto character : result) {
+            if (character == '\\' || character == '$' || character == '`') escaped += '\\';
+            escaped += character;
+        }
+        result = std::move(escaped);
     }
     return result;
+}
+
+struct MacroReplacement {
+    std::size_t begin;
+    std::size_t end;
+    std::string value;
+    bool raw;
+};
+
+void validate_heredocs(
+    const std::string_view command,
+    const std::vector<HereDocument>& documents,
+    const std::vector<MacroReplacement>& replacements
+) {
+    for (const auto& document : documents) {
+        std::string body;
+        auto previous = document.begin;
+        bool raw = false;
+        for (const auto& replacement : replacements) {
+            if (replacement.begin < document.begin || replacement.begin >= document.end) continue;
+            body += command.substr(previous, replacement.begin - previous);
+            if (document.strip_tabs && !replacement.raw && !replacement.value.empty()) {
+                const auto newline = body.find_last_of('\n');
+                const auto prefix = std::string_view(body).substr(newline == std::string::npos ? 0U : newline + 1U);
+                if ((replacement.value.front() == '\t' && prefix.find_first_not_of('\t') == std::string_view::npos) ||
+                    replacement.value.find("\n\t") != std::string::npos) {
+                    throw std::invalid_argument("a menu macro would lose leading tabs in <<-; use << instead");
+                }
+            }
+            body += replacement.value;
+            previous = replacement.end;
+            raw = raw || replacement.raw;
+        }
+        if (raw) continue;
+        body += command.substr(previous, document.end - previous);
+        if (document.strip_tabs) {
+            std::string stripped;
+            bool start = true;
+            for (const auto character : body) {
+                if (start && character == '\t') continue;
+                stripped += character;
+                start = character == '\n';
+            }
+            body = std::move(stripped);
+        }
+        if (!document.literal) {
+            std::string joined;
+            for (std::size_t index = 0; index < body.size(); ++index) {
+                if (body[index] == '\\' && index + 1U < body.size()) {
+                    if (body[index + 1U] != '\n') {
+                        joined += body[index];
+                        joined += body[index + 1U];
+                    }
+                    ++index;
+                } else joined += body[index];
+            }
+            body = std::move(joined);
+        }
+        for (std::size_t offset = 0; offset < body.size();) {
+            const auto end = body.find('\n', offset);
+            auto line = std::string_view(body).substr(offset, end == std::string::npos ? end : end - offset);
+            if (document.strip_tabs) {
+                while (!line.empty() && line.front() == '\t') line.remove_prefix(1U);
+            }
+            if (line == document.delimiter) {
+                throw std::invalid_argument("menu macro would terminate a here-document; use a different literal delimiter");
+            }
+            offset = end == std::string::npos ? body.size() : end + 1U;
+        }
+    }
+}
+
+struct DirectoryWord {
+    std::string value;
+    bool unquoted_start{false};
+};
+
+DirectoryWord directory_word(const std::string_view command) {
+    DirectoryWord result;
+    char quote = '\0';
+    bool started = false;
+    bool finished = false;
+    for (std::size_t index = 0; index < command.size(); ++index) {
+        const auto character = command[index];
+        if (quote == '\0' && blank(character)) {
+            if (started) finished = true;
+            continue;
+        }
+        if (finished) throw std::invalid_argument("%cd needs one literal directory, not shell commands");
+        if ((character == '\'' || character == '"') && (quote == '\0' || quote == character)) {
+            quote = quote == '\0' ? character : '\0';
+            started = true;
+            continue;
+        }
+        if (!started) result.unquoted_start = character != '\\';
+        started = true;
+        if (character == '\\' && quote != '\'') {
+            if (++index == command.size()) throw std::invalid_argument("unfinished escape in %cd directory");
+            const auto next = command[index];
+            if (quote == '"' && std::string_view("$`\"\\\n").find(next) == std::string_view::npos) result.value += '\\';
+            if (next != '\n') result.value += next;
+        } else {
+            if ((quote != '\'' && (character == '$' || character == '`')) ||
+                (quote == '\0' && std::string_view(";&|<>()*?[]{}").find(character) != std::string_view::npos)) {
+                throw std::invalid_argument("%cd accepts literal paths and menu macros, not shell expansion or commands");
+            }
+            result.value += character;
+        }
+    }
+    if (quote != '\0') throw std::invalid_argument("unfinished quoting in %cd directory");
+    if (result.value.empty()) throw std::invalid_argument("%cd directory is empty");
+    return result;
+}
+
+std::string home_directory(const std::string_view value) {
+    const auto slash = value.find('/');
+    const auto user = std::string(value.substr(1U, slash == std::string_view::npos ? slash : slash - 1U));
+    std::string home;
+    if (user.empty()) {
+        const auto* environment = std::getenv("HOME");
+        if (environment == nullptr || *environment == '\0') throw std::invalid_argument("%cd: HOME is not set");
+        home = environment;
+    } else {
+        std::vector<char> buffer(1024U);
+        struct passwd information {};
+        struct passwd* found = nullptr;
+        int error;
+        while ((error = getpwnam_r(user.c_str(), &information, buffer.data(), buffer.size(), &found)) == ERANGE &&
+               buffer.size() < 1024U * 1024U) buffer.resize(buffer.size() * 2U);
+        if (error != 0) throw std::system_error(error, std::generic_category(), "%cd: look up home directory");
+        if (found == nullptr || information.pw_dir == nullptr || *information.pw_dir == '\0') {
+            throw std::invalid_argument("%cd: unknown home directory: " + user);
+        }
+        home = information.pw_dir;
+    }
+    if (!std::filesystem::path(home).is_absolute()) throw std::invalid_argument("%cd: home directory is not absolute");
+    return home + (slash == std::string_view::npos ? std::string{} : std::string(value.substr(slash)));
+}
+
+bool directory_exists(const std::filesystem::path& path, const bool allow_regular_file = false) {
+    struct stat information {};
+    if (::stat(path.c_str(), &information) == 0) {
+        return S_ISDIR(information.st_mode) || (allow_regular_file && S_ISREG(information.st_mode));
+    }
+    if (errno == ENOENT || errno == ENOTDIR) return false;
+    throw std::system_error(errno, std::generic_category(), "%cd: inspect " + path.string());
 }
 
 }  // namespace
@@ -586,8 +915,9 @@ NativeMenuSelection select_native_menu(
 }
 
 NativeMenuRequirements native_menu_requirements(const std::string_view command, const bool editor) {
+    if (command.find('\0') != std::string_view::npos) throw std::invalid_argument("NUL in user-menu command");
     NativeMenuRequirements result;
-    for (const auto& location : command_macros(command)) {
+    for (const auto& location : command_macros(command).macros) {
         const auto& macro = location.macro;
         if (macro.kind == MacroKind::prompt) result.prompts.push_back(macro.argument);
         if (editor && macro.kind == MacroKind::scalar) {
@@ -623,19 +953,19 @@ NativeMenuExpansion expand_native_menu(
     }
     auto active_tagged = context.active.tagged;
     auto other_tagged = context.other.tagged;
+    const auto scanned = command_macros(command);
+    std::vector<MacroReplacement> replacements;
     std::size_t prompt = 0;
     std::size_t previous = 0;
-    for (const auto& location : command_macros(command)) {
+    for (const auto& location : scanned.macros) {
         result.command += command.substr(previous, location.begin - previous);
         previous = location.macro.end;
         const auto& macro = location.macro;
         const auto quote = location.quote;
         if (macro.kind == MacroKind::literal) {
             result.command += '%';
+            replacements.push_back({location.begin, macro.end, "%", false});
             continue;
-        }
-        if (macro.raw && quote == '\0') {
-            throw std::invalid_argument("unquoted %0 menu macros are unsafe; use a quoted macro or the default quoting");
         }
         if (macro.kind == MacroKind::view || macro.kind == MacroKind::change_directory) {
             throw std::invalid_argument("%view and %cd must be the first command in a menu entry");
@@ -702,7 +1032,10 @@ NativeMenuExpansion expand_native_menu(
                 case 'S':
                     list = true;
                     for (const auto& file : tagged) values.push_back(file.name);
-                    if ((code == 's' || code == 'S') && values.empty() && pane.file) values.push_back(file_name(pane));
+                    if ((code == 's' || code == 'S') && values.empty() && pane.file) {
+                        values.push_back(file_name(pane));
+                        list = false;
+                    }
                     if (code == 'u' || code == 'U') {
                         auto& untag = other ? result.untag_other : result.untag_active;
                         for (const auto& file : tagged) untag.push_back(file.path);
@@ -712,15 +1045,30 @@ NativeMenuExpansion expand_native_menu(
                 default: throw std::invalid_argument("unsupported user-menu macro");
             }
         }
-        if (list && quote != '\0') throw std::invalid_argument("tagged-file menu macros must be outside quotes");
-        bool first = true;
-        for (const auto& value : values) {
-            if (!first) result.command += ' ';
-            result.command += quoted_value(value, quote);
-            first = false;
+        std::string replacement;
+        if (list && location.arithmetic && !macro.raw && values.size() != 1U) {
+            throw std::invalid_argument("a tagged-file macro in arithmetic needs exactly one decimal integer");
         }
+        if (list && !location.arithmetic && (quote != ShellQuote::none || macro.raw)) {
+            std::string joined;
+            for (const auto& value : values) {
+                joined += value;
+                joined += ' ';
+            }
+            replacement = macro_value(joined, location);
+        } else {
+            bool first = true;
+            for (const auto& value : values) {
+                if (!first) replacement += ' ';
+                replacement += macro_value(value, location);
+                first = false;
+            }
+        }
+        result.command += replacement;
+        replacements.push_back({location.begin, macro.end, std::move(replacement), macro.raw});
     }
     result.command += command.substr(previous);
+    validate_heredocs(command, scanned.heredocs, replacements);
     if (prompt != answers.size()) throw std::invalid_argument("too many answers for user-menu prompts");
     if (result.action == NativeMenuAction::change_directory && trim(result.command).empty()) {
         throw std::invalid_argument("%cd needs a directory");
@@ -729,6 +1077,43 @@ NativeMenuExpansion expand_native_menu(
         throw std::invalid_argument("user-menu command is empty");
     }
     return result;
+}
+
+std::string native_menu_directory(
+    const std::string_view expanded_command,
+    const NativeMenuContext& context,
+    const std::string_view previous_directory
+) {
+    if (expanded_command.find('\0') != std::string_view::npos) throw std::invalid_argument("NUL in %cd directory");
+    auto word = directory_word(expanded_command);
+    if (word.unquoted_start && word.value == "-") {
+        if (previous_directory.empty()) throw std::invalid_argument("%cd: no previous directory");
+        return std::string(previous_directory);
+    }
+    if (word.unquoted_start && word.value.starts_with('~')) return home_directory(word.value);
+    auto path = std::filesystem::path(word.value);
+    if (path.is_absolute() || word.value.find("://") != std::string::npos || !context.active.local) return word.value;
+    const auto base = std::filesystem::path(context.active.directory);
+    if (!base.is_absolute()) throw std::invalid_argument("%cd: captured local directory is not absolute");
+    const auto current = base / path;
+    // The caller still needs to decide whether a regular file is an enterable archive.
+    if (directory_exists(current, true)) return current.lexically_normal().string();
+    if (const auto* environment = std::getenv("CDPATH"); environment != nullptr) {
+        const auto search = std::string_view(environment);
+        for (std::size_t offset = 0; offset <= search.size();) {
+            const auto end = search.find(':', offset);
+            auto directory = search.substr(offset, end == std::string_view::npos ? end : end - offset);
+            if (!directory.empty()) {
+                auto prefix = std::filesystem::path(directory.starts_with('~') ? home_directory(directory) : std::string(directory));
+                if (prefix.is_relative()) prefix = base / prefix;
+                const auto candidate = prefix / path;
+                if (directory_exists(candidate)) return candidate.lexically_normal().string();
+            }
+            if (end == std::string_view::npos) break;
+            offset = end + 1U;
+        }
+    }
+    throw std::invalid_argument("%cd: directory not found in captured directory or CDPATH: " + word.value);
 }
 
 }  // namespace mcpp

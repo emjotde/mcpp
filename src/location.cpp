@@ -35,10 +35,22 @@ std::filesystem::path archive_draft_directory() {
 
 }  // namespace
 
-ArchiveCache::ArchiveCache(ProviderPtr local_provider, const std::chrono::seconds timeout)
-    : local_(std::move(local_provider)), timeout_(timeout) {
+ArchiveCache::ArchiveCache(
+    ProviderPtr local_provider, const std::chrono::seconds timeout,
+    TransformOpenOptions transformations
+) : local_(std::move(local_provider)), timeout_(timeout),
+    transformations_(timeout, std::move(transformations)) {
     if (!local_) throw std::invalid_argument("local provider is null");
     if (timeout.count() < 0) throw std::invalid_argument("VFS timeout cannot be negative");
+}
+
+ProviderPtr ArchiveCache::open_transform(
+    const Location& source, const std::string_view converter,
+    const std::string_view parameter, const Cancellation& cancellation
+) {
+    return transformations_.open(
+        source.provider, source.path, format(source.provider, source.path),
+        converter, parameter, cancellation);
 }
 
 ProviderPtr ArchiveCache::open(const std::string_view archive_path, const Cancellation& cancellation) {
@@ -82,6 +94,7 @@ std::string ArchiveCache::format(const ProviderPtr& provider, const std::string_
 }
 
 void ArchiveCache::prune() {
+    transformations_.prune();
     const auto now = std::chrono::steady_clock::now();
     const std::lock_guard lock(mutex_);
     for (auto iterator = records_.begin(); iterator != records_.end();) {
@@ -100,13 +113,15 @@ void ArchiveCache::set_timeout(const std::chrono::seconds timeout) {
         const std::lock_guard lock(mutex_);
         timeout_ = timeout;
     }
+    transformations_.set_timeout(timeout);
     prune();
 }
 
 std::vector<std::string> ArchiveCache::locations() {
     prune();
+    const auto transformed = transformations_.locations();
     const std::lock_guard lock(mutex_);
-    std::set<std::string> paths;
+    std::set<std::string> paths(transformed.begin(), transformed.end());
     for (const auto& [key, record] : records_) {
         static_cast<void>(key);
         const auto* archive = dynamic_cast<const ArchiveProvider*>(record.provider.get());
@@ -120,6 +135,10 @@ std::string format_location(const ProviderPtr& provider, const std::string_view 
     if (const auto* archive = dynamic_cast<const ArchiveProvider*>(provider.get())) {
         return archive->archive_path().string() + archive_suffix(*archive, path);
     }
+    if (const auto* transformed = dynamic_cast<const TransformProvider*>(provider.get())) {
+        static_cast<void>(transformed->normalize(path));
+        return transformed->location();
+    }
     return std::string(path);
 }
 
@@ -128,49 +147,92 @@ bool is_archive_location(const std::string_view value) noexcept {
            value.find("/ucpio://") != std::string_view::npos;
 }
 
-Location open_location(
-    const std::string_view value,
-    const ProviderPtr& local_provider,
-    ArchiveCache* archives,
-    const Cancellation& cancellation
+bool is_virtual_location(const std::string_view value) noexcept {
+    return value.find("://") != std::string_view::npos;
+}
+
+bool is_transform_location(const std::string_view value) noexcept {
+    const auto marker = value.rfind("://");
+    if (marker == std::string_view::npos) return false;
+    const auto slash = value.rfind('/', marker);
+    if (slash == std::string_view::npos || slash == 0U || slash + 1U == marker) return false;
+    const auto name = value.substr(slash + 1U, marker - slash - 1U);
+    return name != "utar" && name != "ucpio";
+}
+
+namespace {
+
+Location plain_location(const std::string_view value, const Location& base) {
+    if (!base.provider) throw std::invalid_argument("location provider is null");
+    const std::filesystem::path requested(value);
+    const auto path = base.path.empty() || requested.is_absolute()
+        ? requested : std::filesystem::path(base.path) / requested;
+    return {base.provider, base.provider->normalize(path.lexically_normal().generic_string())};
+}
+
+Location open_location_impl(
+    const std::string_view value, const Location& base,
+    ArchiveCache* archives, const Cancellation& cancellation, const std::size_t depth
 ) {
-    if (!local_provider) {
-        throw std::invalid_argument("local provider is null");
+    cancellation.throw_if_requested();
+    if (!base.provider) throw std::invalid_argument("location provider is null");
+    if (value.size() > 65536U || value.find('\0') != std::string_view::npos) {
+        throw std::invalid_argument("invalid location path");
     }
-    const auto tar = value.rfind("/utar://");
-    const auto cpio = value.rfind("/ucpio://");
-    if (tar != std::string_view::npos || cpio != std::string_view::npos) {
-        if (local_provider->exists(value)) {
-            return {.provider=local_provider, .path=local_provider->normalize(value)};
-        }
-        const bool is_tar = tar != std::string_view::npos &&
-            (cpio == std::string_view::npos || tar > cpio);
-        const auto split = is_tar ? tar : cpio;
-        const auto outer = value.substr(0, split);
-        if (outer.find("://") != std::string_view::npos) {
+    if (depth > 8U) throw std::invalid_argument("too many nested single-file transformations");
+    const auto marker = value.rfind("://");
+    if (marker == std::string_view::npos) return plain_location(value, base);
+    const auto slash = value.rfind('/', marker);
+    if (slash == std::string_view::npos || slash == 0U) {
+        throw std::invalid_argument("non-local providers are not enabled: " + std::string(value));
+    }
+    const auto name = value.substr(slash + 1U, marker - slash - 1U);
+    const auto outer = value.substr(0, slash);
+    const auto parameter = value.substr(marker + 3U);
+    if (name == "utar" || name == "ucpio") {
+        if (dynamic_cast<const LocalProvider*>(base.provider.get()) == nullptr ||
+            is_virtual_location(outer)) {
             throw std::invalid_argument("nested archive locations are not supported yet");
         }
-        ArchiveCache temporary(local_provider);
-        auto provider = (archives == nullptr ? temporary : *archives).open(outer, cancellation);
+        const auto literal = plain_location(value, base);
+        if (literal.provider->exists(literal.path)) return literal;
+        const auto source = plain_location(outer, base);
+        ArchiveCache temporary(base.provider);
+        auto provider = (archives == nullptr ? temporary : *archives).open(source.path, cancellation);
         const auto* archive = dynamic_cast<const ArchiveProvider*>(provider.get());
-        if ((archive->format() == ArchiveFormat::tar) != is_tar) {
+        if ((archive->format() == ArchiveFormat::tar) != (name == "utar")) {
             throw std::invalid_argument("archive format does not match the VFS path");
         }
-        const auto offset = split + (is_tar ? 8U : 9U);
-        const auto member = std::filesystem::path("/" + std::string(value.substr(offset)))
+        const auto member = std::filesystem::path("/" + std::string(parameter))
                                 .lexically_normal().generic_string();
         return {.provider=std::move(provider), .path=member};
     }
-    if (value.find("://") != std::string_view::npos) {
-        throw std::invalid_argument(
-            "remote providers are not enabled yet: " +
-            std::string(value)
-        );
+    const auto source = open_location_impl(outer, base, archives, cancellation, depth + 1U);
+    ProviderPtr provider;
+    if (archives != nullptr) {
+        provider = archives->open_transform(source, name, parameter, cancellation);
+    } else {
+        TransformCache temporary;
+        provider = temporary.open(source.provider, source.path,
+            format_location(source.provider, source.path), name, parameter, cancellation);
     }
-    return {
-        .provider = local_provider,
-        .path = local_provider->normalize(value),
-    };
+    return {.provider=std::move(provider), .path=std::string(TransformProvider::output_path())};
+}
+
+}  // namespace
+
+Location open_location(
+    const std::string_view value, const ProviderPtr& local_provider,
+    ArchiveCache* archives, const Cancellation& cancellation
+) {
+    return open_location_impl(value, {local_provider, {}}, archives, cancellation, 0);
+}
+
+Location open_location(
+    const std::string_view value, const Location& relative_to,
+    ArchiveCache* archives, const Cancellation& cancellation
+) {
+    return open_location_impl(value, relative_to, archives, cancellation, 0);
 }
 
 }  // namespace mcpp

@@ -28,6 +28,8 @@ add_subdirectory(third_party/ftxui)
 include(cmake/ftxui_input.cmake)
 
 find_package(Threads REQUIRED)
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(PCRE2 REQUIRED IMPORTED_TARGET libpcre2-8>=10.34)
 
 function(mcpp_target_defaults target)
     target_compile_options(
@@ -61,6 +63,7 @@ endfunction()
 add_library(
     mcpp_core
     src/archive_provider.cpp
+    src/transform_provider.cpp
     src/command_line.cpp
     src/color_resource.cpp
     src/completion.cpp
@@ -80,6 +83,7 @@ add_library(
     src/local_provider.cpp
     src/local_tools.cpp
     src/native_menu.cpp
+    src/native_regex.cpp
     src/operations.cpp
     src/pane.cpp
     src/search.cpp
@@ -98,11 +102,11 @@ add_library(
     src/editor_search.cpp
 )
 target_include_directories(mcpp_core PUBLIC include)
-target_link_libraries(mcpp_core PUBLIC Threads::Threads screen)
+target_link_libraries(mcpp_core PUBLIC Threads::Threads screen PkgConfig::PCRE2)
 target_compile_definitions(mcpp_core PUBLIC MCPP_VERSION="${PROJECT_VERSION}")
 mcpp_target_defaults(mcpp_core)
 
-add_library(mcpp_ui src/app.cpp src/keymap_input.cpp)
+add_library(mcpp_ui src/app.cpp src/keymap_input.cpp src/cli_display.cpp)
 target_include_directories(mcpp_ui PUBLIC include)
 target_link_libraries(mcpp_ui PUBLIC mcpp_core ftxui::ftxui)
 mcpp_target_defaults(mcpp_ui)
@@ -148,6 +152,9 @@ if(MCPP_BUILD_TESTS)
     add_executable(mcpp_archive_tests tests/test_archive_provider.cpp)
     target_link_libraries(mcpp_archive_tests PRIVATE mcpp_core)
     mcpp_target_defaults(mcpp_archive_tests)
+    add_executable(mcpp_transform_tests tests/test_transform_provider.cpp)
+    target_link_libraries(mcpp_transform_tests PRIVATE mcpp_core)
+    mcpp_target_defaults(mcpp_transform_tests)
     add_executable(mcpp_archive_operation_tests tests/test_archive_operations.cpp)
     target_link_libraries(mcpp_archive_operation_tests PRIVATE mcpp_core)
     mcpp_target_defaults(mcpp_archive_operation_tests)
@@ -163,6 +170,12 @@ if(MCPP_BUILD_TESTS)
     add_executable(mcpp_native_menu_tests tests/test_native_menu.cpp)
     target_link_libraries(mcpp_native_menu_tests PRIVATE mcpp_core)
     mcpp_target_defaults(mcpp_native_menu_tests)
+    add_executable(mcpp_native_menu_complete_tests tests/test_native_menu_complete.cpp)
+    target_link_libraries(mcpp_native_menu_complete_tests PRIVATE mcpp_core)
+    mcpp_target_defaults(mcpp_native_menu_complete_tests)
+    add_executable(mcpp_native_regex_tests tests/test_native_regex.cpp)
+    target_link_libraries(mcpp_native_regex_tests PRIVATE mcpp_core)
+    mcpp_target_defaults(mcpp_native_regex_tests)
     add_executable(mcpp_extension_tests tests/test_extensions.cpp)
     target_link_libraries(mcpp_extension_tests PRIVATE mcpp_core)
     mcpp_target_defaults(mcpp_extension_tests)
@@ -190,6 +203,9 @@ if(MCPP_BUILD_TESTS)
     add_executable(mcpp_help_tests tests/test_help.cpp)
     target_link_libraries(mcpp_help_tests PRIVATE mcpp_core)
     mcpp_target_defaults(mcpp_help_tests)
+    add_executable(mcpp_cli_tests tests/test_cli.cpp)
+    target_link_libraries(mcpp_cli_tests PRIVATE mcpp_ui)
+    mcpp_target_defaults(mcpp_cli_tests)
     add_executable(mcpp_native_config_tests tests/test_native_config.cpp)
     target_link_libraries(mcpp_native_config_tests PRIVATE mcpp_core)
     mcpp_target_defaults(mcpp_native_config_tests)
@@ -219,16 +235,32 @@ if(MCPP_BUILD_TESTS)
             /review/cases/copy-masks
             /review/cases/concurrent-jobs
             /review/cases/independent-screens
+            /review/cases/cli-remaining-ctest
+            /review/cases/menu-complete-ctest
         )
         add_test(
             NAME mcpp_keymap_tests
             COMMAND mcpp_keymap_tests /review/cases/agent-keymap/ctest
         )
         add_test(NAME mcpp_keymap_input_tests COMMAND mcpp_keymap_input_tests)
+        foreach(cli_case IN ITEMS options information operands)
+            add_test(
+                NAME mcpp_cli_${cli_case}
+                COMMAND mcpp_cli_tests ${cli_case}
+                        /review/cases/cli-remaining-ctest/${cli_case}
+            )
+        endforeach()
         add_test(
             NAME mcpp_archive_tests
             COMMAND mcpp_archive_tests /review/cases/agent-archives
         )
+        foreach(transform_case IN ITEMS local namespace errors)
+            add_test(
+                NAME mcpp_transform_${transform_case}
+                COMMAND mcpp_transform_tests ${transform_case}
+                        /review/cases/single-transform-${transform_case}
+            )
+        endforeach()
         add_test(
             NAME mcpp_archive_operation_tests
             COMMAND mcpp_archive_operation_tests /review/cases/agent-archive-operations
@@ -246,6 +278,20 @@ if(MCPP_BUILD_TESTS)
             COMMAND mcpp_editor_lock_tests /review/cases/editor-locks/model
         )
         add_test(NAME mcpp_native_menu_tests COMMAND mcpp_native_menu_tests)
+        foreach(regex_case IN ITEMS core extensions syntax highlight)
+            add_test(
+                NAME mcpp_native_regex_${regex_case}
+                COMMAND mcpp_native_regex_tests ${regex_case}
+                        /review/cases/native-regex-${regex_case}
+            )
+        endforeach()
+        foreach(menu_case IN ITEMS words contexts directories)
+            add_test(
+                NAME mcpp_native_menu_${menu_case}
+                COMMAND mcpp_native_menu_complete_tests ${menu_case}
+                        /review/cases/menu-complete-ctest/${menu_case}
+            )
+        endforeach()
         add_test(NAME mcpp_extension_tests COMMAND mcpp_extension_tests)
         add_test(NAME mcpp_append_resume_bytes COMMAND mcpp_append_resume_tests bytes)
         add_test(NAME mcpp_append_resume_safety COMMAND mcpp_append_resume_tests safety)
@@ -540,6 +586,17 @@ if(MCPP_BUILD_TESTS)
                     ${CMAKE_CURRENT_BINARY_DIR}/keymap-ui
             )
             set_tests_properties(mcpp_keymap_ui PROPERTIES TIMEOUT 150)
+            add_test(
+                NAME mcpp_cli_frontends_ui
+                COMMAND
+                    ${MCPP_PYTHON_EXECUTABLE}
+                    -B
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_cli_frontends_ui.py
+                    $<TARGET_FILE:mcpp>
+                    ${MCPP_TMUX_EXECUTABLE}
+                    /review/cases/cli-remaining-frontends-ctest
+            )
+            set_tests_properties(mcpp_cli_frontends_ui PROPERTIES TIMEOUT 150)
             add_test(
                 NAME mcpp_concurrent_jobs_ui
                 COMMAND

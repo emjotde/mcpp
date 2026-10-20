@@ -2,6 +2,7 @@
 #include "mcpp/editor_search.hpp"
 #include "mcpp/local_provider.hpp"
 #include "mcpp/local_tools.hpp"
+#include "mcpp/transform_provider.hpp"
 
 #include <algorithm>
 #include <array>
@@ -763,19 +764,34 @@ void ViewerModel::refresh_presentation(const bool magic, const bool nroff, std::
         std::ostringstream initial;
         read_source(0, std::min<std::uint64_t>(12, source_size_), initial, cancellation);
         const auto header = std::move(initial).str();
-        std::string tool;
-        if (header.starts_with(std::string("\x1f\x8b", 2))) tool = "gzip";
-        else if (header.starts_with("BZh")) tool = "bzip2";
-        else if (header.starts_with(std::string("\xfd\x37\x7a\x58\x5a\x00", 6))) tool = "xz";
-        else if (header.starts_with(std::string("\x28\xb5\x2f\xfd", 4))) tool = "zstd";
-        if (!tool.empty()) {
-            if (dynamic_cast<LocalProvider*>(provider_.get()) == nullptr) throw std::runtime_error("parsed viewing requires a local file");
-            const auto source = stream_ ? stream_->storage_path() : storage_path_;
-            const auto directory = stream_ ? std::filesystem::current_path() : std::filesystem::path(storage_path_).parent_path();
-            const auto result = capture_command({tool, "-cd", "--", source},
-                directory, cancellation, 64U * 1024U * 1024U);
-            if (result.status != 0) throw std::runtime_error(tool + " exited " + std::to_string(result.status) + ": " + result.error);
-            parsed = result.output;
+        if (const auto decoder = compression_decoder(header)) {
+            if (dynamic_cast<LocalProvider*>(provider_.get()) != nullptr) {
+                std::string tool;
+                if (*decoder == "ugz") tool = "gzip";
+                else if (*decoder == "ubz2") tool = "bzip2";
+                else if (*decoder == "uxz") tool = "xz";
+                else if (*decoder == "uzst") tool = "zstd";
+                else throw std::runtime_error("unsupported compression decoder: " + std::string(*decoder));
+                const auto source = stream_ ? stream_->storage_path() : storage_path_;
+                const auto directory = stream_ ? std::filesystem::current_path() : std::filesystem::path(storage_path_).parent_path();
+                const auto result = capture_command({tool, "-cd", "--", source},
+                    directory, cancellation, 64U * 1024U * 1024U);
+                if (result.status != 0) throw std::runtime_error(tool + " exited " + std::to_string(result.status) + ": " + result.error);
+                parsed = result.output;
+            } else {
+                if (source_size_ > 64U * 1024U * 1024U) {
+                    throw std::runtime_error("parsed viewing is limited to 64 MiB; raw viewing remains available");
+                }
+                const auto before = provider_->stat_follow(path_, cancellation);
+                std::ostringstream output;
+                read_source(0, source_size_, output, cancellation);
+                const auto encoded = std::move(output).str();
+                if (encoded.size() != source_size_ || before.size != source_size_ ||
+                    provider_->stat_follow(path_, cancellation).revision != before.revision) {
+                    throw std::runtime_error("file changed while parsing the viewer");
+                }
+                parsed = decompress_bytes(encoded, *decoder, cancellation);
+            }
         }
     }
     std::optional<std::string> text;

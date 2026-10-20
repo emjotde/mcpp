@@ -1680,6 +1680,7 @@ struct DiffSessionState {
 
 struct App::Impl : ViewerSessionState, DiffSessionState {
     Config config;
+    AppOptions launch_options;
     struct PaletteSet {
         Skin panels;
         Skin editor;
@@ -1887,6 +1888,7 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
     struct UserMenuInvocation {
         UserMenuEntry entry;
         NativeMenuContext context;
+        Location source_directory;
         NativeMenuRequirements requirements;
         std::vector<std::string> answers;
         Mode return_mode{Mode::panels};
@@ -2207,9 +2209,11 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
     Impl(
         std::string left_path,
         std::string right_path,
-        Config configured
+        Config configured,
+        AppOptions options
     )
         : config(std::move(configured)),
+          launch_options(std::move(options)),
           keymap(load_configured_keymap(config)),
           local(std::make_shared<LocalProvider>()),
           archives(local, std::chrono::seconds(static_cast<std::chrono::seconds::rep>(config.vfs_timeout))),
@@ -2220,6 +2224,7 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
           right(right_location.provider, right_location.path, nullptr,
                 dynamic_cast<const ArchiveProvider*>(right_location.provider.get()) != nullptr) {
         for (const auto& diagnostic : config.diagnostics) std::cerr << "mcpp: configuration: " << diagnostic << '\n';
+        prepare_cli_terminal(launch_options.color, launch_options.stickchars);
         initialize_palette();
         active_index = config.current_is_left.value_or(true) ? 0 : 1;
         viewer.set_wrap(config.viewer_wrap);
@@ -2306,22 +2311,8 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
     }
 
     Location resolve_location(const std::string_view value) {
-        std::string path(value);
-        if (is_archive_location(value)) {
-            const auto tar = value.rfind("/utar://");
-            const auto cpio = value.rfind("/ucpio://");
-            const auto separator = tar == std::string_view::npos ? cpio
-                : cpio == std::string_view::npos ? tar : std::max(tar, cpio);
-            const auto archive = std::filesystem::path(value.substr(0, separator));
-            if (archive.is_relative()) {
-                path = std::filesystem::absolute(archive).lexically_normal().string() +
-                       std::string(value.substr(separator));
-            }
-        } else if (value.find("://") == std::string_view::npos &&
-                   std::filesystem::path(value).is_relative()) {
-            path = std::filesystem::absolute(std::filesystem::path(value)).lexically_normal().string();
-        }
-        return open_location(path, local, &archives);
+        return open_location(value,
+            Location{local, std::filesystem::current_path().generic_string()}, &archives);
     }
 
     std::string pane_location(const Pane& pane) const {
@@ -2449,15 +2440,11 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
 
     Location resolve_relative_location(const Location& base, std::string value) {
         Location destination;
-        if (value.find("://") != std::string::npos) {
-            if (!std::filesystem::path(value).is_absolute()) {
-                if (base.provider != local) throw std::runtime_error("nested archives are not supported yet");
-                const auto separator = value.find("://");
-                const auto slash = value.rfind('/', separator);
-                if (slash == std::string::npos) throw std::invalid_argument("VFS path has no archive name");
-                value = local->join(base.path, value.substr(0, slash)) + value.substr(slash);
+        if (is_virtual_location(value)) {
+            if (is_archive_location(value) && std::filesystem::path(value).is_absolute()) {
+                return resolve_location(value);
             }
-            destination = resolve_location(value);
+            return open_location(value, base, &archives);
         } else if (std::filesystem::path(value).is_absolute()) {
             destination = {local, local->normalize(value)};
         } else {
@@ -3093,31 +3080,31 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
                 invocation->context.active.directory, invocation->context.other.directory);
         }
         if (expansion.action == NativeMenuAction::change_directory) {
-            const auto words = plain_command_words(expansion.command);
-            if (!words || words->size() != 1U) {
-                throw std::invalid_argument("%cd needs one directory argument, not shell commands");
+            auto& pane = invocation->pane_index == 0 ? left : right;
+            auto& previous = command_previous_directories[
+                static_cast<std::size_t>(pane_ids[static_cast<std::size_t>(invocation->pane_index)])];
+            auto directory_context = invocation->context;
+            directory_context.active.directory = archives.format(
+                invocation->source_directory.provider, invocation->source_directory.path);
+            const auto destination = native_menu_directory(expansion.command, directory_context, previous);
+            const auto root = archives.format(invocation->source_directory.provider, "/");
+            auto location = invocation->source_directory.provider != local &&
+                    root.find("://") != std::string::npos && destination.starts_with(root)
+                ? Location{invocation->source_directory.provider,
+                    invocation->source_directory.provider->normalize("/" + destination.substr(root.size()))}
+                : resolve_relative_location(invocation->source_directory, destination);
+            const auto entry = location.provider->stat_follow(location.path, {});
+            if (entry.kind == EntryKind::file && is_archive_filename(entry.name)) {
+                if (location.provider != local) throw std::runtime_error("nested archives are not supported yet");
+                location = {archives.open(location.path), "/"};
+            } else if (entry.kind != EntryKind::directory) {
+                throw std::runtime_error("not a directory: " + destination);
             }
-            auto destination = words->front();
-            if (destination.empty()) throw std::invalid_argument("%cd directory is empty");
-            auto& previous = command_previous_directories[static_cast<std::size_t>(pane_ids[active_index])];
-            if (destination == "-") {
-                if (previous.empty()) throw std::runtime_error("%cd: no previous directory");
-                destination = previous;
-            } else if (destination == "~" || destination.starts_with("~/")) {
-                const auto* home = std::getenv("HOME");
-                if (home == nullptr || *home == '\0') throw std::runtime_error("%cd: HOME is not set");
-                destination = std::string(home) + destination.substr(1U);
-            } else if (destination.starts_with('~')) {
-                throw std::invalid_argument("%cd: named home directories are unavailable; use an explicit path");
-            } else if (invocation->context.editor) {
-                const auto location = resolve_editor_location(destination);
-                destination = archives.format(location.provider, location.path);
-            }
-            const auto old = pane_location(active());
-            change_panel_directory(active(), destination);
+            const auto old = pane_location(pane);
+            install_pane_location(pane, std::move(location));
             previous = old;
             complete_user_menu(invocation, expansion);
-            status = "Directory changed: " + pane_location(active());
+            status = "Directory changed: " + pane_location(pane);
             return;
         }
         if (expansion.action == NativeMenuAction::view) {
@@ -3170,8 +3157,11 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
         invocation->context = user_menu_context(user_menu_return, user_menu_source);
         invocation->return_mode = user_menu_return;
         invocation->pane_index = active_index;
+        invocation->source_directory = {active().provider(), active().navigation_path()};
         if (entry.native) invocation->requirements = native_menu_requirements(entry.command, invocation->context.editor);
         if (invocation->context.editor) {
+            invocation->source_directory = {editor.provider(), editor.path().empty()
+                ? editor_directory(editor) : editor.provider()->parent(editor.path())};
             invocation->editor_path = editor.path();
             invocation->editor_change = editor.change_id();
             invocation->editor_position = {editor.row(), editor.column()};
@@ -3744,33 +3734,25 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
                 invocation->context.active.directory, invocation->context.other.directory);
         } else expansion = expand_native_menu(invocation->entry.command, invocation->context, invocation->answers);
         if (expansion.action == NativeMenuAction::change_directory) {
-            const auto words = plain_command_words(expansion.command);
-            if (!words || words->size() != 1U || words->front().empty()) {
-                throw std::invalid_argument("extension %cd needs one literal directory, not shell commands");
-            }
-            auto destination = words->front();
             auto& previous = command_previous_directories[static_cast<std::size_t>(invocation->pane_id)];
-            if (destination == "-") {
-                if (previous.empty()) throw std::runtime_error("extension %cd: no previous directory");
-                destination = previous;
-            } else if (destination == "~" || destination.starts_with("~/")) {
-                const auto* home = std::getenv("HOME");
-                if (home == nullptr || *home == '\0') throw std::runtime_error("extension %cd: HOME is not set");
-                destination = std::string(home) + destination.substr(1U);
-            } else if (destination.starts_with('~')) {
-                throw std::invalid_argument("extension %cd: use an explicit home-directory path");
-            } else if (destination.find("://") != std::string::npos) {
-                if (!std::filesystem::path(destination).is_absolute()) {
-                    if (invocation->provider != local) throw std::runtime_error("nested archives are not supported yet");
-                    destination = invocation->context.active.directory + "/" + destination;
-                }
-            } else {
-                destination = archives.format(invocation->provider,
-                    invocation->provider->join(invocation->provider->parent(invocation->path), destination));
+            const auto destination = native_menu_directory(expansion.command, invocation->context, previous);
+            const auto root = archives.format(invocation->provider, "/");
+            auto location = invocation->provider != local &&
+                    root.find("://") != std::string::npos && destination.starts_with(root)
+                ? Location{invocation->provider,
+                    invocation->provider->normalize("/" + destination.substr(root.size()))}
+                : resolve_relative_location(
+                    {invocation->provider, invocation->provider->parent(invocation->path)}, destination);
+            const auto entry = location.provider->stat_follow(location.path, {});
+            if (entry.kind == EntryKind::file && is_archive_filename(entry.name)) {
+                if (location.provider != local) throw std::runtime_error("nested archives are not supported yet");
+                location = {archives.open(location.path), "/"};
+            } else if (entry.kind != EntryKind::directory) {
+                throw std::runtime_error("not a directory: " + destination);
             }
             auto& pane = pane_ids[0] == invocation->pane_id ? left : right;
             const auto old = pane_location(pane);
-            change_panel_directory(pane, destination);
+            install_pane_location(pane, std::move(location));
             previous = old;
             complete_extension_action(invocation, expansion);
             status = "Directory changed: " + pane_location(pane);
@@ -6043,8 +6025,10 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
                 const auto dirty = session.diff_files[0].dirty() || session.diff_files[1].dirty();
                 const std::string prefix = dirty ? "[Diff*] " : "[Diff] ";
                 const auto paths_width = label_width > prefix.size() + 3U ? label_width - prefix.size() - 3U : 2U;
-                labels.push_back(prefix + path_label(session.diff_files[0].path(), paths_width / 2U) + " : " +
-                    path_label(session.diff_files[1].path(), paths_width - paths_width / 2U));
+                labels.push_back(prefix + path_label(archives.format(session.diff_files[0].provider(),
+                    session.diff_files[0].path()), paths_width / 2U) + " : " +
+                    path_label(archives.format(session.diff_files[1].provider(),
+                        session.diff_files[1].path()), paths_width - paths_width / 2U));
             } else if (target.mode == Mode::editor) {
                 const auto& buffer = target.id == editor.screen_id ? editor
                     : *std::ranges::find(editor_buffers, target.id, &EditorBuffer::screen_id);
@@ -6313,9 +6297,11 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
     }
 
     void open_file_comparison(const std::string& first_path, const std::string& second_path) {
+        const auto first = resolve_location(first_path);
+        const auto second = resolve_location(second_path);
         auto next = std::make_shared<DiffSessionState>();
-        next->diff_files[0].open(local, first_path);
-        next->diff_files[1].open(local, second_path);
+        next->diff_files[0].open(first.provider, first.path);
+        next->diff_files[1].open(second.provider, second.path);
         next->diff_options = {config.diff_quality, config.diff_ignore_case, config.diff_ignore_tab_expansion,
                         config.diff_ignore_space_change, config.diff_ignore_all_space, config.diff_strip_trailing_cr};
         next->diff_split = ftxui::Terminal::Size().dimx / 2;
@@ -6388,7 +6374,8 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
             const auto status_text = side == diff_order ? " Col " + std::to_string(diff_horizontal)
                 : " Dif " + std::to_string(file_diff.hunks().size());
             headers.push_back(gray_menu(hbox({
-                text(std::string(buffer.dirty() ? "* " : "  ") + path_label(display_text(buffer.path()),
+                text(std::string(buffer.dirty() ? "* " : "  ") +
+                    path_label(display_text(archives.format(buffer.provider(), buffer.path())),
                     static_cast<std::size_t>(std::max(1, width - static_cast<int>(status_text.size()) - 3)))) | flex,
                 text(status_text + " ")
             })) | size(WIDTH, EQUAL, width));
@@ -6469,11 +6456,12 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
                 return;
             }
             const auto path = buffer.path();
+            const auto provider = buffer.provider();
             try {
-                buffer.open(local, path, {}, large_file_approval);
+                buffer.open(provider, path, {}, large_file_approval);
             } catch (const EditorLargeFileConfirmationRequired& required) {
                 const auto approval = required.file();
-                confirm_large_editor_file(local, approval, Mode::diff,
+                confirm_large_editor_file(provider, approval, Mode::diff,
                     [this, approval] { resume_diff_after_edit(approval); },
                     [this] {
                         diff_edit_side.reset();
@@ -6759,7 +6747,7 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
             if (diff_files[side].dirty()) show_native_message("Edit", "Save the merged file before opening it in the editor.", Mode::diff);
             else {
                 diff_edit_side = side;
-                edit_file(local, diff_files[side].path(), Mode::diff);
+                edit_file(diff_files[side].provider(), diff_files[side].path(), Mode::diff);
                 if (mode == Mode::diff) resume_diff_after_edit();
             }
         } else if (event == Event::F5 || event == Event::Special("\x1b[28~")) {
@@ -7504,22 +7492,28 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
         return config.theme_override ? *config.theme_override : config.theme;
     }
 
-    static std::shared_ptr<const PaletteSet> make_palette(Skin skin) {
+    std::shared_ptr<const PaletteSet> make_palette(Skin skin) const {
         auto result = std::make_shared<PaletteSet>();
         result->panels = std::move(skin);
         result->editor = result->viewer = result->help = result->diff = result->panels;
-        if (result->panels.resource.empty()) return result;
-        const auto adapt = [&](Skin& target, const std::string_view section) {
-            target.normal = skin_color(target, section, "_default_", target.normal);
-            target.syntax[0] = target.normal.foreground;
-        };
-        adapt(result->editor, "editor");
-        result->editor.selected = skin_color(result->editor, "editor", "editmarked", result->editor.selected);
-        result->editor.search = skin_color(result->editor, "editor", "editbold", result->editor.search);
-        result->editor.dim = skin_color(result->editor, "editor", "editwhitespace", result->editor.normal).foreground;
-        adapt(result->viewer, "viewer");
-        adapt(result->help, "help");
-        adapt(result->diff, "diffviewer");
+        if (!result->panels.resource.empty()) {
+            const auto adapt = [&](Skin& target, const std::string_view section) {
+                target.normal = skin_color(target, section, "_default_", target.normal);
+                target.syntax[0] = target.normal.foreground;
+            };
+            adapt(result->editor, "editor");
+            result->editor.selected = skin_color(result->editor, "editor", "editmarked", result->editor.selected);
+            result->editor.search = skin_color(result->editor, "editor", "editbold", result->editor.search);
+            result->editor.dim = skin_color(result->editor, "editor", "editwhitespace", result->editor.normal).foreground;
+            adapt(result->viewer, "viewer");
+            adapt(result->help, "help");
+            adapt(result->diff, "diffviewer");
+        }
+        apply_cli_colors(result->panels, launch_options.colors, CliPaletteContext::panels);
+        apply_cli_colors(result->editor, launch_options.colors, CliPaletteContext::editor);
+        apply_cli_colors(result->viewer, launch_options.colors, CliPaletteContext::viewer);
+        apply_cli_colors(result->help, launch_options.colors, CliPaletteContext::help);
+        apply_cli_colors(result->diff, launch_options.colors, CliPaletteContext::diff);
         return result;
     }
 
@@ -7754,7 +7748,7 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
                 complete_path(native_input_value, native_input_state, native_input_directory,
                               native_input_return == Mode::panels ? active().provider() : local,
                               false, native_input_return != Mode::panels ||
-                                  is_archive_location(native_input_directory));
+                                  is_virtual_location(native_input_directory));
                 native_input_error = native_input_state.message;
             } catch (const std::exception& error) {
                 native_input_error = error.what();
@@ -9836,7 +9830,25 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
         if (dialog_destination.empty()) {
             throw std::runtime_error("destination is empty");
         }
-        const auto sources = matching_operation_sources();
+        const bool source_operand = is_virtual_location(dialog_source_mask);
+        if (source_operand && !operation_draft) {
+            throw std::runtime_error("the captured source location is unavailable; reopen the dialog");
+        }
+        const auto captured = operation_draft ? operation_draft : capture_operation_job();
+        std::optional<Location> explicit_source;
+        auto source_provider = captured->source_provider;
+        std::vector<Entry> sources;
+        if (source_operand) {
+            explicit_source = resolve_relative_location(
+                {captured->source_provider, captured->source_base_directory}, dialog_source_mask);
+            source_provider = explicit_source->provider;
+            sources.push_back(source_provider->stat(explicit_source->path, {}));
+            if (dialog_move && !has_capability(source_provider->capabilities(), ProviderCapability::remove)) {
+                throw std::runtime_error("the source filesystem is read-only; use Copy instead");
+            }
+        } else {
+            sources = matching_operation_sources();
+        }
         if (sources.empty()) {
             throw std::runtime_error(
                 "source mask matches no selected entries"
@@ -9844,7 +9856,8 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
         }
         const auto& source_pane = tree_operation_source
             ? (tree_operation_source_index == 0 ? left : right) : active();
-        const CopyMask mask(dialog_source_mask, dialog_shell_patterns);
+        const CopyMask mask(source_operand ? "*" : dialog_source_mask,
+                            source_operand || dialog_shell_patterns);
         const auto slash = dialog_destination.rfind('/');
         const auto directory = slash == std::string::npos
             ? std::string{} : dialog_destination.substr(0, slash + 1U);
@@ -9895,19 +9908,29 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
         }
         dialog_exact = sources.size() == 1U &&
                        !destination_directory;
-        const auto source_provider = operation_draft ? operation_draft->source_provider
-            : tree_operation_source ? tree_operation_source_provider : source_pane.provider();
         if (dialog_stable_symlinks &&
             (dynamic_cast<LocalProvider*>(source_provider.get()) == nullptr ||
              dynamic_cast<LocalProvider*>(destination_provider.get()) == nullptr)) {
             throw std::runtime_error("stable symlinks require local source and destination filesystems");
+        }
+        std::shared_ptr<OperationJob> resolved_source;
+        if (explicit_source) {
+            resolved_source = std::make_shared<OperationJob>();
+            resolved_source->source_provider = source_provider;
+            resolved_source->sources = std::move(sources);
+            resolved_source->source_pane_id = captured->source_pane_id;
+            resolved_source->source_side = captured->source_side;
+            resolved_source->source_directory = source_provider->parent(explicit_source->path);
+            resolved_source->source_base_directory = resolved_source->source_directory;
+            resolved_source->destination_provider = captured->destination_provider;
         }
         run_operation(
             dialog_move,
             destination.path,
             !config.confirm_overwrite,
             dialog_exact,
-            destination_provider
+            destination_provider,
+            std::move(resolved_source)
         );
     }
 
@@ -9926,15 +9949,18 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
         const std::string& destination,
         const bool overwrite,
         const bool exact = false,
-        ProviderPtr destination_override = {}
+        ProviderPtr destination_override = {},
+        std::shared_ptr<OperationJob> resolved_source = {}
     ) {
         if (traversal_running.load(std::memory_order_acquire)) {
             throw std::runtime_error(
                 "cannot start an operation while search is running"
             );
         }
-        auto job = operation_draft ? operation_draft : capture_operation_job();
-        job->sources = matching_operation_sources();
+        const bool source_operand = static_cast<bool>(resolved_source);
+        auto job = source_operand ? std::move(resolved_source)
+            : operation_draft ? operation_draft : capture_operation_job();
+        if (!source_operand) job->sources = matching_operation_sources();
         if (job->sources.empty()) {
             throw std::runtime_error(
                 "source mask matches no selected entries"
@@ -9953,9 +9979,9 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
             .collision = {},
             .error = {},
             .compute_totals = config.compute_totals,
-            .source_mask = dialog_source_mask,
+            .source_mask = source_operand ? "*" : dialog_source_mask,
             .destination_mask = dialog_destination_mask,
-            .shell_patterns = dialog_shell_patterns,
+            .shell_patterns = source_operand || dialog_shell_patterns,
             .stable_symlinks = dialog_stable_symlinks,
             .dive_into_subdirectories = dialog_dive_into_subdirectories,
         };
@@ -14025,11 +14051,13 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
                 }
                 connector += is_last_sibling(ancestor)
                                  ? "   "
-                                 : "│  ";
+                                 : launch_options.stickchars ? "|  " : "│  ";
             }
             if (node.depth > 0U) {
                 connector +=
-                    is_last_sibling(index) ? "└─ " : "├─ ";
+                    is_last_sibling(index)
+                        ? (launch_options.stickchars ? "`- " : "└─ ")
+                        : (launch_options.stickchars ? "|- " : "├─ ");
             }
             if (node.inaccessible) {
                 connector += "! ";
@@ -20153,6 +20181,7 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
     }
 
     bool handle_input(const ftxui::Event& event) try {
+        if (!launch_options.mouse && event.is_mouse()) return true;
         archives.prune();
         if (event == ftxui::Event::Custom && !event.is_character()) return false;
         if (!config.single_escape && mode != Mode::native_key_query && mode != Mode::learn_key &&
@@ -20379,12 +20408,14 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
 App::App(
     std::string left,
     std::string right,
-    Config config
+    Config config,
+    AppOptions options
 )
     : impl_(std::make_unique<Impl>(
           std::move(left),
           std::move(right),
-          std::move(config)
+          std::move(config),
+          std::move(options)
       )) {}
 
 App::~App() = default;
@@ -20460,9 +20491,7 @@ void App::open_editor_files(const std::vector<EditorFile>& files, const std::siz
 
 void App::open_diff(const std::string& first, const std::string& second) {
     if (first.empty() || second.empty()) throw std::invalid_argument("file name is empty");
-    const auto provider = impl_->active().provider();
-    impl_->open_file_comparison(provider->join(impl_->active().path(), first),
-                               provider->join(impl_->active().path(), second));
+    impl_->open_file_comparison(first, second);
     impl_->exit_after_diff = true;
 }
 
@@ -20485,7 +20514,7 @@ int App::run() {
         auto terminal = ftxui::App::FullscreenAlternateScreen();
         terminal.ForceHandleCtrlC(false);
         terminal.ForceHandleCtrlZ(false);
-        terminal.TrackMouse(true);
+        terminal.TrackMouse(impl_->launch_options.mouse);
         impl_->terminal = &terminal;
         impl_->shell.set_notify([implementation = impl_.get()] {
             implementation->post_ui([implementation] { implementation->process_shell_events(true); });
@@ -20536,7 +20565,15 @@ int App::run() {
                 first_frame = false;
                 std::cout << "\033[H\033[2J" << std::flush;
             }
-            return impl_->render();
+            prepare_cli_terminal(impl_->launch_options.color, impl_->launch_options.stickchars);
+            auto element = impl_->render();
+            const std::array<const Skin*, 5> palettes{
+                &impl_->active_palette->panels, &impl_->active_palette->editor,
+                &impl_->active_palette->viewer, &impl_->active_palette->help,
+                &impl_->active_palette->diff
+            };
+            return cli_display(std::move(element), impl_->launch_options.color == false,
+                               impl_->launch_options.stickchars, palettes);
         });
         component = ftxui::CatchEvent(
             std::move(component),

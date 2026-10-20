@@ -2,6 +2,7 @@
 
 #include "mcpp/editor_search.hpp"
 #include "mcpp/local_tools.hpp"
+#include "mcpp/native_regex.hpp"
 
 #include <algorithm>
 #include <array>
@@ -9,7 +10,6 @@
 #include <cctype>
 #include <fcntl.h>
 #include <map>
-#include <regex.h>
 #include <sstream>
 #include <stdexcept>
 #include <sys/stat.h>
@@ -72,39 +72,25 @@ std::string ini_value(
 
 class Expression {
 public:
-    Expression(const Value& value, const bool ignore_case, const std::string_view source) {
-        if (value.text.size() > 4096U) extension_error(source, value.line, "expression exceeds 4096 bytes");
-        for (std::size_t index = 0; index + 1U < value.text.size(); ++index) {
-            if (value.text[index] != '\\') continue;
-            if (std::string_view("dDpPKQERXxukgzZ").find(value.text[++index]) != std::string_view::npos) {
-                extension_error(source, value.line, "unsupported expression escape; use POSIX character classes");
-            }
-        }
-        auto expression = std::make_shared<Compiled>();
-        const auto result = regcomp(&expression->regex, value.text.c_str(), REG_EXTENDED | REG_NOSUB |
-                                    (ignore_case ? REG_ICASE : 0));
-        if (result != 0) {
-            std::array<char, 256> message{};
-            regerror(result, &expression->regex, message.data(), message.size());
-            extension_error(source, value.line, "invalid expression (POSIX extended): " + std::string(message.data()));
-        }
-        expression->ready = true;
-        compiled_ = std::move(expression);
-    }
+    Expression(const Value& value, const bool ignore_case, const std::string_view source)
+        : compiled_(compile(value, ignore_case, source)) {}
 
     [[nodiscard]] bool matches(const std::string& value) const {
-        const auto result = regexec(&compiled_->regex, value.c_str(), 0, nullptr, 0);
-        if (result != 0 && result != REG_NOMATCH) throw std::runtime_error("extension matching failed");
-        return result == 0;
+        return compiled_.search(value);
     }
 
 private:
-    struct Compiled {
-        regex_t regex{};
-        bool ready{false};
-        ~Compiled() { if (ready) regfree(&regex); }
-    };
-    std::shared_ptr<Compiled> compiled_;
+    static NativeRegex compile(
+        const Value& value, const bool ignore_case, const std::string_view source
+    ) {
+        if (value.text.size() > 4096U) extension_error(source, value.line, "expression exceeds 4096 bytes");
+        try {
+            return NativeRegex(value.text, ignore_case);
+        } catch (const std::invalid_argument& error) {
+            extension_error(source, value.line, error.what());
+        }
+    }
+    NativeRegex compiled_;
 };
 
 struct Rule {

@@ -1,4 +1,5 @@
 #include "syntax_rules.hpp"
+#include "mcpp/native_regex.hpp"
 
 #include <algorithm>
 #include <array>
@@ -6,7 +7,6 @@
 #include <fstream>
 #include <functional>
 #include <map>
-#include <regex>
 #include <set>
 #include <sstream>
 #include <stdexcept>
@@ -344,11 +344,11 @@ SyntaxColor parse_colors(
     return color;
 }
 
-std::regex registry_regex(const std::string& value, const SourceLine& line) {
+NativeRegex registry_regex(const std::string& value, const SourceLine& line) {
     try {
-        return std::regex(value, std::regex::extended | std::regex::optimize);
-    } catch (const std::regex_error& error) {
-        fail(line, "invalid or unsupported registry regular expression: " + std::string(error.what()));
+        return NativeRegex(value);
+    } catch (const std::invalid_argument& error) {
+        fail(line, error.what());
     }
 }
 
@@ -357,8 +357,8 @@ std::regex registry_regex(const std::string& value, const SourceLine& line) {
 struct SyntaxRuleSet {
     bool insensitive{false};
     std::vector<Context> contexts;
-    std::regex filename;
-    std::optional<std::regex> first_line;
+    NativeRegex filename{""};
+    std::optional<NativeRegex> first_line;
 };
 
 namespace {
@@ -551,9 +551,8 @@ const SyntaxRegistryEntry* SyntaxRegistry::select(
     }
     const auto filename = path.string();
     for (const auto& entry : entries_) {
-        if (std::regex_search(filename, entry.rules->filename) ||
-            (entry.rules->first_line && std::regex_search(
-                first_line.begin(), first_line.end(), *entry.rules->first_line))) return &entry;
+        if (entry.rules->filename.search(filename) ||
+            (entry.rules->first_line && entry.rules->first_line->search(first_line))) return &entry;
     }
     return nullptr;
 }

@@ -101,4 +101,11 @@ struct NativeMenuExpansion {
     const std::vector<std::string>& answers = {}
 );
 
+// Non-local relative paths stay relative for resolution against the captured provider.
+[[nodiscard]] std::string native_menu_directory(
+    std::string_view expanded_command,
+    const NativeMenuContext& context,
+    std::string_view previous_directory = {}
+);
+
 }  // namespace mcpp

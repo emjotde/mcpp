@@ -1,5 +1,6 @@
 #pragma once
 
+#include "mcpp/cli_display.hpp"
 #include "mcpp/command_line.hpp"
 #include "mcpp/config.hpp"
 #include "mcpp/editor.hpp"
@@ -9,17 +10,26 @@
 
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
 namespace mcpp {
+
+struct AppOptions {
+    bool mouse{true};
+    std::optional<bool> color;
+    std::vector<CliColorOverride> colors;
+    bool stickchars{false};
+};
 
 class App {
 public:
     App(
         std::string left,
         std::string right,
-        Config config = {}
+        Config config = {},
+        AppOptions options = {}
     );
     ~App();
 

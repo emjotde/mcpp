@@ -1,6 +1,6 @@
 # mcpp versus GNU Midnight Commander
 
-Review dates: 2026-10-17 through 2026-10-19 (UTC)
+Review dates: 2026-10-17 through 2026-10-20 (UTC)
 
 This is a functional review of the supported Linux workflows, not a claim that
 mcpp is a complete MC clone. Remote providers remain deferred. The current
@@ -101,11 +101,12 @@ are retained; they are not bugs to remove in pursuit of default MC behavior.
 | L19 | Closed for implemented commands: MC-format resources, overlays, key aliases/terminal decoding, all 16 contexts, manager/editor extended maps, action rebinding/removal, and actual dispatch across the four frontends and focused controls. `-K` / `--keymap` and `--nokeymap` are launch-only; unavailable commands fail explicitly rather than invoking another action. |
 | L25 | Closed: independently written contextual help has linked topics, an index, back navigation, scrolling and mouse controls. Manager/dialog drafts, editor/custom keys, raw key capture and dirty-viewer return are checked. MC `.hlp` import and full-text help search are not implemented. |
 | L27 | Closed: whole-document and current-word checking, dictionary selection, native suggestions/Add word/Replace/Skip/Cancel controls, and persisted personal dictionaries through standard `aspell(1)`. Byte offsets are validated, replacements are undoable, marks/search settings remain separate, and errors retain the draft and retryable dialog. |
+| L30 | Closed for local single-file transformations: native `source/name://suffix` paths, original standard compression converters and trusted local `/1` registry helpers, read-only provider snapshots, revision-aware caching and captured-namespace resolution. Viewer/editor/diff and actual F5 Source-mask copying retain provider identity; readonly F6 fails before writes. Inputs/outputs are currently bounded to 64 MiB; non-local helper flags remain outside the paused remote scope. |
 | L33 | Closed for the currently supported local providers: cached revisions, active-provider retention, unused timeout, private cache creation, native Active VFS list and timeout setting, and logical URI/alias preservation. Changed containers open a new snapshot; remote options stay outside the current scope. |
 | L34 | Closed: independent viewer/diff sessions appear alongside editor buffers in the native screen list and next/previous cycling. Dirty bytes, search/cursor/bookmarks, streams, comparison/editor return identity, save/link/conflict decisions and final standalone exits retain their own state. Labels fit the actual dialog content width without hiding filenames. |
 
-Standalone frontends are **4/4**. **Twenty of the 34 baseline work packages are
-closed; 14 baseline packages remain open**. This is a feature backlog, not an
+Standalone frontends are **4/4**. **Twenty-one of the 34 baseline work packages are
+closed; 13 baseline packages remain open**. This is a feature backlog, not an
 overall parity percentage. Additional gaps discovered afterward are listed
 separately, rather than silently changing the baseline denominator.
 The broader command-line option set is still L03, not implicitly completed by
@@ -268,16 +269,21 @@ diagnosed and preserved instead of silently accepted.
 
 Local user/editor menus now load native conditions, command blocks, prompts,
 pane/editor macros and view/cd directives, while retaining legacy menu rows.
-F2/editor execution is checked. **L20 remains partial** against the original
-complete-expansion target: unsupported quoting contexts and unsafe raw forms
-produce explicit errors; named-home/CDPATH expansion in `%cd` is not supported.
+Expansion now includes explicit raw `%0`, quoted tagged lists, backticks, ANSI
+quotes, arithmetic and heredocs. Ordinary values remain literal rather than
+becoming shell source. Named homes and CDPATH use a captured provider/directory;
+relative archive paths do not search the host filesystem. **L20 remains partial**
+against the original complete-expansion target: ordinary arithmetic values are
+signed decimal only, nested old-style backticks and `case` substitutions remain
+unsupported, and unsafe or unsupported heredoc forms fail explicitly.
 
 External `Syntax` registries and definitions now feed the actual editor chooser
 and color renderer, with transactional reload, saved selections and legacy-file
-preservation. **L22 remains partial**: registry regex is POSIX ERE and unsupported
-directives are rejected; case folding is ASCII-oriented and pattern sets are
-byte-based. Context `spellcheck` now emits color-independent eligible byte ranges
-and filters whole-document and continuation results. Its focused workflow
+preservation. Registry expressions now use PCRE2. **L22 remains partial**:
+unsupported directives are rejected; keyword/context case folding is
+ASCII-oriented and pattern sets are byte-based. Context `spellcheck` now emits
+color-independent eligible byte ranges and filters whole-document and
+continuation results. Its focused workflow
 preserves UTF-8 offsets, explicit word checking, marks, Undo and saved bytes.
 Delimiter changes that newly expose text require another whole-document check.
 No MC resource collection is copied or bundled.
@@ -286,16 +292,46 @@ Native skin selection, color aliases/attributes/inheritance and filename/type
 highlighting now affect the real UI, with Appearance preview/cancel/persistence
 and transactional reload. Original palettes and legacy aliases remain intact;
 unmatched native groups preserve builtin type colors. **L23 remains partial**
-for custom line/widget glyphs, PCRE-only patterns and some auxiliary native
-widget-color roles. Four focused cases passed; final preservation guards were
-recompiled and the small model rechecked, without another UI sweep.
+for custom line/widget glyphs and some auxiliary native widget-color roles.
+Filename expressions now use PCRE2. Four focused cases passed; final preservation
+guards were recompiled and the small model rechecked, without another UI sweep.
 
 Native extension resources now match Open/View/Edit and execute through the
 shared directive/macro engine, preserving legacy rules, dirty buffers and
-archive provider boundaries. **L21 remains bounded** by POSIX versus PCRE
-matching, explicit local-copy requirements for external archive actions and a
+archive provider boundaries. Expressions now use PCRE2. **L21 remains bounded**
+by explicit local-copy requirements for external archive actions and a
 16 MiB buffered-filter limit. Missing helpers and invalid resources remain
 visible errors, not reasons to execute a legacy fallback.
+
+### Command line, regular expressions and single-file transformations
+
+The four frontends now share CLI parsing and launch-only mouse, ASCII-frame,
+monochrome/color, color-role and subshell controls. Informational options return
+without opening the UI, and literal-colon/process-cwd handling and saved setup
+remain intact. A titled-help ASCII corner defect was fixed without changing
+ordinary file-text glyphs. **L03 remains partial** for renderer-specific native
+backend controls and unavailable color-role fields; non-UTF-8 terminal handling
+remains L24.
+
+PCRE2 is an explicitly approved dependency. Native menu conditions, extension
+rules, syntax-registry expressions and filename highlighting now use its Unicode,
+lookaround and property support. Compile errors identify byte offsets, and
+matching has explicit work/depth/memory limits. Four tiny cases cover these
+consumers, invalid bytes, diagnostics and transactional resource preservation;
+the directly changed menu model also passes. These changes do not close the
+other documented L20-L23 restrictions.
+
+Single-file converters preserve the source provider, revision and logical URI,
+use private source/output files and retain independent cached snapshots. Native
+controls and three focused model cases pass; the existing local case also
+checks compressed virtual and ordinary local viewing. Actual frontend checks
+cover SFS viewing/comparison and F5 copying from a relative operand. The copied
+12 bytes, original destination base, unrelated marks and pre-write readonly F6
+rejection were checked directly. Only the deferred ASCII and new copy portions
+were repeated after their fixes; no full suite was rerun.
+
+Local tar, cpio and single-file transformation families are now present, with
+their documented format/size bounds. Extfs and ext2 undelete remain absent.
 
 ### Additional compatibility gaps
 
