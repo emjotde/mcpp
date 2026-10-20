@@ -65,6 +65,7 @@ add_library(
     src/archive_provider.cpp
     src/extfs_provider.cpp
     src/extfs_helper.cpp
+    src/ext2_undelete_provider.cpp
     src/transform_provider.cpp
     src/command_line.cpp
     src/color_resource.cpp
@@ -198,6 +199,12 @@ if(MCPP_BUILD_TESTS)
     add_executable(mcpp_extfs_sourceless_tests tests/test_extfs_sourceless.cpp)
     target_link_libraries(mcpp_extfs_sourceless_tests PRIVATE mcpp_core)
     mcpp_target_defaults(mcpp_extfs_sourceless_tests)
+    add_executable(mcpp_ext2_undelete_tests tests/test_ext2_undelete.cpp)
+    target_link_libraries(mcpp_ext2_undelete_tests PRIVATE mcpp_core)
+    mcpp_target_defaults(mcpp_ext2_undelete_tests)
+    add_executable(mcpp_archive_incremental_tests tests/test_archive_incremental.cpp)
+    target_link_libraries(mcpp_archive_incremental_tests PRIVATE mcpp_core)
+    mcpp_target_defaults(mcpp_archive_incremental_tests)
     add_executable(mcpp_viewer_source_tests tests/test_viewer_sources.cpp)
     target_link_libraries(mcpp_viewer_source_tests PRIVATE mcpp_core)
     mcpp_target_defaults(mcpp_viewer_source_tests)
@@ -335,6 +342,13 @@ if(MCPP_BUILD_TESTS)
             COMMAND mcpp_streamed_command_tests /review/cases/streamed-view-filters-model
         )
         set_tests_properties(mcpp_streamed_command_tests PROPERTIES TIMEOUT 15)
+        foreach(incremental_case IN ITEMS browse guards)
+            add_test(
+                NAME mcpp_archive_incremental_${incremental_case}
+                COMMAND mcpp_archive_incremental_tests
+                        /review/cases/archive-incremental-ctest-${incremental_case} ${incremental_case}
+            )
+        endforeach()
         foreach(source_less_case IN ITEMS origin errors)
             add_test(
                 NAME mcpp_extfs_sourceless_${source_less_case}
@@ -422,6 +436,10 @@ if(MCPP_BUILD_TESTS)
             COMMAND mcpp_syntax_rules_tests /review/cases/mc-syntax/native-format native-format
         )
         add_test(
+            NAME mcpp_syntax_native_consumption
+            COMMAND mcpp_syntax_rules_tests /review/cases/mc-syntax/native-consumption native-consumption
+        )
+        add_test(
             NAME mcpp_sparse_special_tests
             COMMAND mcpp_sparse_special_tests /review/cases/sparse-special-files
         )
@@ -493,6 +511,16 @@ if(MCPP_BUILD_TESTS)
     find_program(MCPP_PYTHON_EXECUTABLE python3)
     find_program(MCPP_TMUX_EXECUTABLE tmux)
     if(MCPP_PYTHON_EXECUTABLE AND EXISTS "/review/.operation-regressions-disposable")
+        add_test(
+            NAME mcpp_ext2_undelete
+            COMMAND
+                ${MCPP_PYTHON_EXECUTABLE}
+                -B
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_ext2_undelete.py
+                --binary $<TARGET_FILE:mcpp_ext2_undelete_tests>
+                --root /review/cases/ext2-undelete-ctest
+        )
+        set_tests_properties(mcpp_ext2_undelete PROPERTIES TIMEOUT 60)
         add_test(
             NAME mcpp_shell_variants
             COMMAND
@@ -756,6 +784,26 @@ if(MCPP_BUILD_TESTS)
                     --tmux ${MCPP_TMUX_EXECUTABLE}
             )
             set_tests_properties(mcpp_extfs_ui PROPERTIES TIMEOUT 90)
+            add_test(
+                NAME mcpp_ext2_undelete_ui
+                COMMAND
+                    ${MCPP_PYTHON_EXECUTABLE}
+                    -B
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_ext2_undelete_ui.py
+                    $<TARGET_FILE:mcpp>
+                    --tmux ${MCPP_TMUX_EXECUTABLE}
+            )
+            set_tests_properties(mcpp_ext2_undelete_ui PROPERTIES TIMEOUT 90)
+            add_test(
+                NAME mcpp_archive_incremental_ui
+                COMMAND
+                    ${MCPP_PYTHON_EXECUTABLE}
+                    -B
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_archive_incremental_ui.py
+                    $<TARGET_FILE:mcpp>
+                    --tmux ${MCPP_TMUX_EXECUTABLE}
+            )
+            set_tests_properties(mcpp_archive_incremental_ui PROPERTIES TIMEOUT 90)
             add_test(
                 NAME mcpp_extfs_sourceless_ui
                 COMMAND

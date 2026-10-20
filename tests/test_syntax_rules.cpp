@@ -115,6 +115,37 @@ context [ ] brightmagenta black
     std::cout << "PASS MC-native empty repeated sets, omitted keyword colors and transactional reload\n";
 }
 
+void test_native_consumption(const std::filesystem::path& root) {
+    const auto registry = root / "Syntax";
+    write(registry, R"(file . Original\sConsuming\sPatterns
+context default lightgray black
+ spellcheck
+ keyword whole sentinel yellow
+ keyword \[ab\] brightgreen
+ keyword * brightred
+)");
+    mcpp::SyntaxHighlighter highlighter;
+    highlighter.load_registry(registry, root / "syntax.d");
+    const std::vector<std::string> lines{"sentinel", "abba! aba", ""};
+    const auto spans = highlighter.highlight("original.consume", lines);
+    check(spans.size() == lines.size() && spans.back().empty(),
+          "repetition-only keywords preserve empty rows");
+    for (std::size_t row = 0; row < 2U; ++row) {
+        for (std::size_t byte = 0; byte < lines[row].size(); ++byte) {
+            check(color_at(spans[row], byte).foreground == (row == 0U ? 11 : 10),
+                  "repetition-only keywords match cached native colors at every byte");
+        }
+        for (const auto& span : spans[row]) {
+            check(span.begin < span.end && span.end <= lines[row].size(),
+                  "empty keyword matches always make bounded byte progress");
+        }
+    }
+    const auto spelling = highlighter.spelling_ranges("original.consume", lines);
+    check(spelling && *spelling == std::vector<mcpp::SyntaxSpellingRange>{{0U, 19U}},
+          "empty keyword matches preserve original spelling byte offsets and newlines");
+    std::cout << "PASS cached MC-native repetition-only colors, byte progress and spelling offsets\n";
+}
+
 void test_native_bytes(const std::filesystem::path& root) {
     const auto registry = root / "Syntax";
     write(registry, R"(file . Original\sNative\sBytes
@@ -193,16 +224,19 @@ int main(const int argc, const char* const* argv) {
     try {
         if (argc != 2 && !(argc == 3 && (std::string_view(argv[2]) == "spellcheck" ||
                                        std::string_view(argv[2]) == "native-bytes" ||
-                                       std::string_view(argv[2]) == "native-format"))) {
+                                       std::string_view(argv[2]) == "native-format" ||
+                                       std::string_view(argv[2]) == "native-consumption"))) {
             throw std::runtime_error(
-                "usage: syntax-model owned-fixture-directory [spellcheck|native-bytes|native-format]"
+                "usage: syntax-model owned-fixture-directory "
+                "[spellcheck|native-bytes|native-format|native-consumption]"
             );
         }
         const auto root = std::filesystem::path(argv[1]);
         const auto definitions = root / "syntax.d";
         std::filesystem::create_directories(definitions);
         if (argc == 3) {
-            if (std::string_view(argv[2]) == "native-format") test_native_format(root);
+            if (std::string_view(argv[2]) == "native-consumption") test_native_consumption(root);
+            else if (std::string_view(argv[2]) == "native-format") test_native_format(root);
             else if (std::string_view(argv[2]) == "native-bytes") test_native_bytes(root);
             else test_spelling_contexts(root);
             return 0;

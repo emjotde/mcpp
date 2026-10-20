@@ -246,7 +246,8 @@ The later archive work below adds nested archives, sparse/special members,
 older cpio formats and streamed data beyond the former byte caps. Standard GNU
 tar `./` prefixes still work; traversal and ambiguous canonical names are
 rejected. The single-file transformation family is delivered separately;
-source-based extfs now exists, while ext2 undelete is still missing.
+source-based extfs now exists, and the read-only ext2 image extension below is
+partial L32 support rather than native block-device undelete.
 
 The hex viewer now highlights the matching byte in both hex and ASCII columns.
 Only the input column receives the terminal cursor; mouse/nibble placement,
@@ -265,9 +266,24 @@ and revision in their cache keys and return paths. GNU sparse tar variants,
 odc and V7 binary little/big-endian cpio preserve their data/kinds, including
 sparse holes and safe FIFO extraction. Private seekable storage replaces the
 former 64 MiB encoded/256 MiB expanded caps. Member/path/metadata/extent and
-natural format/disk limits remain enforced. Ambiguous PWB/vendor cpio,
-incremental/multivolume tar and unsupported PAX extensions remain explicit
+natural format/disk limits remain enforced. GNU `D` directories and local PAX
+`GNU.dumpdir` now support read-only browsing and exact member copying. Restore
+names/renames are validated metadata, not destination operations; omitted prior
+backup contents are not invented. The native MC control navigated directories
+but returned next-header bytes for the regular member, so mcpp's actual payload
+was checked against GNU tar instead of reproducing that bug.
+Ambiguous PWB/vendor cpio, writable incremental archives, multivolume tar and
+unsupported PAX extensions remain explicit
 format limits; the zstd command path was not runtime-checked in this environment.
+
+`image/undel://member` now provides read-only deleted regular inode recovery from
+stable ext2 images, with actual source-provider identity/revision, explicit
+unrecoverable reads and real-image root exits. Missing pointers are not treated
+as holes, and the source image is never modified. The member colon remains part
+of editor filenames; explicit line suffixes follow it. Native MC rejected both
+tested regular-image URI forms, so native block-device naming/root/metadata
+parity is not claimed. **L32 remains partial** for native device recovery and
+other unsupported filesystem/inode features.
 
 Native source-based extfs helpers now provide listing, copyout and accepted
 copyin/rm/mkdir/rmdir through guarded private candidates. Actual extension
@@ -327,10 +343,12 @@ and color renderer, with transactional reload, saved selections and legacy-file
 preservation. Colorless keywords inherit their context colors, and empty
 `\[\]` repeat markers retain surrounding literal patterns, matching native
 MC 4.8.30. Registry expressions now use PCRE2. No further directive or flag
-omissions were found in the installed format. **L22 is not yet counted closed**:
-patterns made only of `*` and repeated sets remain rejected, and their native
-behavior has not been checked. Aggregate input/include/macro/atom bounds remain
-explicit. Native MC 4.8.30 controls
+omissions were found in the installed format. Repetition-only keywords now
+match the cached native control, including zero-byte matches that color and
+advance at least one byte. **L22 is not yet counted closed**: truly empty
+patterns remain rejected and context transitions require positive consumption;
+native equivalence at that context boundary is unverified. Aggregate
+input/include/macro/atom bounds remain explicit. Native MC 4.8.30 controls
 confirm the existing ASCII-only case folding and byte-based sets, including
 partial UTF-8-byte matches; those are baseline behavior, not compatibility gaps.
 The editor now keeps UTF-8 characters visible across partial-byte syntax spans,
@@ -391,8 +409,9 @@ cover SFS viewing/comparison and F5 copying from a relative operand. The copied
 rejection were checked directly. Only the deferred ASCII and new copy portions
 were repeated after their fixes; no full suite was rerun.
 
-Local tar, cpio and single-file transformation families are now present, with
-their documented format/size bounds. Extfs and ext2 undelete remain absent.
+At that checkpoint, local tar, cpio and single-file transformation families
+were present with documented bounds, while extfs and ext2 undelete were absent.
+The later helper and read-only image deliveries above extend that snapshot.
 
 ### Large viewer data and skin inspection
 

@@ -384,6 +384,7 @@ struct ParseState {
     Model model;
     std::uint64_t next_object{1};
     std::set<std::string, std::less<>> explicit_names;
+    bool incremental{false};
     explicit ParseState() {
         auto root = new_node(EntryKind::directory, next_object++);
         root.implicit = true;
@@ -502,7 +503,7 @@ Pax parse_pax(const std::string_view bytes, SparseMap* sparse, const ArchiveLimi
         "path", "linkpath", "size", "uid", "gid", "uname", "gname",
         "mtime", "atime", "ctime", "hdrcharset", "GNU.sparse.major", "GNU.sparse.minor",
         "GNU.sparse.name", "GNU.sparse.realsize", "GNU.sparse.size", "GNU.sparse.numblocks",
-        "GNU.sparse.map", "GNU.sparse.offset", "GNU.sparse.numbytes"
+        "GNU.sparse.map", "GNU.sparse.offset", "GNU.sparse.numbytes", "GNU.dumpdir"
     };
     Pax result;
     std::optional<std::uint64_t> sparse_offset;
@@ -520,7 +521,8 @@ Pax parse_pax(const std::string_view bytes, SparseMap* sparse, const ArchiveLimi
         const auto key = record.substr(0, equal);
         if (!supported.contains(key)) invalid("unsupported PAX metadata: " + std::string(key));
         auto value = std::string(record.substr(equal + 1U, record.size() - equal - 2U));
-        if (value.find('\0') != std::string::npos) invalid("NUL in PAX metadata");
+        if (key != "GNU.dumpdir" && value.find('\0') != std::string::npos) invalid("NUL in PAX metadata");
+        if (key == "GNU.dumpdir" && sparse == nullptr) invalid("global PAX directory dump is unsupported");
         if (key.starts_with("GNU.sparse.") && sparse == nullptr) invalid("global sparse PAX metadata");
         if (key == "GNU.sparse.offset") {
             if (sparse_offset) invalid("unpaired PAX sparse offset");
@@ -534,6 +536,49 @@ Pax parse_pax(const std::string_view bytes, SparseMap* sparse, const ArchiveLimi
     }
     if (sparse_offset) invalid("unpaired PAX sparse offset");
     return result;
+}
+
+void validate_dumpdir(
+    const std::string_view bytes, const ArchiveLimits& limits, const Cancellation& cancellation
+) {
+    if (bytes.empty() || bytes.size() > limits.metadata_bytes) invalid("invalid or oversized GNU directory dump");
+    bool rename_target = false;
+    bool temporary_directory = false;
+    for (std::size_t offset = 0; offset < bytes.size();) {
+        cancellation.throw_if_requested();
+        const char code = bytes[offset];
+        if (code == '\0') {
+            if (offset + 1U != bytes.size() || rename_target) invalid("invalid GNU directory dump terminator");
+            return;
+        }
+        const auto end = bytes.find('\0', offset + 1U);
+        if (end == std::string_view::npos) invalid("unterminated GNU directory dump record");
+        const auto name = bytes.substr(offset + 1U, end - offset - 1U);
+        if (name.size() > limits.path_bytes) invalid("overlong GNU directory dump name");
+        if (rename_target && code != 'T') invalid("unpaired GNU directory dump rename");
+        switch (code) {
+            case 'Y': case 'N': case 'D':
+                static_cast<void>(member_path(name, code == 'D', limits));
+                break;
+            case 'X':
+                if (name.empty()) invalid("invalid GNU directory dump temporary directory");
+                temporary_directory = true;
+                break;
+            case 'R':
+                if (name.empty() && !temporary_directory) invalid("missing GNU directory dump rename source");
+                rename_target = true;
+                break;
+            case 'T':
+                if (!rename_target || (name.empty() && !temporary_directory)) {
+                    invalid("unpaired GNU directory dump rename target");
+                }
+                rename_target = false;
+                break;
+            default: invalid("unsupported GNU directory dump control code");
+        }
+        offset = end + 1U;
+    }
+    invalid("missing GNU directory dump terminator");
 }
 
 void check_tar_checksum(const std::string_view header) {
@@ -658,7 +703,7 @@ ParseState parse_tar(
         const bool extension = type == 'x' || type == 'g' || type == 'L' || type == 'K';
         if (!extension) {
             for (const auto& [key, value] : local) {
-                if (value.empty() && !key.starts_with("GNU.sparse.")) fields.erase(key);
+                if (value.empty() && !key.starts_with("GNU.sparse.") && key != "GNU.dumpdir") fields.erase(key);
                 else fields.insert_or_assign(key, value);
             }
             if (const auto found = fields.find("size"); found != fields.end()) size = unsigned_number(found->second, 10, "PAX size");
@@ -738,14 +783,26 @@ ParseState parse_tar(
         switch (type) {
             case '\0': case '0': case '1': case '7': case 'S': kind = EntryKind::file; break;
             case '2': kind = EntryKind::symlink; break;
-            case '5': kind = EntryKind::directory; break;
+            case '5': case 'D': kind = EntryKind::directory; break;
             case '3': kind = EntryKind::other; type_mode = S_IFCHR; break;
             case '4': kind = EntryKind::other; type_mode = S_IFBLK; break;
             case '6': kind = EntryKind::other; type_mode = S_IFIFO; break;
-            default: invalid("unsupported tar member type (incremental or multivolume archive)");
+            default: invalid("unsupported tar member type (multivolume or vendor extension)");
         }
         const bool regular_data = type == '\0' || type == '0' || type == '7' || type == 'S';
-        if ((!regular_data && size != 0U) || (pax_sparse && !regular_data)) invalid("data or sparse map on a non-regular tar member");
+        if ((!regular_data && type != 'D' && size != 0U) || (pax_sparse && !regular_data)) {
+            invalid("data or sparse map on a non-regular tar member");
+        }
+        const auto dumpdir = fields.find("GNU.dumpdir");
+        if (dumpdir != fields.end()) {
+            if (kind != EntryKind::directory || type == 'D') invalid("conflicting or misplaced PAX directory dump");
+            validate_dumpdir(dumpdir->second, limits, cancellation);
+            state.incremental = true;
+        } else if (type == 'D') {
+            if (size > limits.metadata_bytes) invalid("GNU directory dump exceeds the metadata byte limit");
+            validate_dumpdir(bytes->bytes(body_offset, static_cast<std::size_t>(size), cancellation), limits, cancellation);
+            state.incremental = true;
+        }
         auto node = new_node(kind, state.next_object++);
         auto& entry = node.entry;
         if (type_mode != 0U) entry.mode = type_mode;
@@ -765,7 +822,7 @@ ParseState parse_tar(
             entry.changed = parse_time(std::to_string(tar_number(header.substr(357, 12))));
             if (nonnegative_tar_number(header.substr(369, 12)) != 0U || !all_zero(header.substr(381, 5)) ||
                 !all_zero(header.substr(495)) || (type != 'S' && !all_zero(header.substr(386, 109)))) {
-                invalid("unsupported GNU incremental or multivolume metadata");
+                invalid("unsupported GNU multivolume or reserved metadata");
             }
         }
         node.device_major = uint32_number(nonnegative_tar_number(header.substr(329, 8)), "tar device major");
@@ -1610,6 +1667,8 @@ public:
             resolve_hardlinks(parsed, cancellation);
         }
         validate_model(parsed.model, bounds, cancellation);
+        // Restore-only dumpdir names and renames must not be lost by a normal archive rewrite.
+        if (options.writable && parsed.incremental) invalid("GNU incremental archives are read-only");
         model = std::move(parsed.model);
         update_links();
         next_object = parsed.next_object;

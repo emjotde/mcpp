@@ -23,13 +23,27 @@ std::size_t parse_line_number(const std::string_view value) {
 
 EditorFile parse_editor_file(std::string path) {
     if (path.empty()) throw std::invalid_argument("file name is empty");
+    const auto digits = [](const std::string_view value) {
+        return !value.empty() && std::ranges::all_of(value, [](const char character) {
+            return character >= '0' && character <= '9';
+        });
+    };
+    constexpr std::string_view undelete = "/undel://";
+    if (const auto marker = path.rfind(undelete); marker != std::string::npos) {
+        const auto member = std::string_view(path).substr(marker + undelete.size());
+        const auto colon = member.find(':');
+        if (colon != std::string_view::npos && digits(member.substr(0, colon)) &&
+            digits(member.substr(colon + 1U))) {
+            return {std::move(path), 0};
+        }
+    }
     const auto end = path.size() - (path.ends_with(':') ? 1U : 0U);
     const auto separator = path.rfind(':', end == 0U ? 0U : end - 1U);
     if (separator == std::string::npos || separator == 0U || separator + 1U >= end) {
         return {std::move(path), 0};
     }
     const auto number = std::string_view(path).substr(separator + 1U, end - separator - 1U);
-    if (!std::ranges::all_of(number, [](const char value) { return value >= '0' && value <= '9'; }) ||
+    if (!digits(number) ||
         std::filesystem::exists(std::filesystem::symlink_status(path))) {
         return {std::move(path), 0};
     }

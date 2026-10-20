@@ -217,9 +217,7 @@ Pattern parse_pattern(
             });
         }
     }
-    if (pattern.atoms.empty() || std::ranges::all_of(pattern.atoms, [](const Atom& atom) {
-            return atom.kind == AtomKind::any || atom.kind == AtomKind::set_many;
-        })) fail(line, "syntax pattern must consume at least one character");
+    if (pattern.atoms.empty()) fail(line, "syntax pattern must consume at least one character");
     if (pattern.atoms.size() > 512U) fail(line, "syntax pattern exceeds 512 elements");
     if (delimiter && (pattern.atoms.front().kind == AtomKind::any ||
                       pattern.atoms.back().kind == AtomKind::any)) {
@@ -232,7 +230,8 @@ std::optional<std::size_t> match(
     const Pattern& pattern,
     const std::string_view text,
     const std::size_t begin,
-    const bool insensitive
+    const bool insensitive,
+    const bool allow_empty = false
 ) {
     if (begin >= text.size() ||
         (pattern.linestart && begin != 0U && text[begin - 1U] != '\n') ||
@@ -243,7 +242,7 @@ std::optional<std::size_t> match(
     const auto visit = [&](auto&& self, const std::size_t index, const std::size_t cursor)
         -> std::optional<std::size_t> {
         if (index == pattern.atoms.size()) {
-            if (cursor == begin || (pattern.right && cursor < text.size() &&
+            if ((!allow_empty && cursor == begin) || (pattern.right && cursor < text.size() &&
                 in_set(text[cursor], pattern.right_characters, insensitive))) return {};
             return cursor;
         }
@@ -256,6 +255,9 @@ std::optional<std::size_t> match(
             return accepts ? self(self, index + 1U, cursor + 1U) : std::optional<std::size_t>{};
         }
         if (failed.contains({index, cursor})) return {};
+        if (atom.kind == AtomKind::any && allow_empty) {
+            if (auto found = self(self, index + 1U, cursor)) return found;
+        }
         auto end = cursor;
         while (end < text.size()) {
             const auto value = text[end];
@@ -580,9 +582,11 @@ void scan_rules(const SyntaxRuleSet& rules, const std::string_view text, Emit em
         const auto& context = rules.contexts[active];
         bool consumed = false;
         for (const auto& keyword : context.keywords) {
-            if (const auto end = match(keyword.pattern, text, cursor, rules.insensitive)) {
-                emit(cursor, *end, keyword.color, context.spellcheck);
-                cursor = *end;
+            if (const auto end = match(keyword.pattern, text, cursor, rules.insensitive, true)) {
+                // MC colors the current byte even when a keyword matches no bytes.
+                const auto next = std::max(cursor + 1U, *end);
+                emit(cursor, next, keyword.color, context.spellcheck);
+                cursor = next;
                 consumed = true;
                 break;
             }

@@ -34,6 +34,10 @@ public:
         const Location& source,
         const Cancellation& cancellation = {}
     );
+    [[nodiscard]] ProviderPtr open_undelete(
+        const Location& source,
+        const Cancellation& cancellation = {}
+    );
     [[nodiscard]] ProviderPtr open_transform(
         const Location& source, std::string_view converter,
         std::string_view parameter = {},
@@ -53,15 +57,21 @@ public:
     void prune();
 
 private:
+    enum class CacheKind { archive, ext2_undelete };
+
     struct Record {
         ProviderPtr provider;
         std::string source_location;
         std::chrono::steady_clock::time_point last_used;
     };
+    [[nodiscard]] ProviderPtr open_cached(
+        const Location& source, CacheKind kind,
+        const Cancellation& cancellation
+    );
     ProviderPtr local_;
     std::chrono::seconds timeout_;
     mutable std::mutex mutex_;
-    std::map<std::tuple<ProviderPtr, std::string, std::string>, Record> records_;
+    std::map<std::tuple<CacheKind, ProviderPtr, std::string, std::string>, Record> records_;
     TransformCache transformations_;
     ExtfsCache external_filesystems_;
 };

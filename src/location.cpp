@@ -1,6 +1,7 @@
 #include "mcpp/location.hpp"
 #include "mcpp/archive_provider.hpp"
 #include "mcpp/config.hpp"
+#include "mcpp/ext2_undelete_provider.hpp"
 #include "mcpp/local_provider.hpp"
 
 #include <algorithm>
@@ -71,12 +72,23 @@ ProviderPtr ArchiveCache::open_extfs_source_less(
 }
 
 ProviderPtr ArchiveCache::open(const Location& source, const Cancellation& cancellation) {
+    return open_cached(source, CacheKind::archive, cancellation);
+}
+
+ProviderPtr ArchiveCache::open_undelete(const Location& source, const Cancellation& cancellation) {
+    return open_cached(source, CacheKind::ext2_undelete, cancellation);
+}
+
+ProviderPtr ArchiveCache::open_cached(
+    const Location& source, const CacheKind kind, const Cancellation& cancellation
+) {
     prune();
-    if (!source.provider) throw std::invalid_argument("archive source provider is null");
+    const std::string kind_name = kind == CacheKind::archive ? "archive" : "ext2 image";
+    if (!source.provider) throw std::invalid_argument(kind_name + " source provider is null");
     const auto path = source.provider->normalize(source.path);
     const auto entry = source.provider->stat_follow(path, cancellation);
-    if (entry.kind != EntryKind::file) throw std::runtime_error("archive is not a regular file: " + path);
-    const auto key = std::tuple{source.provider, path, entry.revision};
+    if (entry.kind != EntryKind::file) throw std::runtime_error(kind_name + " is not a regular file: " + path);
+    const auto key = std::tuple{kind, source.provider, path, entry.revision};
     {
         const std::lock_guard lock(mutex_);
         const auto found = records_.find(key);
@@ -86,10 +98,15 @@ ProviderPtr ArchiveCache::open(const Location& source, const Cancellation& cance
         }
     }
     const auto label = format(source.provider, path);
-    auto provider = open_archive_provider(source.provider, path,
-        {.draft_directory=archive_draft_directory()}, cancellation);
+    ProviderPtr provider;
+    if (kind == CacheKind::archive) {
+        provider = open_archive_provider(source.provider, path,
+            {.draft_directory=archive_draft_directory()}, cancellation);
+    } else {
+        provider = open_ext2_undelete_provider(source.provider, path, label, {}, cancellation);
+    }
     if (source.provider->stat_follow(path, cancellation).revision != entry.revision) {
-        throw std::runtime_error("archive changed while it was being opened: " + path);
+        throw std::runtime_error(kind_name + " changed while it was being opened: " + path);
     }
     const std::lock_guard lock(mutex_);
     const auto [found, inserted] = records_.try_emplace(
@@ -148,7 +165,9 @@ std::vector<std::string> ArchiveCache::locations() {
     for (const auto& [key, record] : records_) {
         static_cast<void>(key);
         const auto* archive = dynamic_cast<const ArchiveProvider*>(record.provider.get());
-        paths.insert(record.source_location + archive_suffix(*archive, "/"));
+        paths.insert(archive != nullptr
+            ? record.source_location + archive_suffix(*archive, "/")
+            : format_location(record.provider, "/"));
     }
     return {paths.begin(), paths.end()};
 }
@@ -157,6 +176,9 @@ std::string format_location(const ProviderPtr& provider, const std::string_view 
     if (!provider) throw std::invalid_argument("location provider is null");
     if (const auto* archive = dynamic_cast<const ArchiveProvider*>(provider.get())) {
         return format_location(archive->source_provider(), archive->source_path()) + archive_suffix(*archive, path);
+    }
+    if (const auto* undelete = dynamic_cast<const Ext2UndeleteProvider*>(provider.get())) {
+        return undelete->location(path);
     }
     if (const auto* external = dynamic_cast<const ExtfsProvider*>(provider.get())) {
         return external->location(path);
@@ -171,6 +193,10 @@ std::string format_location(const ProviderPtr& provider, const std::string_view 
 std::optional<Location> source_location(const Provider& provider) {
     if (const auto* archive = dynamic_cast<const ArchiveProvider*>(&provider)) {
         return Location{archive->source_provider(), archive->source_path()};
+    }
+    if (const auto* undelete = dynamic_cast<const Ext2UndeleteProvider*>(&provider)) {
+        const auto source = undelete->source();
+        return Location{source.provider, source.path};
     }
     if (const auto* external = dynamic_cast<const ExtfsProvider*>(&provider)) {
         if (external->is_source_less()) return std::nullopt;
@@ -222,7 +248,7 @@ bool is_transform_location(const std::string_view value) noexcept {
     const auto slash = value.rfind('/', marker);
     if (slash == std::string_view::npos || slash == 0U || slash + 1U == marker) return false;
     const auto name = value.substr(slash + 1U, marker - slash - 1U);
-    return name != "utar" && name != "ucpio";
+    return name != "utar" && name != "ucpio" && name != "undel";
 }
 
 namespace {
@@ -257,7 +283,11 @@ Location open_location_impl(
     if (std::ranges::any_of(remote_schemes, [name](const auto scheme) { return name == scheme; })) {
         throw std::invalid_argument("remote providers are not enabled: " + std::string(value));
     }
-    const auto helper = name == "utar" || name == "ucpio"
+    if (name == "undel" && (slash == std::string_view::npos || slash == 0U)) {
+        throw std::invalid_argument(
+            "block-device undelete is not enabled; use a regular image/undel://member location");
+    }
+    const auto helper = name == "utar" || name == "ucpio" || name == "undel"
         ? std::optional<ExtfsHelper>{} : find_extfs_helper(name);
     const auto parameter = value.substr(marker + 3U);
     if (helper && !helper->requires_source) {
@@ -302,6 +332,12 @@ Location open_location_impl(
         return {.provider=std::move(provider), .path=member};
     }
     const auto source = open_location_impl(outer, base, archives, cancellation, depth + 1U);
+    if (name == "undel") {
+        ArchiveCache temporary(base.provider);
+        auto provider = (archives == nullptr ? temporary : *archives).open_undelete(source, cancellation);
+        const auto member = provider->normalize("/" + std::string(parameter));
+        return {.provider=std::move(provider), .path=member};
+    }
     if (helper) {
         ProviderPtr provider;
         if (archives != nullptr) provider = archives->open_extfs(source, name, cancellation);

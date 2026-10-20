@@ -146,6 +146,15 @@ void editor_operands(const std::filesystem::path& root) {
             mcpp::parse_editor_file(parsed.paths.back()).path == "literal:12" &&
             mcpp::parse_editor_file(parsed.paths.back()).line == 0U,
             "existing literal colon names take precedence over line suffixes");
+    const std::string recovered = "/captured.ext2/undel://12:1";
+    const auto literal_member = mcpp::parse_editor_file(recovered);
+    require(literal_member.path == recovered && literal_member.line == 0U,
+            "the undelete member colon is not an editor line suffix");
+    for (const auto& suffix : {std::string(":9"), std::string(":9:")}) {
+        const auto positioned = mcpp::parse_editor_file(recovered + suffix);
+        require(positioned.path == recovered && positioned.line == 9U,
+                "an explicit line suffix follows the complete undelete member");
+    }
     const auto standalone = mcpp::parse_cli(std::array{"+4"sv, "--"sv, "-draft"sv},
                                            mcpp::CliFrontend::editor);
     require(standalone.first_line == 4U && standalone.paths == std::vector<std::string>{"-draft"},

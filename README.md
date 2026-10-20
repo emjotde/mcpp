@@ -445,9 +445,11 @@ expressions use PCRE2, including lookarounds, Unicode properties and case foldin
 
 No further directive or flag omissions were found in the installed MC 4.8.30
 format. Definitions are bounded to 8 MiB combined input, 64 active includes,
-64 active macro names and 512 pattern atoms. Patterns made only of `*` and
-repeated sets still fail explicitly; their native behavior is unverified, so
-complete syntax compatibility is not yet claimed. Keyword/context case
+64 active macro names and 512 pattern atoms. Repetition-only keywords are
+supported; a zero-byte keyword match colors and advances at least one byte.
+Truly empty patterns still fail, and context transitions require positive
+consumption. Native equivalence for that context bound is unverified, so complete
+syntax compatibility is not yet claimed. Keyword/context case
 folding and byte-based pattern sets match MC 4.8.30, including byte offsets
 inside UTF-8 text; they are not Unicode word matching. Unknown directives fail
 explicitly. The editor keeps UTF-8 characters intact when byte-oriented syntax
@@ -543,8 +545,13 @@ missing tools fail explicitly. Data streams through private seekable snapshots,
 without the former 64 MiB encoded/256 MiB expanded caps or whole-file RAM buffers.
 Index limits remain 100,000 members, 4,096-byte paths, 16 MiB metadata and one
 million sparse extents; disk, `off_t` and format field ranges still apply.
-Ambiguous PWB/vendor cpio, incremental/multivolume tar and unsupported PAX
-extensions fail explicitly. No archive is blindly extracted into a host directory.
+GNU incremental `D` directories and local PAX `GNU.dumpdir` metadata support
+read-only browsing and copying. Dump names and rename/deletion records are
+validated as restore metadata, not exposed as members or replayed on the
+destination. Contents omitted from an earlier backup are not reconstructed.
+Writable incremental archives, ambiguous PWB/vendor cpio, multivolume tar and
+unsupported PAX extensions fail explicitly. No archive is blindly extracted into
+a host directory.
 
 ## External filesystem helpers
 
@@ -604,6 +611,27 @@ native Yes/No/All/None/Abort choices. All and None apply to the rest of that
 operation. None leaves nonempty directories and their selection marks intact,
 while selected regular files and empty directories can still be removed.
 Safe delete defaults to No in both initial and recursive confirmations.
+
+## Ext2 image recovery
+
+`image.ext2/undel://` opens a read-only view of deleted regular inodes in a
+stable ext2 image. This is an mcpp image extension, not verified compatibility
+with MC's block-device undelete paths. Members use `<inode>:<free-data-blocks>`
+names; original filenames and directory trees are not recovered.
+The member's colon stays part of its filename in editor arguments; an optional
+editor line suffix follows the complete member name.
+
+The reader supports Linux ext2 revision 0/1, 1/2/4 KiB blocks and traditional
+direct/indirect block maps. Missing, reused, overlapping or invalid blocks make
+recovery fail before any bytes are returned; missing pointers are not guessed
+to be sparse holes. Source revisions are checked throughout reads, so replacing
+or modifying an image invalidates the open view. The image is never written.
+
+Block devices, journals/extents, unknown filesystem features, dirty filesystems,
+external inode xattrs and nonregular inode recovery are rejected. Image, inode,
+metadata and block-map limits remain explicit. Ext2 cannot prove that a block
+which is free now was not overwritten and freed again. Work from a stable image
+without writing to the filesystem being recovered.
 
 ## Shell
 
