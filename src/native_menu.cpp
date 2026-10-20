@@ -386,6 +386,12 @@ public:
     [[nodiscard]] bool enabled() const { return enabled_; }
     [[nodiscard]] bool word_started() const { return word_started_; }
 
+    [[nodiscard]] bool extended_pattern(const std::string_view remaining) const {
+        return enabled_ && !cases_.empty() && cases_.back().phase == Phase::pattern &&
+            remaining.size() >= 2U && remaining[1] == '(' &&
+            std::string_view("?*+@!").find(remaining.front()) != std::string_view::npos;
+    }
+
     void literal(const char character) {
         if (!enabled_) return;
         word_started_ = true;
@@ -694,12 +700,12 @@ private:
     }
 
     void shell(const char closing, const bool arithmetic, const std::size_t backticks,
-               const std::size_t depth = 0U) {
+               const std::size_t depth = 0U, const bool pattern = false) {
         if (depth > 128U) throw std::invalid_argument("user-menu shell substitutions are nested too deeply");
         ShellQuote quote = ShellQuote::none;
         std::size_t parentheses = closing == ')' ? (arithmetic ? 2U : 1U) : closing == ']' ? 1U : 0U;
         std::vector<HereDocument> pending;
-        SubstitutionCases cases(closing == ')' && !arithmetic);
+        SubstitutionCases cases(closing == ')' && !arithmetic && !pattern);
         while (index_ < command_.size()) {
             const auto character = command_[index_];
             if (character == '\\' && quote != ShellQuote::single) {
@@ -758,10 +764,17 @@ private:
                 continue;
             }
             if (quote == ShellQuote::none) {
+                if (cases.extended_pattern(command_.substr(index_))) {
+                    cases.quoted();
+                    index_ += 2U;
+                    // Bash balances the pattern word separately from the case-arm close.
+                    shell(')', false, backticks, depth + 1U, true);
+                    continue;
+                }
                 if (blank(character) || std::string_view(";&|()<>").find(character) != std::string_view::npos) {
                     cases.finish_word(character == '<' || character == '>');
                 }
-                if (character == '#' && !arithmetic &&
+                if (character == '#' && !arithmetic && !pattern &&
                     (cases.enabled() ? !cases.word_started() :
                      (index_ == 0U || blank(command_[index_ - 1U]) ||
                       std::string_view(";|&()").find(command_[index_ - 1U]) != std::string_view::npos))) {
@@ -779,15 +792,15 @@ private:
                     pending.clear();
                     continue;
                 }
-                if (!arithmetic && character == '<' && command_.substr(index_).starts_with("<<<")) {
+                if (!arithmetic && !pattern && character == '<' && command_.substr(index_).starts_with("<<<")) {
                     index_ += 3U;
                     continue;
                 }
-                if (!arithmetic && character == '<' && command_.substr(index_).starts_with("<<")) {
+                if (!arithmetic && !pattern && character == '<' && command_.substr(index_).starts_with("<<")) {
                     pending.push_back(delimiter());
                     continue;
                 }
-                if (!arithmetic && command_.substr(index_).starts_with("((")) {
+                if (!arithmetic && !pattern && command_.substr(index_).starts_with("((")) {
                     index_ += 2U;
                     shell(')', true, backticks, depth + 1U);
                     continue;

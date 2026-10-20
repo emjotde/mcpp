@@ -119,7 +119,7 @@ void information_and_errors() {
     rejects([] { static_cast<void>(mcpp::parse_cli(std::array{"--skin"sv})); }, "requires a value");
     rejects([] { static_cast<void>(mcpp::parse_cli(std::array{"--termcap"sv})); }, "does not use termcap");
     rejects([] { static_cast<void>(mcpp::parse_cli(std::array{"--ftplog=log"sv})); }, "remote providers");
-    rejects([] { static_cast<void>(mcpp::parse_cli_colors(std::vector<std::string>{"input=red"})); },
+    rejects([] { static_cast<void>(mcpp::parse_cli_colors(std::vector<std::string>{"commandlinemark=red"})); },
             "unsupported color role");
     rejects([] { static_cast<void>(mcpp::parse_cli_colors(std::vector<std::string>{"header=red,blue"})); },
             "only a foreground");

@@ -92,6 +92,73 @@ def cases(root):
     print(json.dumps(results, indent=2))
 
 
+def extglobs(root):
+    left, right, ui = root / "left", root / "right", root / "ui"
+    left.mkdir()
+    right.mkdir()
+    (left / "selected").write_text("extended case fixture\n")
+    runner = root / "bash-extglob"
+    runner.write_text('#!/bin/sh\nexec /bin/bash -O extglob "$@"\n')
+    runner.chmod(0o700)
+    answer = "literal ' \" @(?|*) ) | \\ $(printf DATA)"
+    command = (
+        "printf '%%s\\0' \"$(case abbz-tail in "
+        "(@(%f|[()]|literal\\)|'quoted|)'|?(@(a|x))*(b)+(z|q)!(blocked))) "
+        "printf '%%s' %{Extglob bytes};; *) printf miss;; esac)\" "
+        "%f %0var{L20_EXTGLOB_WORDS:raw words} '@(?|*)'"
+    )
+    malformed = "printf '%%s' \"$(case x in @(?(@(x|y))) printf bad;; esac)\""
+    (left / ".mc.menu").write_text(
+        "g Record extended case patterns\n"
+        "    " + str(runner) + " <<'L20_EXTGLOB_BASH'\n"
+        "    shopt -p extglob > " + str(root / "extglob-state") + "\n"
+        "    " + command + " > " + str(root / "nested.bin") + "\n"
+        "    L20_EXTGLOB_BASH\n"
+        "    " + str(runner) + " -n <<'L20_EXTGLOB_INVALID' 2> " +
+        str(root / "invalid.stderr") + "\n"
+        "    " + malformed + "\n"
+        "    L20_EXTGLOB_INVALID\n"
+        "    printf '%%s' \"$?\" > " + str(root / "invalid.status") + "\n"
+        "    printf done > " + str(root / "done") + "\n"
+    )
+    config = ui / "config/mc"
+    config.mkdir(parents=True)
+    (config / "ini").write_text(
+        "[Midnight-Commander]\npause_after_run=0\nconfirm_exit=0\n"
+        "show_dot_files=0\n"
+    )
+    os.environ["LD_LIBRARY_PATH"] = "/review/control/lib"
+    # MC 4.8.30 leaves this raw environment form literal; do not mistake it for a pattern error.
+    expected = b"".join(value.encode() + b"\0" for value in (
+        answer, "selected", "%var{L20_EXTGLOB_WORDS:raw", "words}", "@(?|*)",
+    ))
+    with TerminalSession("/review/control/mc", "/usr/bin/tmux", ui,
+                         ["-u", left, right]) as terminal:
+        terminal.record_output()
+        terminal.wait_for("selected")
+        terminal.press("End", "F2")
+        terminal.wait_for("Record extended case patterns")
+        terminal.press("g")
+        terminal.wait_for("Extglob bytes")
+        terminal.type(answer)
+        terminal.press("Enter")
+        terminal.wait_file(root / "done", b"done")
+        terminal.wait_file(root / "nested.bin", expected)
+        terminal.wait_file(root / "extglob-state", b"shopt -s extglob\n")
+        terminal.wait_file(root / "invalid.status", b"2")
+        terminal.wait_idle()
+        terminal.save("native-extended-case-patterns")
+    results = {
+        "runner": runner.read_text(),
+        "nested_hex": (root / "nested.bin").read_bytes().hex(),
+        "extglob_state": (root / "extglob-state").read_text(),
+        "invalid_status": (root / "invalid.status").read_text(),
+        "invalid_stderr": (root / "invalid.stderr").read_text(),
+    }
+    (root / "observations.json").write_text(json.dumps(results, indent=2) + "\n")
+    print(json.dumps(results, indent=2))
+
+
 def main():
     if (os.geteuid() != 1001 or not Path("/.dockerenv").is_file() or
             not Path("/review/.operation-regressions-disposable").is_file()):
@@ -105,6 +172,8 @@ def main():
             numbers(root)
         elif sys.argv[2] == "cases":
             cases(root)
+        elif sys.argv[2] == "extglobs":
+            extglobs(root)
         else:
             raise SystemExit("unknown native menu reference selector")
         return

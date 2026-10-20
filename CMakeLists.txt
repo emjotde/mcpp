@@ -115,6 +115,7 @@ mcpp_target_defaults(mcpp_core)
 add_library(
     mcpp_ui
     src/app.cpp
+    src/input_styles.cpp
     src/keymap_input.cpp
     src/cli_display.cpp
     src/skin_glyphs_ui.cpp
@@ -253,6 +254,10 @@ if(MCPP_BUILD_TESTS)
     target_include_directories(mcpp_viewer_help_style_tests PRIVATE src)
     target_link_libraries(mcpp_viewer_help_style_tests PRIVATE mcpp_ui)
     mcpp_target_defaults(mcpp_viewer_help_style_tests)
+    add_executable(mcpp_input_style_tests tests/test_input_styles.cpp)
+    target_include_directories(mcpp_input_style_tests PRIVATE src)
+    target_link_libraries(mcpp_input_style_tests PRIVATE mcpp_ui)
+    mcpp_target_defaults(mcpp_input_style_tests)
     add_executable(mcpp_translation_tests tests/test_translation.cpp)
     target_link_libraries(mcpp_translation_tests PRIVATE mcpp_core)
     mcpp_target_defaults(mcpp_translation_tests)
@@ -315,6 +320,10 @@ if(MCPP_BUILD_TESTS)
             )
         endforeach()
         add_test(
+            NAME mcpp_native_input_styles
+            COMMAND mcpp_input_style_tests /review/cases/input-styles/model/ctest
+        )
+        add_test(
             NAME mcpp_archive_tests
             COMMAND mcpp_archive_tests /review/cases/agent-archives
         )
@@ -361,7 +370,7 @@ if(MCPP_BUILD_TESTS)
                         /review/cases/native-regex-${regex_case}
             )
         endforeach()
-        foreach(menu_case IN ITEMS words contexts numbers cases directories)
+        foreach(menu_case IN ITEMS words contexts numbers cases extglobs directories)
             add_test(
                 NAME mcpp_native_menu_${menu_case}
                 COMMAND mcpp_native_menu_complete_tests ${menu_case}

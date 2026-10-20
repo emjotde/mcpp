@@ -4,6 +4,7 @@
 
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -205,10 +206,9 @@ void cases(const std::filesystem::path& root) {
              "printf '%%s' \"$(case x in (x|) printf %f;; esac)\"",
              "printf '%%s' \"$(case x in x) case y in y) printf %f;; esac)\"",
              "printf '%%s' \"$(case x in (x printf %f;; esac)\"",
-             "printf '%%s' \"$(case x in x) printf 'esac';)\"",
-             "printf '%%s' \"$(case x in @(x|y)) printf %f;; esac)\""}) {
+             "printf '%%s' \"$(case x in x) printf 'esac';)\""}) {
         rejects([&] { static_cast<void>(mcpp::expand_native_menu(command, captured)); },
-                "malformed or unsupported case grammar must fail during expansion");
+                "malformed case grammar must fail during expansion");
         rejects([&] { static_cast<void>(mcpp::native_menu_requirements(command, true)); },
                 "requirements must reject the same malformed case grammar");
     }
@@ -216,6 +216,51 @@ void cases(const std::filesystem::path& root) {
         static_cast<void>(mcpp::expand_native_menu(
             "printf '%%s' \"$(case x in x) printf '%%s' $((%f));; esac)\"", captured));
     }, "case scanning must not turn ordinary arithmetic macro data into an expression");
+}
+
+void extglobs(const std::filesystem::path& root) {
+    const auto runner = root / "bash-extglob";
+    {
+        std::ofstream script(runner);
+        script << "#!/bin/sh\nexec /bin/bash -O extglob \"$@\"\n";
+        check(static_cast<bool>(script), "write the explicit extglob-enabled Bash runner");
+    }
+    std::filesystem::permissions(runner, std::filesystem::perms::owner_all);
+    auto captured = context(root);
+    captured.active.file = file("extglob ' \" @(?|*) ) | \\ café\n*.case");
+    captured.editor = true;
+    captured.block_file = "/captured/block @(|)";
+    captured.error_file = "/captured/error !()";
+    const auto name = captured.active.file->name;
+    const std::string command =
+        "printf '%%s\\0' \"$(case abbz-tail in "
+        "(@(%f|[()]|literal\\)|'quoted|)'|?(@(a|x))*(b)+(z|q)!(blocked))) "
+        "printf '%%s' %{Extglob bytes};; *) printf miss;; esac)\" "
+        "\"$(case %f in @('%f'|\"%{Pattern bytes}\"|%b|%e)) "
+        "printf '%%s' %f;; *) printf miss;; esac)\" "
+        "\"%f\" '%f' %0var{L20_EXTGLOB_F1DEC888:raw words} '@(?|*)'";
+    const auto requirements = mcpp::native_menu_requirements(command, true);
+    check(requirements.prompts == std::vector<std::string>{"Extglob bytes", "Pattern bytes"} &&
+              requirements.block_file && requirements.error_file,
+          "extended patterns must share the requirements and expansion scanner");
+    const std::string answer = "literal ' \" @(?|*) ) | \\ $(printf DATA)";
+    output(command, captured,
+           nul_values({answer, name, name, name, "raw", "words", "@(?|*)"}),
+           {answer, answer}, runner.string());
+    auto trusted = captured;
+    trusted.active.file = file("@(x|y)");
+    check(mcpp::expand_native_menu(
+              "printf '%%s' \"$(case x in %0f) printf trusted;; esac)\"", trusted).command ==
+              "printf '%s' \"$(case x in @(x|y)) printf trusted;; esac)\"",
+          "raw opt-in must retain trusted pattern source without rescanning macro bytes");
+    for (const auto malformed : {
+             "printf '%%s' \"$(case x in @(?(@(x|y))) printf bad;; esac)\"",
+             "printf '%%s' \"$(case x in @([)]|x)) printf bad;; esac)\""}) {
+        rejects([&] { static_cast<void>(mcpp::expand_native_menu(malformed, captured)); },
+                "extended patterns must not consume or invent the case-arm close");
+        rejects([&] { static_cast<void>(mcpp::native_menu_requirements(malformed, true)); },
+                "requirements must reject the same malformed extended patterns");
+    }
 }
 
 void directories(const std::filesystem::path& root) {
@@ -271,7 +316,7 @@ int main(int argc, char** argv) {
         return 1;
     }
     try {
-        check(argc == 3, "usage: native-menu-complete words|contexts|numbers|cases|directories /review/cases/menu-complete-*");
+        check(argc == 3, "usage: native-menu-complete words|contexts|numbers|cases|extglobs|directories /review/cases/menu-complete-*");
         const auto root = std::filesystem::path(argv[2]).lexically_normal();
         check(root.string().starts_with("/review/cases/menu-complete-"), "invalid disposable menu fixture root");
         std::filesystem::create_directories(root);
@@ -280,6 +325,7 @@ int main(int argc, char** argv) {
         else if (selected == "contexts") contexts(root);
         else if (selected == "numbers") numbers(root);
         else if (selected == "cases") cases(root);
+        else if (selected == "extglobs") extglobs(root);
         else if (selected == "directories") directories(root);
         else throw std::invalid_argument("unknown focused menu case");
         std::cout << "PASS native menu " << selected << '\n';

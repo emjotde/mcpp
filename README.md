@@ -100,6 +100,11 @@ attributes; omitted fields keep their current values and disabled-label contrast
 `errdhotfocus` retains its earlier whole-error-focus alias, not separate mnemonic
 styling. Native skin and CLI colors share `#RGB`/`#RRGGBB` parsing and the
 `inverse`/`reverse` attribute aliases. This does not add native INI `[Colors]`.
+Dialog fields use native `input`, `inputmark` and `inputunchanged` pairs.
+Pristine text and blank fill keep the unchanged style across blur; accepted
+interaction makes the field changed even if its bytes later match the original.
+Manual selection keeps its mark style when unfocused. Missing roles preserve
+the earlier fallback. The manager command line is excluded from these roles.
 Native backend controls `-x/-X/-g/-t/-s/-k` remain unavailable;
 `--help-terminal` explains why. ASCII frames do not implement non-UTF-8 terminal
 output or 7-bit input.
@@ -452,9 +457,12 @@ not Bash-only base prefixes, so it also works with `sh`/dash.
 Modern `$(...)` substitutions support standard `case`
 lists, alternatives, optional pattern parentheses, nested cases and Bash
 fallthrough (`;&`/`;;&`). Quoted words and ordinary arguments do not become
-structural keywords. Extended-glob case patterns, nested old-style backticks,
-unsupported heredoc delimiters, and values that would terminate a heredoc or
-lose tabs with `<<-` fail explicitly.
+structural keywords. Nested Bash case patterns using `?()`, `*()`, `+()`,
+`@()` and `!()` are supported when the authored Bash command enables extglob
+before parsing, such as an explicit `bash -O extglob` runner. Mcpp does not
+silently enable shell options. Nested old-style backticks, unsupported heredoc
+delimiters, and values that would terminate a heredoc or lose tabs with `<<-`
+fail explicitly.
 
 ## External syntax definitions
 

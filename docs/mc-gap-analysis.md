@@ -342,11 +342,13 @@ quotes, arithmetic and heredocs. Ordinary values remain literal rather than
 becoming shell source. Named homes and CDPATH use a captured provider/directory;
 relative archive paths do not search the host filesystem. **L20 remains partial**
 against the original complete-expansion target: ordinary arithmetic values are
-decimal or hexadecimal literals only, nested old-style backticks and extended
-case patterns remain unsupported, and unsafe or unsupported heredoc forms fail
-explicitly. Standard `case` lists inside modern command substitutions now
+decimal or hexadecimal literals only, nested old-style backticks remain
+unsupported, and unsafe or unsupported heredoc forms fail explicitly.
+Standard `case` lists inside modern command substitutions now
 balance patterns, alternatives, nested cases and Bash fallthrough while keeping
 ordinary macro values literal. Requirements and expansion use the same scanner.
+Nested extended case patterns also work with an explicit extglob-enabled Bash
+runner; mcpp does not change the selected shell's options.
 
 External `Syntax` registries and definitions now feed the actual editor chooser
 and color renderer, with transactional reload, saved selections and legacy-file
@@ -407,8 +409,12 @@ dialog/error title and error-focus pairs. Inactive menus accept their complete
 pair while omitted fields preserve the current background and disabled contrast.
 Native skins and CLI overrides share color/attribute parsing, including hex RGB
 and `inverse`. The earlier `errdhotfocus` alias still paints the whole focus;
-independent mnemonic/input/editor-window roles without widget consumers remain
-explicit errors. Formatted viewer/Quick view text now consumes `viewbold` and
+unrendered command-line-mark, statusbar, mnemonic and editor-window roles remain
+explicit errors. Dialog input fields now use full `input`, `inputmark` and
+`inputunchanged` pairs, including pristine blank fill and blurred selection.
+Handled interaction clears pristine state rather than comparing the current
+bytes to the original; command input remains excluded.
+Formatted viewer/Quick view text now consumes `viewbold` and
 `viewunderline`, and original help headings/title/navigation use `helpbold` and
 `helpitalic`. Full pairs and explicit attributes are respected; missing roles
 retain prior emphasis, search colors win over nroff styles, and selected help

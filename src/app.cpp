@@ -28,6 +28,7 @@
 #include "mcpp/translation.hpp"
 #include "mcpp/diff.hpp"
 #include "mcpp/user_menu.hpp"
+#include "input_styles.hpp"
 #include "local_tools_stream.hpp"
 #include "viewer_help_styles.hpp"
 
@@ -1489,6 +1490,7 @@ struct TextInputState {
     ftxui::Box cursor_box;
     ftxui::Box box;
     bool dragging{false};
+    bool pristine{false};
     std::string history_id;
     std::vector<std::string> history;
     std::size_t history_index{0};
@@ -1507,6 +1509,7 @@ struct TextInputState {
                      ? std::optional<std::size_t>(0U)
                      : std::nullopt;
         dragging = false;
+        pristine = select_initial;
         history_index = history.size();
         draft = value;
         draft_cursor = cursor;
@@ -9628,6 +9631,7 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
                 state->history_index = state->history.size() - selected - 1U;
                 state->cursor = destination->size();
                 state->anchor.reset();
+                state->pristine = false;
                 state->completions.clear();
             }, mode);
         local_list_native = true;
@@ -9808,6 +9812,7 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
         } else {
             return false;
         }
+        input.pristine = false;
         return true;
     }
 
@@ -9822,6 +9827,10 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
         input.rendered_cursor = input.cursor;
         const auto anchor = std::min(input.anchor.value_or(input.cursor), value.size());
         const auto selected = std::minmax(anchor, input.cursor);
+        const bool use_input_roles = &input != &command_input &&
+            (find_skin_color(palette(), "core", "input") ||
+             find_skin_color(palette(), "core", "inputmark") ||
+             find_skin_color(palette(), "core", "inputunchanged"));
         Elements cells;
         for (std::size_t offset = 0; offset <= value.size();) {
             const auto next = next_utf8(value, offset);
@@ -9831,7 +9840,9 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
                     : display_text(std::string_view(value).substr(offset, next - offset))
             );
             if (offset >= selected.first && offset < selected.second) {
-                cell = cell | bold | underlined;
+                cell = use_input_roles
+                    ? detail::input_selection_style(std::move(cell), palette(), input.pristine)
+                    : std::move(cell) | bold | underlined;
             }
             if (offset == input.cursor) {
                 cell = std::move(cell) | reflect(input.cursor_box);
@@ -9844,6 +9855,15 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
                 break;
             }
             offset = next;
+        }
+        if (use_input_roles) {
+            auto label = text(std::string(prefix));
+            if (active) label = highlight(std::move(label), palette().dialog_focus);
+            return hbox({
+                std::move(label),
+                detail::input_field_style(
+                    hbox(std::move(cells)) | xflex | xframe, palette(), active, input.pristine),
+            }) | reflect(input.box);
         }
         auto field = hbox({
             text(std::string(prefix)),
@@ -9893,6 +9913,7 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
         }
         if (input.dragging) {
             input.cursor = position;
+            input.pristine = false;
             input.completions.clear();
             input.message.clear();
             return true;
@@ -9907,6 +9928,7 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
         value = std::move(edit.value);
         input.cursor = edit.cursor;
         input.anchor.reset();
+        input.pristine = false;
         input.completed_value = value;
         input.message = input.completion_warning;
     }
