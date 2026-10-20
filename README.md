@@ -678,8 +678,13 @@ the corresponding installed standard command; missing/failed tools are explicit
 errors. Parsed data is read-only, so hex Save cannot replace a compressed file
 with decompressed bytes. F9 toggles nroff overstrike formatting, including bold
 and underlined text. Formatting and codepages never convert the file on disk.
-Parsed/formatted buffers and advanced searches have a 64 MiB buffer limit;
-ordinary raw viewing and forward literal/hex search retain bounded range reads.
+Parsed/formatted data uses private seekable storage instead of the former
+64 MiB memory-buffer limit. Mapping uses owned immutable snapshots, not live
+files that could be truncated underneath it. Advanced searches retain the
+existing wildcard, word, direction and codepage behavior. Full POSIX-regex
+subjects remain limited to 2,147,483,647 bytes by libc; disk space, `off_t`,
+provider limits and regex workspace impose their own explicit limits.
+Ordinary raw viewing and forward literal/hex search retain bounded range reads.
 
 Digits `0`-`9` choose a viewer bookmark slot; `m` stores the displayed position
 and `r` restores it. `Alt-R` cycles ruler off/top/bottom. `Alt-E` chooses a data

@@ -14,6 +14,12 @@
 
 namespace mcpp {
 
+namespace viewer_detail {
+class Data;
+class OffsetMap;
+class Styles;
+}
+
 enum class ViewerLinkedSave { require_choice, detach, preserve_links };
 
 struct ViewerTextStyle {
@@ -57,7 +63,7 @@ public:
     void set_encoding(std::string codepage, const Cancellation& cancellation = {});
     [[nodiscard]] bool magic() const noexcept { return magic_; }
     [[nodiscard]] bool nroff() const noexcept { return nroff_; }
-    [[nodiscard]] bool parsed() const noexcept { return magic_content_.has_value(); }
+    [[nodiscard]] bool parsed() const noexcept { return magic_content_ != nullptr; }
     [[nodiscard]] const std::string& encoding() const noexcept { return encoding_; }
     void select_bookmark(std::size_t slot);
     void set_bookmark();
@@ -156,11 +162,14 @@ private:
     void read_source(std::uint64_t offset, std::uint64_t length, std::ostream& output,
                      const Cancellation& cancellation);
     void validate_edit_source(const Cancellation& cancellation) const;
+    void validate_snapshot_source(const Cancellation& cancellation) const;
+    [[nodiscard]] std::shared_ptr<viewer_detail::Data> capture_source(const Cancellation& cancellation);
+    [[nodiscard]] std::shared_ptr<viewer_detail::Data> search_data(const Cancellation& cancellation);
     void refresh_presentation(bool magic, bool nroff, std::string codepage, const Cancellation& cancellation);
     void select_presentation();
-    [[nodiscard]] const std::string* presentation() const noexcept;
-    [[nodiscard]] std::string read_all(const Cancellation& cancellation);
+    [[nodiscard]] const viewer_detail::Data* presentation() const noexcept;
     [[nodiscard]] std::uint64_t source_position(std::uint64_t position) const;
+    void set_view_end(std::uint64_t position);
     [[nodiscard]] std::optional<std::uint64_t> reveal_search_match(
         std::pair<std::uint64_t, std::uint64_t> match, const Cancellation& cancellation);
 
@@ -181,18 +190,19 @@ private:
     bool magic_{true};
     bool nroff_{false};
     std::string encoding_;
-    std::optional<std::string> magic_content_;
-    std::optional<std::string> text_content_;
+    std::shared_ptr<viewer_detail::Data> magic_content_;
+    std::shared_ptr<viewer_detail::Data> text_content_;
     bool presentation_dirty_{false};
-    std::vector<ViewerTextStyle> presentation_styles_;
-    std::vector<std::pair<std::size_t, std::size_t>> nroff_offsets_;
-    std::vector<std::pair<std::size_t, std::size_t>> codepage_offsets_;
-    std::string decoded_content_;
+    std::shared_ptr<viewer_detail::Styles> presentation_styles_;
+    std::shared_ptr<viewer_detail::OffsetMap> nroff_offsets_;
+    std::shared_ptr<viewer_detail::OffsetMap> codepage_offsets_;
+    std::shared_ptr<viewer_detail::Data> search_content_;
     std::vector<std::vector<ViewerTextStyle>> text_style_rows_;
     std::array<std::uint64_t, 10> bookmarks_{};
     std::size_t bookmark_slot_{0};
     std::uint64_t offset_{0};
     std::uint64_t view_end_{0};
+    std::uint64_t source_view_end_{0};
     std::uint64_t window_offset_{0};
     std::string window_;
     std::vector<std::uint64_t> previous_offsets_;

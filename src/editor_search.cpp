@@ -1,4 +1,5 @@
 #include "mcpp/editor_search.hpp"
+#include "editor_search_data.hpp"
 #include "mcpp/local_tools.hpp"
 #include <cerrno>
 #include <system_error>
@@ -287,6 +288,10 @@ public:
         const std::size_t match_count
     ) const {
         const Utf8CType locale(utf8_);
+        if (begin > static_cast<std::size_t>(std::numeric_limits<regoff_t>::max()) ||
+            end > static_cast<std::size_t>(std::numeric_limits<regoff_t>::max())) {
+            throw std::length_error("POSIX regex range exceeds this libc's offset limit");
+        }
         matches[0].rm_so = static_cast<regoff_t>(begin);
         matches[0].rm_eo = static_cast<regoff_t>(end);
         auto flags = REG_STARTEND;
@@ -296,13 +301,15 @@ public:
         if (end < text.size()) {
             flags |= REG_NOTEOL;
         }
-        return regexec(
+        const auto status = regexec(
             &value_,
             text.data(),
             match_count,
             matches,
             flags
         );
+        if (status == REG_ESPACE) throw std::runtime_error("POSIX regex exhausted its working memory");
+        return status;
     }
 
     [[nodiscard]] std::size_t capture_count() const { return value_.re_nsub + 1U; }
@@ -393,7 +400,9 @@ std::vector<EditorSearchMatch> regex_matches(
     const std::size_t range_end,
     const EditorSearchOptions& options,
     const bool overlap,
-    const std::size_t limit
+    const std::size_t limit,
+    const bool retain_last = false,
+    const std::optional<std::size_t> excluded_empty = std::nullopt
 ) {
     const RegexPattern expression(
         options.mode == EditorSearchMode::wildcard ? wildcard_expression(pattern) : std::string(pattern),
@@ -428,10 +437,14 @@ std::vector<EditorSearchMatch> regex_matches(
             );
         }
         if (!(candidate.begin == candidate.end && candidate.begin == text.size()) &&
+            !(excluded_empty && candidate.begin == candidate.end && candidate.begin == *excluded_empty) &&
             (!options.whole_words || whole_word(text, candidate))) {
-            result.push_back(candidate);
-            if (result.size() >= limit) {
-                return result;
+            if (retain_last) {
+                if (result.empty()) result.push_back(std::move(candidate));
+                else result.front() = std::move(candidate);
+            } else {
+                result.push_back(std::move(candidate));
+                if (result.size() >= limit) return result;
             }
         }
         const auto next =
@@ -573,6 +586,18 @@ std::vector<EditorSearchMatch> matches(
 
 }  // namespace
 
+bool search_detail::word_character(const std::string_view text) {
+    return word_at(text, 0);
+}
+
+std::vector<EditorSearchMatch> search_detail::casefolded_literals(
+    const std::string_view text, const std::string_view pattern,
+    const std::size_t begin, const std::size_t end
+) {
+    if (begin > end || end > text.size() || pattern.empty()) return {};
+    return utf8_literal_matches(text, pattern, begin, end, {}, false, std::numeric_limits<std::size_t>::max());
+}
+
 std::string EditorSearch::decode_hexadecimal(const std::string_view pattern) {
     return hexadecimal_pattern(pattern);
 }
@@ -684,15 +709,14 @@ std::optional<EditorSearchMatch> EditorSearch::find(
     const bool overlap
 ) {
     if (options.backwards) {
-        const auto before = matches(
-            text,
-            pattern,
-            range_begin,
-            std::clamp(start, range_begin, range_end),
-            options,
-            overlap,
-            std::numeric_limits<std::size_t>::max()
-        );
+        const auto last_matches = [&](const std::size_t begin, const std::size_t end,
+                                      const std::optional<std::size_t> excluded = std::nullopt) {
+            if (options.mode == EditorSearchMode::regular_expression || options.mode == EditorSearchMode::wildcard) {
+                return regex_matches(text, pattern, begin, end, options, overlap, 1U, true, excluded);
+            }
+            return matches(text, pattern, begin, end, options, overlap, std::numeric_limits<std::size_t>::max());
+        };
+        const auto before = last_matches(range_begin, std::clamp(start, range_begin, range_end), start);
         auto valid = before;
         std::erase_if(valid, [&](const EditorSearchMatch& match) {
             return match.begin == match.end && match.begin == start;
@@ -703,15 +727,7 @@ std::optional<EditorSearchMatch> EditorSearch::find(
         if (!wrap) {
             return std::nullopt;
         }
-        const auto wrapped = matches(
-            text,
-            pattern,
-            std::clamp(start, range_begin, range_end),
-            range_end,
-            options,
-            overlap,
-            std::numeric_limits<std::size_t>::max()
-        );
+        const auto wrapped = last_matches(std::clamp(start, range_begin, range_end), range_end);
         return wrapped.empty()
                    ? std::nullopt
                    : std::optional<EditorSearchMatch>{

@@ -96,6 +96,7 @@ add_library(
     src/user_menu.cpp
     src/tree_cache.cpp
     src/viewer.cpp
+    src/viewer_data.cpp
     src/editor.cpp
     src/editor_lock.cpp
     src/editor_clipboard.cpp
@@ -182,6 +183,9 @@ if(MCPP_BUILD_TESTS)
     add_executable(mcpp_viewer_source_tests tests/test_viewer_sources.cpp)
     target_link_libraries(mcpp_viewer_source_tests PRIVATE mcpp_core)
     mcpp_target_defaults(mcpp_viewer_source_tests)
+    add_executable(mcpp_viewer_large_tests tests/test_viewer_large.cpp)
+    target_link_libraries(mcpp_viewer_large_tests PRIVATE mcpp_core)
+    mcpp_target_defaults(mcpp_viewer_large_tests)
     add_executable(mcpp_append_resume_tests tests/test_append_resume.cpp)
     target_link_libraries(mcpp_append_resume_tests PRIVATE mcpp_core)
     mcpp_target_defaults(mcpp_append_resume_tests)
@@ -329,6 +333,13 @@ if(MCPP_BUILD_TESTS)
             NAME mcpp_viewer_source_stream
             COMMAND mcpp_viewer_source_tests stream /review/cases/streamed-viewer/stream
         )
+        foreach(viewer_large_case IN ITEMS boundary parsed search mapping)
+            add_test(
+                NAME mcpp_viewer_large_${viewer_large_case}
+                COMMAND mcpp_viewer_large_tests ${viewer_large_case}
+                        /review/cases/viewer-large-${viewer_large_case}-8f9fb4ef
+            )
+        endforeach()
         add_test(
             NAME mcpp_hotlist_tests
             COMMAND mcpp_hotlist_tests /review/cases/hierarchical-hotlists

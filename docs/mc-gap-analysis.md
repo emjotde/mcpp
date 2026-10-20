@@ -95,6 +95,7 @@ are retained; they are not bugs to remove in pursuit of default MC behavior.
 | L11 | Closed: native first-change `.#filename` locks, owner/stale-lock handling, Grab/Ignore/Escape decisions, lock-safe deferred actions/macros, transactional Save As and owned-lock cleanup. Save/close release locks without removing another session's replacement. Readonly archives and transient diff buffers do not lock host paths. |
 | L12 | Closed: dirty buffers and undo/redo survive codepage changes, encoded raw-byte searches map back to document positions, and marks/cursor/exact saves remain consistent. Invalid historical bytes fail explicitly during undo/redo without consuming history. Refined model cases and the real editor workflow pass. |
 | L13 | Closed: growing/truncated/replaced local sources refresh; streamed/fd input spools privately with terminal keyboard separation, range navigation and exit before EOF. Streams are raw/read-only, staged hex edits retain source-conflict guards, and transformed snapshots require explicit refresh. |
+| L14 | Closed for the former 64 MiB parsed/formatted/advanced-search cap: private seekable data, immutable owned mappings, streaming conversion and exact source/presentation offsets handle larger views without arbitrary whole-file RAM allocation. Four focused boundary/parsed/search/mapping cases pass. Real disk/`off_t`/provider limits, libc regex workspace and its 2,147,483,647-byte subject-offset bound remain explicit. |
 | L15 | Closed: command-position PATH/builtin/keyword completion and variable/user/local-host completion share native list/common-prefix behavior with filenames. Quotes, cursor suffixes, selection, UTF-8 and archive namespaces are preserved; completed archive URIs are accepted by F4. No shell evaluation/hooks or network lookup. |
 | L16 | Closed: purpose-separated dialog histories persist atomically in a private independent file, including filename/directory/copy and search/replace/goto inputs. Restart, draft/cursor restore, cleanup confirmation and failed-accept/retry behavior are verified. Arbitrary menu answers, secret inputs and key queries are not automatically enrolled. |
 | L17 | Closed: named entries/groups in the native hotlist format, hierarchical navigation, add/group/move/remove controls, safe persistence and flat-bookmark preservation. Cancels and failed writes retain data; canonical archive URIs, C-x h and configurable HotListAdd share the same flow. |
@@ -105,8 +106,8 @@ are retained; they are not bugs to remove in pursuit of default MC behavior.
 | L33 | Closed for the currently supported local providers: cached revisions, active-provider retention, unused timeout, private cache creation, native Active VFS list and timeout setting, and logical URI/alias preservation. Changed containers open a new snapshot; remote options stay outside the current scope. |
 | L34 | Closed: independent viewer/diff sessions appear alongside editor buffers in the native screen list and next/previous cycling. Dirty bytes, search/cursor/bookmarks, streams, comparison/editor return identity, save/link/conflict decisions and final standalone exits retain their own state. Labels fit the actual dialog content width without hiding filenames. |
 
-Standalone frontends are **4/4**. **Twenty-one of the 34 baseline work packages are
-closed; 13 baseline packages remain open**. This is a feature backlog, not an
+Standalone frontends are **4/4**. **Twenty-two of the 34 baseline work packages are
+closed; 12 baseline packages remain open**. This is a feature backlog, not an
 overall parity percentage. Additional gaps discovered afterward are listed
 separately, rather than silently changing the baseline denominator.
 The broader command-line option set is still L03, not implicitly completed by
@@ -332,6 +333,23 @@ were repeated after their fixes; no full suite was rerun.
 
 Local tar, cpio and single-file transformation families are now present, with
 their documented format/size bounds. Extfs and ext2 undelete remain absent.
+
+### Large viewer data and skin inspection
+
+Parsed/formatted views and advanced searches no longer require the former
+64 MiB materialized string. Private seekable snapshots and streaming adapters
+preserve byte/codepage/nroff mapping, search direction and source safeguards.
+Only owned immutable data is mapped; live file truncation cannot invalidate a
+mapped source. The shared Release/Werror build and four focused boundary,
+parsed, search and mapping cases pass. The libc POSIX-regex subject limit remains
+2,147,483,647 bytes; upstream provider limits are not silently removed.
+
+A separate read-only inspection of frozen `cb38117` visually covered all sixteen
+built-in skins at 110x32 truecolor. Controls/errors, editor menus/syntax, hex/ASCII
+cursor highlights and help looked correct in the captured states. Two issues
+remain unfixed: changed-row comparison searches use the wrong search colors in
+all skins, and disabled dropdown labels have low contrast in Default/Grayscale.
+Other terminal sizes/capabilities and external skins were not covered.
 
 ### Additional compatibility gaps
 

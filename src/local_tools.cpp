@@ -1,4 +1,5 @@
 #include "mcpp/local_tools.hpp"
+#include "local_tools_stream.hpp"
 
 #include <array>
 #include <cerrno>
@@ -137,12 +138,15 @@ TemporaryFile::~TemporaryFile() {
     if (error) std::cerr << "mcpp: temporary cleanup failed: " << error.message() << '\n';
 }
 
-CommandOutput capture_command(
+namespace {
+
+CommandOutput capture_command_impl(
     const std::vector<std::string>& arguments,
     const std::filesystem::path& directory,
     const Cancellation& cancellation,
     const std::size_t limit,
-    const std::optional<std::filesystem::path> input
+    const std::optional<std::filesystem::path> input,
+    std::ostream* streamed_output
 ) {
     if (arguments.empty() || arguments.front().empty()) {
         throw std::invalid_argument("command is empty");
@@ -213,6 +217,9 @@ CommandOutput capture_command(
                 auto& text = index == 0U ? result.output : result.error;
                 if (count == 0) {
                     pipe.close_end(0);
+                } else if (index == 0U && streamed_output != nullptr) {
+                    streamed_output->write(bytes.data(), count);
+                    if (!*streamed_output) throw std::runtime_error("cannot write local command output");
                 } else {
                     const auto size = static_cast<std::size_t>(count);
                     if (text.size() > limit || size > limit - text.size()) {
@@ -239,6 +246,29 @@ CommandOutput capture_command(
         throw;
     }
     return result;
+}
+
+}  // namespace
+
+CommandOutput capture_command(
+    const std::vector<std::string>& arguments,
+    const std::filesystem::path& directory,
+    const Cancellation& cancellation,
+    const std::size_t limit,
+    const std::optional<std::filesystem::path> input
+) {
+    return capture_command_impl(arguments, directory, cancellation, limit, input, nullptr);
+}
+
+CommandOutput capture_command_to(
+    std::ostream& output,
+    const std::vector<std::string>& arguments,
+    const std::filesystem::path& directory,
+    const Cancellation& cancellation,
+    const std::size_t error_limit,
+    const std::optional<std::filesystem::path> input
+) {
+    return capture_command_impl(arguments, directory, cancellation, error_limit, input, &output);
 }
 
 CommandOutput capture_shell(
