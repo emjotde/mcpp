@@ -88,6 +88,7 @@ are retained; they are not bugs to remove in pursuit of default MC behavior.
 | L04 | Closed for the explicitly listed Bash work: persistent shell state and cwd, Ctrl-O hide/resume including running commands and Bash builtins, guarded drafts, native shell-exit behavior, asynchronous completion, safe shutdown, and command execution alongside file operations. Other shell variants are tracked separately below. |
 | L06 | Closed locally: native Append/Reget choices stage regular-file publication, validate revisions and resume prefixes, retain cancellation/progress and move fallback, and omit unsupported archive/remote/symlink/special append. Native reference, exact bytes, failure safety and actual collision UI are verified. |
 | L07 | Closed for local workflows: source filtering and destination transformation captures/case conversion, native directory Dive placement and revision-checked staged stable-symlink copying. Model and actual dialog outcomes preserve original files/referents. Regex is ECMAScript rather than full PCRE; stable links are local-only. |
+| L08 | Closed: guarded per-directory recursive decisions and native Yes/No/All/None/Abort controls, operation-wide All/None, safe No defaults and partial-result/selection retention. Model cases and two actual All/None workflows pass; skipped nonempty directories are neither entered nor removed. |
 | L09 | Closed: local sparse copies retain logical bytes and supported holes; FIFOs and permitted device nodes are recreated without reading them as streams; sockets fail explicitly. Existing atomic publication, revision, metadata, hardlink, cancellation and error handling remain guarded. Non-root checks cover device permission failures; creating device nodes still requires normal Linux capabilities. |
 | L10 | Closed: files above 64 MiB require approval before contents are read, including queued CLI files, Open/history, manager and Find/Diff editing. Decline/failure retains drafts and other arguments. Exactly 64 MiB opens normally; large backups use streaming copies and revision checks instead of the former 16 MiB rejection. |
 | L11 | Closed: native first-change `.#filename` locks, owner/stale-lock handling, Grab/Ignore/Escape decisions, lock-safe deferred actions/macros, transactional Save As and owned-lock cleanup. Save/close release locks without removing another session's replacement. Readonly archives and transient diff buffers do not lock host paths. |
@@ -100,8 +101,8 @@ are retained; they are not bugs to remove in pursuit of default MC behavior.
 | L27 | Closed: whole-document and current-word checking, dictionary selection, native suggestions/Add word/Replace/Skip/Cancel controls, and persisted personal dictionaries through standard `aspell(1)`. Byte offsets are validated, replacements are undoable, marks/search settings remain separate, and errors retain the draft and retryable dialog. |
 | L33 | Closed for the currently supported local providers: cached revisions, active-provider retention, unused timeout, private cache creation, native Active VFS list and timeout setting, and logical URI/alias preservation. Changed containers open a new snapshot; remote options stay outside the current scope. |
 
-Standalone frontends are **4/4**. **Sixteen of the 34 baseline work packages are
-closed; 18 baseline packages remain open**. This is a feature backlog, not an
+Standalone frontends are **4/4**. **Seventeen of the 34 baseline work packages are
+closed; 17 baseline packages remain open**. This is a feature backlog, not an
 overall parity percentage. Additional gaps discovered afterward are listed
 separately, rather than silently changing the baseline denominator.
 The broader command-line option set is still L03, not implicitly completed by
@@ -241,6 +242,14 @@ and filters whole-document and continuation results. Its focused workflow
 preserves UTF-8 offsets, explicit word checking, marks, Undo and saved bytes.
 Delimiter changes that newly expose text require another whole-document check.
 No MC resource collection is copied or bundled.
+
+Native skin selection, color aliases/attributes/inheritance and filename/type
+highlighting now affect the real UI, with Appearance preview/cancel/persistence
+and transactional reload. Original palettes and legacy aliases remain intact;
+unmatched native groups preserve builtin type colors. **L23 remains partial**
+for custom line/widget glyphs, PCRE-only patterns and some auxiliary native
+widget-color roles. Four focused cases passed; final preservation guards were
+recompiled and the small model rechecked, without another UI sweep.
 
 Native extension resources now match Open/View/Edit and execute through the
 shared directive/macro engine, preserving legacy rules, dirty buffers and

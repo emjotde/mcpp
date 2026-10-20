@@ -40,6 +40,18 @@ using OperationErrorResolver = std::function<OperationErrorDecision(
     const std::string& message
 )>;
 
+enum class RecursiveDeleteDecision {
+    yes,
+    no,
+    all,
+    none,
+    cancel,
+};
+
+using RecursiveDeleteResolver = std::function<RecursiveDeleteDecision(
+    const Entry& directory
+)>;
+
 class CopyMask {
 public:
     explicit CopyMask(std::string_view source = "*", bool shell_patterns = true);
@@ -140,7 +152,8 @@ public:
         const ProgressCallback& progress = {},
         OperationResult* result = nullptr,
         const OperationErrorResolver& error = {},
-        bool compute_totals = true
+        bool compute_totals = true,
+        const RecursiveDeleteResolver& recursive_delete = {}
     ) const;
 
 private:

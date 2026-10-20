@@ -124,6 +124,13 @@ public:
         const Cancellation& cancellation,
         const ProgressCallback& progress
     ) override;
+    [[nodiscard]] bool remove_checked(
+        std::string_view path,
+        bool recursive,
+        const Cancellation& cancellation,
+        const ProgressCallback& progress,
+        const std::function<bool()>& confirm_recursive
+    );
     void rename(
         std::string_view source,
         std::string_view destination,

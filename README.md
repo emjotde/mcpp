@@ -428,6 +428,12 @@ requires a smaller destination matching the source prefix and copies only the
 remaining suffix. Both stage publication and retain revision/cancellation
 checks. Archive, remote, symlink and special-file append is not advertised.
 
+Recursive deletion asks before descending into nonempty directories, with
+native Yes/No/All/None/Abort choices. All and None apply to the rest of that
+operation. None leaves nonempty directories and their selection marks intact,
+while selected regular files and empty directories can still be removed.
+Safe delete defaults to No in both initial and recursive confirmations.
+
 ## Shell
 
 With Bash, commander commands and `Ctrl-O` use the same interactive shell.
@@ -491,6 +497,19 @@ upgrading does not prevent startup or require rewriting the configuration.
 Dropdown selections, shortcut letters, the F2 user menu, focused controls, and
 popup lists also use skin colors; highlights do not merely invert a near-white
 label color shared by several palettes.
+
+User-provided MC-format skins can also be selected by name or file path.
+Appearance lists discovered skin files alongside the sixteen original palettes;
+preview, Cancel and saved selection retain the same behavior. Native color
+aliases, inherited values and supported attributes are applied to actual roles.
+Reloading an invalid resource reports an error and retains the previous palette.
+
+Native `filehighlight.ini` filename/type rules and the legacy `highlighting`
+file feed the selected skin's file-colour groups. Rules that do not supply a
+matching group leave builtin type colours intact. Search includes mcpp's config
+and installed resource directories; no MC skins or rules are bundled.
+Compatibility remains partial for custom line/widget glyphs, PCRE-only patterns
+and some auxiliary widget-colour roles.
 
 ## Modal Tree and diff/merge
 

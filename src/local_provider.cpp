@@ -512,13 +512,15 @@ void validate_reget_prefix(
     cancellation.throw_if_requested();
 }
 
-void remove_tree_at(
+bool remove_tree_at(
     const int parent_descriptor,
     const std::string& name,
     const std::filesystem::path& display_path,
+    const bool recursive,
     const Cancellation& cancellation,
     std::uint64_t& removed,
-    const ProgressCallback& progress
+    const ProgressCallback& progress,
+    const std::function<bool()>& confirm_recursive = {}
 ) {
     cancellation.throw_if_requested();
     struct stat status {};
@@ -534,7 +536,30 @@ void remove_tree_at(
             std::string(std::strerror(errno))
         );
     }
-    if (S_ISDIR(status.st_mode)) {
+    const auto validate = [&](const bool contents_changed) {
+        struct stat current {};
+        if (fstatat(parent_descriptor, name.c_str(), &current, AT_SYMLINK_NOFOLLOW) != 0 ||
+            current.st_dev != status.st_dev || current.st_ino != status.st_ino ||
+            (current.st_mode & S_IFMT) != (status.st_mode & S_IFMT) ||
+            (!contents_changed && revision_for(current) != revision_for(status))) {
+            throw std::runtime_error("entry changed before removal: " + display_path.string());
+        }
+    };
+    bool unlinked = false;
+    if (S_ISDIR(status.st_mode) &&
+        unlinkat(parent_descriptor, name.c_str(), AT_REMOVEDIR) == 0) {
+        unlinked = true;
+    } else if (S_ISDIR(status.st_mode)) {
+        const auto removal_failure = errno;
+        if (!recursive || (removal_failure != ENOTEMPTY && removal_failure != EEXIST)) {
+            throw std::runtime_error(
+                "cannot remove " + display_path.string() + ": " +
+                std::string(std::strerror(removal_failure))
+            );
+        }
+        if (confirm_recursive && !confirm_recursive()) return false;
+        cancellation.throw_if_requested();
+        validate(false);
         const int child_descriptor = openat(
             parent_descriptor,
             name.c_str(),
@@ -546,6 +571,13 @@ void remove_tree_at(
                 display_path.string() + ": " +
                 std::string(std::strerror(errno))
             );
+        }
+        struct stat opened {};
+        if (fstat(child_descriptor, &opened) != 0 ||
+            revision_for(opened) != revision_for(status) ||
+            opened.st_mode != status.st_mode) {
+            close(child_descriptor);
+            throw std::runtime_error("directory changed before removal: " + display_path.string());
         }
         DIR* directory = fdopendir(child_descriptor);
         if (directory == nullptr) {
@@ -574,14 +606,16 @@ void remove_tree_at(
                 if (child_name == "." || child_name == "..") {
                     continue;
                 }
-                remove_tree_at(
+                validate(true);
+                static_cast<void>(remove_tree_at(
                     dirfd(directory),
                     child_name,
                     display_path / child_name,
+                    true,
                     cancellation,
                     removed,
                     progress
-                );
+                ));
             }
         } catch (...) {
             closedir(directory);
@@ -589,24 +623,29 @@ void remove_tree_at(
         }
         closedir(directory);
     }
-    cancellation.throw_if_requested();
-    if (unlinkat(
-            parent_descriptor,
-            name.c_str(),
-            S_ISDIR(status.st_mode) ? AT_REMOVEDIR : 0
-        ) != 0) {
-        throw std::runtime_error(
-            "cannot remove " + display_path.string() + ": " +
-            std::string(std::strerror(errno))
-        );
+    if (!unlinked) {
+        cancellation.throw_if_requested();
+        validate(S_ISDIR(status.st_mode));
+        if (unlinkat(
+                parent_descriptor,
+                name.c_str(),
+                S_ISDIR(status.st_mode) ? AT_REMOVEDIR : 0
+            ) != 0) {
+            throw std::runtime_error(
+                "cannot remove " + display_path.string() + ": " +
+                std::string(std::strerror(errno))
+            );
+        }
     }
     ++removed;
     if (progress) {
         progress({
             .files_done = removed,
+            .files_total = recursive ? 0U : removed,
             .current_path = display_path.string(),
         });
     }
+    return true;
 }
 
 }  // namespace
@@ -1411,6 +1450,16 @@ void LocalProvider::remove(
     const Cancellation& cancellation,
     const ProgressCallback& progress
 ) {
+    static_cast<void>(remove_checked(path, recursive, cancellation, progress, {}));
+}
+
+bool LocalProvider::remove_checked(
+    const std::string_view path,
+    const bool recursive,
+    const Cancellation& cancellation,
+    const ProgressCallback& progress,
+    const std::function<bool()>& confirm_recursive
+) {
     cancellation.throw_if_requested();
     const auto target = resolve(path);
     if (target == root_) {
@@ -1418,46 +1467,64 @@ void LocalProvider::remove(
             "refusing to remove provider root"
         );
     }
-    std::uint64_t count = 0;
-    if (recursive) {
-        const auto parent = target.parent_path();
-        const int parent_descriptor = open(
-            parent.c_str(),
-            O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
+    const auto open_parent = [&] {
+        int descriptor = open(
+            root_.c_str(), O_PATH | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
         );
-        if (parent_descriptor < 0) {
-            throw std::runtime_error(
-                "cannot open removal parent: " + parent.string()
-            );
+        if (descriptor < 0) {
+            throw std::runtime_error("cannot open removal root: " + root_.string());
         }
         try {
-            remove_tree_at(
-                parent_descriptor,
-                target.filename().string(),
-                target,
-                cancellation,
-                count,
-                progress
-            );
+            for (const auto& component : target.parent_path().lexically_relative(root_)) {
+                if (component == ".") continue;
+                const int next = openat(
+                    descriptor, component.c_str(),
+                    O_PATH | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
+                );
+                if (next < 0) {
+                    throw std::runtime_error(
+                        "cannot open removal parent: " + target.parent_path().string() +
+                        ": " + std::string(std::strerror(errno))
+                    );
+                }
+                close(descriptor);
+                descriptor = next;
+            }
         } catch (...) {
-            close(parent_descriptor);
+            close(descriptor);
             throw;
         }
-        close(parent_descriptor);
-    } else {
-        count = std::filesystem::remove(target) ? 1U : 0U;
-    }
-    if (count == 0U) {
-        throw std::runtime_error(
-            "nothing removed: " + target.string()
+        return descriptor;
+    };
+    const int parent_descriptor = open_parent();
+    try {
+        struct stat parent_status {};
+        if (fstat(parent_descriptor, &parent_status) != 0) {
+            throw std::runtime_error("cannot inspect removal parent: " + target.parent_path().string());
+        }
+        const auto guarded_confirmation = [&] {
+            if (confirm_recursive && !confirm_recursive()) return false;
+            cancellation.throw_if_requested();
+            const int current_descriptor = open_parent();
+            struct stat current {};
+            const bool unchanged = fstat(current_descriptor, &current) == 0 &&
+                current.st_dev == parent_status.st_dev && current.st_ino == parent_status.st_ino;
+            close(current_descriptor);
+            if (!unchanged) {
+                throw std::runtime_error("parent changed before removal: " + target.parent_path().string());
+            }
+            return true;
+        };
+        std::uint64_t count = 0;
+        const bool complete = remove_tree_at(
+            parent_descriptor, target.filename().string(), target,
+            recursive, cancellation, count, progress, guarded_confirmation
         );
-    }
-    if (progress && !recursive) {
-        progress({
-            .files_done = count,
-            .files_total = count,
-            .current_path = target.string(),
-        });
+        close(parent_descriptor);
+        return complete;
+    } catch (...) {
+        close(parent_descriptor);
+        throw;
     }
 }
 

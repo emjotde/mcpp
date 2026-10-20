@@ -3,6 +3,8 @@
 #include <ftxui/screen/color.hpp>
 
 #include <array>
+#include <filesystem>
+#include <map>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -10,14 +12,25 @@
 namespace mcpp {
 
 struct SkinPair {
+    static constexpr unsigned bold = 1U;
+    static constexpr unsigned italic = 2U;
+    static constexpr unsigned underline = 4U;
+    static constexpr unsigned reverse = 8U;
+    static constexpr unsigned blink = 16U;
+
     ftxui::Color foreground;
     ftxui::Color background;
+    unsigned attributes{0};
+    bool explicit_style{false};
 };
 
 struct Skin {
     std::string id;
     std::string label;
     bool light{false};
+    std::filesystem::path resource;
+    std::string warning;
+    std::map<std::string, std::map<std::string, SkinPair, std::less<>>, std::less<>> colors;
     SkinPair normal{ftxui::Color::Grey85, ftxui::Color::Grey3};
     SkinPair menu{ftxui::Color::Grey11, ftxui::Color::Grey78};
     SkinPair menu_selected{ftxui::Color::Grey100, ftxui::Color::Grey23};
@@ -57,7 +70,17 @@ struct Skin {
     };
 };
 
+struct SkinChoice {
+    std::string id;
+    std::string label;
+};
+
 [[nodiscard]] const std::vector<Skin>& builtin_skins();
 [[nodiscard]] const Skin& find_skin(std::string_view id);
+[[nodiscard]] Skin load_skin(std::string_view id, const std::filesystem::path& config_directory);
+[[nodiscard]] std::vector<SkinChoice> available_skins(const std::filesystem::path& config_directory);
+[[nodiscard]] const SkinPair& skin_color(
+    const Skin& skin, std::string_view section, std::string_view key, const SkinPair& fallback
+);
 
 }  // namespace mcpp

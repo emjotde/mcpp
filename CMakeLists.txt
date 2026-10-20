@@ -62,10 +62,12 @@ add_library(
     mcpp_core
     src/archive_provider.cpp
     src/command_line.cpp
+    src/color_resource.cpp
     src/completion.cpp
     src/config.cpp
     src/entry.cpp
     src/extension.cpp
+    src/file_highlight.cpp
     src/listing.cpp
     src/compare.cpp
     src/diff.cpp
@@ -81,6 +83,7 @@ add_library(
     src/search.cpp
     src/shell.cpp
     src/skin.cpp
+    src/skin_file.cpp
     src/spelling.cpp
     src/syntax.cpp
     src/syntax_rules.cpp
@@ -170,6 +173,12 @@ if(MCPP_BUILD_TESTS)
     add_executable(mcpp_copy_mask_tests tests/test_copy_masks.cpp)
     target_link_libraries(mcpp_copy_mask_tests PRIVATE mcpp_core)
     mcpp_target_defaults(mcpp_copy_mask_tests)
+    add_executable(mcpp_recursive_delete_tests tests/test_recursive_delete.cpp)
+    target_link_libraries(mcpp_recursive_delete_tests PRIVATE mcpp_core)
+    mcpp_target_defaults(mcpp_recursive_delete_tests)
+    add_executable(mcpp_native_skin_tests tests/test_native_skins.cpp)
+    target_link_libraries(mcpp_native_skin_tests PRIVATE mcpp_core)
+    mcpp_target_defaults(mcpp_native_skin_tests)
     add_executable(mcpp_editor_codepage_tests tests/test_editor_codepages.cpp)
     target_link_libraries(mcpp_editor_codepage_tests PRIVATE mcpp_core)
     mcpp_target_defaults(mcpp_editor_codepage_tests)
@@ -244,6 +253,14 @@ if(MCPP_BUILD_TESTS)
         add_test(
             NAME mcpp_editor_codepage_tests
             COMMAND mcpp_editor_codepage_tests /review/cases/editor-codepages/model
+        )
+        add_test(
+            NAME mcpp_recursive_delete_tests
+            COMMAND mcpp_recursive_delete_tests /review/cases/recursive-delete/model
+        )
+        add_test(
+            NAME mcpp_native_skin_tests
+            COMMAND mcpp_native_skin_tests /review/cases/native-skins/model
         )
         add_test(
             NAME mcpp_viewer_source_growing

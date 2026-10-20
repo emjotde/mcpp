@@ -402,7 +402,8 @@ bool remove_with_retry(
     const Cancellation& cancellation,
     const ProgressCallback& progress,
     const OperationErrorResolver& resolve,
-    const std::function<void()>& validate = {}
+    const std::function<void()>& validate = {},
+    const std::function<bool()>& perform = {}
 ) {
     for (;;) {
         cancellation.throw_if_requested();
@@ -410,6 +411,9 @@ bool remove_with_retry(
             require_capability(provider, ProviderCapability::remove, "deletion");
             if (validate) {
                 validate();
+            }
+            if (perform) {
+                return perform();
             }
             provider.remove(
                 entry.path, entry.kind == EntryKind::directory,
@@ -1607,28 +1611,107 @@ void OperationEngine::remove(
     const ProgressCallback& progress,
     OperationResult* result,
     const OperationErrorResolver& error,
-    const bool compute_totals
+    const bool compute_totals,
+    const RecursiveDeleteResolver& recursive_delete
 ) const {
     TransferProgress state;
-    if (compute_totals) for (const auto& entry : entries) {
-        accumulate_removal(provider, entry, cancellation, state, static_cast<bool>(error));
+    if (compute_totals) {
+        if (recursive_delete) {
+            state.files_total = entries.size();
+            for (const auto& entry : entries) {
+                if (entry.kind != EntryKind::directory) state.bytes_total += entry.size;
+            }
+        } else {
+            for (const auto& entry : entries) {
+                accumulate_removal(provider, entry, cancellation, state, static_cast<bool>(error));
+            }
+        }
     }
+    std::optional<bool> all_recursive;
     for (const auto& entry : entries) {
         cancellation.throw_if_requested();
         bool reported = false;
+        bool approved = !recursive_delete;
+        bool measured = !recursive_delete || !compute_totals;
+        std::string skip_reason = "user skipped deletion after error";
+        const std::function<bool()> confirm_recursive = [&] {
+            if (!approved) {
+                bool accept = false;
+                if (all_recursive.has_value()) {
+                    accept = *all_recursive;
+                } else {
+                    switch (recursive_delete(entry)) {
+                        case RecursiveDeleteDecision::yes:
+                            accept = true;
+                            break;
+                        case RecursiveDeleteDecision::no:
+                            break;
+                        case RecursiveDeleteDecision::all:
+                            accept = true;
+                            all_recursive = true;
+                            break;
+                        case RecursiveDeleteDecision::none:
+                            all_recursive = false;
+                            break;
+                        case RecursiveDeleteDecision::cancel:
+                            throw OperationCancelled{};
+                    }
+                }
+                cancellation.throw_if_requested();
+                if (!accept) {
+                    skip_reason = "recursive deletion declined";
+                    return false;
+                }
+                approved = true;
+            }
+            if (!measured) {
+                // Do not walk a directory for totals until its deletion is approved.
+                TransferProgress total;
+                accumulate_removal(provider, entry, cancellation, total, true);
+                state.files_total += total.files_total - 1U;
+                state.bytes_total += total.bytes_total;
+                measured = true;
+            }
+            return true;
+        };
+        const ProgressCallback update = [&](const TransferProgress& current) {
+            reported = true;
+            ++state.files_done;
+            state.bytes_done += current.bytes_done;
+            state.current_path = current.current_path;
+            emit_progress(progress, state);
+        };
         const auto removed = remove_with_retry(
-            provider, entry, cancellation,
-            [&](const TransferProgress& current) {
-                reported = true;
-                ++state.files_done;
-                state.bytes_done += current.bytes_done;
-                state.current_path = current.current_path;
-                emit_progress(progress, state);
-            },
-            error
+            provider, entry, cancellation, update, error, {},
+            [&] {
+                if (auto* local = dynamic_cast<LocalProvider*>(&provider)) {
+                    return local->remove_checked(
+                        entry.path, entry.kind == EntryKind::directory,
+                        cancellation, update, confirm_recursive
+                    );
+                }
+                if (recursive_delete && entry.kind == EntryKind::directory) {
+                    const auto before = provider.stat(entry.path, cancellation);
+                    if (!provider.list(entry.path, {.show_hidden = true, .limit = 1U}, cancellation).empty()) {
+                        if (!confirm_recursive()) return false;
+                        const auto after = provider.stat(entry.path, cancellation);
+                        if (after.kind != before.kind ||
+                            (!before.revision.empty() && after.revision != before.revision)) {
+                            throw std::runtime_error(
+                                "directory changed before removal: " + entry.path
+                            );
+                        }
+                    }
+                }
+                provider.remove(
+                    entry.path, entry.kind == EntryKind::directory,
+                    cancellation, update
+                );
+                return true;
+            }
         );
         if (!removed) {
-            record_skipped(result, entry, "user skipped deletion after error");
+            record_skipped(result, entry, std::move(skip_reason));
             continue;
         }
         record_completed(result, entry);

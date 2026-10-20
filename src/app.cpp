@@ -6,6 +6,7 @@
 #include "mcpp/editor_clipboard.hpp"
 #include "mcpp/editor_lock.hpp"
 #include "mcpp/extension.hpp"
+#include "mcpp/file_highlight.hpp"
 #include "mcpp/hotlist.hpp"
 #include "mcpp/input_history.hpp"
 #include "mcpp/keymap.hpp"
@@ -339,6 +340,7 @@ enum class Mode {
     information,
     operation_dialog,
     delete_dialog,
+    recursive_delete_dialog,
     operation_progress,
     conflict_dialog,
     operation_error_dialog,
@@ -1319,6 +1321,35 @@ private:
     ftxui::Color color_;
 };
 
+class SkinPaint final : public ftxui::Node {
+public:
+    SkinPaint(ftxui::Element child, SkinPair colors) : Node({std::move(child)}), colors_(colors) {}
+    void SetBox(ftxui::Box box) override {
+        Node::SetBox(box);
+        children_.front()->SetBox(box);
+    }
+    void Render(ftxui::Screen& screen) override {
+        for (int row = box_.y_min; row <= box_.y_max; ++row) {
+            for (int column = box_.x_min; column <= box_.x_max; ++column) {
+                auto& cell = screen.CellAt(column, row);
+                cell.foreground_color = colors_.foreground;
+                cell.background_color = colors_.background;
+                cell.bold = (colors_.attributes & SkinPair::bold) != 0U;
+                cell.italic = (colors_.attributes & SkinPair::italic) != 0U;
+                cell.underlined = (colors_.attributes & SkinPair::underline) != 0U;
+                cell.inverted = (colors_.attributes & SkinPair::reverse) != 0U;
+                cell.blink = (colors_.attributes & SkinPair::blink) != 0U;
+                cell.dim = false;
+                cell.underlined_double = false;
+                cell.strikethrough = false;
+            }
+        }
+        Node::Render(screen);
+    }
+private:
+    SkinPair colors_;
+};
+
 std::string type_prefix(const Entry& entry) {
     switch (entry.kind) {
         case EntryKind::directory:
@@ -1548,6 +1579,17 @@ struct TextInputState {
 
 struct App::Impl {
     Config config;
+    struct PaletteSet {
+        Skin panels;
+        Skin editor;
+        Skin viewer;
+        Skin help;
+        Skin diff;
+    };
+    enum class PaletteContext { panels, editor, viewer, help, diff };
+    std::shared_ptr<const PaletteSet> active_palette;
+    std::shared_ptr<const PaletteSet> appearance_original_palette;
+    PaletteContext palette_context{PaletteContext::panels};
     InputHistories input_histories{default_config_path().parent_path() / "input-history"};
     std::optional<Keymap> keymap;
     std::optional<KeymapContext> keymap_prefix;
@@ -1870,7 +1912,7 @@ struct App::Impl {
         std::optional<int> completed_status;
     };
     std::shared_ptr<ExtensionInvocation> extension_pending;
-    std::vector<std::pair<std::string, ftxui::Color>> highlight_rules;
+    FileHighlightRules highlight_rules;
     std::vector<ftxui::Box> editor_line_boxes;
     ftxui::Box editor_header_box;
     int editor_window_action{0};
@@ -2127,7 +2169,7 @@ struct App::Impl {
                dynamic_cast<const ArchiveProvider*>(left_location.provider.get()) != nullptr),
           right(right_location.provider, right_location.path, nullptr,
                 dynamic_cast<const ArchiveProvider*>(right_location.provider.get()) != nullptr) {
-        static_cast<void>(palette());
+        initialize_palette();
         try {
             known_tree_directories = load_tree_cache(tree_cache_path());
         } catch (const std::exception& error) {
@@ -3433,27 +3475,10 @@ struct App::Impl {
     void reload_local_rules() {
         const auto directory = default_config_path().parent_path();
         auto extensions = ExtensionRules::load(find_extension_file(directory));
-        auto highlighting = read_local_rules(directory / "highlighting");
-        std::vector<std::pair<std::string, ftxui::Color>> colors;
-        for (const auto& [pattern, value] : highlighting) {
-            std::istringstream components(value);
-            std::array<int, 3> values{};
-            std::string component;
-            for (auto& number : values) {
-                if (!std::getline(components, component, ',')) throw std::runtime_error("highlight color needs red,green,blue");
-                std::istringstream input(component);
-                if (!(input >> number) || number < 0 || number > 255) throw std::runtime_error("highlight color values must be 0 through 255");
-                input >> std::ws;
-                if (!input.eof()) throw std::runtime_error("invalid highlight color");
-            }
-            if (std::getline(components, component, ',')) throw std::runtime_error("highlight color has too many values");
-            colors.emplace_back(pattern, ftxui::Color::RGB(
-                static_cast<std::uint8_t>(values[0]), static_cast<std::uint8_t>(values[1]),
-                static_cast<std::uint8_t>(values[2])));
-        }
+        auto highlighting = FileHighlightRules::load(directory, highlight_rules.resource());
         reload_syntax_rules();
         extension_rules = std::move(extensions);
-        highlight_rules = std::move(colors);
+        highlight_rules = std::move(highlighting);
         syntax_spans.clear();
         syntax_path.clear();
     }
@@ -7264,16 +7289,75 @@ struct App::Impl {
         return config.theme_override ? *config.theme_override : config.theme;
     }
 
+    static std::shared_ptr<const PaletteSet> make_palette(Skin skin) {
+        auto result = std::make_shared<PaletteSet>();
+        result->panels = std::move(skin);
+        result->editor = result->viewer = result->help = result->diff = result->panels;
+        if (result->panels.resource.empty()) return result;
+        const auto adapt = [&](Skin& target, const std::string_view section) {
+            target.normal = skin_color(target, section, "_default_", target.normal);
+            target.syntax[0] = target.normal.foreground;
+        };
+        adapt(result->editor, "editor");
+        result->editor.selected = skin_color(result->editor, "editor", "editmarked", result->editor.selected);
+        result->editor.search = skin_color(result->editor, "editor", "editbold", result->editor.search);
+        result->editor.dim = skin_color(result->editor, "editor", "editwhitespace", result->editor.normal).foreground;
+        adapt(result->viewer, "viewer");
+        adapt(result->help, "help");
+        adapt(result->diff, "diffviewer");
+        return result;
+    }
+
+    void initialize_palette() {
+        active_palette = make_palette(find_skin("grayscale"));
+        try {
+            active_palette = make_palette(load_skin(config.theme, default_config_path().parent_path()));
+        } catch (const std::exception& error) {
+            std::cerr << "mcpp: skin: " << error.what() << '\n';
+            set_error(error);
+        }
+        if (!config.theme_override) {
+            for (const auto* name : {"MCPP_SKIN", "MC_SKIN"}) {
+                if (const auto* value = std::getenv(name); value && *value) {
+                    config.theme_override = value;
+                    break;
+                }
+            }
+        }
+        if (config.theme_override) {
+            active_palette = make_palette(load_skin(*config.theme_override, default_config_path().parent_path()));
+        }
+        if (!active_palette->panels.warning.empty()) status = "Skin: " + active_palette->panels.warning;
+    }
+
+    void reload_skin_resources() {
+        const auto directory = default_config_path().parent_path();
+        auto candidate = make_palette(load_skin(active_palette->panels.id, directory));
+        auto rules = FileHighlightRules::load(directory, highlight_rules.resource());
+        active_palette = std::move(candidate);
+        highlight_rules = std::move(rules);
+    }
+
     const Skin& palette() const {
-        return find_skin(skin_id());
+        switch (palette_context) {
+            case PaletteContext::editor: return active_palette->editor;
+            case PaletteContext::viewer: return active_palette->viewer;
+            case PaletteContext::help: return active_palette->help;
+            case PaletteContext::diff: return active_palette->diff;
+            case PaletteContext::panels: return active_palette->panels;
+        }
+        return active_palette->panels;
     }
 
     ftxui::Element paint(ftxui::Element element, const SkinPair& colors) const {
+        if (colors.explicit_style) return std::make_shared<SkinPaint>(std::move(element), colors);
         return std::move(element) | ftxui::color(colors.foreground) | ftxui::bgcolor(colors.background);
     }
 
     ftxui::Element highlight(ftxui::Element element, const SkinPair& colors) const {
-        return paint(std::move(element), {colors.background, colors.foreground}) | ftxui::inverted;
+        auto reversed = colors;
+        std::swap(reversed.foreground, reversed.background);
+        return paint(std::move(element), reversed) | ftxui::inverted;
     }
 
     ftxui::Element focus_dialog(ftxui::Element element) const {
@@ -7307,12 +7391,25 @@ struct App::Impl {
         auto selected = paint(std::move(element), active
             ? (marked ? skin.marked_selected : skin.selected)
             : (marked ? skin.inactive_marked_selected : skin.inactive_selected));
-        return marked ? selected | ftxui::bold : selected;
+        return marked && skin.resource.empty() ? selected | ftxui::bold : selected;
     }
 
-    ftxui::Element gray_entry(ftxui::Element element, const Entry& entry, const bool type_colors) const {
+    ftxui::Element gray_entry(
+        ftxui::Element element, const Entry& entry, const bool type_colors, const bool local_entry
+    ) const {
         using namespace ftxui;
         const auto& skin = palette();
+        if (const auto matched = highlight_rules.color_for(entry, skin, local_entry)) {
+            return paint(std::move(element), *matched);
+        }
+        if (!skin.resource.empty()) {
+            const auto group = entry.kind == EntryKind::directory ? "directory" :
+                entry.kind == EntryKind::symlink ? "symlink" : entry.kind == EntryKind::other ? "special" :
+                (entry.permissions & (std::filesystem::perms::owner_exec | std::filesystem::perms::group_exec |
+                                      std::filesystem::perms::others_exec)) != std::filesystem::perms::none
+                    ? "executable" : "_default_";
+            return paint(std::move(element), skin_color(skin, "filehighlight", group, skin.normal));
+        }
         if (entry.kind == EntryKind::directory) {
             return std::move(element) | color(type_colors ? Color::RGB(95, 160, 255) : skin.directory);
         }
@@ -7950,6 +8047,7 @@ struct App::Impl {
         } else if (action == 24) {
             appearance_original_skin = config.theme;
             appearance_original_override = config.theme_override;
+            appearance_original_palette = active_palette;
             appearance_original_shadows = config.shadows;
             appearance_skin = palette().label;
             appearance_shadows = config.shadows;
@@ -8131,19 +8229,31 @@ struct App::Impl {
     }
 
     void choose_skin() {
-        const auto& skins = builtin_skins();
+        auto skins = available_skins(default_config_path().parent_path());
+        const auto current = active_palette->panels.id;
+        if (std::ranges::find(skins, current, &SkinChoice::id) == skins.end()) {
+            skins.push_back({current, active_palette->panels.label});
+        }
         std::vector<std::string> names;
         for (const auto& skin : skins) names.push_back(skin.label);
-        const auto current = palette().id;
-        show_local_list("Skins", std::move(names), [this](const std::size_t selected) {
-            const auto& skin = builtin_skins().at(selected);
-            appearance_skin = skin.label;
-            config.theme = skin.id;
-            config.theme_override.reset();
+        const auto cursor = static_cast<std::size_t>(
+            std::ranges::find(skins, current, &SkinChoice::id) - skins.begin());
+        show_local_list("Skins", std::move(names), [this, skins = std::move(skins)](const std::size_t selected) {
+            try {
+                auto candidate = make_palette(load_skin(skins.at(selected).id, default_config_path().parent_path()));
+                auto label = candidate->panels.label;
+                auto id = candidate->panels.id;
+                active_palette = std::move(candidate);
+                appearance_skin = std::move(label);
+                config.theme = std::move(id);
+                config.theme_override.reset();
+                if (!active_palette->panels.warning.empty()) status = "Skin: " + active_palette->panels.warning;
+            } catch (const std::exception& error) {
+                show_native_message("Skin error", error.what(), Mode::appearance_dialog);
+            }
         }, Mode::appearance_dialog);
         local_list_native = true;
-        local_list_cursor = static_cast<std::size_t>(
-            std::ranges::find(skins, current, &Skin::id) - skins.begin());
+        local_list_cursor = cursor;
     }
 
     bool handle_appearance(const ftxui::Event& event) {
@@ -8151,6 +8261,7 @@ struct App::Impl {
         if (modal_cancel(event)) {
             config.theme = appearance_original_skin;
             config.theme_override = appearance_original_override;
+            active_palette = appearance_original_palette;
             config.shadows = appearance_original_shadows;
             mode = Mode::panels;
             return true;
@@ -8766,7 +8877,8 @@ struct App::Impl {
         Entry source,
         std::optional<Entry> destination,
         std::string error = {},
-        const CollisionOptions collision_options = {}
+        const CollisionOptions collision_options = {},
+        const bool recursive_delete = false
     ) {
         {
             std::lock_guard lock(operation_prompt_mutex);
@@ -8775,7 +8887,8 @@ struct App::Impl {
         }
         post_ui([
             this, source = std::move(source),
-            destination = std::move(destination), error = std::move(error), collision_options
+            destination = std::move(destination), error = std::move(error),
+            collision_options, recursive_delete
         ]() mutable {
             if (!operation_prompt_pending.load(std::memory_order_acquire) ||
                 operation_cancellation.requested()) {
@@ -8787,8 +8900,9 @@ struct App::Impl {
             operation_prompt_destination = std::move(destination);
             operation_prompt_collision_options = collision_options;
             operation_prompt_error = std::move(error);
-            dialog_focus = operation_prompt_destination && config.safe_overwrite ? 1U : 0U;
-            mode = operation_prompt_destination
+            dialog_focus = recursive_delete ? (config.safe_delete ? 1U : 0U)
+                : operation_prompt_destination && config.safe_overwrite ? 1U : 0U;
+            mode = recursive_delete ? Mode::recursive_delete_dialog : operation_prompt_destination
                        ? Mode::conflict_dialog
                        : Mode::operation_error_dialog;
         });
@@ -8884,7 +8998,8 @@ struct App::Impl {
         const std::vector<std::string>& completed_sources = {},
         bool notify = false
     ) {
-        if (mode == Mode::conflict_dialog || mode == Mode::operation_error_dialog) {
+        if (mode == Mode::conflict_dialog || mode == Mode::operation_error_dialog ||
+            mode == Mode::recursive_delete_dialog) {
             mode = operation_return_mode;
             dialog_focus = operation_return_focus;
         }
@@ -9907,7 +10022,21 @@ struct App::Impl {
                         },
                         &result,
                         resolve_error,
-                        compute_totals
+                        compute_totals,
+                        [this](const Entry& directory) {
+                            switch (ask_operation(directory, std::nullopt, {}, {}, true)) {
+                                case OperationChoice::overwrite:
+                                    return RecursiveDeleteDecision::yes;
+                                case OperationChoice::skip:
+                                    return RecursiveDeleteDecision::no;
+                                case OperationChoice::overwrite_all:
+                                    return RecursiveDeleteDecision::all;
+                                case OperationChoice::skip_all:
+                                    return RecursiveDeleteDecision::none;
+                                default:
+                                    return RecursiveDeleteDecision::cancel;
+                            }
+                        }
                     );
                     post_ui([
                         this,
@@ -10597,17 +10726,13 @@ struct App::Impl {
             if (index == pane.cursor()) {
                 row = gray_selected(std::move(row), pane.is_selected(entry), focused);
             } else {
-                row = config.highlight_file_types ? gray_entry(std::move(row), entry, skin_id() == "type-colors")
+                row = config.highlight_file_types ? gray_entry(std::move(row), entry, skin_id() == "type-colors",
+                                                               pane.provider() == local)
                                                   : std::move(row) | color(palette().normal.foreground);
-                if (config.highlight_file_types && skin_id() == "type-colors") {
-                    for (const auto& [pattern, foreground] : highlight_rules) {
-                        if (EditorSearch::filename_matches(entry.name, pattern, true)) {
-                            row = row | color(foreground);
-                            break;
-                        }
-                    }
+                if (pane.is_selected(entry)) {
+                    row = palette().resource.empty() ? row | bold | color(palette().bright)
+                        : paint(std::move(row), skin_color(palette(), "core", "marked", palette().normal));
                 }
-                if (pane.is_selected(entry)) row = row | bold | color(palette().bright);
             }
             return std::move(row) | reflect(entry_boxes[index]);
         };
@@ -12585,9 +12710,13 @@ struct App::Impl {
                         "d Disk usage\n    du -sh -- %f\n");
                     return;
                 case 20:
-                    open_config_editor(default_config_path().parent_path() / "highlighting",
-                        "# Enable File-type accents in Options / Appearance\n"
-                        "# pattern=red,green,blue\n# *.log=255,180,90\n");
+                    {
+                        const auto path = find_file_highlight_file(default_config_path().parent_path());
+                        open_config_editor(path, path.filename() == "highlighting"
+                            ? "# pattern=red,green,blue\n# *.log=255,180,90\n"
+                            : "# Groups use colors from the skin's [filehighlight] section.\n"
+                              "# [notes]\n# extensions=log;txt\n# extensions_case=false\n");
+                    }
                     return;
                 default:
                     break;
@@ -13189,6 +13318,15 @@ struct App::Impl {
     }
 
     std::vector<OperationChoiceButton> operation_choice_buttons() const {
+        if (mode == Mode::recursive_delete_dialog) {
+            return {
+                {OperationChoice::overwrite, "Yes", 'y'},
+                {OperationChoice::skip, "No", 'n'},
+                {OperationChoice::overwrite_all, "All", 'l'},
+                {OperationChoice::skip_all, "None", 'e'},
+                {OperationChoice::cancel, "Abort", 'a'},
+            };
+        }
         if (mode == Mode::operation_error_dialog) {
             return {
                 {OperationChoice::retry, "Retry", 'r'},
@@ -13218,6 +13356,27 @@ struct App::Impl {
 
     ftxui::Element render_conflict_dialog() {
         using namespace ftxui;
+        if (mode == Mode::recursive_delete_dialog) {
+            const auto width = std::min(76, Terminal::Size().dimx);
+            const auto choices = operation_choice_buttons();
+            Elements buttons;
+            for (std::size_t index = 0; index < choices.size(); ++index) {
+                auto button = text(" [ " + std::string(choices[index].label) + " ] ");
+                if (dialog_focus == index) button = focus_dialog(std::move(button));
+                buttons.push_back(std::move(button) | reflect(operation_choice_boxes[index]));
+            }
+            return vbox({
+                text("Delete") | bold | center,
+                separator(),
+                text("Directory \"" + path_label(
+                    operation_prompt_source ? display_text(operation_prompt_source->path) : "",
+                    static_cast<std::size_t>(std::max(1, width - 25))
+                ) + "\" not empty."),
+                text("Delete it recursively?") | center,
+                separator(),
+                hbox(std::move(buttons)) | center,
+            }) | borderStyled(LIGHT) | size(WIDTH, EQUAL, width);
+        }
         const bool error = mode == Mode::operation_error_dialog;
         const auto choices = operation_choice_buttons();
         Elements rows{
@@ -13811,7 +13970,8 @@ struct App::Impl {
         rendered_width = terminal_dimensions.dimx;
         rendered_height = terminal_dimensions.dimy;
         const auto display_mode =
-            mode == Mode::conflict_dialog || mode == Mode::operation_error_dialog
+            mode == Mode::conflict_dialog || mode == Mode::operation_error_dialog ||
+                mode == Mode::recursive_delete_dialog
                 ? operation_return_mode
                 : mode == Mode::file_search_dialog ? file_search_return()
                 : mode == Mode::local_list ? local_list_return
@@ -13864,6 +14024,9 @@ struct App::Impl {
                 display_mode == Mode::prompt &&
                 mode_before_prompt == Mode::viewer
             );
+        palette_context = display_mode == Mode::help || display_mode == Mode::editor_help
+            ? PaletteContext::help : editor_context ? PaletteContext::editor
+            : viewer_context ? PaletteContext::viewer : diff_context ? PaletteContext::diff : PaletteContext::panels;
         Element body;
         const auto left_width = panel_width(0);
         const auto right_width = panel_width(1);
@@ -14541,7 +14704,8 @@ struct App::Impl {
                 centered_modal(render_operation_progress()),
             });
         } else if (mode == Mode::conflict_dialog ||
-                   mode == Mode::operation_error_dialog) {
+                   mode == Mode::operation_error_dialog ||
+                   mode == Mode::recursive_delete_dialog) {
             document = dbox({
                 document,
                 centered_modal(render_conflict_dialog()),
@@ -15666,12 +15830,21 @@ struct App::Impl {
             if (saved_path.parent_path() == default_config_path().parent_path() &&
                 (saved_path.filename() == "syntax" || saved_path.filename() == "extensions" ||
                  saved_path.filename() == "mc.ext.ini" || saved_path.filename() == "mc.ext" ||
-                 saved_path.filename() == "highlighting")) {
+                 saved_path.filename() == "highlighting" || saved_path.filename() == "filehighlight.ini")) {
                 try {
                     reload_local_rules();
                 } catch (const std::exception& error) {
                     editor_quit_requested = false;
                     show_editor_message("Saved; configuration error", error.what());
+                    return;
+                }
+            }
+            if (saved_path == active_palette->panels.resource || saved_path == highlight_rules.resource()) {
+                try {
+                    reload_skin_resources();
+                } catch (const std::exception& error) {
+                    editor_quit_requested = false;
+                    show_editor_message("Saved; skin/highlighting error", error.what());
                     return;
                 }
             }
@@ -19970,7 +20143,8 @@ struct App::Impl {
         if (mode == Mode::operation_progress) {
             return handle_operation_progress(event);
         }
-        if (mode == Mode::conflict_dialog || mode == Mode::operation_error_dialog) {
+        if (mode == Mode::conflict_dialog || mode == Mode::operation_error_dialog ||
+            mode == Mode::recursive_delete_dialog) {
             return handle_conflict_dialog(event);
         }
         if (mode == Mode::jobs) {
