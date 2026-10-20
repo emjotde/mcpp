@@ -31,8 +31,10 @@
 #include "editor_display.hpp"
 #include "input_styles.hpp"
 #include "local_tools_stream.hpp"
+#include "extension_view_checkout.hpp"
 #include "shell_display.hpp"
 #include "panel_selection_keys.hpp"
+#include "tree_navigation.hpp"
 #include "viewer_help_styles.hpp"
 
 #include <algorithm>
@@ -3659,11 +3661,13 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
                (error.empty() ? "" : ": " + error) + source;
     }
 
-    std::string extension_shell_command(
-        const ExtensionInvocation& invocation, const std::string& command
-    ) const {
+    static std::string extension_shell_command(
+        const ExtensionInvocation& invocation, const std::string& command,
+        const std::optional<std::string_view> local_file = {}
+    ) {
         const auto scalar = [&](const std::string& value) {
             auto context = invocation.context;
+            context.active.local = true;
             context.active.file->name = value;
             return expand_native_menu("%p", context).command;
         };
@@ -3673,7 +3677,7 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
             tagged += file.name;
         }
         const auto& file = *invocation.context.active.file;
-        return "( export MC_EXT_FILENAME=" + scalar(file.name) +
+        return "( export MC_EXT_FILENAME=" + scalar(local_file ? std::string(*local_file) : file.name) +
             " MC_EXT_BASENAME=" + scalar(invocation.provider->basename(invocation.path)) +
             " MC_EXT_CURRENTDIR=" + scalar(invocation.context.active.directory) +
             " MC_EXT_SELECTED=" + scalar(tagged.empty() ? file.name : tagged) +
@@ -3706,6 +3710,44 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
         }
     }
 
+    void start_extension_view_checkout(const std::shared_ptr<ExtensionInvocation>& invocation) {
+        guard_extension_editor(invocation);
+        if (!invocation->context.active.file || invocation->context.active.file->kind != EntryKind::file) {
+            throw std::runtime_error("filtered virtual viewing requires a regular file; symlinks are not supported");
+        }
+        if (!invocation->context.active.tagged.empty()) {
+            throw std::runtime_error("filtered virtual viewing supports only the current file; clear active-pane marks first");
+        }
+        static_cast<void>(expand_native_view_filter(
+            invocation->entry.command, invocation->context, invocation->answers,
+            "/.mcpp-view-preflight"));
+        const auto output = std::make_shared<TemporaryFile>("");
+        const auto expanded = std::make_shared<NativeMenuExpansion>();
+        const auto source = *invocation->context.active.file;
+        start_local_task("Extension " + extension_action_name(invocation->action),
+            [invocation, source, output, expanded](const Cancellation& cancellation) {
+                const ExtensionViewCheckout checkout(invocation->provider, source, cancellation);
+                const auto local_file = checkout.path().string();
+                *expanded = expand_native_view_filter(
+                    invocation->entry.command, invocation->context, invocation->answers, local_file);
+                const auto command = extension_shell_command(*invocation, expanded->command, local_file);
+                auto result = capture_view_output(
+                    command, checkout.directory(), *output, cancellation, 16U * 1024U * 1024U);
+                checkout.validate_source(cancellation);
+                return result;
+            },
+            [this, invocation, output, expanded](CommandOutput result) {
+                if (result.status != 0) {
+                    throw std::runtime_error(extension_failure(*invocation, result.status, result.error));
+                }
+                complete_extension_action(invocation, *expanded);
+                open_output_viewer("Extension " + extension_action_name(invocation->action), output);
+                set_viewer_return_mode(invocation->return_mode);
+                set_user_menu_view_options(*expanded);
+                show_command_warnings(result.error);
+            }, invocation->return_mode);
+    }
+
     void continue_extension_action(const std::shared_ptr<ExtensionInvocation>& invocation) {
         if (invocation->answers.size() < invocation->requirements.prompts.size()) {
             const auto index = invocation->answers.size();
@@ -3724,6 +3766,11 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
         }
         if (invocation->entry.command.find("@EXTHELPERSDIR@") != std::string::npos) {
             throw std::runtime_error("unconfigured @EXTHELPERSDIR@ resource; mcpp does not bundle MC helper scripts");
+        }
+        if (!invocation->entry.legacy && !invocation->context.active.local &&
+            native_menu_has_view_filter(invocation->entry.command)) {
+            start_extension_view_checkout(invocation);
+            return;
         }
         NativeMenuExpansion expansion;
         if (invocation->prepared) expansion = *invocation->prepared;
@@ -5392,14 +5439,18 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
     }
 
     void sync_dynamic_tree() {
-        if (modal_tree_snapshot || !tree_dynamic ||
+        if (modal_tree_snapshot || !tree_panel ||
+            !detail::tree_selection_follows(config.xtree_mode, tree_dynamic) ||
             tree_cursor >= tree_nodes.size()) {
             return;
         }
         try {
-            active().change_directory(
-                tree_nodes[tree_cursor].path
-            );
+            const auto& source = *tree_panel == 0 ? left : right;
+            const auto& path = tree_nodes[tree_cursor].path;
+            if (detail::tree_selection_changes_location(
+                    active().provider() == source.provider(), active().path(), path)) {
+                install_pane_location(active(), {source.provider(), path});
+            }
         } catch (const std::exception& error) {
             set_error(error);
         }
@@ -11244,6 +11295,8 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
                    viewer.source_error().empty()) {
             elements.push_back(text("End of input (0 bytes)"));
         }
+        detail::append_viewer_eof_rows(
+            elements, display_text(config.mcview_eof.value_or("")), viewer, height);
         if (viewer_ruler != 0U) {
             std::string ruler(width, '-');
             for (std::size_t column = 0; column < width; ++column) {
@@ -14244,6 +14297,8 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
                 quick_viewer.text_highlight(index), quick_viewer.text_styles(index)
             ));
         }
+        detail::append_viewer_eof_rows(
+            rows, display_text(config.mcview_eof.value_or("")), quick_viewer, content_height);
         auto title =
             text("Quick view: " + path_label(
                 display_text(entry->name),

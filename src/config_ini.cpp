@@ -25,6 +25,8 @@ struct NativeOption {
 constexpr NativeOption native_options[]{
     {"Midnight-Commander", "verbose", "verbose_operation"},
     {"Midnight-Commander", "shell_patterns", "shell_patterns"},
+    {"Midnight-Commander", "mcview_eof", "mcview_eof", Conversion::string},
+    {"Midnight-Commander", "xtree_mode", "xtree_mode"},
     {"Midnight-Commander", "alternate_plus_minus", "alternate_plus_minus"},
     {"Midnight-Commander", "only_leading_plus_minus", "only_leading_plus_minus"},
     {"Midnight-Commander", "auto_save_setup", "auto_save_setup"},

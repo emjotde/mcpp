@@ -5,6 +5,7 @@
 #include <cerrno>
 #include <cctype>
 #include <cstdlib>
+#include <filesystem>
 #include <fnmatch.h>
 #include <pwd.h>
 #include <stdexcept>
@@ -354,6 +355,19 @@ void viewer_options(const std::string& argument, NativeMenuExpansion& result) {
         if (end == std::string_view::npos) break;
         options.remove_prefix(end + 1U);
     }
+}
+
+void menu_directive(std::string_view& command, NativeMenuExpansion& result) {
+    command = trim(command);
+    if (!command.starts_with('%')) return;
+    const auto directive = read_macro(command, 0);
+    if (directive.kind != MacroKind::view && directive.kind != MacroKind::change_directory) return;
+    if (directive.raw) throw std::invalid_argument("quoting prefixes do not apply to menu directives");
+    result.action = directive.kind == MacroKind::view ? NativeMenuAction::view
+                                                     : NativeMenuAction::change_directory;
+    if (directive.kind == MacroKind::view) viewer_options(directive.argument, result);
+    command.remove_prefix(directive.end);
+    command = trim(command);
 }
 
 enum class ShellQuote { none, single, double_quote, ansi, heredoc_literal, heredoc_expanding };
@@ -1263,27 +1277,27 @@ NativeMenuRequirements native_menu_requirements(const std::string_view command, 
     return result;
 }
 
-NativeMenuExpansion expand_native_menu(
+bool native_menu_has_view_filter(std::string_view command) {
+    if (command.find('\0') != std::string_view::npos) throw std::invalid_argument("NUL in user-menu command");
+    NativeMenuExpansion result;
+    menu_directive(command, result);
+    return result.action == NativeMenuAction::view && !command.empty();
+}
+
+static NativeMenuExpansion expand_native_menu_command(
     std::string_view command,
     const NativeMenuContext& context,
-    const std::vector<std::string>& answers
+    const std::vector<std::string>& answers,
+    const std::optional<std::string_view> local_file
 ) {
     if (command.find('\0') != std::string_view::npos) throw std::invalid_argument("NUL in user-menu command");
     NativeMenuExpansion result;
-    command = trim(command);
-    if (command.starts_with('%')) {
-        const auto directive = read_macro(command, 0);
-        if (directive.kind == MacroKind::view || directive.kind == MacroKind::change_directory) {
-            result.action = directive.kind == MacroKind::view ? NativeMenuAction::view
-                                                            : NativeMenuAction::change_directory;
-            if (directive.raw) throw std::invalid_argument("quoting prefixes do not apply to menu directives");
-            if (directive.kind == MacroKind::view) viewer_options(directive.argument, result);
-            command.remove_prefix(directive.end);
-            command = trim(command);
-        }
+    menu_directive(command, result);
+    if (local_file && (result.action != NativeMenuAction::view || command.empty())) {
+        throw std::invalid_argument("a local view file requires a nonempty %view filter");
     }
     const bool shell_command = result.action != NativeMenuAction::change_directory && !command.empty();
-    if (shell_command && !context.active.local) {
+    if (shell_command && !context.active.local && !local_file) {
         throw std::invalid_argument("copy archive members to a local directory before running file commands");
     }
     auto active_tagged = context.active.tagged;
@@ -1321,7 +1335,7 @@ NativeMenuExpansion expand_native_menu(
             }
             auto& tagged = other ? other_tagged : active_tagged;
             switch (code) {
-                case 'f':
+                case 'f': values.push_back(local_file ? std::string(*local_file) : file_name(pane)); break;
                 case 'p':
                 case 'P':
                 case 'F': values.push_back(file_name(pane)); break;
@@ -1412,6 +1426,23 @@ NativeMenuExpansion expand_native_menu(
         throw std::invalid_argument("user-menu command is empty");
     }
     return result;
+}
+
+NativeMenuExpansion expand_native_menu(
+    const std::string_view command, const NativeMenuContext& context,
+    const std::vector<std::string>& answers
+) {
+    return expand_native_menu_command(command, context, answers, {});
+}
+
+NativeMenuExpansion expand_native_view_filter(
+    const std::string_view command, const NativeMenuContext& context,
+    const std::vector<std::string>& answers, const std::string_view local_file
+) {
+    if (local_file.find('\0') != std::string_view::npos || !std::filesystem::path(local_file).is_absolute()) {
+        throw std::invalid_argument("a local view file must be an absolute path without NUL");
+    }
+    return expand_native_menu_command(command, context, answers, local_file);
 }
 
 std::string native_menu_directory(

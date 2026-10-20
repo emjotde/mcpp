@@ -416,8 +416,18 @@ guards were recompiled and the small model rechecked, without another UI sweep.
 Native extension resources now match Open/View/Edit and execute through the
 shared directive/macro engine, preserving legacy rules, dirty buffers and
 archive provider boundaries. Expressions now use PCRE2. **L21 remains bounded**
-by explicit local-copy requirements for external archive actions and the
-documented macro restrictions. Extension View, user-menu `%view` and Filtered
+by explicit local-copy requirements for external Open/Edit and unsupported
+archive actions plus the documented macro restrictions. Native View filters
+now stream a regular selected virtual source into a private basename-preserving
+checkout, override only `%f`/`MC_EXT_FILENAME`, and keep original `%p`/`%d` and
+metadata identity. Dirty/unsupported-source/mark/argument checks precede copying;
+the command uses checkout cwd, source revisions are rechecked, and no copyback
+occurs. Output retains its own screen-owned file after checkout cleanup.
+Symlinks and active virtual marks remain an explicit selected-only bound.
+The failed native prompt-interpolation control is recorded as such; mcpp
+literal argv preservation is verified independently rather than claiming that
+failed native argv control passed.
+Extension View, user-menu `%view` and Filtered
 view now stream output to private files without the former 16/64 MiB stdout
 caps. Each screen retains its own read-only output; failed commands do not
 open partial output. Stderr remains bounded. Missing helpers, storage errors

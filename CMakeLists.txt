@@ -74,6 +74,7 @@ add_library(
     src/config_ini.cpp
     src/entry.cpp
     src/extension.cpp
+    src/extension_view_checkout.cpp
     src/file_highlight.cpp
     src/listing.cpp
     src/compare.cpp
@@ -276,6 +277,18 @@ if(MCPP_BUILD_TESTS)
     add_executable(mcpp_panel_torben_preferences tests/test_panel_torben_preferences.cpp)
     target_link_libraries(mcpp_panel_torben_preferences PRIVATE mcpp_core)
     mcpp_target_defaults(mcpp_panel_torben_preferences)
+    add_executable(mcpp_tree_navigation_tests tests/test_tree_navigation_preferences.cpp)
+    target_include_directories(mcpp_tree_navigation_tests PRIVATE src)
+    target_link_libraries(mcpp_tree_navigation_tests PRIVATE mcpp_core)
+    mcpp_target_defaults(mcpp_tree_navigation_tests)
+    add_executable(mcpp_viewer_eof_tests tests/test_viewer_eof.cpp)
+    target_include_directories(mcpp_viewer_eof_tests PRIVATE src)
+    target_link_libraries(mcpp_viewer_eof_tests PRIVATE mcpp_ui)
+    mcpp_target_defaults(mcpp_viewer_eof_tests)
+    add_executable(mcpp_extension_view_checkout_tests tests/test_extension_view_checkout.cpp)
+    target_include_directories(mcpp_extension_view_checkout_tests PRIVATE src)
+    target_link_libraries(mcpp_extension_view_checkout_tests PRIVATE mcpp_core)
+    mcpp_target_defaults(mcpp_extension_view_checkout_tests)
     add_executable(mcpp_translation_tests tests/test_translation.cpp)
     target_link_libraries(mcpp_translation_tests PRIVATE mcpp_core)
     mcpp_target_defaults(mcpp_translation_tests)
@@ -365,6 +378,24 @@ if(MCPP_BUILD_TESTS)
         add_test(NAME mcpp_shell_display_preferences COMMAND mcpp_shell_display_tests model)
         add_test(NAME mcpp_panel_torben_preferences COMMAND mcpp_panel_torben_preferences)
         set_tests_properties(mcpp_panel_torben_preferences PROPERTIES WORKING_DIRECTORY /review/cases)
+        add_test(
+            NAME mcpp_native_tree_navigation
+            COMMAND mcpp_tree_navigation_tests /review/cases/xtree-fd3eff6e/model/ctest
+        )
+        foreach(viewer_eof_case IN ITEMS render state)
+            add_test(
+                NAME mcpp_viewer_eof_${viewer_eof_case}
+                COMMAND mcpp_viewer_eof_tests ${viewer_eof_case}
+                        /review/cases/viewer-eof/models/${viewer_eof_case}-ctest
+            )
+        endforeach()
+        foreach(view_checkout_case IN ITEMS success failure)
+            add_test(
+                NAME mcpp_extension_view_checkout_${view_checkout_case}
+                COMMAND mcpp_extension_view_checkout_tests ${view_checkout_case}
+                        /review/cases/l21-view-checkout/model
+            )
+        endforeach()
         add_test(
             NAME mcpp_archive_tests
             COMMAND mcpp_archive_tests /review/cases/agent-archives

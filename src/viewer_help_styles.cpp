@@ -110,6 +110,15 @@ ftxui::Element render_viewer_text(
     return hbox(std::move(segments));
 }
 
+void append_viewer_eof_rows(
+    std::vector<ftxui::Element>& rows, const std::string_view display_marker,
+    const ViewerModel& viewer, const std::size_t height
+) {
+    if (display_marker.empty() || !viewer.open() || viewer.hex() ||
+        viewer.view_end() != viewer.size() || !viewer.source_error().empty()) return;
+    while (rows.size() < height) rows.push_back(glyph_text(display_marker));
+}
+
 ftxui::Element help_text_style(
     ftxui::Element element, const Skin& skin, const HelpTextStyle style
 ) {

@@ -484,6 +484,8 @@ Config Config::load(const std::filesystem::path& path) {
             result.select_flags = flags;
         } else if (key == "torben_fj_mode") {
             result.torben_fj_mode = parse_bool(value, key);
+        } else if (key == "xtree_mode") {
+            result.xtree_mode = parse_bool(value, key);
         } else if (key == "alternate_plus_minus" || key == "only_leading_plus_minus") {
             const auto setting = parse_bool(value, key);
             (key == "alternate_plus_minus" ? result.alternate_plus_minus : result.only_leading_plus_minus) = setting;
@@ -505,6 +507,8 @@ Config Config::load(const std::filesystem::path& path) {
             result.viewer_mouse_page_scrolling = parse_bool(value, key);
         } else if (key == "viewer_remember_file_position") {
             result.viewer_remember_file_position = parse_bool(value, key);
+        } else if (key == "mcview_eof") {
+            result.mcview_eof = decode_value(value);
         } else if (key == "source_codepage") {
             auto encoding = decode_value(value);
             if (encoding == "~" || encoding == "Other_8_bit") encoding.clear();
@@ -862,6 +866,7 @@ void Config::save(const std::filesystem::path& path) const {
            << "saved_right_path=" << encode_value(saved_right_path) << '\n';
     if (select_flags) output << "select_flags=" << *select_flags << '\n';
     if (torben_fj_mode) output << "torben_fj_mode=" << (*torben_fj_mode ? "true" : "false") << '\n';
+    if (xtree_mode) output << "xtree_mode=" << (*xtree_mode ? "true" : "false") << '\n';
     if (alternate_plus_minus) {
         output << "alternate_plus_minus=" << (*alternate_plus_minus ? "true" : "false") << '\n';
     }
@@ -875,6 +880,7 @@ void Config::save(const std::filesystem::path& path) const {
         output << "viewer_mouse_page_scrolling=" << (*viewer_mouse_page_scrolling ? "true" : "false") << '\n';
     }
     output << "viewer_remember_file_position=" << (viewer_remember_file_position ? "true" : "false") << '\n';
+    if (mcview_eof) output << "mcview_eof=" << encode_value(*mcview_eof) << '\n';
     if (source_codepage) output << "source_codepage=" << encode_value(*source_codepage) << '\n';
     if (clipboard_store) output << "clipboard_store=" << encode_value(*clipboard_store) << '\n';
     if (clipboard_paste) output << "clipboard_paste=" << encode_value(*clipboard_paste) << '\n';

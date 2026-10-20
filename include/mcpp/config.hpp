@@ -83,6 +83,7 @@ struct Config {
     bool simple_swap{false};
     bool auto_save_panels_setup{false};
     bool navigate_with_arrows{false};
+    std::optional<bool> xtree_mode;
     bool scroll_pages{true};
     bool scroll_center{false};
     std::optional<bool> torben_fj_mode;
@@ -122,6 +123,7 @@ struct Config {
     bool viewer_wrap{true};
     std::optional<bool> viewer_mouse_page_scrolling;
     bool viewer_remember_file_position{false};
+    std::optional<std::string> mcview_eof;
     std::optional<std::string> source_codepage;
     std::optional<std::string> clipboard_store;
     std::optional<std::string> clipboard_paste;

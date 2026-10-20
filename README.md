@@ -375,6 +375,10 @@ remain available regardless of the draft; explicit user key bindings win.
 Native `torben_fj_mode` makes Home/End visit the visible midpoint, then the
 visible edge, then the directory edge. It does not change ordinary arrow/page
 scrolling. Missing keys retain the earlier routing and navigation.
+Explicit `xtree_mode` controls whether changing the focused tree selection also
+changes the listing; F4 traversal and tree focus remain independent. Missing
+keys retain the previous dynamic-tree choice, and same-directory following does
+not reset marks or cursor.
 `editor_simple_statusbar` selects compact flags, visual column, row/total,
 byte position/size, character/EOF and percentage fields.
 `editor_show_right_margin` shades cells from the configured
@@ -545,8 +549,16 @@ expansion. Internal View honors a matching View action; external View follows
 VIEWER/PAGER. Native Edit actions run with either editor preference.
 
 Invalid resources and missing helpers report explicit errors, without executing
-a legacy fallback. Native expressions use PCRE2. External archive commands
-require a local copy; internal `%view` reads the archive provider. Compatibility
+a legacy fallback. Native expressions use PCRE2. Native `%view COMMAND` filters
+can privately check out the current regular virtual file: `%f` and
+`MC_EXT_FILENAME` use the local copy, while `%p`, `%d` and basename/directory
+metadata retain the original identity. The command runs in the private checkout
+directory; filtered output has its own independent read-only screen lifetime.
+Source revisions are checked and the original is never written back.
+Virtual symlinks and active-pane marks are explicitly rejected before copying;
+opposite virtual-file arguments retain their existing guard. External Open/Edit
+and other unsupported archive commands still require a manual local copy.
+Internal `%view` without a command reads the provider directly. Compatibility
 remains bounded by documented macro restrictions. Extension View filters, user
 menu `%view` commands and Filtered view stream stdout to private files instead
 of buffering it or imposing the former 16/64 MiB output limits. Each viewer
@@ -892,6 +904,9 @@ the corresponding installed standard command; missing/failed tools are explicit
 errors. Parsed data is read-only, so hex Save cannot replace a compressed file
 with decompressed bytes. F9 toggles nroff overstrike formatting, including bold
 and underlined text. Formatting and codepages never convert the file on disk.
+Native `mcview_eof` is literal text, including `"0"`, repeated at column zero
+on otherwise unused text rows in the viewer and Quick view. Empty/absent values
+leave those rows blank; hex mode ignores the marker. It is not file data.
 Native `viewbold` and `viewunderline` pairs style formatted text in both the
 viewer and Quick view; search highlights take precedence. Missing native roles
 retain the earlier emphasis, while explicit attributes replace that fallback.

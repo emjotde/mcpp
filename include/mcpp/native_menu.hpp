@@ -95,10 +95,17 @@ struct NativeMenuExpansion {
     bool editor
 );
 
+[[nodiscard]] bool native_menu_has_view_filter(std::string_view command);
+
 [[nodiscard]] NativeMenuExpansion expand_native_menu(
     std::string_view command,
     const NativeMenuContext& context,
     const std::vector<std::string>& answers = {}
+);
+
+[[nodiscard]] NativeMenuExpansion expand_native_view_filter(
+    std::string_view command, const NativeMenuContext& context,
+    const std::vector<std::string>& answers, std::string_view local_file
 );
 
 // Non-local relative paths stay relative for resolution against the captured provider.
