@@ -5,10 +5,15 @@
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
+#include <climits>
 #include <cstring>
+#include <cwchar>
+#include <cwctype>
 #include <filesystem>
 #include <fstream>
 #include <fcntl.h>
+#include <fnmatch.h>
+#include <regex>
 #include <sstream>
 #include <stdexcept>
 #include <streambuf>
@@ -17,6 +22,134 @@
 
 namespace mcpp {
 namespace {
+
+std::size_t mask_character_length(const std::string_view value) {
+    if (value.empty()) return 0U;
+    std::mbstate_t state{};
+    const auto count = std::mbrlen(value.data(), value.size(), &state);
+    return count == 0U || count == static_cast<std::size_t>(-1) ||
+           count == static_cast<std::size_t>(-2) ? 1U : count;
+}
+
+std::size_t shell_class_end(const std::string_view pattern, const std::size_t begin) {
+    auto index = begin + 1U;
+    if (index < pattern.size() && (pattern[index] == '!' || pattern[index] == '^')) ++index;
+    if (index < pattern.size() && pattern[index] == ']') ++index;
+    for (; index < pattern.size(); ++index) {
+        if (pattern[index] == '\\' && index + 1U < pattern.size()) {
+            ++index;
+        } else if (pattern[index] == '[' && index + 1U < pattern.size() &&
+                   std::string_view(":.=").find(pattern[index + 1U]) != std::string_view::npos) {
+            const auto end = pattern.find(std::string{pattern[index + 1U], ']'}, index + 2U);
+            if (end != std::string_view::npos) index = end + 1U;
+        } else if (pattern[index] == ']') {
+            return index + 1U;
+        }
+    }
+    return begin + 1U;
+}
+
+std::vector<std::string> shell_mask_captures(
+    const std::string& pattern, const std::string& name
+) {
+    std::vector<std::string> captures{name};
+    std::vector<std::size_t> boundaries{0U};
+    while (boundaries.back() < name.size()) {
+        boundaries.push_back(boundaries.back() +
+            mask_character_length(std::string_view(name).substr(boundaries.back())));
+    }
+    std::size_t position = 0U;
+    for (std::size_t index = 0U; index < pattern.size();) {
+        const auto character = pattern[index++];
+        if (character == '*') {
+            auto boundary = boundaries.end() - 1;
+            while (*boundary > position &&
+                   fnmatch(pattern.c_str() + index, name.c_str() + *boundary, 0) != 0) {
+                --boundary;
+            }
+            const auto end = *boundary;
+            captures.push_back(name.substr(position, end - position));
+            position = end;
+        } else {
+            const auto length = mask_character_length(std::string_view(name).substr(position));
+            if (character == '?') {
+                captures.push_back(name.substr(position, length));
+            } else if (character == '[') {
+                index = shell_class_end(pattern, index - 1U);
+            } else {
+                if (character == '\\' && index < pattern.size()) ++index;
+                while (index < pattern.size() &&
+                       (static_cast<unsigned char>(pattern[index]) & 0xc0U) == 0x80U) ++index;
+            }
+            position += length;
+        }
+    }
+    return captures;
+}
+
+void append_mask_text(
+    std::string& result, const std::string_view value, const char conversion,
+    char& next_conversion
+) {
+    if (conversion == '\0' && next_conversion == '\0') {
+        result += value;
+        return;
+    }
+    std::mbstate_t input_state{};
+    for (std::size_t offset = 0; offset < value.size();) {
+        wchar_t character{};
+        auto count = std::mbrtowc(&character, value.data() + offset, value.size() - offset, &input_state);
+        const auto mode = next_conversion != '\0' ? next_conversion : conversion;
+        next_conversion = '\0';
+        if (count == static_cast<std::size_t>(-1) || count == static_cast<std::size_t>(-2)) {
+            input_state = {};
+            result += value[offset++];
+            continue;
+        }
+        if (count == 0U) count = 1U;
+        if (mode == 'u' || mode == 'U') character = static_cast<wchar_t>(std::towupper(static_cast<wint_t>(character)));
+        else if (mode == 'l' || mode == 'L') character = static_cast<wchar_t>(std::towlower(static_cast<wint_t>(character)));
+        char encoded[MB_LEN_MAX];
+        std::mbstate_t output_state{};
+        const auto length = std::wcrtomb(encoded, character, &output_state);
+        if (length == static_cast<std::size_t>(-1)) result.append(value.substr(offset, count));
+        else result.append(encoded, length);
+        offset += count;
+    }
+}
+
+std::vector<Entry> matching_sources(
+    const std::vector<Entry>& sources, const CopyMask& mask, const OperationOptions& options
+) {
+    std::vector<Entry> result;
+    for (const auto& source : sources) {
+        if (!mask.matches(source.name)) continue;
+        if (options.destination_mask) {
+            static_cast<void>(mask.transform(source.name, *options.destination_mask));
+        }
+        result.push_back(source);
+    }
+    return result;
+}
+
+std::string masked_destination(
+    Provider& provider, const std::string_view directory, const Entry& source,
+    const CopyMask& mask, const OperationOptions& options, const Cancellation& cancellation
+) {
+    const auto name = options.destination_mask
+        ? *mask.transform(source.name, *options.destination_mask) : source.name;
+    auto destination = provider.join(directory, name);
+    if (options.dive_into_subdirectories &&
+        (source.kind == EntryKind::directory ||
+         (!options.preserve_symlinks && source.target_is_directory)) &&
+        provider.exists(destination)) {
+        const auto target = provider.stat(destination, cancellation);
+        if (target.kind == EntryKind::directory || target.target_is_directory) {
+            destination = provider.join(destination, source.name);
+        }
+    }
+    return destination;
+}
 
 void require_capability(
     const Provider& provider, const ProviderCapability capability,
@@ -507,6 +640,124 @@ private:
 
 }  // namespace
 
+struct CopyMask::Pattern {
+    Pattern(std::string value, const bool shell)
+        : source(std::move(value)), shell_patterns(shell) {
+        if (!shell_patterns) expression.emplace(source);
+    }
+    std::string source;
+    bool shell_patterns;
+    std::optional<std::regex> expression;
+};
+
+CopyMask::CopyMask(const std::string_view source, const bool shell_patterns) {
+    if (source.find('\0') != std::string_view::npos) {
+        throw std::invalid_argument("source mask contains NUL");
+    }
+    try {
+        pattern_ = std::make_shared<Pattern>(std::string(source), shell_patterns);
+    } catch (const std::regex_error& error) {
+        throw std::invalid_argument("invalid source mask: " + std::string(error.what()));
+    }
+}
+
+bool CopyMask::matches(const std::string_view name) const {
+    return pattern_->shell_patterns
+        ? fnmatch(pattern_->source.c_str(), std::string(name).c_str(), 0) == 0
+        : std::regex_search(name.begin(), name.end(), *pattern_->expression);
+}
+
+std::optional<std::string> CopyMask::transform(
+    const std::string_view name, const std::string_view destination
+) const {
+    std::vector<std::string> captures;
+    if (pattern_->shell_patterns) {
+        if (!matches(name)) return std::nullopt;
+        captures = shell_mask_captures(pattern_->source, std::string(name));
+    } else {
+        std::match_results<std::string_view::const_iterator> match;
+        if (!std::regex_search(name.begin(), name.end(), match, *pattern_->expression)) {
+            return std::nullopt;
+        }
+        for (const auto& capture : match) captures.push_back(capture.str());
+        captures[0] = name;
+    }
+    std::string result;
+    std::size_t next_group = 1U;
+    char conversion = '\0';
+    char next_conversion = '\0';
+    const auto append = [&](const std::string_view value) {
+        append_mask_text(result, value, conversion, next_conversion);
+    };
+    const auto group = [&](const std::size_t index) {
+        if (index == 0U) {
+            append(name);
+        } else {
+            if (index >= captures.size()) {
+                throw std::invalid_argument("destination mask refers to missing source group " + std::to_string(index));
+            }
+            append(captures[index]);
+        }
+    };
+    for (std::size_t index = 0; index < destination.size();) {
+        const auto character = destination[index++];
+        if (character == '*') {
+            group(next_group++);
+        } else if (character == '\\') {
+            if (index == destination.size()) {
+                throw std::invalid_argument("unfinished escape in destination mask");
+            }
+            const auto escaped = destination[index++];
+            if (escaped >= '0' && escaped <= '9') {
+                group(static_cast<std::size_t>(escaped - '0'));
+            } else if (escaped == 'u' || escaped == 'l') {
+                next_conversion = escaped;
+            } else if (escaped == 'U' || escaped == 'L' || escaped == 'E') {
+                conversion = escaped == 'E' ? '\0' : escaped;
+            } else {
+                append(destination.substr(index - 1U, 1U));
+            }
+        } else {
+            const auto begin = index - 1U;
+            while (index < destination.size() && destination[index] != '*' && destination[index] != '\\') ++index;
+            append(destination.substr(begin, index - begin));
+        }
+    }
+    if (result.empty() || result == "." || result == ".." ||
+        result.find('/') != std::string::npos || result.find('\0') != std::string::npos) {
+        throw std::invalid_argument("destination mask must produce a nonempty file name, not a path");
+    }
+    return result;
+}
+
+bool CopyMask::has_replacements(const std::string_view destination) {
+    for (std::size_t index = 0; index < destination.size(); ++index) {
+        if (destination[index] == '*') return true;
+        if (destination[index] == '\\' && index + 1U < destination.size()) {
+            const auto escaped = destination[++index];
+            if ((escaped >= '0' && escaped <= '9') ||
+                std::string_view("uUlLE").find(escaped) != std::string_view::npos) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+std::string CopyMask::unescape_path(const std::string_view path) {
+    if (path.find('\0') != std::string_view::npos) {
+        throw std::invalid_argument("destination path contains NUL");
+    }
+    std::string result;
+    for (std::size_t index = 0; index < path.size(); ++index) {
+        if (path[index] == '\\' && ++index == path.size()) {
+            throw std::invalid_argument("unfinished escape in destination path");
+        }
+        result += path[index];
+    }
+    return result;
+}
+
 CollisionOptions OperationEngine::collision_options(
     const Provider& source_provider,
     const Entry& source,
@@ -804,6 +1055,22 @@ bool OperationEngine::copy_entry_once(
         emit_completed_progress(progress, state);
         return true;
     }
+    if (local_source != nullptr && local_destination != nullptr &&
+        source.kind == EntryKind::symlink && options.preserve_symlinks) {
+        local_destination->copy_symlink_from(
+            *local_source, source.path, destination_path,
+            options.stable_symlinks, overwrite, cancellation,
+            source.revision.empty() ? std::nullopt : std::optional{source.revision},
+            expected_destination_revision
+        );
+        if (options.preserve_permissions) {
+            preserve_time(destination_provider, destination_path, source);
+        }
+        state.bytes_done += source.size;
+        ++state.files_done;
+        emit_completed_progress(progress, state);
+        return true;
+    }
     if (effective_source.kind == EntryKind::other) {
         throw std::runtime_error("unsupported special file copy between providers: " + source.path);
     }
@@ -833,7 +1100,9 @@ bool OperationEngine::copy_entry_once(
             }
         );
         if (copied_all) {
-            preserve_time(destination_provider, destination_path, source);
+            if (options.preserve_permissions) {
+                preserve_time(destination_provider, destination_path, source);
+            }
             remember_link();
             TransferProgress completed;
             accumulate_entry(
@@ -917,7 +1186,7 @@ bool OperationEngine::copy_entry_once(
                 effective_source.permissions
             );
         }
-        if (copied_all) {
+        if (copied_all && options.preserve_permissions) {
             preserve_time(destination_provider, destination_path, effective_source);
         }
         return copied_all;
@@ -991,7 +1260,9 @@ bool OperationEngine::copy_entry_once(
             effective_source.permissions
         );
     }
-    preserve_time(destination_provider, destination_path, effective_source);
+    if (options.preserve_permissions) {
+        preserve_time(destination_provider, destination_path, effective_source);
+    }
     remember_link();
     state.bytes_done += effective_source.size;
     ++state.files_done;
@@ -1001,7 +1272,7 @@ bool OperationEngine::copy_entry_once(
 
 void OperationEngine::copy(
     Provider& source_provider,
-    const std::vector<Entry>& sources,
+    const std::vector<Entry>& requested_sources,
     Provider& destination_provider,
     const std::string_view destination_directory,
     const OperationOptions& options,
@@ -1009,6 +1280,8 @@ void OperationEngine::copy(
     const ProgressCallback& progress,
     OperationResult* result
 ) const {
+    const CopyMask mask(options.source_mask, options.shell_patterns);
+    const auto sources = matching_sources(requested_sources, mask, options);
     auto state = options.compute_totals
                      ? measure(source_provider, sources, cancellation, static_cast<bool>(options.error))
                      : TransferProgress{};
@@ -1020,9 +1293,8 @@ void OperationEngine::copy(
                 source_provider,
                 source,
                 destination_provider,
-                destination_provider.join(
-                    destination_directory,
-                    source.name
+                masked_destination(
+                    destination_provider, destination_directory, source, mask, options, cancellation
                 ),
                 options,
                 cancellation,
@@ -1056,6 +1328,7 @@ void OperationEngine::copy_exact(
     OperationResult* result
 ) const {
     cancellation.throw_if_requested();
+    if (!CopyMask(options.source_mask, options.shell_patterns).matches(source.name)) return;
     if (directory_destination(
             destination_provider,
             destination,
@@ -1100,7 +1373,7 @@ void OperationEngine::copy_exact(
 
 void OperationEngine::move(
     Provider& source_provider,
-    const std::vector<Entry>& sources,
+    const std::vector<Entry>& requested_sources,
     Provider& destination_provider,
     const std::string_view destination_directory,
     const OperationOptions& options,
@@ -1111,6 +1384,8 @@ void OperationEngine::move(
     cancellation.throw_if_requested();
     require_capability(source_provider, ProviderCapability::remove, "move source removal");
     require_capability(destination_provider, ProviderCapability::write, "move destination");
+    const CopyMask mask(options.source_mask, options.shell_patterns);
+    const auto sources = matching_sources(requested_sources, mask, options);
     auto links = std::make_shared<LinkCache>();
     if (&source_provider == &destination_provider &&
         has_capability(
@@ -1129,9 +1404,8 @@ void OperationEngine::move(
                 record_skipped(result, source, "user requested skip");
                 continue;
             }
-            const auto destination = destination_provider.join(
-                destination_directory,
-                source.name
+            const auto destination = masked_destination(
+                destination_provider, destination_directory, source, mask, options, cancellation
             );
             validate_move_target(
                 source_provider, source, destination_provider,
@@ -1157,7 +1431,9 @@ void OperationEngine::move(
             }
             const bool overwrite = collision.destination.has_value();
             std::string rename_skip;
-            const auto renamed = collision.decision == CollisionDecision::overwrite
+            const auto renamed = collision.decision == CollisionDecision::overwrite &&
+                                 !(options.stable_symlinks && options.preserve_symlinks &&
+                                   source.kind == EntryKind::symlink)
                 ? rename_with_retry(
                       source_provider, source, destination_provider, destination,
                       overwrite, options, cancellation, rename_skip
@@ -1227,7 +1503,8 @@ void OperationEngine::move(
                     if (remove_with_retry(
                             source_provider, source, cancellation, {}, options.error,
                             [&] {
-                                if (transferred_decision != CollisionDecision::overwrite) {
+                                if (transferred_decision != CollisionDecision::overwrite ||
+                                    (options.stable_symlinks && source.kind == EntryKind::symlink)) {
                                     validate_move_source(source_provider, transferred_source, cancellation);
                                 }
                                 validate_move_target(
@@ -1259,8 +1536,8 @@ void OperationEngine::move(
                      : TransferProgress{};
     for (const auto& source : sources) {
         try {
-            const auto destination = destination_provider.join(
-                destination_directory, source.name
+            const auto destination = masked_destination(
+                destination_provider, destination_directory, source, mask, options, cancellation
             );
             validate_move_target(
                 source_provider, source, destination_provider,
@@ -1299,7 +1576,8 @@ void OperationEngine::move(
                 if (remove_with_retry(
                         source_provider, source, cancellation, {}, options.error,
                         [&] {
-                            if (transferred_decision != CollisionDecision::overwrite) {
+                            if (transferred_decision != CollisionDecision::overwrite ||
+                                (options.stable_symlinks && source.kind == EntryKind::symlink)) {
                                 validate_move_source(source_provider, transferred_source, cancellation);
                             }
                             validate_move_target(
@@ -1375,6 +1653,7 @@ void OperationEngine::move_exact(
     cancellation.throw_if_requested();
     require_capability(source_provider, ProviderCapability::remove, "move source removal");
     require_capability(destination_provider, ProviderCapability::write, "move destination");
+    if (!CopyMask(options.source_mask, options.shell_patterns).matches(source.name)) return;
     if (source_provider.id() == destination_provider.id() &&
         source_provider.normalize(source.path) ==
             destination_provider.normalize(destination)) {
@@ -1433,6 +1712,7 @@ void OperationEngine::move_exact(
     }
     if (&source_provider == &destination_provider &&
         collision.decision == CollisionDecision::overwrite &&
+        !(options.stable_symlinks && options.preserve_symlinks && source.kind == EntryKind::symlink) &&
         has_capability(
             source_provider.capabilities(),
             ProviderCapability::rename
@@ -1510,7 +1790,8 @@ void OperationEngine::move_exact(
         if (remove_with_retry(
                 source_provider, source, cancellation, {}, options.error,
                 [&] {
-                    if (transferred_decision != CollisionDecision::overwrite) {
+                    if (transferred_decision != CollisionDecision::overwrite ||
+                        (options.stable_symlinks && source.kind == EntryKind::symlink)) {
                         validate_move_source(source_provider, transferred_source, cancellation);
                     }
                     validate_move_target(

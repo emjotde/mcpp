@@ -254,10 +254,11 @@ The terminal renderer requires UTF-8. Display bits reports that fixed terminal
 mode; legacy non-UTF-8 terminal output and 7-bit input are not implemented.
 The separate pane/editor Encoding commands use the reference Choose codepage
 list to interpret file data without renaming files or converting them on disk.
-Editor codepage changes require a clean buffer without undo/redo history;
-unrepresentable input is rejected before changing the draft. Saving retains the
-selected file encoding. Raw hexadecimal search in another file codepage
-requires reopening with No translation.
+Editor codepage changes retain dirty text, marks and undo/redo history.
+Unrepresentable conversions fail without replacing the draft or consuming
+history. Saving retains the selected file encoding. Raw hexadecimal search
+uses encoded file bytes and maps matches back to document positions, without
+requiring a reopen with No translation.
 
 Learn keys tests the listed terminal keys and teaches a missing sequence.
 Printable ASCII keys, Tab, and Return are not accepted as replacement terminal
@@ -412,6 +413,14 @@ read as streams; device creation still needs normal Linux permissions. Unix
 sockets are rejected. Cancellation, source identity, overwrite choices and
 hardlink groups retain their guards. A failed final directory sync is reported
 even if the destination has already been published.
+
+Copy/move dialogs support filename transformation masks as well as source
+filtering. Captures and case-conversion replacements can rename matching files;
+shell-style masks and ECMAScript regex are supported, not full PCRE. The native
+Dive option controls placement into an existing destination folder. Stable
+symlinks adjusts local relative links to keep their original referent, using
+revision-checked staged publication. Unsupported nonlocal stable-link handling
+is not silently substituted.
 
 Regular local-file collisions offer native Append and Reget choices when
 applicable. Append publishes the destination followed by the source; Reget

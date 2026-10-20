@@ -62,6 +62,13 @@ public:
         bool overwrite, const Cancellation& cancellation,
         std::optional<std::string> expected_destination_revision = {}
     );
+    void copy_symlink_from(
+        const LocalProvider& source_provider,
+        std::string_view source, std::string_view destination,
+        bool stable, bool overwrite, const Cancellation& cancellation,
+        std::optional<std::string> expected_source_revision = {},
+        std::optional<std::string> expected_destination_revision = {}
+    );
     void copy_file_from(
         const LocalProvider& source_provider,
         std::string_view source, std::string_view destination,

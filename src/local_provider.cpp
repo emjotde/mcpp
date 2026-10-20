@@ -1346,6 +1346,65 @@ void LocalProvider::copy_hardlink(
     }
 }
 
+void LocalProvider::copy_symlink_from(
+    const LocalProvider& source_provider,
+    const std::string_view source, const std::string_view destination,
+    const bool stable, const bool overwrite, const Cancellation& cancellation,
+    const std::optional<std::string> expected_source_revision,
+    const std::optional<std::string> expected_destination_revision
+) {
+    cancellation.throw_if_requested();
+    const auto from = source_provider.resolve(source);
+    const auto to = resolve(destination);
+    if (to == root_) {
+        throw std::invalid_argument("refusing to replace provider root with a symbolic link");
+    }
+    struct stat original{};
+    if (!lstat_if_present(from, original) || !S_ISLNK(original.st_mode)) {
+        throw std::runtime_error("copy source is no longer a symbolic link: " + from.string());
+    }
+    if (expected_source_revision && revision_for(original) != *expected_source_revision) {
+        throw std::runtime_error("source changed before copying: " + from.string());
+    }
+    auto target = std::filesystem::read_symlink(from);
+    if (stable && target.is_relative()) {
+        // Keep the referent, including dangling targets and symlink/.. components.
+        target = from.parent_path() / target;
+    }
+    validate_copied_source(from, original);
+    const auto previous = destination_status(to);
+    if (!overwrite && previous) {
+        throw std::runtime_error("destination exists: " + to.string());
+    }
+    if (expected_destination_revision &&
+        (!previous || revision_for(*previous) != *expected_destination_revision)) {
+        throw std::runtime_error("destination changed since the collision decision: " + to.string());
+    }
+    std::filesystem::create_directories(to.parent_path());
+    const DirectorySync parent_directory(to.parent_path());
+    auto pattern = (to.parent_path() / ".mcpp-link-XXXXXX").string();
+    if (mkdtemp(pattern.data()) == nullptr) {
+        throw std::system_error(errno, std::generic_category(), "stage copied symbolic link");
+    }
+    const std::filesystem::path directory(pattern);
+    const auto temporary = directory / "link";
+    try {
+        std::filesystem::create_symlink(target, temporary);
+        const DirectorySync staged_directory(directory);
+        staged_directory.sync();
+        cancellation.throw_if_requested();
+        validate_copied_source(from, original);
+        publish_output(temporary, to, overwrite, previous);
+        std::filesystem::remove(directory);
+        parent_directory.sync_published(to);
+    } catch (...) {
+        std::error_code ignored;
+        std::filesystem::remove(temporary, ignored);
+        std::filesystem::remove(directory, ignored);
+        throw;
+    }
+}
+
 void LocalProvider::remove(
     const std::string_view path,
     const bool recursive,
@@ -1591,7 +1650,7 @@ void LocalProvider::copy_file_from(
                     return static_cast<std::uint64_t>(output_size);
                 },
                 validate,
-                modified_for(original)
+                preserve_permissions ? std::optional{modified_for(original)} : std::nullopt
             );
         } catch (...) {
             if (prefix_descriptor >= 0) static_cast<void>(close(prefix_descriptor));
@@ -1635,9 +1694,11 @@ void LocalProvider::copy_file_from(
         if (chmod(temporary.c_str(), static_cast<mode_t>(permission_mode)) != 0) {
             throw std::system_error(errno, std::generic_category(), "set copied special file permissions");
         }
-        const auto times = modification_times(modified_for(original));
-        if (utimensat(AT_FDCWD, temporary.c_str(), times.data(), AT_SYMLINK_NOFOLLOW) != 0) {
-            throw std::system_error(errno, std::generic_category(), "preserve special file modification time");
+        if (preserve_permissions) {
+            const auto times = modification_times(modified_for(original));
+            if (utimensat(AT_FDCWD, temporary.c_str(), times.data(), AT_SYMLINK_NOFOLLOW) != 0) {
+                throw std::system_error(errno, std::generic_category(), "preserve special file modification time");
+            }
         }
         const DirectorySync staged_directory(directory);
         staged_directory.sync();

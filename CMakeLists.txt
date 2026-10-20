@@ -167,6 +167,12 @@ if(MCPP_BUILD_TESTS)
     add_executable(mcpp_append_resume_tests tests/test_append_resume.cpp)
     target_link_libraries(mcpp_append_resume_tests PRIVATE mcpp_core)
     mcpp_target_defaults(mcpp_append_resume_tests)
+    add_executable(mcpp_copy_mask_tests tests/test_copy_masks.cpp)
+    target_link_libraries(mcpp_copy_mask_tests PRIVATE mcpp_core)
+    mcpp_target_defaults(mcpp_copy_mask_tests)
+    add_executable(mcpp_editor_codepage_tests tests/test_editor_codepages.cpp)
+    target_link_libraries(mcpp_editor_codepage_tests PRIVATE mcpp_core)
+    mcpp_target_defaults(mcpp_editor_codepage_tests)
     add_executable(mcpp_hotlist_tests tests/test_hotlist.cpp)
     target_link_libraries(mcpp_hotlist_tests PRIVATE mcpp_core)
     mcpp_target_defaults(mcpp_hotlist_tests)
@@ -190,6 +196,7 @@ if(MCPP_BUILD_TESTS)
             /review/cases/sparse-special-files
             /review/cases/input-histories
             /review/cases/append-resume
+            /review/cases/copy-masks
         )
         add_test(
             NAME mcpp_keymap_tests
@@ -223,6 +230,20 @@ if(MCPP_BUILD_TESTS)
         set_tests_properties(
             mcpp_append_resume_bytes mcpp_append_resume_safety
             PROPERTIES WORKING_DIRECTORY /review/cases/append-resume
+        )
+        foreach(copy_mask_case IN ITEMS masks placement links)
+            add_test(
+                NAME mcpp_copy_${copy_mask_case}
+                COMMAND mcpp_copy_mask_tests ${copy_mask_case}
+            )
+            set_tests_properties(
+                mcpp_copy_${copy_mask_case}
+                PROPERTIES WORKING_DIRECTORY /review/cases/copy-masks
+            )
+        endforeach()
+        add_test(
+            NAME mcpp_editor_codepage_tests
+            COMMAND mcpp_editor_codepage_tests /review/cases/editor-codepages/model
         )
         add_test(
             NAME mcpp_viewer_source_growing

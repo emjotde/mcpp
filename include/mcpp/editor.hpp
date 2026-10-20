@@ -274,6 +274,7 @@ private:
         const Cancellation& cancellation
     );
     struct Snapshot {
+        // Positions and column ranges use encoded byte columns, independent of the display codepage.
         std::size_t row{0};
         std::size_t column{0};
         std::size_t over_column{0};
@@ -284,6 +285,7 @@ private:
         std::optional<std::size_t> column_selection_width;
         std::optional<std::size_t> selection_begin_display;
         std::optional<std::size_t> selection_end_display;
+        std::vector<std::pair<EditorPosition, EditorPosition>> column_ranges;
         std::size_t byte_size{0};
         char line_separator{'\n'};
     };
@@ -296,17 +298,23 @@ private:
         EditKind kind{EditKind::compound};
         std::uint64_t epoch{0};
         [[nodiscard]] std::size_t bytes() const noexcept {
-            return removed.size() + inserted.size();
+            return removed.size() + inserted.size() +
+                   (before.column_ranges.size() + after.column_ranges.size()) *
+                       sizeof(std::pair<EditorPosition, EditorPosition>);
         }
     };
 
     [[nodiscard]] std::string content() const;
     [[nodiscard]] std::string encode_content(std::string_view value) const;
     void update_storage_offsets() const;
+    [[nodiscard]] EditorPosition to_storage_position(EditorPosition position) const;
+    [[nodiscard]] EditorPosition from_storage_position(EditorPosition position, bool upper = false) const;
+    [[nodiscard]] std::size_t storage_offset(EditorPosition position) const;
+    [[nodiscard]] EditorPosition storage_position(std::size_t offset, bool upper = false) const;
+    [[nodiscard]] EditorSearchMatch storage_match(EditorSearchMatch match) const;
     [[nodiscard]] std::string search_content() const;
-    void validate_search_options(const EditorSearchOptions& options) const;
     [[nodiscard]] std::string normalize_insert(std::string_view value) const;
-    void set_content(std::string_view content);
+    void set_content(std::string_view content, bool track_columns = true);
     [[nodiscard]] std::size_t offset(EditorPosition position) const;
     void update_mark();
     [[nodiscard]] std::pair<std::size_t, std::size_t>
@@ -329,7 +337,7 @@ private:
         bool typed = false
     );
     void erase_text(EditorPosition begin, EditorPosition end);
-    void edit_text(EditorPosition begin, EditorPosition end, std::string_view replacement);
+    void edit_text(EditorPosition begin, EditorPosition end, std::string_view replacement, bool normalize = true);
     void record_undo(EditKind kind = EditKind::compound);
     void finalize_undo();
     void wrap_typed_text();
@@ -365,6 +373,7 @@ private:
     std::optional<std::size_t> column_selection_width_;
     std::optional<std::size_t> selection_begin_display_;
     std::optional<std::size_t> selection_end_display_;
+    std::vector<std::pair<EditorPosition, EditorPosition>> column_ranges_;
     bool overwrite_{false};
     bool new_file_{false};
     EditorSaveMode save_mode_{EditorSaveMode::atomic};
@@ -381,6 +390,7 @@ private:
     std::uint64_t undo_epoch_{0};
     std::size_t edit_depth_{0};
     std::optional<EditorSearchMatch> search_match_;
+    std::optional<EditorSearchMatch> storage_search_match_;
     std::string search_match_pattern_;
     EditorSearchOptions search_match_options_;
     std::uint64_t search_match_change_id_{0};

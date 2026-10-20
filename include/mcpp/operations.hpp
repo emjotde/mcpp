@@ -40,6 +40,21 @@ using OperationErrorResolver = std::function<OperationErrorDecision(
     const std::string& message
 )>;
 
+class CopyMask {
+public:
+    explicit CopyMask(std::string_view source = "*", bool shell_patterns = true);
+    [[nodiscard]] bool matches(std::string_view name) const;
+    [[nodiscard]] std::optional<std::string> transform(
+        std::string_view name, std::string_view destination = "\\0"
+    ) const;
+    [[nodiscard]] static bool has_replacements(std::string_view destination);
+    [[nodiscard]] static std::string unescape_path(std::string_view path);
+
+private:
+    struct Pattern;
+    std::shared_ptr<const Pattern> pattern_;
+};
+
 struct OperationOptions {
     bool overwrite{false};
     bool preserve_permissions{true};
@@ -47,6 +62,11 @@ struct OperationOptions {
     CollisionResolver collision;
     OperationErrorResolver error{};
     bool compute_totals{true};
+    std::string source_mask{"*"};
+    std::optional<std::string> destination_mask{};
+    bool shell_patterns{true};
+    bool stable_symlinks{false};
+    bool dive_into_subdirectories{false};
 };
 
 struct SkippedSource {

@@ -1791,7 +1791,7 @@ struct App::Impl {
     std::size_t macro_repeats{0};
     std::vector<EditorLocation> declaration_history;
     std::size_t declaration_cursor{0};
-    std::array<ftxui::Box, 7> operation_dialog_boxes{};
+    std::array<ftxui::Box, 10> operation_dialog_boxes{};
     ftxui::Box operation_dialog_viewport;
     std::string status{"Ready"};
     std::optional<std::string> pending_operation_notice;
@@ -2059,11 +2059,15 @@ struct App::Impl {
     bool dialog_exact{false};
     std::string dialog_destination;
     std::string dialog_source_mask{"*"};
+    std::optional<std::string> dialog_destination_mask;
     std::string operation_input_error;
     bool dialog_preserve_attributes{true};
     bool dialog_preserve_symlinks{true};
+    bool dialog_shell_patterns{true};
+    bool dialog_stable_symlinks{false};
+    bool dialog_dive_into_subdirectories{false};
     bool dialog_background{false};
-    std::size_t dialog_focus{1};
+    std::size_t dialog_focus{2};
     std::array<ftxui::Box, 2> delete_button_boxes{};
     std::size_t compare_choice{0};
     std::array<ftxui::Box, 4> compare_boxes{};
@@ -3088,7 +3092,10 @@ struct App::Impl {
     void show_editor_encoding() {
         show_codepage_chooser(editor.encoding(), Mode::editor, [this](const std::string& codepage) {
             editor.set_encoding(codepage);
+            spelling_issues.clear();
+            spelling_match.reset();
             reset_editor_view_state();
+            update_editor_view();
             status = "Editor codepage changed";
         });
     }
@@ -5215,14 +5222,11 @@ struct App::Impl {
 
     std::vector<Entry> matching_operation_sources() const {
         auto sources = current_operation_sources();
+        const CopyMask mask(dialog_source_mask, dialog_shell_patterns);
         std::erase_if(
             sources,
             [&](const Entry& entry) {
-                return fnmatch(
-                           dialog_source_mask.c_str(),
-                           entry.name.c_str(),
-                           0
-                       ) != 0;
+                return !mask.matches(entry.name);
             }
         );
         return sources;
@@ -5261,16 +5265,21 @@ struct App::Impl {
         }
         dialog_move = move_operation;
         dialog_exact = move_operation;
-        dialog_destination = modal_tree_snapshot ? passive().path() : active().path();
-        dialog_source_mask = "*";
+        dialog_destination = modal_tree_snapshot ? pane_location(passive()) : pane_location(active());
+        if (!dialog_destination.ends_with('/')) dialog_destination += '/';
+        dialog_shell_patterns = config.shell_patterns;
+        dialog_source_mask = dialog_shell_patterns ? "*" : "^(.*)$";
+        dialog_destination_mask.reset();
         operation_input_error.clear();
         bind_input_history(destination_input, move_operation ? "file.move-destination" : "file.copy-destination");
         destination_input.reset(dialog_destination, true);
         mask_input.reset(dialog_source_mask, true);
         dialog_preserve_attributes = true;
         dialog_preserve_symlinks = true;
+        dialog_stable_symlinks = false;
+        dialog_dive_into_subdirectories = false;
         dialog_background = false;
-        dialog_focus = 0;
+        dialog_focus = 2;
         mode = Mode::operation_dialog;
         return true;
     }
@@ -9425,15 +9434,20 @@ struct App::Impl {
         dialog_move = move_operation;
         dialog_exact = exact && sources.size() == 1U;
         dialog_destination = pane_location(passive());
+        if (!dialog_destination.ends_with('/')) dialog_destination += '/';
         dialog_preserve_attributes = true;
         dialog_preserve_symlinks = true;
+        dialog_shell_patterns = config.shell_patterns;
+        dialog_stable_symlinks = false;
+        dialog_dive_into_subdirectories = false;
         dialog_background = false;
-        dialog_source_mask = "*";
+        dialog_source_mask = dialog_shell_patterns ? "*" : "^(.*)$";
+        dialog_destination_mask.reset();
         operation_input_error.clear();
         bind_input_history(destination_input, move_operation ? "file.move-destination" : "file.copy-destination");
         destination_input.reset(dialog_destination, true);
         mask_input.reset(dialog_source_mask, true);
-        dialog_focus = 0;
+        dialog_focus = 2;
         mode = Mode::operation_dialog;
     }
 
@@ -9447,10 +9461,28 @@ struct App::Impl {
                 "source mask matches no selected entries"
             );
         }
-        bool destination_directory = dialog_destination.ends_with('/');
         const auto& source_pane = tree_operation_source
             ? (tree_operation_source_index == 0 ? left : right) : active();
-        const auto destination = resolve_pane_location(source_pane, dialog_destination);
+        const CopyMask mask(dialog_source_mask, dialog_shell_patterns);
+        const auto slash = dialog_destination.rfind('/');
+        const auto directory = slash == std::string::npos
+            ? std::string{} : dialog_destination.substr(0, slash + 1U);
+        const auto name = dialog_destination.substr(slash == std::string::npos ? 0U : slash + 1U);
+        dialog_destination_mask.reset();
+        std::string destination_value;
+        bool destination_directory = name.empty();
+        if (CopyMask::has_replacements(name)) {
+            dialog_destination_mask = name;
+            for (const auto& source : sources) {
+                static_cast<void>(mask.transform(source.name, name));
+            }
+            destination_value = CopyMask::unescape_path(directory.empty() ? "." : directory);
+            destination_directory = true;
+        } else {
+            destination_value = CopyMask::unescape_path(directory);
+            destination_value += CopyMask::unescape_path(name);
+        }
+        const auto destination = resolve_pane_location(source_pane, destination_value);
         const auto& destination_provider = destination.provider;
         if (!has_capability(destination_provider->capabilities(), ProviderCapability::write)) {
             throw std::runtime_error("the destination filesystem is read-only");
@@ -9468,7 +9500,7 @@ struct App::Impl {
                     "destination is not a directory"
                 );
             }
-            destination_directory = is_directory;
+            destination_directory = is_directory || dialog_destination_mask.has_value();
             if (sources.size() > 1U && !is_directory) {
                 throw std::runtime_error(
                     "multiple sources require a directory destination"
@@ -9477,6 +9509,13 @@ struct App::Impl {
         }
         dialog_exact = sources.size() == 1U &&
                        !destination_directory;
+        const auto source_provider = tree_operation_source
+            ? tree_operation_source_provider : source_pane.provider();
+        if (dialog_stable_symlinks &&
+            (dynamic_cast<LocalProvider*>(source_provider.get()) == nullptr ||
+             dynamic_cast<LocalProvider*>(destination_provider.get()) == nullptr)) {
+            throw std::runtime_error("stable symlinks require local source and destination filesystems");
+        }
         run_operation(
             dialog_move,
             destination.path,
@@ -9588,6 +9627,11 @@ struct App::Impl {
                 },
             .error = error_handler(policy),
             .compute_totals = config.compute_totals,
+            .source_mask = dialog_source_mask,
+            .destination_mask = dialog_destination_mask,
+            .shell_patterns = dialog_shell_patterns,
+            .stable_symlinks = dialog_stable_symlinks,
+            .dive_into_subdirectories = dialog_dive_into_subdirectories,
         };
         clear_tree_operation_context();
         operation_running.store(true, std::memory_order_release);
@@ -12974,30 +13018,33 @@ struct App::Impl {
             return element | reflect(operation_dialog_boxes[index]);
         };
         Elements rows{
-            text("To:"),
-            render_input(
-                dialog_destination, destination_input, dialog_focus == 0U
-            ) | reflect(operation_dialog_boxes[0]),
             text("Source mask:"),
             render_input(
-                dialog_source_mask, mask_input, dialog_focus == 1U
-            ) | reflect(operation_dialog_boxes[1]),
+                dialog_source_mask, mask_input, dialog_focus == 0U
+            ) | reflect(operation_dialog_boxes[0]),
+            focused(
+                text(std::string(dialog_shell_patterns ? "[x] " : "[ ] ") +
+                     "Using shell patterns"), 1
+            ) | align_right,
+            text("to:"),
+            render_input(
+                dialog_destination, destination_input, dialog_focus == 2U
+            ) | reflect(operation_dialog_boxes[2]),
             separator(),
-            focused(
-                text(std::string(dialog_preserve_attributes ? "[x] " : "[ ] ") +
-                     "Preserve permissions"),
-                2
-            ),
-            focused(
-                text(std::string(dialog_preserve_symlinks ? "[x] " : "[ ] ") +
-                     "Preserve symbolic links"),
-                3
-            ),
-            focused(
-                text(std::string(dialog_background ? "[x] " : "[ ] ") +
-                     "Run in background"),
-                4
-            ),
+            hbox({
+                vbox({
+                    focused(text(std::string(dialog_preserve_symlinks ? "[ ] " : "[x] ") +
+                                 "Follow links"), 3),
+                    focused(text(std::string(dialog_preserve_attributes ? "[x] " : "[ ] ") +
+                                 "Preserve attributes"), 4),
+                }) | flex,
+                vbox({
+                    focused(text(std::string(dialog_dive_into_subdirectories ? "[x] " : "[ ] ") +
+                                 "Dive into subdir if exists"), 5),
+                    focused(text(std::string(dialog_stable_symlinks ? "[x] " : "[ ] ") +
+                                 "Stable symlinks"), 6),
+                }) | flex,
+            }),
         };
         const auto width = std::min(68, Terminal::Size().dimx);
         const auto title = std::string(dialog_move ? "Move / Rename: " : "Copy: ") +
@@ -13012,9 +13059,11 @@ struct App::Impl {
             operation_input_error.empty() ? emptyElement() : paragraph(display_text(operation_input_error)),
             separator(),
             hbox({
-                focused(text(" [ OK ] "), 5),
+                focused(text(" [ OK ] "), 7),
                 text(" "),
-                focused(text(" [ Cancel ] "), 6),
+                focused(text(" [ Background ] "), 8),
+                text(" "),
+                focused(text(" [ Cancel ] "), 9),
             }) | center,
         };
         if (Terminal::Size().dimy < 20) {
@@ -17969,8 +18018,8 @@ struct App::Impl {
     bool handle_operation_dialog(const ftxui::Event& event) {
         const auto scroll_body = [&](const int amount) {
             dialog_focus = static_cast<std::size_t>(std::clamp(
-                static_cast<int>(std::min<std::size_t>(dialog_focus, 4U)) + amount,
-                0, 4
+                static_cast<int>(std::min<std::size_t>(dialog_focus, 6U)) + amount,
+                0, 6
             ));
         };
         if (event == ftxui::Event::PageUp || event == ftxui::Event::PageDown) {
@@ -17997,16 +18046,16 @@ struct App::Impl {
             if (mouse.button == ftxui::Mouse::Left &&
                 mouse.motion == ftxui::Mouse::Pressed) {
                 for (std::size_t index = 0; index < operation_dialog_boxes.size(); ++index) {
-                    if ((index < 5U && !operation_dialog_viewport.Contain(mouse.x, mouse.y)) ||
+                    if ((index < 7U && !operation_dialog_viewport.Contain(mouse.x, mouse.y)) ||
                         !operation_dialog_boxes[index].Contain(mouse.x, mouse.y)) {
                         continue;
                     }
                     dialog_focus = index;
                     if (index == 0U) {
-                        input_mouse(dialog_destination, destination_input, mouse);
-                    } else if (index == 1U) {
                         input_mouse(dialog_source_mask, mask_input, mouse);
-                    } else if (index < 5U) {
+                    } else if (index == 2U) {
+                        input_mouse(dialog_destination, destination_input, mouse);
+                    } else if (index < 7U) {
                         return handle_operation_dialog(ftxui::Event::Character(' '));
                     } else {
                         return handle_operation_dialog(ftxui::Event::Return);
@@ -18018,23 +18067,39 @@ struct App::Impl {
         }
         if (modal_cancel(event) ||
             ((event == ftxui::Event::Return ||
-              event == ftxui::Event::Character(' ')) && dialog_focus == 6U)) {
+              event == ftxui::Event::Character(' ')) && dialog_focus == 9U)) {
             mode = modal_tree_snapshot && tree_operation_source ? Mode::directory_tree_dialog : Mode::panels;
             status = "Operation cancelled";
             clear_tree_operation_context();
             return true;
         }
+        const auto mnemonic = [&](const char key) {
+            return event == ftxui::Event::Special(std::string("\x1B") + key) ||
+                   ((dialog_focus != 0U && dialog_focus != 2U) &&
+                    event == ftxui::Event::Character(key));
+        };
+        for (const auto& [key, index] : std::array<std::pair<char, std::size_t>, 5>{
+                 {{'u', 1U}, {'l', 3U}, {'p', 4U}, {'d', 5U}, {'s', 6U}}}) {
+            if (mnemonic(key)) {
+                dialog_focus = index;
+                return handle_operation_dialog(ftxui::Event::Character(' '));
+            }
+        }
+        if (mnemonic('o') || mnemonic('b') || mnemonic('c')) {
+            dialog_focus = mnemonic('c') ? 9U : mnemonic('b') ? 8U : 7U;
+            return handle_operation_dialog(ftxui::Event::Return);
+        }
         if (event == ftxui::Event::Tab) {
-            dialog_focus = (dialog_focus + 1U) % 7U;
+            dialog_focus = (dialog_focus + 1U) % 10U;
             return true;
         }
         if (event == ftxui::Event::TabReverse) {
-            dialog_focus = (dialog_focus + 6U) % 7U;
+            dialog_focus = (dialog_focus + 9U) % 10U;
             return true;
         }
         if (event == ftxui::Event::ArrowDown) {
             dialog_focus = std::min<std::size_t>(
-                6U,
+                9U,
                 dialog_focus + 1U
             );
             return true;
@@ -18046,23 +18111,29 @@ struct App::Impl {
         }
         if (event == ftxui::Event::Character(' ') &&
             (
-                dialog_focus == 2U ||
+                dialog_focus == 1U ||
                 dialog_focus == 3U ||
-                dialog_focus == 4U
+                dialog_focus == 4U ||
+                dialog_focus == 5U ||
+                dialog_focus == 6U
             )) {
-            if (dialog_focus == 2U) {
+            if (dialog_focus == 1U) {
+                dialog_shell_patterns = !dialog_shell_patterns;
+            } else if (dialog_focus == 4U) {
                 dialog_preserve_attributes =
                     !dialog_preserve_attributes;
             } else if (dialog_focus == 3U) {
                 dialog_preserve_symlinks =
                     !dialog_preserve_symlinks;
+            } else if (dialog_focus == 5U) {
+                dialog_dive_into_subdirectories = !dialog_dive_into_subdirectories;
             } else {
-                dialog_background = !dialog_background;
+                dialog_stable_symlinks = !dialog_stable_symlinks;
             }
             return true;
         }
         if (event == ftxui::Event::Return ||
-            (event == ftxui::Event::Character(' ') && dialog_focus == 5U)) {
+            (event == ftxui::Event::Character(' ') && (dialog_focus == 7U || dialog_focus == 8U))) {
             try {
                 remember_input(destination_input, dialog_destination);
                 remember_input(mask_input, dialog_source_mask);
@@ -18072,18 +18143,17 @@ struct App::Impl {
                 return true;
             }
             try {
+                dialog_background = dialog_focus == 8U;
                 confirm_operation_dialog();
             } catch (const std::exception& error) {
-                set_error(error);
-                mode = Mode::panels;
-                clear_tree_operation_context();
+                operation_input_error = error.what();
             }
             return true;
         }
-        if (dialog_focus == 0U || dialog_focus == 1U) {
+        if (dialog_focus == 0U || dialog_focus == 2U) {
             if (event == ftxui::Event::Special("\x1B\t")) {
                 try {
-                    if (dialog_focus == 0U) {
+                    if (dialog_focus == 2U) {
                         complete_path(dialog_destination, destination_input, active().path(), active().provider());
                         status = destination_input.message.empty()
                                      ? "Path completed"
@@ -18097,8 +18167,8 @@ struct App::Impl {
                 return true;
             }
             return edit_input(
-                dialog_focus == 0U ? dialog_destination : dialog_source_mask,
-                dialog_focus == 0U ? destination_input : mask_input,
+                dialog_focus == 2U ? dialog_destination : dialog_source_mask,
+                dialog_focus == 2U ? destination_input : mask_input,
                 event
             );
         }
