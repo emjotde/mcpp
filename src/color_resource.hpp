@@ -1,7 +1,10 @@
 #pragma once
 
+#include <ftxui/screen/color.hpp>
+
 #include <cstddef>
 #include <filesystem>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -23,6 +26,10 @@ struct ColorSection {
 };
 
 [[nodiscard]] std::string_view color_trim(std::string_view value);
+[[nodiscard]] ftxui::Color parse_color_value(
+    std::string_view value, std::optional<ftxui::Color> base = {}
+);
+[[nodiscard]] unsigned parse_color_attributes(std::string_view value);
 [[noreturn]] void color_resource_error(
     const std::filesystem::path& path, std::size_t line, std::string_view message
 );

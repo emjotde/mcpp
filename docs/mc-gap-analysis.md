@@ -392,6 +392,14 @@ ordinary file-text glyphs. **L03 remains partial** for renderer-specific native
 backend controls and unavailable color-role fields; non-UTF-8 terminal handling
 remains L24.
 
+CLI overrides now reach the already-rendered popup normal/title, editor gutter,
+dialog/error title and error-focus pairs. Inactive menus accept their complete
+pair while omitted fields preserve the current background and disabled contrast.
+Native skins and CLI overrides share color/attribute parsing, including hex RGB
+and `inverse`. The earlier `errdhotfocus` alias still paints the whole focus;
+independent mnemonic/input/window/viewer/help roles without widget consumers
+remain explicit errors. Native INI `[Colors]` is separate pending work.
+
 PCRE2 is an explicitly approved dependency. Native menu conditions, extension
 rules, syntax-registry expressions and filename highlighting now use its Unicode,
 lookaround and property support. Compile errors identify byte offsets, and

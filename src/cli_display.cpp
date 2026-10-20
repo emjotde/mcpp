@@ -1,14 +1,13 @@
 #include "mcpp/cli_display.hpp"
 #include "mcpp/skin_glyphs_ui.hpp"
 
+#include "color_resource.hpp"
+
 #include <ftxui/screen/screen.hpp>
 #include <ftxui/screen/terminal.hpp>
 
 #include <algorithm>
 #include <array>
-#include <charconv>
-#include <cstdint>
-#include <map>
 #include <stdexcept>
 #include <utility>
 
@@ -22,6 +21,9 @@ struct ColorRole {
     std::optional<CliPaletteContext> context;
     SkinPair Skin::*pair{nullptr};
     ftxui::Color Skin::*foreground{nullptr};
+    bool foreground_only{false};
+    SkinPair Skin::*fallback{&Skin::normal};
+    ftxui::Color Skin::*fallback_foreground{nullptr};
 };
 
 constexpr std::array roles{
@@ -33,25 +35,33 @@ constexpr std::array roles{
     ColorRole{"errors", "error", "_default_", {}, &Skin::error},
     ColorRole{"dnormal", "dialog", "_default_", {}, &Skin::dialog},
     ColorRole{"dfocus", "dialog", "dfocus", {}, &Skin::dialog_focus},
+    ColorRole{"dtitle", "dialog", "dtitle", {}, nullptr, nullptr, false, &Skin::dialog},
+    ColorRole{"errdfocus", "error", "errdfocus", {}, &Skin::error_focus},
+    // Keep the existing whole-focus alias; mnemonic colors are not separate widgets.
     ColorRole{"errdhotfocus", "error", "errdfocus", {}, &Skin::error_focus},
+    ColorRole{"errdtitle", "error", "errdtitle", {}, nullptr, nullptr, false, &Skin::error},
     ColorRole{"menunormal", "menu", "_default_", {}, &Skin::menu},
     ColorRole{"menusel", "menu", "menusel", {}, &Skin::menu_selected},
+    ColorRole{"pmenunormal", "popupmenu", "_default_", {}, nullptr, nullptr, false, &Skin::menu},
     ColorRole{"pmenusel", "popupmenu", "menusel", {}, &Skin::popup_selected},
+    ColorRole{"pmenutitle", "popupmenu", "menutitle", {}, nullptr, nullptr, false, &Skin::menu},
     ColorRole{"bbarhotkey", "buttonbar", "hotkey", {}, &Skin::key_number},
     ColorRole{"bbarbutton", "buttonbar", "button", {}, &Skin::key_label},
-    ColorRole{"marked", "core", "marked", {}, nullptr, &Skin::bright},
-    ColorRole{"disabled", "core", "disabled", {}, nullptr, &Skin::dim},
-    ColorRole{"header", "core", "header", {}, nullptr, &Skin::column_header},
-    ColorRole{"menuhot", "menu", "menuhot", {}, nullptr, &Skin::menu_hot},
-    ColorRole{"menuinactive", "menu", "menuinactive", {}, nullptr, &Skin::disabled},
+    ColorRole{"marked", "core", "marked", {}, nullptr, &Skin::bright, true},
+    ColorRole{"disabled", "core", "disabled", {}, nullptr, &Skin::dim, true},
+    ColorRole{"header", "core", "header", {}, nullptr, &Skin::column_header, true},
+    ColorRole{"menuhot", "menu", "menuhot", {}, nullptr, &Skin::menu_hot, true, &Skin::menu},
+    ColorRole{"menuinactive", "menu", "menuinactive", {}, nullptr, &Skin::disabled, false, &Skin::menu},
     ColorRole{"editnormal", "editor", "_default_", CliPaletteContext::editor, &Skin::normal},
     ColorRole{"editbold", "editor", "editbold", CliPaletteContext::editor, &Skin::search},
     ColorRole{"editmarked", "editor", "editmarked", CliPaletteContext::editor, &Skin::selected},
-    ColorRole{"editwhitespace", "editor", "editwhitespace", CliPaletteContext::editor, nullptr, &Skin::dim},
+    ColorRole{"editwhitespace", "editor", "editwhitespace", CliPaletteContext::editor, nullptr, &Skin::dim, true},
+    ColorRole{"editlinestate", "editor", "editlinestate", CliPaletteContext::editor,
+              nullptr, nullptr, false, &Skin::normal, &Skin::dim},
     ColorRole{"viewnormal", "viewer", "_default_", CliPaletteContext::viewer, &Skin::normal},
     ColorRole{"viewselected", "viewer", "viewselected", CliPaletteContext::viewer, &Skin::viewer_cursor},
     ColorRole{"helpnormal", "help", "_default_", CliPaletteContext::help, &Skin::normal},
-    ColorRole{"helplink", "help", "helplink", CliPaletteContext::help, &Skin::normal},
+    ColorRole{"helplink", "help", "helplink", CliPaletteContext::help},
     ColorRole{"helpslink", "help", "helpslink", CliPaletteContext::help, &Skin::selected},
 };
 
@@ -62,65 +72,6 @@ const ColorRole& color_role(const std::string_view name) {
                                     "; use --help-color for supported roles");
     }
     return *found;
-}
-
-std::string_view trim(const std::string_view value) {
-    const auto begin = value.find_first_not_of(" \t\r\n");
-    if (begin == std::string_view::npos) return {};
-    return value.substr(begin, value.find_last_not_of(" \t\r\n") - begin + 1U);
-}
-
-ftxui::Color parse_color(const std::string_view name) {
-    static constexpr std::array<std::string_view, 16> names{
-        "black", "red", "green", "brown", "blue", "magenta", "cyan", "lightgray",
-        "gray", "brightred", "brightgreen", "yellow", "brightblue", "brightmagenta",
-        "brightcyan", "white"
-    };
-    if (name == "default") return {};
-    if (const auto found = std::ranges::find(names, name); found != names.end()) {
-        return ftxui::Color(static_cast<ftxui::Color::Palette16>(found - names.begin()));
-    }
-    const auto decimal = [](const std::string_view text, const int maximum) {
-        int result = -1;
-        const auto parsed = std::from_chars(text.data(), text.data() + text.size(), result);
-        if (text.empty() || parsed.ec != std::errc{} || parsed.ptr != text.data() + text.size() ||
-            result < 0 || result > maximum || text.front() == '-') {
-            throw std::invalid_argument("invalid color index: " + std::string(text));
-        }
-        return result;
-    };
-    if (name.starts_with("color")) {
-        return ftxui::Color(static_cast<ftxui::Color::Palette256>(decimal(name.substr(5), 255)));
-    }
-    if (name.starts_with("gray")) {
-        return ftxui::Color(static_cast<ftxui::Color::Palette256>(232 + decimal(name.substr(4), 23)));
-    }
-    if (name.size() == 6U && name.starts_with("rgb") &&
-        std::ranges::all_of(name.substr(3), [](const char digit) { return digit >= '0' && digit <= '5'; })) {
-        return ftxui::Color(static_cast<ftxui::Color::Palette256>(
-            16 + 36 * (name[3] - '0') + 6 * (name[4] - '0') + name[5] - '0'));
-    }
-    throw std::invalid_argument("unknown color: " + std::string(name));
-}
-
-unsigned parse_attributes(const std::string_view value) {
-    if (value == "none") return 0;
-    unsigned result = 0;
-    std::size_t begin = 0;
-    for (;;) {
-        const auto end = value.find('+', begin);
-        const auto attribute = trim(value.substr(begin,
-            end == std::string_view::npos ? value.size() - begin : end - begin));
-        if (attribute == "bold") result |= SkinPair::bold;
-        else if (attribute == "italic") result |= SkinPair::italic;
-        else if (attribute == "underline") result |= SkinPair::underline;
-        else if (attribute == "reverse") result |= SkinPair::reverse;
-        else if (attribute == "blink") result |= SkinPair::blink;
-        else throw std::invalid_argument("unknown color attribute: " + std::string(attribute));
-        if (end == std::string_view::npos) break;
-        begin = end + 1U;
-    }
-    return result;
 }
 
 void apply_pair(SkinPair& pair, const CliColorOverride& override) {
@@ -195,33 +146,33 @@ std::vector<CliColorOverride> parse_cli_colors(const std::span<const std::string
         std::size_t begin = 0;
         for (;;) {
             const auto end = value.find(':', begin);
-            const auto entry = trim(std::string_view(value).substr(begin,
+            const auto entry = detail::color_trim(std::string_view(value).substr(begin,
                 end == std::string::npos ? value.size() - begin : end - begin));
             const auto equals = entry.find('=');
             if (equals == std::string_view::npos) {
                 throw std::invalid_argument("color overrides require role=foreground,background,attributes");
             }
-            const auto& role = color_role(trim(entry.substr(0, equals)));
+            const auto& role = color_role(detail::color_trim(entry.substr(0, equals)));
             std::array<std::string_view, 3> fields{};
             std::size_t field = 0;
             std::size_t offset = equals + 1U;
             for (;;) {
                 if (field == fields.size()) throw std::invalid_argument("too many fields for color role " + std::string(role.name));
                 const auto comma = entry.find(',', offset);
-                fields[field++] = trim(entry.substr(offset,
+                fields[field++] = detail::color_trim(entry.substr(offset,
                     comma == std::string_view::npos ? entry.size() - offset : comma - offset));
                 if (comma == std::string_view::npos) break;
                 offset = comma + 1U;
             }
-            if (role.foreground && (!fields[1].empty() || !fields[2].empty())) {
+            if (role.foreground_only && (!fields[1].empty() || !fields[2].empty())) {
                 throw std::invalid_argument(std::string(role.name) +
                     " currently supports only a foreground color; omit its background and attributes");
             }
             CliColorOverride override;
             override.role = role.name;
-            if (!fields[0].empty()) override.foreground = parse_color(fields[0]);
-            if (!fields[1].empty()) override.background = parse_color(fields[1]);
-            if (!fields[2].empty()) override.attributes = parse_attributes(fields[2]);
+            if (!fields[0].empty()) override.foreground = detail::parse_color_value(fields[0]);
+            if (!fields[1].empty()) override.background = detail::parse_color_value(fields[1]);
+            if (!fields[2].empty()) override.attributes = detail::parse_color_attributes(fields[2]);
             if (!override.foreground && !override.background && !override.attributes) {
                 throw std::invalid_argument("color override for " + override.role + " has no fields");
             }
@@ -240,19 +191,18 @@ void apply_cli_colors(
         for (const auto& override : overrides) {
             const auto& role = color_role(override.role);
             if (role.context.has_value() != specific || (role.context && *role.context != context)) continue;
-            auto pair = role.pair ? skin.*role.pair
-                : role.section == "menu" ? skin.menu : skin.normal;
+            auto pair = skin.*(role.pair ? role.pair : role.fallback);
             if (role.foreground) pair.foreground = skin.*role.foreground;
-            const auto group = skin.colors.find(role.section);
-            if (group != skin.colors.end()) {
-                if (const auto found = group->second.find(role.key); found != group->second.end()) pair = found->second;
+            if (role.fallback_foreground) pair.foreground = skin.*role.fallback_foreground;
+            if (const auto* found = find_skin_color(skin, role.section, role.key)) {
+                pair = *found;
+            } else if (!role.pair && !role.foreground) {
+                pair = skin_color(skin, role.section, role.key, pair);
             }
             apply_pair(pair, override);
             skin.colors[std::string(role.section)][std::string(role.key)] = pair;
-            if (role.name != "helplink") {
-                if (role.pair) skin.*role.pair = pair;
-                else skin.*role.foreground = pair.foreground;
-            }
+            if (role.pair) skin.*role.pair = pair;
+            if (role.foreground) skin.*role.foreground = pair.foreground;
             if (role.name == "normal" || role.name == "editnormal") skin.syntax[0] = skin.normal.foreground;
             if (role.name == "header") skin.inactive_title = pair.foreground;
         }

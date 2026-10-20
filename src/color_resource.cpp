@@ -1,9 +1,13 @@
 #include "color_resource.hpp"
 
+#include "mcpp/skin.hpp"
+
 #include <algorithm>
 #include <array>
 #include <cerrno>
+#include <charconv>
 #include <cctype>
+#include <cstdint>
 #include <fcntl.h>
 #include <sstream>
 #include <stdexcept>
@@ -19,9 +23,80 @@ const ColorSetting* ColorSection::find(const std::string_view key) const {
 }
 
 std::string_view color_trim(const std::string_view value) {
-    const auto first = value.find_first_not_of(" \t\r");
+    const auto first = value.find_first_not_of(" \t\r\n");
     if (first == std::string_view::npos) return {};
-    return value.substr(first, value.find_last_not_of(" \t\r") - first + 1U);
+    return value.substr(first, value.find_last_not_of(" \t\r\n") - first + 1U);
+}
+
+ftxui::Color parse_color_value(
+    const std::string_view value, const std::optional<ftxui::Color> base
+) {
+    const auto name = color_trim(value);
+    if (name == "base" && base) return *base;
+    if (name == "default") return {};
+    static constexpr std::array<std::string_view, 16> names{
+        "black", "red", "green", "brown", "blue", "magenta", "cyan", "lightgray",
+        "gray", "brightred", "brightgreen", "yellow", "brightblue", "brightmagenta",
+        "brightcyan", "white"
+    };
+    if (const auto found = std::ranges::find(names, name); found != names.end()) {
+        return ftxui::Color(static_cast<ftxui::Color::Palette16>(found - names.begin()));
+    }
+    const auto decimal = [](const std::string_view text, const int maximum) {
+        int result = -1;
+        const auto parsed = std::from_chars(text.data(), text.data() + text.size(), result);
+        if (text.empty() || parsed.ec != std::errc{} || parsed.ptr != text.data() + text.size() ||
+            result < 0 || result > maximum || text.front() == '-') {
+            throw std::invalid_argument("invalid color index: " + std::string(text));
+        }
+        return result;
+    };
+    if (name.starts_with("color")) {
+        return ftxui::Color(static_cast<ftxui::Color::Palette256>(decimal(name.substr(5), 255)));
+    }
+    if (name.starts_with("gray")) {
+        return ftxui::Color(static_cast<ftxui::Color::Palette256>(232 + decimal(name.substr(4), 23)));
+    }
+    if (name.size() == 6U && name.starts_with("rgb") &&
+        std::ranges::all_of(name.substr(3), [](const char digit) { return digit >= '0' && digit <= '5'; })) {
+        return ftxui::Color(static_cast<ftxui::Color::Palette256>(
+            16 + 36 * (name[3] - '0') + 6 * (name[4] - '0') + name[5] - '0'));
+    }
+    if (name.starts_with('#') && (name.size() == 4U || name.size() == 7U)) {
+        std::array<std::uint8_t, 3> components{};
+        const auto digits = (name.size() - 1U) / 3U;
+        bool valid = true;
+        for (std::size_t index = 0; index < components.size(); ++index) {
+            const auto fragment = name.substr(1U + index * digits, digits);
+            unsigned component{};
+            const auto parsed = std::from_chars(fragment.data(), fragment.data() + fragment.size(), component, 16);
+            valid = valid && parsed.ec == std::errc{} && parsed.ptr == fragment.data() + fragment.size();
+            components[index] = static_cast<std::uint8_t>(digits == 1U ? component * 17U : component);
+        }
+        if (valid) return ftxui::Color::RGB(components[0], components[1], components[2]);
+    }
+    throw std::invalid_argument("unknown color or alias: " + std::string(name));
+}
+
+unsigned parse_color_attributes(const std::string_view value) {
+    const auto attributes = color_trim(value);
+    if (attributes == "none") return 0;
+    unsigned result = 0;
+    std::size_t begin = 0;
+    for (;;) {
+        const auto end = attributes.find('+', begin);
+        const auto attribute = color_trim(attributes.substr(begin,
+            end == std::string_view::npos ? attributes.size() - begin : end - begin));
+        if (attribute == "bold") result |= SkinPair::bold;
+        else if (attribute == "italic") result |= SkinPair::italic;
+        else if (attribute == "underline") result |= SkinPair::underline;
+        else if (attribute == "reverse" || attribute == "inverse") result |= SkinPair::reverse;
+        else if (attribute == "blink") result |= SkinPair::blink;
+        else throw std::invalid_argument("unknown color attribute or alias: " + std::string(attribute));
+        if (end == std::string_view::npos) break;
+        begin = end + 1U;
+    }
+    return result;
 }
 
 [[noreturn]] void color_resource_error(

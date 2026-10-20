@@ -129,54 +129,11 @@ public:
         const std::string_view original, const std::size_t line, const ftxui::Color& base
     ) const {
         const auto name = expand(original, line);
-        if (name == "base") return base;
-        if (name == "default") return {};
-        static const std::map<std::string_view, ftxui::Color::Palette16, std::less<>> names{
-            {"black", ftxui::Color::Black}, {"red", ftxui::Color::Red},
-            {"green", ftxui::Color::Green}, {"brown", ftxui::Color::Yellow},
-            {"blue", ftxui::Color::Blue}, {"magenta", ftxui::Color::Magenta},
-            {"cyan", ftxui::Color::Cyan}, {"lightgray", ftxui::Color::GrayLight},
-            {"gray", ftxui::Color::GrayDark}, {"brightred", ftxui::Color::RedLight},
-            {"brightgreen", ftxui::Color::GreenLight}, {"yellow", ftxui::Color::YellowLight},
-            {"brightblue", ftxui::Color::BlueLight}, {"brightmagenta", ftxui::Color::MagentaLight},
-            {"brightcyan", ftxui::Color::CyanLight}, {"white", ftxui::Color::White},
-        };
-        if (const auto found = names.find(name); found != names.end()) return found->second;
-        const auto decimal = [](const std::string_view value, const int maximum) -> std::optional<int> {
-            int result{};
-            const auto parsed = std::from_chars(value.data(), value.data() + value.size(), result);
-            if (parsed.ec != std::errc{} || parsed.ptr != value.data() + value.size() ||
-                result < 0 || result > maximum) return {};
-            return result;
-        };
-        if (name.starts_with("color")) {
-            if (const auto index = decimal(std::string_view(name).substr(5), 255)) {
-                return ftxui::Color(static_cast<ftxui::Color::Palette256>(*index));
-            }
-        } else if (name.starts_with("gray")) {
-            if (const auto index = decimal(std::string_view(name).substr(4), 23)) {
-                return ftxui::Color(static_cast<ftxui::Color::Palette256>(232 + *index));
-            }
-        } else if (name.size() == 6U && name.starts_with("rgb") &&
-                   std::ranges::all_of(std::string_view(name).substr(3), [](const char digit) {
-                       return digit >= '0' && digit <= '5';
-                   })) {
-            const auto index = 16 + 36 * (name[3] - '0') + 6 * (name[4] - '0') + (name[5] - '0');
-            return ftxui::Color(static_cast<ftxui::Color::Palette256>(index));
-        } else if (name.front() == '#' && (name.size() == 4U || name.size() == 7U)) {
-            std::array<std::uint8_t, 3> components{};
-            const auto digits = (name.size() - 1U) / 3U;
-            bool valid = true;
-            for (std::size_t index = 0; index < components.size(); ++index) {
-                const auto fragment = std::string_view(name).substr(1U + index * digits, digits);
-                unsigned component{};
-                const auto parsed = std::from_chars(fragment.data(), fragment.data() + fragment.size(), component, 16);
-                valid = valid && parsed.ec == std::errc{} && parsed.ptr == fragment.data() + fragment.size();
-                components[index] = static_cast<std::uint8_t>(digits == 1U ? component * 17U : component);
-            }
-            if (valid) return ftxui::Color::RGB(components[0], components[1], components[2]);
+        try {
+            return detail::parse_color_value(name, base);
+        } catch (const std::invalid_argument& error) {
+            color_resource_error(path_, line, error.what());
         }
-        color_resource_error(path_, line, "unknown color or alias: " + name);
     }
 
     unsigned attributes(const std::string_view original, const std::size_t line, const unsigned depth = 0) const {
@@ -193,12 +150,14 @@ public:
             if (name.find('+') != std::string::npos) {
                 // Attribute-list aliases can be used as individual members of a list.
                 result |= attributes(name, line, depth + 1U);
-            } else if (name == "bold") result |= SkinPair::bold;
-            else if (name == "italic") result |= SkinPair::italic;
-            else if (name == "underline") result |= SkinPair::underline;
-            else if (name == "reverse" || name == "inverse") result |= SkinPair::reverse;
-            else if (name == "blink") result |= SkinPair::blink;
-            else color_resource_error(path_, line, "unknown attribute or alias: " + name);
+            } else {
+                try {
+                    if (name == "none") throw std::invalid_argument("unknown attribute or alias: " + name);
+                    result |= detail::parse_color_attributes(name);
+                } catch (const std::invalid_argument& error) {
+                    color_resource_error(path_, line, error.what());
+                }
+            }
             if (end == std::string::npos) break;
             begin = end + 1U;
         }
@@ -392,13 +351,20 @@ Skin parse_skin(const std::filesystem::path& path) {
 
 }  // namespace
 
+const SkinPair* find_skin_color(
+    const Skin& skin, const std::string_view section, const std::string_view key
+) {
+    const auto group = skin.colors.find(section);
+    if (group == skin.colors.end()) return nullptr;
+    const auto found = group->second.find(key);
+    return found == group->second.end() ? nullptr : &found->second;
+}
+
 const SkinPair& skin_color(
     const Skin& skin, const std::string_view section, const std::string_view key, const SkinPair& fallback
 ) {
-    const auto group = skin.colors.find(section);
-    if (group == skin.colors.end()) return fallback;
-    if (const auto found = group->second.find(key); found != group->second.end()) return found->second;
-    if (const auto found = group->second.find("_default_"); found != group->second.end()) return found->second;
+    if (const auto* found = find_skin_color(skin, section, key)) return *found;
+    if (const auto* found = find_skin_color(skin, section, "_default_")) return *found;
     return fallback;
 }
 

@@ -238,6 +238,9 @@ if(MCPP_BUILD_TESTS)
     add_executable(mcpp_cli_tests tests/test_cli.cpp)
     target_link_libraries(mcpp_cli_tests PRIVATE mcpp_ui)
     mcpp_target_defaults(mcpp_cli_tests)
+    add_executable(mcpp_cli_color_tests tests/test_cli_color_roles.cpp)
+    target_link_libraries(mcpp_cli_color_tests PRIVATE mcpp_ui)
+    mcpp_target_defaults(mcpp_cli_color_tests)
     add_executable(mcpp_native_config_tests tests/test_native_config.cpp)
     target_link_libraries(mcpp_native_config_tests PRIVATE mcpp_core)
     mcpp_target_defaults(mcpp_native_config_tests)
@@ -280,6 +283,13 @@ if(MCPP_BUILD_TESTS)
                 NAME mcpp_cli_${cli_case}
                 COMMAND mcpp_cli_tests ${cli_case}
                         /review/cases/cli-remaining-ctest/${cli_case}
+            )
+        endforeach()
+        foreach(cli_color_case IN ITEMS roles preservation)
+            add_test(
+                NAME mcpp_cli_color_${cli_color_case}
+                COMMAND mcpp_cli_color_tests ${cli_color_case}
+                        /review/cases/cli-color-roles/${cli_color_case}-ctest
             )
         endforeach()
         add_test(

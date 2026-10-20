@@ -93,7 +93,14 @@ build/release/mcppedit --colors 'editnormal=lightgray,blue:editmarked=black,cyan
 
 `-C` / `--colors` overrides supported color roles for this run without changing
 the saved skin. Unknown roles and unsupported fields are errors, not ignored
-settings. Native backend controls `-x/-X/-g/-t/-s/-k` remain unavailable;
+settings. Supported pairs include popup normal/title, editor gutter, dialog/error
+titles and error focus (`pmenunormal`, `pmenutitle`, `editlinestate`, `dtitle`,
+`errdtitle`, `errdfocus`). `menuinactive` accepts foreground, background and
+attributes; omitted fields keep their current values and disabled-label contrast.
+`errdhotfocus` retains its earlier whole-error-focus alias, not separate mnemonic
+styling. Native skin and CLI colors share `#RGB`/`#RRGGBB` parsing and the
+`inverse`/`reverse` attribute aliases. This does not add native INI `[Colors]`.
+Native backend controls `-x/-X/-g/-t/-s/-k` remain unavailable;
 `--help-terminal` explains why. ASCII frames do not implement non-UTF-8 terminal
 output or 7-bit input.
 

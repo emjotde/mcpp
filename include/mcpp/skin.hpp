@@ -82,6 +82,9 @@ struct SkinChoice {
 [[nodiscard]] const Skin& find_skin(std::string_view id);
 [[nodiscard]] Skin load_skin(std::string_view id, const std::filesystem::path& config_directory);
 [[nodiscard]] std::vector<SkinChoice> available_skins(const std::filesystem::path& config_directory);
+[[nodiscard]] const SkinPair* find_skin_color(
+    const Skin& skin, std::string_view section, std::string_view key
+);
 [[nodiscard]] const SkinPair& skin_color(
     const Skin& skin, std::string_view section, std::string_view key, const SkinPair& fallback
 );

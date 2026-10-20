@@ -110,8 +110,9 @@ void print_color_options(std::ostream& output) {
            << "An omitted field keeps its current value; join attributes with '+'.\n"
            << "Colors: black, red, green, brown, blue, magenta, cyan, lightgray,\n"
            << "gray, brightred, brightgreen, yellow, brightblue, brightmagenta,\n"
-           << "brightcyan, white, default, color0..color255, rgb000..rgb555, gray0..gray23.\n"
-           << "Attributes: bold, italic, underline, reverse, blink, none.\n";
+           << "brightcyan, white, default, color0..color255, rgb000..rgb555, gray0..gray23,\n"
+           << "#RGB and #RRGGBB.\n"
+           << "Attributes: bold, italic, underline, reverse (or inverse), blink, none.\n";
     output << cli_color_roles();
 }
 
@@ -129,10 +130,12 @@ std::string_view cli_program_name(const CliFrontend frontend) {
 
 std::string_view cli_color_roles() {
     return "Color pairs: normal, selected, markselect, reverse, gauge, errors,\n"
-           "dnormal, dfocus, errdhotfocus, menunormal, menusel, pmenusel,\n"
-           "bbarhotkey, bbarbutton, editnormal, editbold, editmarked, viewnormal,\n"
+           "dnormal, dfocus, dtitle, errdtitle, errdfocus, errdhotfocus,\n"
+           "menunormal, menusel, menuinactive, pmenunormal, pmenusel, pmenutitle,\n"
+           "bbarhotkey, bbarbutton, editnormal, editbold, editmarked, editlinestate, viewnormal,\n"
            "viewselected, helpnormal, helplink, helpslink.\n"
-           "Foreground-only roles: marked, disabled, header, menuhot, menuinactive, editwhitespace.\n"
+           "Foreground-only roles: marked, disabled, header, menuhot, editwhitespace.\n"
+           "errdhotfocus is the existing whole-error-focus alias of errdfocus.\n"
            "Other MC roles are not rendered independently and are rejected.\n";
 }
 
