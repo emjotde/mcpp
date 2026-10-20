@@ -60,12 +60,14 @@ endfunction()
 
 add_library(
     mcpp_core
+    src/archive_provider.cpp
     src/command_line.cpp
     src/config.cpp
     src/entry.cpp
     src/listing.cpp
     src/compare.cpp
     src/diff.cpp
+    src/keymap.cpp
     src/location.cpp
     src/local_provider.cpp
     src/local_tools.cpp
@@ -88,7 +90,7 @@ target_link_libraries(mcpp_core PUBLIC Threads::Threads screen)
 target_compile_definitions(mcpp_core PUBLIC MCPP_VERSION="${PROJECT_VERSION}")
 mcpp_target_defaults(mcpp_core)
 
-add_library(mcpp_ui src/app.cpp)
+add_library(mcpp_ui src/app.cpp src/keymap_input.cpp)
 target_include_directories(mcpp_ui PUBLIC include)
 target_link_libraries(mcpp_ui PUBLIC mcpp_core ftxui::ftxui)
 mcpp_target_defaults(mcpp_ui)
@@ -123,6 +125,65 @@ if(MCPP_BUILD_TESTS)
             mcpp_tests PROPERTIES ENVIRONMENT
             "MCPP_DISPOSABLE_TESTS=1;TMPDIR=/review/runtime"
         )
+    endif()
+    add_executable(mcpp_keymap_tests tests/test_keymap.cpp)
+    target_link_libraries(mcpp_keymap_tests PRIVATE mcpp_core)
+    mcpp_target_defaults(mcpp_keymap_tests)
+    add_executable(mcpp_keymap_input_tests tests/test_keymap_input.cpp)
+    target_include_directories(mcpp_keymap_input_tests PRIVATE third_party/ftxui/src)
+    target_link_libraries(mcpp_keymap_input_tests PRIVATE mcpp_ui)
+    mcpp_target_defaults(mcpp_keymap_input_tests)
+    add_executable(mcpp_archive_tests tests/test_archive_provider.cpp)
+    target_link_libraries(mcpp_archive_tests PRIVATE mcpp_core)
+    mcpp_target_defaults(mcpp_archive_tests)
+    add_executable(mcpp_archive_operation_tests tests/test_archive_operations.cpp)
+    target_link_libraries(mcpp_archive_operation_tests PRIVATE mcpp_core)
+    mcpp_target_defaults(mcpp_archive_operation_tests)
+    add_executable(mcpp_archive_location_tests tests/test_archive_locations.cpp)
+    target_link_libraries(mcpp_archive_location_tests PRIVATE mcpp_core)
+    mcpp_target_defaults(mcpp_archive_location_tests)
+    add_executable(mcpp_editor_large_files tests/test_editor_large_files.cpp)
+    target_link_libraries(mcpp_editor_large_files PRIVATE mcpp_core)
+    mcpp_target_defaults(mcpp_editor_large_files)
+    add_executable(mcpp_sparse_special_tests tests/test_sparse_special.cpp)
+    target_link_libraries(mcpp_sparse_special_tests PRIVATE mcpp_core)
+    target_link_options(
+        mcpp_sparse_special_tests PRIVATE
+        -Wl,--wrap=lseek,--wrap=pread,--wrap=__pread_chk,--wrap=pwrite,--wrap=ftruncate,--wrap=fsync
+    )
+    mcpp_target_defaults(mcpp_sparse_special_tests)
+    if(EXISTS "/review/.operation-regressions-disposable")
+        file(MAKE_DIRECTORY
+            /review/cases/agent-archives
+            /review/cases/agent-archive-operations
+            /review/cases/sparse-special-files
+        )
+        add_test(
+            NAME mcpp_keymap_tests
+            COMMAND mcpp_keymap_tests /review/cases/agent-keymap/ctest
+        )
+        add_test(NAME mcpp_keymap_input_tests COMMAND mcpp_keymap_input_tests)
+        add_test(
+            NAME mcpp_archive_tests
+            COMMAND mcpp_archive_tests /review/cases/agent-archives
+        )
+        add_test(
+            NAME mcpp_archive_operation_tests
+            COMMAND mcpp_archive_operation_tests /review/cases/agent-archive-operations
+        )
+        add_test(
+            NAME mcpp_archive_location_tests
+            COMMAND mcpp_archive_location_tests /review/cases/archive-locations
+        )
+        add_test(
+            NAME mcpp_editor_large_files
+            COMMAND mcpp_editor_large_files /review/cases/editor-large-files/model
+        )
+        add_test(
+            NAME mcpp_sparse_special_tests
+            COMMAND mcpp_sparse_special_tests /review/cases/sparse-special-files
+        )
+        set_tests_properties(mcpp_editor_large_files mcpp_sparse_special_tests PROPERTIES TIMEOUT 90)
     endif()
     add_executable(mcpp_editor_regressions tests/test_editor_regressions.cpp)
     target_link_libraries(mcpp_editor_regressions PRIVATE mcpp_core)
@@ -340,6 +401,56 @@ if(MCPP_BUILD_TESTS)
                     ${CMAKE_CURRENT_BINARY_DIR}/shell-ui
             )
             set_tests_properties(mcpp_shell_ui PROPERTIES TIMEOUT 120)
+            add_test(
+                NAME mcpp_keymap_ui
+                COMMAND
+                    ${MCPP_PYTHON_EXECUTABLE}
+                    -B
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_keymap_ui.py
+                    $<TARGET_FILE:mcpp>
+                    $<TARGET_FILE:mcppedit>
+                    $<TARGET_FILE:mcppview>
+                    $<TARGET_FILE:mcppdiff>
+                    ${MCPP_TMUX_EXECUTABLE}
+                    ${CMAKE_CURRENT_BINARY_DIR}/keymap-ui
+            )
+            set_tests_properties(mcpp_keymap_ui PROPERTIES TIMEOUT 150)
+            add_test(
+                NAME mcpp_archives_ui
+                COMMAND
+                    ${MCPP_PYTHON_EXECUTABLE}
+                    -B
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_archives_ui.py
+                    $<TARGET_FILE:mcpp>
+                    $<TARGET_FILE:mcppview>
+                    ${MCPP_TMUX_EXECUTABLE}
+                    ${CMAKE_CURRENT_BINARY_DIR}/archives-ui
+            )
+            set_tests_properties(mcpp_archives_ui PROPERTIES TIMEOUT 180)
+            add_test(
+                NAME mcpp_hex_cursor_ui
+                COMMAND
+                    ${MCPP_PYTHON_EXECUTABLE}
+                    -B
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_hex_cursor_ui.py
+                    $<TARGET_FILE:mcpp>
+                    ${MCPP_TMUX_EXECUTABLE}
+                    ${CMAKE_CURRENT_BINARY_DIR}/hex-cursor-ui
+            )
+            set_tests_properties(mcpp_hex_cursor_ui PROPERTIES TIMEOUT 60)
+            add_test(
+                NAME mcpp_editor_large_files_ui
+                COMMAND
+                    ${MCPP_PYTHON_EXECUTABLE}
+                    -B
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_editor_large_files_ui.py
+                    $<TARGET_FILE:mcpp>
+                    $<TARGET_FILE:mcppedit>
+                    $<TARGET_FILE:mcppdiff>
+                    ${MCPP_TMUX_EXECUTABLE}
+                    /review/cases/editor-large-files/ui
+            )
+            set_tests_properties(mcpp_editor_large_files_ui PROPERTIES TIMEOUT 180)
             add_test(
                 NAME mcpp_audit_ui
                 COMMAND

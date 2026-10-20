@@ -12,7 +12,10 @@ namespace mcpp {
 
 class Pane {
 public:
-    Pane(ProviderPtr provider, std::string path);
+    Pane(
+        ProviderPtr provider, std::string path,
+        const Pane* preferences = nullptr, bool external_parent = false
+    );
 
     void refresh(const Cancellation& cancellation = {}, bool force = false);
     void move_cursor(int amount);
@@ -89,6 +92,7 @@ private:
     [[nodiscard]] bool matches_pattern(std::string_view pattern, std::string_view name) const;
 
     ProviderPtr provider_;
+    bool external_parent_{false};
     std::string path_;
     std::vector<Entry> entries_;
     std::set<std::string, std::less<>> selected_;

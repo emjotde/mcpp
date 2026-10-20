@@ -1,5 +1,7 @@
 #include "mcpp/app.hpp"
 #include "mcpp/config.hpp"
+#include "mcpp/local_provider.hpp"
+#include "mcpp/location.hpp"
 
 #include <filesystem>
 #include <fstream>
@@ -25,6 +27,8 @@ int main(const int argc, char** argv) {
             << "  -e, --edit [files]   Open editor (unnamed if no files)\n"
             << "                      Files accept file:line or file:line:\n"
             << "  -S, --skin <name>   Select a skin for this run\n"
+            << "  -K, --keymap <file> Load MC-format key bindings\n"
+            << "      --nokeymap     Use built-in key bindings only\n"
             << "  -U, --subshell      Enable persistent Bash for this run\n"
             << "  -u, --nosubshell    Disable persistent Bash for this run\n"
             << "  -P, --printwd <file> Write final directory\n";
@@ -40,6 +44,8 @@ int main(const int argc, char** argv) {
         std::size_t first_line = 0;
         std::optional<std::filesystem::path> print_directory;
         std::optional<std::string> skin;
+        std::optional<std::string> keymap;
+        bool keymap_disabled = false;
         std::optional<bool> subshell;
         std::vector<std::string> paths;
         for (std::size_t index = 0; index < arguments.size(); ++index) {
@@ -56,6 +62,16 @@ int main(const int argc, char** argv) {
                 skin = take_value();
             } else if (argument.starts_with("--skin=")) {
                 skin = argument.substr(7);
+            } else if (argument == "-K" || argument == "--keymap") {
+                keymap = take_value();
+                if (keymap->empty()) throw std::invalid_argument("keymap file name is empty");
+                keymap_disabled = false;
+            } else if (argument.starts_with("--keymap=")) {
+                keymap = argument.substr(9);
+                if (keymap->empty()) throw std::invalid_argument("keymap file name is empty");
+                keymap_disabled = false;
+            } else if (argument == "--nokeymap") {
+                keymap_disabled = true;
             } else if (argument == "-U" || argument == "--subshell") {
                 subshell = true;
             } else if (argument == "-u" || argument == "--nosubshell") {
@@ -100,9 +116,12 @@ int main(const int argc, char** argv) {
         }
         auto config = mcpp::Config::load(mcpp::default_config_path());
         config.theme_override = std::move(skin);
+        config.keymap_override = std::move(keymap);
+        config.keymap_disabled = keymap_disabled;
         config.subshell_override = subshell;
         const auto current = std::filesystem::current_path();
         const auto pane_path = [&](const std::string& value) {
+            if (mcpp::is_archive_location(value)) return value;
             const auto path = std::filesystem::path(value);
             return (
                 path.is_absolute() ? path : current / path
@@ -111,6 +130,14 @@ int main(const int argc, char** argv) {
         const auto saved_path = [&](const std::string& value, const char* panel) {
             if (!config.auto_save_panels_setup || value.empty()) return current.string();
             const auto path = pane_path(value);
+            if (mcpp::is_archive_location(path)) {
+                try {
+                    const auto location = mcpp::open_location(path, std::make_shared<mcpp::LocalProvider>());
+                    if (location.provider->stat_follow(location.path, {}).kind == mcpp::EntryKind::directory) return path;
+                } catch (const std::exception& error) {
+                    std::cerr << "mcpp: saved " << panel << " panel: " << error.what() << '\n';
+                }
+            }
             std::error_code error;
             if (std::filesystem::is_directory(path, error) && !error) return path;
             std::cerr << "mcpp: cannot restore saved " << panel << " panel; using the current directory\n";

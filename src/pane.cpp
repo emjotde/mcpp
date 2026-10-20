@@ -71,10 +71,30 @@ bool wildcard_match(
 
 }  // namespace
 
-Pane::Pane(ProviderPtr provider, std::string path)
-    : provider_(std::move(provider)) {
+Pane::Pane(
+    ProviderPtr provider, std::string path,
+    const Pane* preferences, const bool external_parent
+)
+    : provider_(std::move(provider)), external_parent_(external_parent) {
     if (!provider_) {
         throw std::invalid_argument("pane provider is null");
+    }
+    if (preferences != nullptr) {
+        viewport_rows_ = preferences->viewport_rows_;
+        show_hidden_ = preferences->show_hidden_;
+        show_backups_ = preferences->show_backups_;
+        fast_reload_ = preferences->fast_reload_;
+        page_scrolling_ = preferences->page_scrolling_;
+        center_scrolling_ = preferences->center_scrolling_;
+        shell_patterns_ = preferences->shell_patterns_;
+        follow_links_ = preferences->follow_links_;
+        directories_first_ = preferences->directories_first_;
+        filter_ = preferences->filter_;
+        sort_ = preferences->sort_;
+        descending_ = preferences->descending_;
+        sort_case_sensitive_ = preferences->sort_case_sensitive_;
+        executable_first_ = preferences->executable_first_;
+        reverse_files_only_ = preferences->reverse_files_only_;
     }
     path_ = provider_->normalize(path);
     history_.push_back(path_);
@@ -170,7 +190,7 @@ void Pane::refresh(const Cancellation& cancellation, const bool force) {
         );
     }
     const auto parent_path = provider_->parent(path_);
-    if (parent_path != path_) {
+    if (parent_path != path_ || external_parent_) {
         Entry parent_entry;
         try {
             parent_entry = provider_->stat(parent_path, cancellation);
@@ -674,7 +694,12 @@ void Pane::set_shell_patterns(const bool value) {
 }
 
 void Pane::swap_contents(Pane& other) {
-    if (provider_ != other.provider_) throw std::invalid_argument("content swap requires the same provider");
+    if (provider_ != other.provider_) {
+        std::swap(history_, other.history_);
+        std::swap(history_index_, other.history_index_);
+    }
+    std::swap(provider_, other.provider_);
+    std::swap(external_parent_, other.external_parent_);
     std::swap(path_, other.path_);
     std::swap(entries_, other.entries_);
     std::swap(selected_, other.selected_);

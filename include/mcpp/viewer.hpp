@@ -87,6 +87,7 @@ public:
     [[nodiscard]] std::uint64_t data_size() const noexcept;
     [[nodiscard]] std::size_t horizontal_offset() const noexcept;
     [[nodiscard]] const std::string& path() const noexcept;
+    [[nodiscard]] const ProviderPtr& provider() const noexcept { return provider_; }
     [[nodiscard]] std::vector<std::string> lines(
         std::size_t width,
         std::size_t height,

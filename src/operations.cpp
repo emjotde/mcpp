@@ -1,8 +1,10 @@
 #include "mcpp/operations.hpp"
+#include "mcpp/archive_provider.hpp"
 #include "mcpp/local_provider.hpp"
 
 #include <algorithm>
 #include <cerrno>
+#include <chrono>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -15,6 +17,17 @@
 
 namespace mcpp {
 namespace {
+
+void require_capability(
+    const Provider& provider, const ProviderCapability capability,
+    const std::string_view operation
+) {
+    if (!has_capability(provider.capabilities(), capability)) {
+        throw std::runtime_error(
+            std::string(operation) + " is not supported by this read-only provider: " + provider.display_name()
+        );
+    }
+}
 
 void emit_progress(
     const ProgressCallback& callback,
@@ -42,6 +55,10 @@ void preserve_time(
 ) {
     if (auto* local = dynamic_cast<LocalProvider*>(&destination_provider)) {
         local->set_modified(destination, source.modified);
+    } else if (auto* archive = dynamic_cast<ArchiveProvider*>(&destination_provider)) {
+        const auto modified = archive->format() == ArchiveFormat::tar ? source.modified :
+            std::chrono::system_clock::time_point{std::chrono::floor<std::chrono::seconds>(source.modified.time_since_epoch())};
+        archive->set_modified(destination, modified);
     }
 }
 
@@ -94,6 +111,18 @@ void validate_directory_target(
         local_source->validate_directory_target(
             source, *local_destination, destination
         );
+        return;
+    }
+    const auto* archive_source = dynamic_cast<const ArchiveProvider*>(&source_provider);
+    const auto* archive_destination = dynamic_cast<const ArchiveProvider*>(&destination_provider);
+    if (archive_source != nullptr && archive_destination != nullptr &&
+        archive_source->stat(source, {}).kind == EntryKind::directory) {
+        archive_source->validate_directory_target(source, *archive_destination, destination);
+    } else if (local_source != nullptr && archive_destination != nullptr) {
+        const LocalProvider filesystem;
+        local_source->validate_directory_target(
+            source, filesystem, archive_destination->archive_path().string()
+        );
     }
 }
 
@@ -113,6 +142,17 @@ bool same_move_file(
                local_source->same_file(
                    source, *local_destination, destination
                );
+    }
+    if (dynamic_cast<const ArchiveProvider*>(&source_provider) != nullptr &&
+        dynamic_cast<const ArchiveProvider*>(&destination_provider) != nullptr &&
+        source_provider.id() == destination_provider.id() &&
+        source_provider.exists(source) && destination_provider.exists(destination)) {
+        const auto first = source_provider.stat(source, {});
+        const auto second = destination_provider.stat(destination, {});
+        if (first.kind == EntryKind::file && second.kind == EntryKind::file &&
+            first.inode == second.inode && first.revision == second.revision) {
+            return true;
+        }
     }
     return source_provider.id() == destination_provider.id() &&
            source_provider.normalize(source) ==
@@ -222,6 +262,7 @@ bool remove_with_retry(
     for (;;) {
         cancellation.throw_if_requested();
         try {
+            require_capability(provider, ProviderCapability::remove, "deletion");
             if (validate) {
                 validate();
             }
@@ -580,6 +621,7 @@ bool OperationEngine::copy_entry_once(
     const std::shared_ptr<LinkCache>& links
 ) {
     cancellation.throw_if_requested();
+    require_capability(destination_provider, ProviderCapability::write, "copy destination");
     const auto destination_path = std::string(destination);
     if (same_move_file(
             source_provider, source.path, destination_provider, destination_path
@@ -620,10 +662,6 @@ bool OperationEngine::copy_entry_once(
 
     state.current_path = source.path;
     emit_progress(progress, state);
-    validate_directory_target(
-        source_provider, source.path, destination_provider, destination_path
-    );
-
     auto effective_source = source;
     if (source.kind == EntryKind::symlink && !options.preserve_symlinks) {
         effective_source = source_provider.stat_follow(source.path, cancellation);
@@ -639,16 +677,29 @@ bool OperationEngine::copy_entry_once(
     }
     auto* local_source = dynamic_cast<LocalProvider*>(&source_provider);
     auto* local_destination = dynamic_cast<LocalProvider*>(&destination_provider);
+    auto* archive_source = dynamic_cast<ArchiveProvider*>(&source_provider);
+    auto* archive_destination = dynamic_cast<ArchiveProvider*>(&destination_provider);
+    // Local revisions include st_dev as well as st_ino. Archive revisions
+    // identify the virtual object and its version, not the whole repack.
     const auto link_key = source_provider.id() + "|" + source.revision;
     const bool track_links =
-        local_source != nullptr && local_destination != nullptr &&
-        options.preserve_symlinks && source.kind == EntryKind::file &&
-        (links->contains(link_key) || local_source->hardlink_count(source.path) > 1U);
+        (local_source != nullptr || archive_source != nullptr) &&
+        (local_destination != nullptr || archive_destination != nullptr) &&
+        options.preserve_symlinks &&
+        (source.kind == EntryKind::file ||
+         (source.kind == EntryKind::other && local_source != nullptr && local_destination != nullptr)) &&
+        (links->contains(link_key) || (local_source != nullptr
+            ? local_source->hardlink_count(source.path)
+            : archive_source->hardlink_count(source.path)) > 1U);
     if (track_links) {
         const auto cached = links->find(link_key);
         if (cached != links->end() && destination_provider.exists(cached->second.first) &&
             destination_provider.stat(cached->second.first, cancellation).revision == cached->second.second) {
-            local_destination->copy_hardlink(cached->second.first, destination_path, overwrite, cancellation);
+            if (local_destination != nullptr) {
+                local_destination->copy_hardlink(cached->second.first, destination_path, overwrite, cancellation);
+            } else {
+                archive_destination->copy_hardlink(cached->second.first, destination_path, overwrite, cancellation);
+            }
             cached->second.second = destination_provider.stat(cached->second.first, cancellation).revision;
             state.bytes_done += effective_source.size;
             ++state.files_done;
@@ -663,6 +714,28 @@ bool OperationEngine::copy_entry_once(
             };
         }
     };
+
+    if (local_source != nullptr && local_destination != nullptr &&
+        (effective_source.kind == EntryKind::file || effective_source.kind == EntryKind::other)) {
+        local_destination->copy_file_from(
+            *local_source, effective_source.path, destination_path, overwrite,
+            options.preserve_permissions, cancellation,
+            [&](const TransferProgress& value) {
+                auto overall = state;
+                overall.bytes_done += value.bytes_done;
+                overall.current_path = value.current_path.empty() ? source.path : value.current_path;
+                emit_progress(progress, overall);
+            }
+        );
+        remember_link();
+        state.bytes_done += effective_source.size;
+        ++state.files_done;
+        emit_completed_progress(progress, state);
+        return true;
+    }
+    if (effective_source.kind == EntryKind::other) {
+        throw std::runtime_error("unsupported special file copy between providers: " + source.path);
+    }
 
     if (&source_provider == &destination_provider &&
         options.preserve_permissions &&
@@ -964,6 +1037,10 @@ void OperationEngine::move(
     const ProgressCallback& progress,
     OperationResult* result
 ) const {
+    cancellation.throw_if_requested();
+    require_capability(source_provider, ProviderCapability::remove, "move source removal");
+    require_capability(destination_provider, ProviderCapability::write, "move destination");
+    auto links = std::make_shared<LinkCache>();
     if (&source_provider == &destination_provider &&
         has_capability(
             source_provider.capabilities(),
@@ -1090,7 +1167,9 @@ void OperationEngine::move(
                     state,
                     progress,
                     skip_reason,
-                    overwrite
+                    overwrite,
+                    {},
+                    links
                 );
                 if (copied) {
                     if (remove_with_retry(
@@ -1152,7 +1231,10 @@ void OperationEngine::move(
                 cancellation,
                 state,
                 progress,
-                skip_reason
+                skip_reason,
+                false,
+                {},
+                links
             );
             if (copied) {
                 if (remove_with_retry(
@@ -1229,6 +1311,8 @@ void OperationEngine::move_exact(
     OperationResult* result
 ) const {
     cancellation.throw_if_requested();
+    require_capability(source_provider, ProviderCapability::remove, "move source removal");
+    require_capability(destination_provider, ProviderCapability::write, "move destination");
     if (source_provider.id() == destination_provider.id() &&
         source_provider.normalize(source.path) ==
             destination_provider.normalize(destination)) {

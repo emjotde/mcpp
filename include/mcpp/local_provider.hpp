@@ -17,6 +17,7 @@ public:
     [[nodiscard]] std::string display_name() const override;
     [[nodiscard]] ProviderCapability capabilities() const override;
     [[nodiscard]] std::string normalize(std::string_view path) const override;
+    [[nodiscard]] std::filesystem::path native_path(std::string_view path) const;
     [[nodiscard]] std::string join(
         std::string_view directory,
         std::string_view name
@@ -53,6 +54,12 @@ public:
     void copy_hardlink(
         std::string_view source, std::string_view destination,
         bool overwrite, const Cancellation& cancellation
+    );
+    void copy_file_from(
+        const LocalProvider& source_provider,
+        std::string_view source, std::string_view destination,
+        bool overwrite, bool preserve_permissions,
+        const Cancellation& cancellation, const ProgressCallback& progress
     );
     [[nodiscard]] std::vector<Entry> list(
         std::string_view path,
@@ -139,6 +146,15 @@ private:
         std::optional<std::string> expected_revision,
         const Cancellation& cancellation, const ProgressCallback& progress,
         std::optional<std::filesystem::perms> permissions
+    );
+    void write_staged(
+        std::string_view path, std::optional<std::uint64_t> length,
+        bool overwrite, std::optional<std::string> expected_revision,
+        const Cancellation& cancellation, const ProgressCallback& progress,
+        std::optional<std::filesystem::perms> permissions,
+        const std::function<std::uint64_t(int)>& transfer,
+        const std::function<void()>& validate_source = {},
+        std::optional<std::chrono::system_clock::time_point> modified = {}
     );
     [[nodiscard]] std::filesystem::path resolve(
         std::string_view path

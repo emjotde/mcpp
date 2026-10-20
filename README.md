@@ -4,8 +4,8 @@
 manager written in C++20. It provides a familiar two-pane workflow without
 using Midnight Commander source code or resources.
 
-The first provider is the local Linux filesystem. Planned providers are
-Azure Blob Storage through azcpp. SSH/SFTP work is currently paused.
+Providers cover the local Linux filesystem and bounded, read-only tar/cpio
+archives. Remote work, including Azure Blob Storage and SSH/SFTP, is paused.
 
 ## Current functionality
 
@@ -28,6 +28,8 @@ Azure Blob Storage through azcpp. SSH/SFTP work is currently paused.
 - Skipped sources are reported as incomplete and keep their selection marks
 - Atomic no-clobber writes and symlink/root confinement
 - Source-cycle rejection, preserved copy modification times and copied hardlink groups
+- Sparse regular-file copies and safe recreation of FIFOs and permitted device nodes
+- Read-only tar/cpio browsing, viewing, extraction and native VFS paths
 - Creation permissions follow the process umask when permissions are not preserved
 - Mode, owner/group, file information, free-space display, and links
 - Directory comparison plus fixed-width Quick view and live Info panels
@@ -43,11 +45,12 @@ Azure Blob Storage through azcpp. SSH/SFTP work is currently paused.
 - Clickable function-key bars, consistent modal controls and pointer-editable command text
 - Direct View/Edit from Find results with the result position retained on return
 - Stable listing viewports and filename-preserving headers for long paths
+- MC-format configurable keys, including editor/manager extended keymaps
 - Staged viewer hex/ASCII edits with explicit save/discard decisions
 - UTF-8-aware character search, greedy wildcard captures and regex replacement escapes
 
-The implementation is behaviorally familiar but does not use Midnight
-Commander source code, resources, strings, tests, or artwork. A shallow MC
+The implementation is behaviorally familiar but does not copy Midnight
+Commander implementation, resources, tests, or artwork. A shallow MC
 checkout under ignored `reference/` is used only to study behavior and
 documentation; no MC implementation is copied.
 
@@ -263,6 +266,74 @@ not MC's complete syntax database or configuration-file compatibility layer.
 Remote providers remain explicitly paused. Local archive/VFS and remaining
 shell-compatibility work are tracked separately from these local menu controls.
 
+## Keymaps
+
+All four executables accept `-K file` / `--keymap=file` and `--nokeymap`.
+An explicit file takes precedence over the saved `keymap` setting and
+`MCPP_KEYMAP`. Without those, mcpp looks for `mcpp.keymap` in its XDG config
+directory, then `/etc/mcpp/`. A bare configured filename also searches those
+directories. Command-line overrides are not saved.
+
+Resources use MC section/action/key names, with semicolon-separated alternatives:
+
+```ini
+[editor]
+Save = ctrl-s; f2
+Quit = f10; alt-q
+
+[filemanager]
+ExtendedKeyMap = ctrl-x
+
+[filemanager:xmap]
+OptionsAppearance = a
+```
+
+Definitions replace an action's old bindings; an empty list unbinds it.
+Untouched actions retain mcpp's existing shortcuts. Contexts cover panels,
+editor, viewer/hex viewer, diff, menus, dialogs and focused controls. Extended
+maps consume one following key; Escape cancels the prefix without quitting.
+Learned terminal sequences are decoded before action lookup. Invalid resources
+report their file, line and column. Binding an unavailable command reports an
+error rather than running a different action.
+
+## Local archives and copying
+
+Enter opens recognized tar/cpio files; directories and `..` navigate inside,
+and `Ctrl-PageUp` at the archive root returns to its containing local directory.
+Viewing and copying out use the archive provider, not similarly named host
+paths. File bytes, modes, modification times, safe symlinks and hardlink groups
+are retained when requested. Archives are read-only in the UI, like MC TarFS:
+editor Save reports that restriction, while Save As can publish a local copy.
+External file commands and comparisons require a local copy.
+
+Native paths work at startup, in directory changes and in saved pane paths:
+
+```text
+/path/to/sample.tar/utar://directory
+/path/to/sample.cpio/ucpio://directory/file
+```
+
+Active VFS list (`Ctrl-X a`) reopens cached archives. Virtual FS options set
+the timeout for freeing unused providers; active panes, viewers and editor
+buffers keep their snapshots alive. A changed container opens a new revision.
+Command execution from an archive uses its containing local directory and does
+not replace the archive pane with the shell's physical directory.
+
+The archive reader supports ustar/common GNU/PAX tar and newc/CRC cpio.
+Compressed variants use installed `gzip`, `bzip2`, `xz`, or `zstd` commands;
+missing tools fail explicitly. Limits are 64 MiB encoded, 256 MiB expanded,
+100,000 members and 4,096 bytes per member path. Nested archives, sparse/special
+archive members, older cpio formats and other local VFS families remain open
+compatibility work. Archive data is indexed in memory, never blindly extracted
+into a host directory.
+
+Local copying retains sparse holes where the filesystem supports them, with
+exact logical bytes and size. FIFOs and device nodes are recreated rather than
+read as streams; device creation still needs normal Linux permissions. Unix
+sockets are rejected. Cancellation, source identity, overwrite choices and
+hardlink groups retain their guards. A failed final directory sync is reported
+even if the destination has already been published.
+
 ## Shell
 
 With Bash, commander commands and `Ctrl-O` use the same interactive shell.
@@ -385,7 +456,9 @@ read-only and supports Go to, native Search, Parse and codepage selection.
 
 The wheel scrolls hex content immediately while retaining the cursor's relative
 row. Hex progress follows the active byte. Click a hex digit or ASCII byte to
-position the cursor, including the low nibble of a hex byte. Edits stay staged
+position the cursor, including the low nibble of a hex byte. Both columns
+highlight the selected byte; Tab changes which column receives input without
+losing the matching-byte highlight. Edits stay staged
 until `F6` Save or an explicit save decision on exit. Hardlinked files offer
 detach / preserve links / cancel before publication; preserve links is an
 explicit non-atomic write. The final byte reports 100%.
@@ -394,6 +467,13 @@ attempts retain the visible location, and successful text searches reveal
 their hit through wrapping and horizontal scrolling.
 
 ## Editor buffers
+
+Files above 64 MiB require confirmation before their contents are read.
+Accept opens the file; declining retains the current draft and other queued
+CLI files. This applies to manager editing, editor Open/history, standalone
+startup and Find/Diff round trips. Exactly 64 MiB opens without that warning.
+The former 16 MiB rejection is removed, and backups use guarded streaming
+copies rather than a separate 16 MiB limit.
 
 General options uses the native Wrap mode, Tabulation, and Other options groups.
 None, Dynamic paragraphing, and Type writer wrap all change typing behavior.

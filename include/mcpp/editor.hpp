@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <optional>
 #include <set>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -37,12 +38,29 @@ struct EditorBehavior {
     std::size_t wrap_length{72};
 };
 
+class EditorLargeFileConfirmationRequired final : public std::runtime_error {
+public:
+    explicit EditorLargeFileConfirmationRequired(Entry file)
+        : std::runtime_error("large editor file requires confirmation"),
+          file_(std::move(file)) {}
+
+    [[nodiscard]] const Entry& file() const noexcept { return file_; }
+
+private:
+    Entry file_;
+};
+
 class EditorModel {
 public:
+    static constexpr std::uint64_t large_file_threshold = 64U * 1024U * 1024U;
+
+    // Retry a confirmed large open with EditorLargeFileConfirmationRequired::file().
+    // The approval must still match the file's path, revision and size.
     void open(
         ProviderPtr provider,
         std::string path,
-        const Cancellation& cancellation = {}
+        const Cancellation& cancellation = {},
+        const std::optional<Entry>& large_file_approval = std::nullopt
     );
     void create(
         ProviderPtr provider,
@@ -51,6 +69,7 @@ public:
     void close();
     [[nodiscard]] bool open() const noexcept;
     [[nodiscard]] bool dirty() const noexcept;
+    [[nodiscard]] const ProviderPtr& provider() const noexcept { return provider_; }
     [[nodiscard]] const std::string& path() const noexcept;
     [[nodiscard]] const std::vector<std::string>& lines() const noexcept;
     [[nodiscard]] std::size_t row() const noexcept;
@@ -166,11 +185,19 @@ public:
         EditorLineEnding ending,
         const Cancellation& cancellation = {}
     );
+    void save_as(
+        ProviderPtr provider, std::string path, bool force,
+        EditorLineEnding ending, const Cancellation& cancellation = {}
+    );
     void save_as_preserving_links(
         std::string path,
         bool force,
         EditorLineEnding ending,
         const Cancellation& cancellation = {}
+    );
+    void save_as_preserving_links(
+        ProviderPtr provider, std::string path, bool force,
+        EditorLineEnding ending, const Cancellation& cancellation = {}
     );
     [[nodiscard]] bool find(
         std::string_view needle,
@@ -235,6 +262,11 @@ private:
     void save_as_impl(
         std::string path, bool force, EditorLineEnding ending,
         bool preserve_links, const Cancellation& cancellation
+    );
+    void save_as_with_provider(
+        ProviderPtr provider, std::string path, bool force,
+        EditorLineEnding ending, bool preserve_links,
+        const Cancellation& cancellation
     );
     void backup_target(
         const std::string& storage, const std::string& path,

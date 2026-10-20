@@ -370,6 +370,14 @@ Config Config::load(const std::filesystem::path& path) {
             }
         } else if (key == "theme") {
             result.theme = decode_value(value);
+        } else if (key == "keymap") {
+            result.keymap_file = decode_value(value);
+        } else if (key == "vfs_timeout") {
+            const auto parsed = std::from_chars(value.data(), value.data() + value.size(), result.vfs_timeout);
+            if (parsed.ec != std::errc{} || parsed.ptr != value.data() + value.size() ||
+                result.vfs_timeout > 86400U) {
+                throw std::runtime_error("invalid VFS cache timeout: " + value);
+            }
         } else if (key == "shadows") {
             result.shadows = parse_bool(value, key);
         } else if (key == "editor_syntax") {
@@ -509,6 +517,8 @@ void Config::save(const std::filesystem::path& path) const {
            << "sort_descending="
            << (sort_descending ? "true" : "false") << '\n'
            << "theme=" << encode_value(theme) << '\n'
+           << "keymap=" << encode_value(keymap_file) << '\n'
+           << "vfs_timeout=" << vfs_timeout << '\n'
            << "shadows=" << (shadows ? "true" : "false") << '\n'
            << "editor_syntax="
            << (editor_syntax ? "true" : "false") << '\n'

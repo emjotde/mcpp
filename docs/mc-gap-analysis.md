@@ -86,10 +86,14 @@ are retained; they are not bugs to remove in pursuit of default MC behavior.
 | L01 | Closed: separate `mcppview` and `mcppdiff` executables share the existing viewer and diff/merge code. Quit exits the process; dirty Save/Discard/Cancel and diff-to-editor return paths retain their guards. |
 | L02 | Closed: unnamed startup and New buffers, name-on-save including inactive-buffer Quit, `file:line` / `file:line:` notation, `+line`, existing literal colon filenames, and ordered multi-file `mcpp --edit`. CLI filename resolution and unnamed CLI startup use process cwd rather than restored pane paths. |
 | L04 | Closed for the explicitly listed Bash work: persistent shell state and cwd, Ctrl-O hide/resume including running commands and Bash builtins, guarded drafts, native shell-exit behavior, asynchronous completion, safe shutdown, and command execution alongside file operations. Other shell variants are tracked separately below. |
+| L09 | Closed: local sparse copies retain logical bytes and supported holes; FIFOs and permitted device nodes are recreated without reading them as streams; sockets fail explicitly. Existing atomic publication, revision, metadata, hardlink, cancellation and error handling remain guarded. Non-root checks cover device permission failures; creating device nodes still requires normal Linux capabilities. |
+| L10 | Closed: files above 64 MiB require approval before contents are read, including queued CLI files, Open/history, manager and Find/Diff editing. Decline/failure retains drafts and other arguments. Exactly 64 MiB opens normally; large backups use streaming copies and revision checks instead of the former 16 MiB rejection. |
+| L19 | Closed for implemented commands: MC-format resources, overlays, key aliases/terminal decoding, all 16 contexts, manager/editor extended maps, action rebinding/removal, and actual dispatch across the four frontends and focused controls. `-K` / `--keymap` and `--nokeymap` are launch-only; unavailable commands fail explicitly rather than invoking another action. |
 | L27 | Closed: whole-document and current-word checking, dictionary selection, native suggestions/Add word/Replace/Skip/Cancel controls, and persisted personal dictionaries through standard `aspell(1)`. Byte offsets are validated, replacements are undoable, marks/search settings remain separate, and errors retain the draft and retryable dialog. |
+| L33 | Closed for the currently supported local providers: cached revisions, active-provider retention, unused timeout, private cache creation, native Active VFS list and timeout setting, and logical URI/alias preservation. Changed containers open a new snapshot; remote options stay outside the current scope. |
 
-Standalone frontends are **4/4**. **Four of the 34 baseline work packages are
-closed; 30 baseline packages remain open**. This is a feature backlog, not an
+Standalone frontends are **4/4**. **Eight of the 34 baseline work packages are
+closed; 26 baseline packages remain open**. This is a feature backlog, not an
 overall parity percentage. Additional gaps discovered afterward are listed
 separately, rather than silently changing the baseline denominator.
 The broader command-line option set is still L03, not implicitly completed by
@@ -184,6 +188,33 @@ The running-command case does not pause merely because the user hid it.
 The expanded normal run covered 26 CTest entries. It exposed one command-output
 ordering race in the existing pause workflow; after the fix, all 18 Bash
 workflows, the 36-case follow-up suite and terminal restoration smoke check pass.
+
+### Local providers, keys, large files and copying
+
+Tar/cpio browsing, range viewing and extraction are now reachable from Enter and
+native `/utar://` / `/ucpio://` paths. Pane exit, saved paths, histories, shell
+cwd and panel synchronization preserve the provider instead of interpreting a
+virtual member as a host pathname. Relative copy destinations retain that same
+namespace and readonly checks run before touching a destination. Editor Save
+reports readonly archives; Save As can publish a guarded local copy without
+changing the source. Extracted files retain requested modes, modification times,
+safe symlinks and hardlink groups.
+
+Two of the five local VFS families are therefore available in bounded form, but
+**L28/L29 remain partial**, not closed: nested archives, sparse/special archive
+members, older cpio variants and streaming beyond the documented archive limits
+remain. Standard GNU tar `./` prefixes work; traversal and ambiguous canonical
+names are rejected. sfs, extfs and ext2 undelete are still open.
+
+The hex viewer now highlights the matching byte in both hex and ASCII columns.
+Only the input column receives the terminal cursor; mouse/nibble placement,
+partial rows and horizontal cropping retain the corresponding highlight.
+
+The broad normal run passed 35/37 entries. The affected frontend/keymap cases
+passed after correcting relative CLI paths, settings-action dispatch and
+controller expectations. Later archive namespace fixes were checked only in
+their affected cases; no second full run is claimed or required for this batch.
+Future work uses a build and a few relevant checks, not broad repeated suites.
 
 ### Additional compatibility gaps
 

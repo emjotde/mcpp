@@ -679,6 +679,9 @@ void ViewerModel::toggle_hex_editing() {
     if (!open()) {
         throw std::runtime_error("viewer is not open");
     }
+    if (!hex_editing_ && !has_capability(provider_->capabilities(), ProviderCapability::write)) {
+        throw std::runtime_error("this filesystem is read-only");
+    }
     if (parsed()) throw std::runtime_error("parsed data cannot be hex-edited; select Raw first");
     if (!hex_) toggle_hex();
     hex_editing_ = !hex_editing_;

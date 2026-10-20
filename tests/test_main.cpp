@@ -19,12 +19,15 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <fcntl.h>
 #include <iostream>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/un.h>
 #include <thread>
 #include <unistd.h>
 
@@ -81,6 +84,35 @@ public:
 private:
     std::filesystem::path path_;
 };
+
+std::filesystem::path create_socket_fixture(const std::filesystem::path& directory) {
+    const int parent = ::open(directory.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    check(parent >= 0, "open Unix socket fixture directory");
+    const int descriptor = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (descriptor < 0) {
+        static_cast<void>(::close(parent));
+        throw std::runtime_error("create Unix socket fixture");
+    }
+    try {
+        sockaddr_un address{};
+        address.sun_family = AF_UNIX;
+        // Keep the bound pathname short even when the owned workspace is deeply nested.
+        const auto name = "/proc/self/fd/" + std::to_string(parent) + "/socket";
+        check(name.size() < sizeof(address.sun_path), "short Unix socket fixture path");
+        std::copy(name.begin(), name.end(), address.sun_path);
+        check(
+            ::bind(descriptor, reinterpret_cast<const sockaddr*>(&address), static_cast<socklen_t>(sizeof(address))) == 0,
+            "bind Unix socket fixture"
+        );
+    } catch (...) {
+        static_cast<void>(::close(descriptor));
+        static_cast<void>(::close(parent));
+        throw;
+    }
+    static_cast<void>(::close(descriptor));
+    static_cast<void>(::close(parent));
+    return directory / "socket";
+}
 
 void write_file(
     const std::filesystem::path& path,
@@ -1073,14 +1105,13 @@ void test_operations() {
         "dereferenced symlink copy is complete"
     );
 
-    const auto fifo = source_dir / "pipe";
-    check(::mkfifo(fifo.c_str(), 0600) == 0, "create FIFO fixture");
-    const auto fifo_entry = provider.stat(fifo.string(), {});
+    const auto socket_path = create_socket_fixture(source_dir);
+    const auto socket_entry = provider.stat(socket_path.string(), {});
     bool rejected_special = false;
     try {
         operations.copy(
             provider,
-            {fifo_entry},
+            {socket_entry},
             provider,
             destination_dir.string(),
             {
@@ -1096,7 +1127,7 @@ void test_operations() {
     }
     check(rejected_special, "special-file copy rejection");
     check(
-        !std::filesystem::exists(destination_dir / "pipe"),
+        !std::filesystem::exists(destination_dir / socket_path.filename()),
         "special-file copy leaves no destination"
     );
 }
@@ -1544,15 +1575,14 @@ void test_operation_results() {
               pane.selected_entries().front().path == sources[1].path,
           "only completed source marks are removed");
 
-    const auto fifo = root / "pipe";
-    check(::mkfifo(fifo.c_str(), 0600) == 0, "result FIFO fixture");
+    const auto socket_path = create_socket_fixture(root);
     std::filesystem::create_directory(root / "partial");
     mcpp::OperationResult partial;
     bool failed = false;
     try {
         operations.copy(
             *provider,
-            {sources[0], provider->stat(fifo.string(), {})},
+            {sources[0], provider->stat(socket_path.string(), {})},
             *provider, (root / "partial").string(),
             options, {}, {}, &partial
         );
@@ -1563,7 +1593,7 @@ void test_operation_results() {
               partial.completed_sources ==
                   std::vector<std::string>{sources[0].path} &&
               read_file(root / "partial" / "same.txt") == first.bytes &&
-              !std::filesystem::exists(root / "partial" / "pipe"),
+              !std::filesystem::exists(root / "partial" / socket_path.filename()),
           "completed sources survive a later operation error");
     check_unchanged(sources[0].path, first);
     check_unchanged(sources[1].path, second);
@@ -2839,6 +2869,9 @@ void test_config() {
     config.sort = mcpp::SortField::size;
     config.sort_descending = true;
     config.theme = "blue";
+    config.keymap_file = "my\nmap.keymap";
+    config.keymap_override = "launch-only.keymap";
+    config.keymap_disabled = true;
     config.editor_syntax = false;
     config.editor_line_numbers = false;
     config.editor_tab_width = 8;
@@ -2857,6 +2890,9 @@ void test_config() {
     check_equal(loaded.sort, mcpp::SortField::size, "config sort");
     check(loaded.sort_descending, "config sort direction");
     check_equal(loaded.theme, std::string("blue"), "config theme");
+    check_equal(loaded.keymap_file, config.keymap_file, "config keymap path");
+    check(!loaded.keymap_override && !loaded.keymap_disabled,
+          "keymap command-line overrides are not saved");
     check(
         !loaded.editor_syntax && !loaded.editor_line_numbers,
         "config editor display settings"

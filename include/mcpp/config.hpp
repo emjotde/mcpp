@@ -84,6 +84,10 @@ struct Config {
     std::size_t pause_after_run{1};
     bool use_subshell{true};
     std::optional<bool> subshell_override;
+    std::string keymap_file;
+    std::optional<std::string> keymap_override;
+    bool keymap_disabled{false};
+    std::size_t vfs_timeout{60};
     bool use_internal_edit{true};
     bool use_internal_view{true};
     bool ask_new_filename{false};

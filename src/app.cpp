@@ -1,7 +1,10 @@
 #include "mcpp/app.hpp"
 
+#include "mcpp/archive_provider.hpp"
 #include "mcpp/compare.hpp"
 #include "mcpp/editor_clipboard.hpp"
+#include "mcpp/keymap.hpp"
+#include "mcpp/keymap_input.hpp"
 #include "mcpp/local_provider.hpp"
 #include "mcpp/local_tools.hpp"
 #include "mcpp/location.hpp"
@@ -796,6 +799,216 @@ ftxui::Event named_event(const std::string& name) {
     throw std::runtime_error("unknown learned key action: " + name);
 }
 
+std::optional<Keymap> load_configured_keymap(const Config& config) {
+    if (config.keymap_disabled) return std::nullopt;
+    auto requested = config.keymap_override.value_or(config.keymap_file);
+    if (!config.keymap_override && requested.empty()) {
+        const auto* environment = std::getenv("MCPP_KEYMAP");
+        if (environment != nullptr) requested = environment;
+    }
+    const auto configuration = default_config_path().parent_path();
+    const auto present = [](const std::filesystem::path& path) {
+        std::error_code error;
+        const auto status = std::filesystem::symlink_status(path, error);
+        if (error == std::errc::no_such_file_or_directory) return false;
+        if (error) throw std::filesystem::filesystem_error("inspect keymap", path, error);
+        return std::filesystem::exists(status);
+    };
+    if (!requested.empty()) {
+        const std::filesystem::path path(requested);
+        if (!path.has_parent_path() && !present(path)) {
+            for (const auto& directory : {configuration, std::filesystem::path("/etc/mcpp")}) {
+                if (present(directory / path)) return Keymap::load(directory / path);
+            }
+        }
+        return Keymap::load(path);
+    }
+    for (const auto& path : {configuration / "mcpp.keymap",
+                             std::filesystem::path("/etc/mcpp/mcpp.keymap")}) {
+        if (present(path)) return Keymap::load(path);
+    }
+    return std::nullopt;
+}
+
+struct OriginalKeyBinding {
+    KeymapContext context;
+    std::string_view action;
+    std::string_view keys;
+};
+
+std::span<const OriginalKeyBinding> original_keymap_bindings() {
+    using enum KeymapContext;
+    static constexpr OriginalKeyBinding bindings[]{
+        {filemanager, "Help", "f1"}, {filemanager, "UserMenu", "f2"},
+        {filemanager, "View", "f3"}, {filemanager, "Edit", "f4"},
+        {filemanager, "Copy", "f5"}, {filemanager, "Move", "f6"},
+        {filemanager, "MakeDir", "f7"}, {filemanager, "Delete", "f8"},
+        {filemanager, "Menu", "f9"}, {filemanager, "Quit", "f10"},
+        {filemanager, "ChangePanel", "tab"}, {filemanager, "Reread", "ctrl-r"},
+        {filemanager, "Swap", "ctrl-u"}, {filemanager, "Shell", "ctrl-o"},
+        {filemanager, "HotList", "ctrl-backslash"}, {filemanager, "Find", "alt-question"},
+        {filemanager, "CdQuick", "alt-c"}, {filemanager, "ShowHidden", "alt-dot"},
+        {filemanager, "ExtendedKeyMap", "ctrl-x"}, {filemanager, "History", "alt-h"},
+        {filemanager, "SelectCodepage", "alt-e"}, {filemanager, "EditorViewerHistory", "alt-E"},
+        {filemanager, "ViewFiltered", "alt-exclamation"}, {filemanager, "ScreenList", "alt-`"},
+        {filemanager_xmap, "PanelQuickView", "q"}, {filemanager_xmap, "PanelInfo", "i"},
+        {filemanager_xmap, "ChangeMode", "c"}, {filemanager_xmap, "Link", "l"},
+        {filemanager_xmap, "LinkSymbolic", "s"}, {filemanager_xmap, "LinkSymbolicRelative", "v"},
+        {filemanager_xmap, "ChangeOwn", "o"}, {filemanager_xmap, "CompareDirs", "d"},
+        {filemanager_xmap, "CompareFiles", "ctrl-d"}, {filemanager_xmap, "LinkSymbolicEdit", "ctrl-s"},
+        {filemanager_xmap, "ChangeAttributes", "e"}, {filemanager_xmap, "Jobs", "j"},
+        {filemanager_xmap, "VfsList", "a"},
+        {filemanager_xmap, "ExternalPanelize", "exclamation"},
+        {panel, "Up", "up"}, {panel, "Down", "down"},
+        {panel, "Left", "left"}, {panel, "Right", "right"},
+        {panel, "PageUp", "pgup"}, {panel, "PageDown", "pgdn"},
+        {panel, "Top", "home"}, {panel, "Bottom", "end"},
+        {panel, "Enter", "enter"}, {panel, "CdParent", "ctrl-pgup"},
+        {panel, "CdChild", "ctrl-pgdn"}, {panel, "HistoryPrev", "alt-y"},
+        {panel, "HistoryNext", "alt-u"}, {panel, "Mark", "insert"},
+        {panel, "MarkAll", "ctrl-a"}, {panel, "MarkUp", "shift-up"},
+        {panel, "MarkDown", "shift-down"}, {panel, "Search", "ctrl-s;alt-s"},
+        {panel, "Select", "plus"}, {panel, "Unselect", "minus"},
+        {panel, "SelectInvert", "asterisk"},
+        {tree, "Up", "up"}, {tree, "Down", "down"},
+        {tree, "Left", "left"}, {tree, "Right", "right"},
+        {tree, "PageUp", "pgup"}, {tree, "PageDown", "pgdn"},
+        {tree, "Top", "home"}, {tree, "Bottom", "end"},
+        {tree, "Enter", "enter"}, {tree, "Help", "f1"},
+        {tree, "Reread", "f2;ctrl-r"}, {tree, "Forget", "f3"},
+        {tree, "ToggleNavigation", "f4"}, {tree, "Copy", "f5"},
+        {tree, "Move", "f6"}, {tree, "Remove", "f8"},
+        {tree, "Search", "ctrl-s;alt-s"},
+        {editor, "Help", "f1"}, {editor, "Save", "f2"},
+        {editor, "Mark", "f3"}, {editor, "Replace", "f4"},
+        {editor, "Copy", "f5"}, {editor, "Move", "f6"},
+        {editor, "Search", "f7"}, {editor, "Delete", "f8"},
+        {editor, "Menu", "f9"}, {editor, "Quit", "f10;esc"},
+        {editor, "UserMenu", "f11"}, {editor, "SaveAs", "f12"},
+        {editor, "MarkColumn", "f13;shift-f1"},
+        {editor, "InsertFile", "f15"}, {editor, "SearchContinue", "f17;shift-f7"},
+        {editor, "Up", "up"}, {editor, "Down", "down"},
+        {editor, "Left", "left"}, {editor, "Right", "right"},
+        {editor, "Home", "home"}, {editor, "End", "end"},
+        {editor, "PageUp", "pgup"}, {editor, "PageDown", "pgdn"},
+        {editor, "WordLeft", "ctrl-left;ctrl-z"}, {editor, "WordRight", "ctrl-right;ctrl-x"},
+        {editor, "Top", "ctrl-home"}, {editor, "Bottom", "ctrl-end"},
+        {editor, "TopOnScreen", "ctrl-pgup"}, {editor, "BottomOnScreen", "ctrl-pgdn"},
+        {editor, "ScrollUp", "ctrl-up"}, {editor, "ScrollDown", "ctrl-down"},
+        {editor, "MarkUp", "shift-up"}, {editor, "MarkDown", "shift-down"},
+        {editor, "MarkLeft", "shift-left"}, {editor, "MarkRight", "shift-right"},
+        {editor, "MarkToHome", "shift-home"}, {editor, "MarkToEnd", "shift-end"},
+        {editor, "MarkPageUp", "shift-pgup"}, {editor, "MarkPageDown", "shift-pgdn"},
+        {editor, "MarkToWordBegin", "ctrl-shift-left"}, {editor, "MarkToWordEnd", "ctrl-shift-right"},
+        {editor, "MarkToFileBegin", "ctrl-shift-home"}, {editor, "MarkToFileEnd", "ctrl-shift-end"},
+        {editor, "MarkToPageBegin", "ctrl-shift-pgup"}, {editor, "MarkToPageEnd", "ctrl-shift-pgdn"},
+        {editor, "MarkScrollUp", "ctrl-shift-up"}, {editor, "MarkScrollDown", "ctrl-shift-down"},
+        {editor, "MarkColumnUp", "alt-up"}, {editor, "MarkColumnDown", "alt-down"},
+        {editor, "MarkColumnLeft", "alt-left"}, {editor, "MarkColumnRight", "alt-right"},
+        {editor, "MarkColumnPageUp", "alt-pgup"}, {editor, "MarkColumnPageDown", "alt-pgdn"},
+        {editor, "Store", "ctrl-insert"}, {editor, "Cut", "shift-delete"},
+        {editor, "Paste", "shift-insert"}, {editor, "Undo", "ctrl-u"},
+        {editor, "Redo", "alt-r"}, {editor, "EditNew", "ctrl-n"},
+        {editor, "InsertOverwrite", "insert"}, {editor, "BackSpace", "backspace"},
+        {editor, "Remove", "delete;ctrl-d"}, {editor, "DeleteLine", "ctrl-y"},
+        {editor, "DeleteToEnd", "ctrl-k"}, {editor, "Enter", "enter"},
+        {editor, "Return", "shift-enter;ctrl-enter;ctrl-shift-enter"},
+        {editor, "Tab", "tab;shift-tab;ctrl-tab;ctrl-shift-tab"},
+        {editor, "Goto", "alt-l"}, {editor, "History", "alt-E"},
+        {editor, "SyntaxOnOff", "ctrl-s"}, {editor, "ShowNumbers", "alt-n"},
+        {editor, "MatchBracket", "alt-b"}, {editor, "BlockSave", "ctrl-f"},
+        {editor, "Bookmark", "alt-k"}, {editor, "BookmarkNext", "alt-j"},
+        {editor, "BookmarkPrev", "alt-i"}, {editor, "BookmarkFlush", "alt-o"},
+        {editor, "SelectCodepage", "alt-e"}, {editor, "Mail", "alt-m"},
+        {editor, "SpellCheckCurrentWord", "ctrl-p"}, {editor, "MacroStartStopRecord", "ctrl-r"},
+        {editor, "InsertLiteral", "ctrl-q"}, {editor, "ParagraphFormat", "alt-p"},
+        {editor, "ExternalCommand", "alt-u"}, {editor, "ScreenList", "alt-`"},
+        {viewer, "Quit", "f10;f3;esc;q"}, {viewer, "Help", "f1"},
+        {viewer, "WrapMode", "f2"}, {viewer, "HexMode", "f4"},
+        {viewer, "Goto", "f5"}, {viewer, "Search", "f7"},
+        {viewer, "SearchForward", "slash"}, {viewer, "SearchBackward", "question"},
+        {viewer, "SearchContinue", "f17;shift-f7;n"},
+        {viewer, "SearchOppositeContinue", "N"},
+        {viewer, "SearchForwardContinue", "ctrl-s"}, {viewer, "SearchBackwardContinue", "ctrl-r"},
+        {viewer, "MagicMode", "f8"}, {viewer, "NroffMode", "f9"},
+        {viewer, "SelectCodepage", "alt-e"}, {viewer, "FileNext", "ctrl-f"},
+        {viewer, "FilePrev", "ctrl-b"}, {viewer, "History", "alt-E"},
+        {viewer, "Ruler", "alt-r"}, {viewer, "Bookmark", "m"},
+        {viewer, "BookmarkGoto", "r"}, {viewer, "Up", "up;k;y;insert;ctrl-p"},
+        {viewer, "Down", "down;j;e;delete;enter;ctrl-n"},
+        {viewer, "Left", "left;h"}, {viewer, "Right", "right;l"},
+        {viewer, "ScrollLeft", "ctrl-left"}, {viewer, "ScrollRight", "ctrl-right"},
+        {viewer, "Top", "ctrl-home;ctrl-pgup;alt-lt;g;home"},
+        {viewer, "Bottom", "ctrl-end;ctrl-pgdn;alt-gt;G;end"},
+        {viewer, "PageUp", "pgup;alt-v;b;backspace"},
+        {viewer, "PageDown", "pgdn;ctrl-v;f;space"},
+        {viewer, "HalfPageUp", "u"}, {viewer, "HalfPageDown", "d"},
+        {viewer_hex, "HexEditMode", "f2"}, {viewer_hex, "Save", "f6"},
+        {viewer_hex, "Tab", "tab"}, {viewer_hex, "Home", "home;ctrl-a"},
+        {viewer_hex, "End", "end;ctrl-e"}, {viewer_hex, "Left", "left;b"},
+        {viewer_hex, "Right", "right;f"}, {viewer_hex, "PageUp", "pgup;alt-v"},
+        {viewer_hex, "PageDown", "pgdn;ctrl-v"},
+        {diffviewer, "Help", "f1"}, {diffviewer, "Save", "f2"},
+        {diffviewer, "Edit", "f4"}, {diffviewer, "EditOther", "f14"},
+        {diffviewer, "Merge", "f5"}, {diffviewer, "MergeOther", "f15"},
+        {diffviewer, "Search", "f7"}, {diffviewer, "SearchContinue", "f17"},
+        {diffviewer, "Options", "f9"}, {diffviewer, "Quit", "f10;esc;q;Q"},
+        {diffviewer, "Undo", "ctrl-z"}, {diffviewer, "Redo", "alt-r"},
+        {diffviewer, "Reread", "ctrl-r"}, {diffviewer, "Swap", "ctrl-u"},
+        {diffviewer, "SelectCodepage", "alt-e"}, {diffviewer, "HunkNext", "n;enter;space"},
+        {diffviewer, "HunkPrev", "p;backspace"}, {diffviewer, "Up", "up"},
+        {diffviewer, "Down", "down"}, {diffviewer, "Left", "left"},
+        {diffviewer, "Right", "right"}, {diffviewer, "Top", "home;ctrl-home"},
+        {diffviewer, "Bottom", "end;ctrl-end"}, {diffviewer, "PageUp", "pgup"},
+        {diffviewer, "PageDown", "pgdn"}, {diffviewer, "SplitFull", "f"},
+        {diffviewer, "SplitEqual", "equal"}, {diffviewer, "SplitLess", "lt"},
+        {diffviewer, "SplitMore", "gt"}, {diffviewer, "ShowSymbols", "s;alt-s"},
+        {diffviewer, "ShowNumbers", "l;alt-n"}, {diffviewer, "Goto", "g;G"},
+        {diffviewer, "Tab2", "2"}, {diffviewer, "Tab3", "3"},
+        {diffviewer, "Tab4", "4"}, {diffviewer, "Tab8", "8"},
+        {input, "Home", "home;ctrl-a"}, {input, "End", "end;ctrl-e"},
+        {input, "Left", "left;ctrl-b"}, {input, "Right", "right;ctrl-f"},
+        {input, "WordLeft", "ctrl-left"}, {input, "WordRight", "ctrl-right"},
+        {input, "MarkLeft", "shift-left"}, {input, "MarkRight", "shift-right"},
+        {input, "MarkToHome", "shift-home"}, {input, "MarkToEnd", "shift-end"},
+        {input, "MarkToWordBegin", "ctrl-shift-left"}, {input, "MarkToWordEnd", "ctrl-shift-right"},
+        {input, "Clear", "ctrl-u"}, {input, "DeleteToEnd", "ctrl-k"},
+        {input, "DeleteToWordBegin", "ctrl-w"}, {input, "DeleteToWordEnd", "ctrl-delete"},
+        {input, "BackSpace", "backspace"}, {input, "Delete", "delete"},
+        {input, "Yank", "ctrl-y;shift-insert"}, {input, "Store", "ctrl-insert"},
+        {input, "Cut", "shift-delete"}, {input, "HistoryPrev", "alt-p;up"},
+        {input, "HistoryNext", "alt-n;down"}, {input, "Complete", "alt-tab"},
+        {dialog, "Ok", "enter"}, {dialog, "Cancel", "esc"},
+        {dialog, "Left", "left"}, {dialog, "Right", "right"},
+        {dialog, "Up", "up"}, {dialog, "Down", "down"},
+        {dialog, "Select", "space"}, {dialog, "Tab", "tab"},
+        {menu, "Left", "left"}, {menu, "Right", "right"},
+        {menu, "Up", "up"}, {menu, "Down", "down"},
+        {menu, "Home", "home"}, {menu, "End", "end"},
+        {menu, "Enter", "enter"}, {menu, "Quit", "esc"},
+        {listbox, "Up", "up"}, {listbox, "Down", "down"},
+        {listbox, "Top", "home"}, {listbox, "Bottom", "end"},
+        {listbox, "PageUp", "pgup"}, {listbox, "PageDown", "pgdn"},
+        {listbox, "Enter", "enter"}, {listbox, "Delete", "delete"},
+        {radio, "Up", "up"}, {radio, "Down", "down"},
+        {radio, "Select", "space"}, {help, "Quit", "esc;f1"},
+        {chattr, "Up", "up"}, {chattr, "Down", "down"},
+        {chattr, "PageUp", "pgup"}, {chattr, "PageDown", "pgdn"},
+        {chattr, "Mark", "space"},
+    };
+    return bindings;
+}
+
+bool binding_has_key(std::string_view keys, const std::string_view key) {
+    while (!keys.empty()) {
+        const auto separator = keys.find(';');
+        if (keys.substr(0, separator) == key) return true;
+        if (separator == std::string_view::npos) break;
+        keys.remove_prefix(separator + 1U);
+    }
+    return false;
+}
+
 struct MacroKey {
     bool character;
     std::string input;
@@ -1135,13 +1348,19 @@ struct TextInputState {
 
 struct App::Impl {
     Config config;
+    std::optional<Keymap> keymap;
+    std::optional<KeymapContext> keymap_prefix;
+    Mode keymap_prefix_mode{Mode::panels};
+    bool keymap_dispatching{false};
     ProviderPtr local;
+    ArchiveCache archives;
     Location left_location;
     Location right_location;
     Pane left;
     Pane right;
     int active_index{0};
     std::array<int, 2> pane_ids{0, 1};
+    std::array<std::vector<Pane>, 2> archive_parents;
     Mode mode{Mode::panels};
     Mode mode_before_prompt{Mode::panels};
     PromptAction prompt_action{PromptAction::none};
@@ -1459,6 +1678,7 @@ struct App::Impl {
     std::size_t editor_overwrite_choice{1};
     EditorSavePurpose editor_save_purpose{EditorSavePurpose::save};
     EditorBuffer* editor_save_buffer{nullptr};
+    ProviderPtr editor_save_provider;
     EditorBuffer* editor_unnamed_save_buffer{nullptr};
     std::optional<EditorSavePurpose> editor_save_as_continuation;
     std::string editor_save_path;
@@ -1624,11 +1844,15 @@ struct App::Impl {
         Config configured
     )
         : config(std::move(configured)),
+          keymap(load_configured_keymap(config)),
           local(std::make_shared<LocalProvider>()),
-          left_location(open_location(left_path, local)),
-          right_location(open_location(right_path, local)),
-          left(left_location.provider, left_location.path),
-          right(right_location.provider, right_location.path) {
+          archives(local, std::chrono::seconds(static_cast<std::chrono::seconds::rep>(config.vfs_timeout))),
+          left_location(open_location(left_path, local, &archives)),
+          right_location(open_location(right_path, local, &archives)),
+          left(left_location.provider, left_location.path, nullptr,
+               dynamic_cast<const ArchiveProvider*>(left_location.provider.get()) != nullptr),
+          right(right_location.provider, right_location.path, nullptr,
+                dynamic_cast<const ArchiveProvider*>(right_location.provider.get()) != nullptr) {
         static_cast<void>(palette());
         user_menu = load_user_menu(default_user_menu_path());
         try {
@@ -1696,6 +1920,10 @@ struct App::Impl {
         editor_auto_indent = config.editor_auto_indent;
         editor_show_whitespace = config.editor_visible_tabs || config.editor_visible_trailing_spaces;
         editor_history = config.editor_history;
+        initialize_archive_parent(left);
+        initialize_archive_parent(right);
+        left_location = {};
+        right_location = {};
     }
 
     Pane& active() {
@@ -1704,6 +1932,212 @@ struct App::Impl {
 
     Pane& passive() {
         return active_index == 0 ? right : left;
+    }
+
+    Location resolve_location(const std::string_view value) {
+        std::string path(value);
+        if (is_archive_location(value)) {
+            const auto tar = value.rfind("/utar://");
+            const auto cpio = value.rfind("/ucpio://");
+            const auto separator = tar == std::string_view::npos ? cpio
+                : cpio == std::string_view::npos ? tar : std::max(tar, cpio);
+            const auto archive = std::filesystem::path(value.substr(0, separator));
+            if (archive.is_relative()) {
+                path = std::filesystem::absolute(archive).lexically_normal().string() +
+                       std::string(value.substr(separator));
+            }
+        } else if (value.find("://") == std::string_view::npos &&
+                   std::filesystem::path(value).is_relative()) {
+            path = std::filesystem::absolute(std::filesystem::path(value)).lexically_normal().string();
+        }
+        return open_location(path, local, &archives);
+    }
+
+    std::string pane_location(const Pane& pane) const {
+        return archives.format(pane.provider(), pane.path());
+    }
+
+    std::string short_archive_location(const std::string& value) const {
+        const auto tar = value.rfind("/utar://");
+        const auto cpio = value.rfind("/ucpio://");
+        if (tar == std::string::npos && cpio == std::string::npos) return value;
+        const auto separator = tar == std::string::npos ? cpio
+            : cpio == std::string::npos ? tar : std::max(tar, cpio);
+        return local->basename(value.substr(0, separator)) + value.substr(separator);
+    }
+
+    std::size_t pane_identity(const Pane& pane) const {
+        if (&pane == &left) return static_cast<std::size_t>(pane_ids[0]);
+        if (&pane == &right) return static_cast<std::size_t>(pane_ids[1]);
+        throw std::logic_error("pane does not belong to this application");
+    }
+
+    std::string archive_file_path(const ProviderPtr& provider) const {
+        const auto* archive = dynamic_cast<const ArchiveProvider*>(provider.get());
+        if (archive == nullptr) throw std::invalid_argument("location is not an archive");
+        const auto location = archives.format(provider, "/");
+        const auto separator = location.rfind(archive->format() == ArchiveFormat::tar ? "/utar://" : "/ucpio://");
+        if (separator == std::string::npos) throw std::logic_error("archive location has no VFS delimiter");
+        return location.substr(0, separator);
+    }
+
+    Pane make_archive_parent(const Pane& pane) {
+        const auto path = archive_file_path(pane.provider());
+        Pane parent(local, local->parent(path), &pane);
+        const auto found = std::ranges::find(parent.entries(), path, &Entry::path);
+        if (found != parent.entries().end()) {
+            parent.move_cursor(static_cast<int>(found - parent.entries().begin()));
+        }
+        return parent;
+    }
+
+    void initialize_archive_parent(Pane& pane) {
+        if (dynamic_cast<const ArchiveProvider*>(pane.provider().get()) != nullptr) {
+            archive_parents[pane_identity(pane)].push_back(make_archive_parent(pane));
+        }
+    }
+
+    std::string pane_execution_directory(const Pane& pane) const {
+        if (dynamic_cast<const ArchiveProvider*>(pane.provider().get()) != nullptr) {
+            return local->parent(archive_file_path(pane.provider()));
+        }
+        return pane.navigation_path();
+    }
+
+    void install_pane_location(Pane& pane, Location location) {
+        if (pane.provider() == location.provider) {
+            pane.change_directory(std::move(location.path));
+            return;
+        }
+        const bool archive = dynamic_cast<const ArchiveProvider*>(location.provider.get()) != nullptr;
+        Pane next(location.provider, std::move(location.path), &pane, archive);
+        std::vector<Pane> parents;
+        if (archive) {
+            const auto container = archive_file_path(next.provider());
+            if (pane.provider() == local && pane.path() == local->parent(container)) {
+                parents.push_back(std::move(next));
+                pane.swap_contents(parents.back());
+            } else {
+                parents.push_back(make_archive_parent(next));
+                pane.swap_contents(next);
+            }
+        } else {
+            pane.swap_contents(next);
+        }
+        archive_parents[pane_identity(pane)] = std::move(parents);
+    }
+
+    bool panel_up(Pane& pane) {
+        if (dynamic_cast<const ArchiveProvider*>(pane.provider().get()) == nullptr ||
+            pane.provider()->parent(pane.path()) != pane.path()) return pane.up();
+        auto& parents = archive_parents[pane_identity(pane)];
+        if (parents.empty()) parents.push_back(make_archive_parent(pane));
+        pane.swap_contents(parents.back());
+        try {
+            pane.refresh({}, true);
+        } catch (...) {
+            pane.swap_contents(parents.back());
+            throw;
+        }
+        parents.pop_back();
+        return true;
+    }
+
+    bool enter_panel_entry(const bool open_archive = true) {
+        const auto* selected = active().current();
+        if (selected == nullptr) return false;
+        if (selected->revision == "mcpp:parent" &&
+            active().provider()->parent(active().path()) == active().path()) {
+            return panel_up(active());
+        }
+        if (active().enter()) return true;
+        if (!open_archive) return false;
+        if (!can_open_file(*selected) || !is_archive_filename(selected->name)) return false;
+        if (active().provider() != local) throw std::runtime_error("nested archives are not supported yet");
+        const auto path = selected->path;
+        const auto directory = active().path();
+        const auto id = pane_ids[active_index];
+        auto opened = std::make_shared<ProviderPtr>();
+        start_local_task("Reading archive", [this, path, opened](const Cancellation& cancellation) {
+            *opened = archives.open(path, cancellation);
+            return CommandOutput{};
+        }, [this, opened, directory, id](CommandOutput) {
+            auto& pane = pane_ids[0] == id ? left : right;
+            if (pane.provider() != local || pane.path() != directory) {
+                throw std::runtime_error("pane changed while the archive was being opened");
+            }
+            install_pane_location(pane, {*opened, "/"});
+            status = "Read-only archive: " + pane_location(pane);
+        });
+        return true;
+    }
+
+    Location resolve_pane_location(const Pane& pane, std::string value) {
+        Location destination;
+        if (value.find("://") != std::string::npos) {
+            if (!std::filesystem::path(value).is_absolute()) {
+                if (pane.provider() != local) throw std::runtime_error("nested archives are not supported yet");
+                const auto separator = value.find("://");
+                const auto slash = value.rfind('/', separator);
+                if (slash == std::string::npos) throw std::invalid_argument("VFS path has no archive name");
+                value = local->join(pane.navigation_path(), value.substr(0, slash)) + value.substr(slash);
+            }
+            destination = resolve_location(value);
+        } else if (std::filesystem::path(value).is_absolute()) {
+            destination = {local, local->normalize(value)};
+        } else {
+            destination = {pane.provider(), pane.navigation_path()};
+            for (const auto& component : std::filesystem::path(value)) {
+                const auto name = component.generic_string();
+                if (name.empty() || name == ".") continue;
+                if (name == "..") {
+                    if (dynamic_cast<const ArchiveProvider*>(destination.provider.get()) != nullptr &&
+                        destination.provider->parent(destination.path) == destination.path) {
+                        destination = {local, local->parent(archive_file_path(destination.provider))};
+                    } else destination.path = destination.provider->parent(destination.path);
+                } else destination.path = destination.provider->join(destination.path, name);
+            }
+        }
+        return destination;
+    }
+
+    void change_panel_directory(Pane& pane, const std::string& value) {
+        auto destination = resolve_pane_location(pane, value);
+        const auto entry = destination.provider->stat_follow(destination.path, {});
+        if (entry.kind == EntryKind::file && is_archive_filename(entry.name)) {
+            if (destination.provider != local) throw std::runtime_error("nested archives are not supported yet");
+            destination = {archives.open(destination.path), "/"};
+        } else if (entry.kind != EntryKind::directory) {
+            throw std::runtime_error("not a directory: " + value);
+        }
+        install_pane_location(pane, std::move(destination));
+    }
+
+    void show_vfs_list() {
+        auto locations = archives.locations();
+        if (locations.empty()) {
+            show_native_message("Active VFS list", "No virtual filesystems are open.");
+            return;
+        }
+        auto activate = [this, locations](const std::size_t index) {
+            change_panel_directory(active(), locations.at(index));
+        };
+        for (auto& location : locations) location = short_archive_location(location);
+        show_local_list("Active VFS list", std::move(locations), std::move(activate));
+        local_list_native = true;
+    }
+
+    void show_vfs_options() {
+        show_native_input("Virtual File System Setting", "Timeout for freeing VFSs (sec):",
+            std::to_string(config.vfs_timeout), [this](const std::string& value) {
+                std::size_t timeout = 0;
+                const auto parsed = std::from_chars(value.data(), value.data() + value.size(), timeout);
+                if (parsed.ec != std::errc{} || parsed.ptr != value.data() + value.size() || timeout > 86400U) {
+                    throw std::invalid_argument("VFS timeout must be between 0 and 86400 seconds");
+                }
+                archives.set_timeout(std::chrono::seconds(static_cast<std::chrono::seconds::rep>(timeout)));
+                config.vfs_timeout = timeout;
+            }, Mode::panels);
     }
 
     bool command_prompt_shown() const { return config.command_prompt || command_prompt_override; }
@@ -1946,8 +2380,31 @@ struct App::Impl {
 
     std::string editor_directory(const EditorBuffer& buffer) const {
         const auto& pane = active_index == 0 ? left : right;
+        if (dynamic_cast<const ArchiveProvider*>(buffer.provider().get()) != nullptr) {
+            return local->parent(archive_file_path(buffer.provider()));
+        }
         if (!buffer.path().empty()) return local->parent(buffer.path());
         return buffer.base_directory.empty() ? pane.navigation_path() : buffer.base_directory;
+    }
+
+    std::string editor_location(const EditorBuffer& buffer) const {
+        return buffer.path().empty() ? std::string{} : archives.format(buffer.provider(), buffer.path());
+    }
+
+    Location resolve_editor_location(
+        const std::string& value, const EditorBuffer* source = nullptr
+    ) {
+        const auto& buffer = source == nullptr ? editor : *source;
+        if (value.find("://") != std::string::npos || std::filesystem::path(value).is_absolute()) {
+            return resolve_location(value);
+        }
+        if (buffer.open() && !buffer.path().empty() && buffer.provider() != local) {
+            const auto provider = buffer.provider();
+            const auto path = (std::filesystem::path(provider->parent(buffer.path())) / value)
+                                  .lexically_normal().generic_string();
+            return {provider, provider->normalize(path)};
+        }
+        return {local, local->join(editor_directory(buffer), value)};
     }
 
     std::string editor_relative_path(const std::string& path) const {
@@ -2448,6 +2905,9 @@ struct App::Impl {
     void activate_file_association() {
         const auto* entry = active().current();
         if (entry == nullptr || !can_open_file(*entry)) return;
+        if (active().provider() != local) {
+            throw std::runtime_error("copy this archive member to a local directory before running an external command");
+        }
         reload_local_rules();
         std::string command;
         for (const auto& [pattern, action] : extension_rules) {
@@ -2483,27 +2943,30 @@ struct App::Impl {
         return {editor.path(), {editor.row(), editor.column()}};
     }
 
-    void open_editor_location(const EditorLocation& location) {
-        open_editor_buffer(local, location.path, false, true);
-        editor.set_position(location.position);
-        center_editor();
-        mode = Mode::editor;
+    void open_editor_location(const EditorLocation& location, std::function<void()> after_open = {}) {
+        const auto source = resolve_editor_location(location.path);
+        open_editor_buffer(source.provider, source.path, false, true, [this, location, after_open = std::move(after_open)] {
+            editor.set_position(location.position);
+            center_editor();
+            if (after_open) after_open();
+        });
     }
 
     void follow_declaration(const Declaration& target) {
         const auto origin = editor_location();
-        open_editor_location({target.path, {target.line - 1U, 0}});
-        if (declaration_history.empty()) {
-            declaration_history.push_back(origin);
-        } else {
-            declaration_history[declaration_cursor] = origin;
-            declaration_history.erase(declaration_history.begin() +
-                                          static_cast<std::ptrdiff_t>(declaration_cursor + 1U),
-                                      declaration_history.end());
-        }
-        declaration_history.push_back(editor_location());
-        declaration_cursor = declaration_history.size() - 1U;
-        status = "Declaration: " + target.path + ":" + std::to_string(target.line);
+        open_editor_location({target.path, {target.line - 1U, 0}}, [this, origin, target] {
+            if (declaration_history.empty()) {
+                declaration_history.push_back(origin);
+            } else {
+                declaration_history[declaration_cursor] = origin;
+                declaration_history.erase(declaration_history.begin() +
+                                              static_cast<std::ptrdiff_t>(declaration_cursor + 1U),
+                                          declaration_history.end());
+            }
+            declaration_history.push_back(editor_location());
+            declaration_cursor = declaration_history.size() - 1U;
+            status = "Declaration: " + target.path + ":" + std::to_string(target.line);
+        });
     }
 
     void move_declaration_history(const bool forward) {
@@ -2515,8 +2978,7 @@ struct App::Impl {
         }
         declaration_history[declaration_cursor] = editor_location();
         const auto next = forward ? declaration_cursor + 1U : declaration_cursor - 1U;
-        open_editor_location(declaration_history[next]);
-        declaration_cursor = next;
+        open_editor_location(declaration_history[next], [this, next] { declaration_cursor = next; });
     }
 
     void show_find_declaration() {
@@ -3187,9 +3649,9 @@ struct App::Impl {
             throw std::system_error(errno, std::generic_category(), "protect configuration directory");
         }
         if (mode != Mode::editor && mode != Mode::editor_menu) editor_return_mode = Mode::panels;
-        open_editor_buffer(local, path.string(), !exists);
-        if (!exists && !starter.empty()) editor.set_text(starter);
-        mode = Mode::editor;
+        open_editor_buffer(local, path.string(), !exists, false, [this, exists, starter] {
+            if (!exists && !starter.empty()) editor.set_text(starter);
+        });
     }
 
     void scroll_editor(const int rows) {
@@ -3952,8 +4414,8 @@ struct App::Impl {
             config.panel_executable_first[id] = pane.executable_first();
         }
         if (config.auto_save_panels_setup) {
-            config.saved_left_path = left.path();
-            config.saved_right_path = right.path();
+            config.saved_left_path = pane_location(left);
+            config.saved_right_path = pane_location(right);
         }
     }
 
@@ -3984,7 +4446,7 @@ struct App::Impl {
 
     void remember_editor_position(const EditorBuffer& buffer) {
         if (!buffer.open() || buffer.path().empty() || !config.editor_save_position) return;
-        config.editor_positions[buffer.path()] = {
+        config.editor_positions[editor_location(buffer)] = {
             buffer.row(), buffer.column(), {buffer.bookmarks().begin(), buffer.bookmarks().end()}
         };
     }
@@ -4300,19 +4762,25 @@ struct App::Impl {
             return;
         }
         const auto panel = active_index;
+        const auto provider = active().provider();
         auto sizes = std::make_shared<std::map<std::string, std::uint64_t>>();
         start_local_task("Directory scanning",
-                [directories, sizes](const Cancellation& cancellation) {
+                [directories, sizes, provider](const Cancellation& cancellation) {
                     for (const auto& directory : directories) {
                         std::uint64_t total = 0;
-                        for (const auto& entry : std::filesystem::recursive_directory_iterator(directory)) {
+                        std::vector<std::string> pending{directory};
+                        while (!pending.empty()) {
                             cancellation.throw_if_requested();
-                            if (!entry.is_symlink() && entry.is_regular_file()) {
-                                const auto size = entry.file_size();
-                                if (size > std::numeric_limits<std::uint64_t>::max() - total) {
-                                    throw std::runtime_error("directory size overflow");
+                            auto current = std::move(pending.back());
+                            pending.pop_back();
+                            for (const auto& entry : provider->list(current, {.show_hidden=true}, cancellation)) {
+                                if (entry.kind == EntryKind::directory) pending.push_back(entry.path);
+                                else if (entry.kind == EntryKind::file) {
+                                    if (entry.size > std::numeric_limits<std::uint64_t>::max() - total) {
+                                        throw std::runtime_error("directory size overflow");
+                                    }
+                                    total += entry.size;
                                 }
-                                total += size;
                             }
                         }
                         (*sizes)[directory] = total;
@@ -4353,10 +4821,11 @@ struct App::Impl {
             [this](const std::size_t index) {
                 const auto& [edit, path] = local_history_files.at(index);
                 if (edit) {
-                    open_editor_buffer(local, path, false, true);
-                    mode = Mode::editor;
+                    const auto location = resolve_editor_location(path);
+                    open_editor_buffer(location.provider, location.path, false, true);
                 } else {
-                    load_viewer(local, path);
+                    const auto location = resolve_location(path);
+                    load_viewer(location.provider, location.path);
                     viewer_return_mode = Mode::panels;
                     mode = Mode::viewer;
                 }
@@ -4467,8 +4936,9 @@ struct App::Impl {
             std::cerr << "mcpp: viewer file navigation unavailable: " << error.what() << '\n';
             viewer_navigation_files.push_back(path);
         }
-        std::erase(config.viewer_history, path);
-        config.viewer_history.insert(config.viewer_history.begin(), path);
+        const auto location = archives.format(provider, path);
+        std::erase(config.viewer_history, location);
+        config.viewer_history.insert(config.viewer_history.begin(), location);
         if (config.viewer_history.size() > 20U) config.viewer_history.resize(20U);
     }
 
@@ -4485,6 +4955,9 @@ struct App::Impl {
             }
             mode = Mode::viewer;
             return;
+        }
+        if (provider != local) {
+            throw std::runtime_error("copy this archive member to a local directory before using an external viewer");
         }
         const auto* pager = std::getenv("PAGER");
         const auto command = std::string(pager != nullptr && *pager != '\0' ? pager : "less") + " " +
@@ -4504,11 +4977,14 @@ struct App::Impl {
     ) {
         if (config.use_internal_edit) {
             const auto retained = editor_buffers.size() + (editor.open() ? 1U : 0U);
-            open_editor_buffer(provider, path, false, require_existing);
-            editor_session_base = return_mode == Mode::search_results || return_mode == Mode::diff ? retained : 0U;
-            editor_return_mode = return_mode;
-            mode = Mode::editor;
+            open_editor_buffer(provider, path, false, require_existing, [this, retained, return_mode] {
+                editor_session_base = return_mode == Mode::search_results || return_mode == Mode::diff ? retained : 0U;
+                editor_return_mode = return_mode;
+            });
             return;
+        }
+        if (provider != local) {
+            throw std::runtime_error("copy archive member to a local directory before using an external editor");
         }
         const auto* external = std::getenv("EDITOR");
         const auto command = std::string(external != nullptr && *external != '\0' ? external : "vi") + " " +
@@ -4541,8 +5017,8 @@ struct App::Impl {
                    ? entry->name : std::string{};
     }
 
-    const std::string& viewer_title() const {
-        return viewer_display_name.empty() ? viewer.path() : viewer_display_name;
+    std::string viewer_title() const {
+        return viewer_display_name.empty() ? archives.format(viewer.provider(), viewer.path()) : viewer_display_name;
     }
 
     void open_output_viewer(const std::string& label, const std::string& value) {
@@ -4581,6 +5057,9 @@ struct App::Impl {
     }
 
     void show_filtered_view() {
+        if (active().provider() != local) {
+            throw std::runtime_error("copy archive members to a local directory before running a file filter");
+        }
         const auto* entry = active().current();
         const auto directory = active().path();
         const auto initial = !command_line.empty() ? command_line : entry == nullptr ? std::string{}
@@ -4600,6 +5079,9 @@ struct App::Impl {
     }
 
     void show_file_comparison() {
+        if (left.provider() != local || right.provider() != local) {
+            throw std::runtime_error("copy archive members to local directories before opening a comparison");
+        }
         const auto* first = left.current();
         const auto* second = right.current();
         if (first == nullptr || second == nullptr || !can_open_file(*first) || !can_open_file(*second)) {
@@ -4754,11 +5236,22 @@ struct App::Impl {
         continue_diff_saves();
     }
 
-    void resume_diff_after_edit() {
+    void resume_diff_after_edit(const std::optional<Entry>& large_file_approval = std::nullopt) {
         if (diff_edit_side) {
             auto& buffer = diff_files[*diff_edit_side];
             const auto path = buffer.path();
-            buffer.open(local, path);
+            try {
+                buffer.open(local, path, {}, large_file_approval);
+            } catch (const EditorLargeFileConfirmationRequired& required) {
+                const auto approval = required.file();
+                confirm_large_editor_file(local, approval, Mode::diff,
+                    [this, approval] { resume_diff_after_edit(approval); },
+                    [this] {
+                        diff_edit_side.reset();
+                        mode = Mode::diff;
+                    });
+                return;
+            }
             diff_edit_side.reset();
         }
         rebuild_diff();
@@ -5252,6 +5745,9 @@ struct App::Impl {
     }
 
     void run_external_panelize(const std::string& command) {
+        if (active().provider() != local) {
+            throw std::runtime_error("external panelization requires a local directory");
+        }
         const auto directory = active().path();
         const auto panel = active_index;
             start_local_task("External panelization",
@@ -7054,8 +7550,8 @@ struct App::Impl {
         return true;
     }
 
-    void request_app_exit() {
-        if (config.confirm_exit) {
+    void request_app_exit(const bool quiet = false) {
+        if (config.confirm_exit && !quiet) {
             show_native_query("Quit", "Do you really want to quit?", {"Yes", "No"},
                 [this](const std::size_t selected) { if (selected == 0U) exit_terminal(); });
         } else exit_terminal();
@@ -7465,9 +7961,12 @@ struct App::Impl {
     bool edit_input(
         std::string& value,
         TextInputState& input,
-        const ftxui::Event& event
+        const ftxui::Event& input_event
     ) {
         using ftxui::Event;
+        const auto mapped = remap_widget_key(KeymapContext::input, input_event);
+        if (!mapped) return true;
+        const auto& event = *mapped;
         input.completions.clear();
         input.message.clear();
         input.cursor = std::min(input.cursor, value.size());
@@ -7851,7 +8350,7 @@ struct App::Impl {
         }
         dialog_move = move_operation;
         dialog_exact = exact && sources.size() == 1U;
-        dialog_destination = passive().path();
+        dialog_destination = pane_location(passive());
         dialog_preserve_attributes = true;
         dialog_preserve_symlinks = true;
         dialog_background = false;
@@ -7872,25 +8371,22 @@ struct App::Impl {
                 "source mask matches no selected entries"
             );
         }
-        const auto destination_provider =
-            tree_operation_source
-                ? tree_operation_destination_provider
-                : passive().provider();
         bool destination_directory = dialog_destination.ends_with('/');
-        if (std::filesystem::path(dialog_destination).is_relative()) {
-            dialog_destination = destination_provider->join(
-                active().path(),
-                dialog_destination
-            );
+        const auto& source_pane = tree_operation_source
+            ? (tree_operation_source_index == 0 ? left : right) : active();
+        const auto destination = resolve_pane_location(source_pane, dialog_destination);
+        const auto& destination_provider = destination.provider;
+        if (!has_capability(destination_provider->capabilities(), ProviderCapability::write)) {
+            throw std::runtime_error("the destination filesystem is read-only");
         }
-        if (destination_provider->exists(dialog_destination)) {
-            const auto destination = destination_provider->stat(
-                dialog_destination,
+        if (destination_provider->exists(destination.path)) {
+            const auto target = destination_provider->stat(
+                destination.path,
                 {}
             );
             const bool is_directory =
-                destination.kind == EntryKind::directory ||
-                destination.target_is_directory;
+                target.kind == EntryKind::directory ||
+                target.target_is_directory;
             if (destination_directory && !is_directory) {
                 throw std::runtime_error(
                     "destination is not a directory"
@@ -7907,9 +8403,10 @@ struct App::Impl {
                        !destination_directory;
         run_operation(
             dialog_move,
-            dialog_destination,
+            destination.path,
             !config.confirm_overwrite,
-            dialog_exact
+            dialog_exact,
+            destination_provider
         );
         if (dialog_background) {
             mode = modal_tree_snapshot ? Mode::directory_tree_dialog : Mode::panels;
@@ -7930,7 +8427,8 @@ struct App::Impl {
         const bool move_operation,
         const std::string& destination,
         const bool overwrite,
-        const bool exact = false
+        const bool exact = false,
+        ProviderPtr destination_override = {}
     ) {
         if (operation_running.load(std::memory_order_acquire)) {
             throw std::runtime_error("an operation is already running");
@@ -7955,7 +8453,7 @@ struct App::Impl {
             tree_operation_source
                 ? tree_operation_source_provider
                 : active().provider();
-        const auto destination_provider =
+        const auto destination_provider = destination_override ? std::move(destination_override) :
             tree_operation_source
                 ? tree_operation_destination_provider
                 : passive().provider();
@@ -8393,11 +8891,12 @@ struct App::Impl {
                 throw ShellBusy("shell is already running a command; use Ctrl-O to resume it");
             }
             if (!shell.busy()) {
-                shell_panel_id = directory.empty() ? std::optional<int>{pane_ids[active_index]} : std::nullopt;
+                shell_panel_id = directory.empty() && active().provider() == local
+                    ? std::optional<int>{pane_ids[active_index]} : std::nullopt;
                 shell_expected_directory = active().path();
             }
         }
-        const auto execution_directory = directory.empty() ? active().path() : directory;
+        const auto execution_directory = directory.empty() ? pane_execution_directory(active()) : directory;
         const auto* executable = std::getenv("SHELL");
         if (executable == nullptr || *executable == '\0') executable = "/bin/sh";
         ShellResult result;
@@ -8520,12 +9019,10 @@ struct App::Impl {
                     }
                     destination = std::string(home) + destination.substr(1U);
                 }
-                const auto old_path = active().path();
-                active().change_directory(active().provider()->join(
-                    active().navigation_path(), destination
-                ));
+                const auto old_path = pane_location(active());
+                change_panel_directory(active(), std::move(destination));
                 previous = old_path;
-                status = "Directory changed: " + active().path();
+                status = "Directory changed: " + pane_location(active());
                 return;
             }
             const auto result = run_process(command, false);
@@ -8672,21 +9169,15 @@ struct App::Impl {
                     break;
                 case PromptAction::editor_open:
                 case PromptAction::editor_new: {
-                    auto path = std::filesystem::path(prompt_value);
-                    if (!prompt_value.empty() && path.is_relative()) {
-                        path = std::filesystem::path(editor_directory(editor)) / path;
-                    }
-                    open_editor_buffer(
-                        active().provider(),
-                        path.string(),
-                        prompt_action ==
-                            PromptAction::editor_new
-                    );
-                    status =
-                        prompt_action == PromptAction::editor_open
-                            ? "File opened"
-                            : "New file";
-                    break;
+                    const auto location = prompt_value.empty()
+                        ? Location{editor.open() ? editor.provider() : local, ""}
+                        : resolve_editor_location(prompt_value);
+                    const bool create = prompt_action == PromptAction::editor_new;
+                    prompt_action = PromptAction::none;
+                    prompt_value.clear();
+                    mode = mode_before_prompt;
+                    open_editor_buffer(location.provider, location.path, create);
+                    return;
                 }
                 case PromptAction::editor_save_as:
                     if (prompt_value.empty()) throw std::invalid_argument("file name is empty");
@@ -8753,14 +9244,7 @@ struct App::Impl {
                     break;
                 }
                 case PromptAction::quick_cd: {
-                    auto destination = (
-                        std::filesystem::path(active().navigation_path()) / prompt_value
-                    ).lexically_normal();
-                    // Keep a trailing separator from resolving a logical symlink leaf.
-                    if (destination.filename().empty()) {
-                        destination = destination.parent_path();
-                    }
-                    active().change_directory(destination.string());
+                    change_panel_directory(active(), prompt_value);
                     status = "Directory changed";
                     break;
                 }
@@ -9036,7 +9520,7 @@ struct App::Impl {
         }
         if (!config.show_free_space) available.clear();
         auto title = text(" " + path_label(
-            display_filename(pane, pane.path()) +
+            display_filename(pane, pane.provider() == local ? pane.path() : short_archive_location(pane_location(pane))) +
                 (pane.panelized() ? " [panelized]" : ""),
             static_cast<std::size_t>(
                 std::max(1, panel_width_value - 8)
@@ -9111,21 +9595,32 @@ struct App::Impl {
             }
             Element line;
             if (viewer.hex() && viewer.hex_cursor() >= row_offset &&
-                viewer.hex_cursor() - row_offset < 16U) {
+                viewer.hex_cursor() - row_offset < rendered.bytes) {
                 const auto byte = static_cast<std::size_t>(viewer.hex_cursor() - row_offset);
                 const auto prefix = row.find("  ") + 2U;
                 const auto cursor = prefix +
                     (viewer.hex_ascii() ? 49U + byte : byte * 3U + low_nibble);
+                const auto counterpart = prefix + (viewer.hex_ascii() ? byte * 3U : 49U + byte);
+                const auto counterpart_width = viewer.hex_ascii() ? 2U : 1U;
                 const auto first = std::min(viewer_hex_first_column, row.size());
-                if (cursor < row.size() && cursor >= first) {
-                    const auto end = std::min(row.size(), first + width);
-                    line = hbox({
-                        text(row.substr(first, cursor - first)),
-                        text(row.substr(cursor, cursor_width)) | inverted | bold |
-                            focusCursorBlock,
-                        text(row.substr(cursor + cursor_width, end - cursor - cursor_width)),
-                    });
+                const auto end = std::min(row.size(), first + width);
+                const auto part_kind = [&](const std::size_t column) {
+                    if (column >= cursor && column - cursor < cursor_width) return 1;
+                    if (column >= counterpart && column - counterpart < counterpart_width) return 2;
+                    return 0;
+                };
+                Elements parts;
+                for (auto begin = first; begin < end;) {
+                    const auto kind = part_kind(begin);
+                    auto finish = begin + 1U;
+                    while (finish < end && part_kind(finish) == kind) ++finish;
+                    auto part = text(row.substr(begin, finish - begin));
+                    if (kind == 1) part = highlight(std::move(part), palette().viewer_cursor) | bold | focusCursorBlock;
+                    else if (kind == 2) part = paint(std::move(part), palette().viewer_cursor);
+                    parts.push_back(std::move(part));
+                    begin = finish;
                 }
+                line = hbox(std::move(parts));
             }
             if (!viewer.hex()) {
                 line = render_viewer_text(row, viewer.text_highlight(index), viewer.text_styles(index));
@@ -9705,7 +10200,7 @@ struct App::Impl {
         ));
         auto status_header = hbox({
                       text(path_label(
-                          display_text(editor.path()), filename_width
+                          display_text(editor_location(editor)), filename_width
                       )) | bold | flex,
                       text(editor_flags),
                       text(position_status),
@@ -9919,7 +10414,7 @@ struct App::Impl {
                    text("Save file") | bold | center,
                    separator(),
                    text("\"" + path_label(
-                       display_text(editor.path()),
+                       display_text(editor_location(editor)),
                        static_cast<std::size_t>(std::max(
                            1, std::min(72, Terminal::Size().dimx) - 6
                        ))
@@ -10455,7 +10950,7 @@ struct App::Impl {
                 {"Command history               M-h", 15, 'h'},
                 {"Viewed/edited files history   M-E", 16, 's'},
                 {"Directory hotlist             C-\\", 7, 'r'},
-                {"Active VFS list               C-x a", -1},
+                {"Active VFS list               C-x a", 9},
                 {"Background jobs               C-x j", 10, 'b'},
                 {"Screen list                   M-`", 17, 't'},
                 {"", -2},
@@ -10473,7 +10968,7 @@ struct App::Impl {
                 {"Appearance...", 24, 'a'},
                 {"Display bits...", 25, 'd'},
                 {"Learn keys...", 26, 'k'},
-                {"Virtual FS...", -1},
+                {"Virtual FS...", 27},
                 {"", -2},
                 {"Save setup", 3, 's'},
             },
@@ -10844,7 +11339,7 @@ struct App::Impl {
                     swap_panels();
                     break;
                 case 6:
-                    passive().change_directory(active().path());
+                    install_pane_location(passive(), {active().provider(), active().path()});
                     break;
                 case 7:
                     bookmark_cursor = 0;
@@ -10853,6 +11348,7 @@ struct App::Impl {
                 case 8:
                     open_user_menu(Mode::panels);
                     return;
+                case 9: show_vfs_list(); return;
                 case 10:
                     open_jobs();
                     return;
@@ -10886,6 +11382,7 @@ struct App::Impl {
             return;
         }
         if (pulldown_category == 3U) {
+            if (action == 27) { show_vfs_options(); return; }
             if (action == 26) {
                 show_learn_keys(Mode::panels);
                 return;
@@ -11500,7 +11997,7 @@ struct App::Impl {
         const auto* entry = active().current();
         Elements rows;
         rows.push_back(
-            text("Location: " + display_text(active().path()))
+            text("Location: " + display_text(pane_location(active())))
         );
         rows.push_back(separator());
         if (entry == nullptr) {
@@ -11953,7 +12450,7 @@ struct App::Impl {
         const auto* user = std::getenv("USER");
         const auto prompt = display_text(
             std::string(user == nullptr ? "user" : user) + "@" +
-            hostname.data() + ":" + active().path() + "$"
+            hostname.data() + ":" + pane_execution_directory(active()) + "$"
         );
         const auto hint =
             pending_operation_notice
@@ -12124,7 +12621,7 @@ struct App::Impl {
             document = dbox({document, vbox({main_menubar, filler()})});
         }
         if (config.xterm_title) {
-            const auto title = "mcpp - " + display_text(active().path());
+            const auto title = "mcpp - " + display_text(pane_location(active()));
             if (title != terminal_title) {
                 if (!terminal_title_pushed) {
                     std::cout << "\033[22;0t";
@@ -12715,8 +13212,9 @@ struct App::Impl {
     void show_viewer_history() {
         std::vector<std::string> paths = config.viewer_history;
         show_local_list("History", paths, [this, paths](const std::size_t selected) {
-            viewer_navigation_provider = local;
-            viewer_switch_pending = paths.at(selected);
+            const auto location = resolve_location(paths.at(selected));
+            viewer_navigation_provider = location.provider;
+            viewer_switch_pending = location.path;
             viewer_switch_preserve_list = false;
             request_viewer_close();
         }, Mode::viewer);
@@ -13210,16 +13708,130 @@ struct App::Impl {
     }
 
     void new_editor_buffer() {
-        open_editor_buffer(active().provider(), "", true);
+        const auto directory = editor.open() ? editor_directory(editor) : pane_execution_directory(active());
+        open_editor_buffer(local, "", true);
+        editor.base_directory = directory;
         mode = Mode::editor;
         status = "New file";
+    }
+
+    struct EditorStartupFile {
+        Location location;
+        std::size_t line{0};
+    };
+    std::function<void()> editor_large_file_cancel;
+    std::vector<EditorStartupFile> editor_startup_files;
+    std::size_t editor_startup_cursor{0};
+    std::size_t editor_startup_first_line{0};
+    std::size_t editor_startup_opened{0};
+    bool editor_startup_placeholder{false};
+
+    void finish_editor_open_confirmation() {
+        if (editor_large_file_cancel && mode != Mode::native_query) {
+            auto cancelled = std::exchange(editor_large_file_cancel, {});
+            cancelled();
+        }
+    }
+
+    void confirm_large_editor_file(
+        const ProviderPtr& provider, const Entry& file, const Mode return_mode,
+        std::function<void()> accepted, std::function<void()> declined = {}
+    ) {
+        if (!declined) declined = [this] { status = "Opening cancelled"; };
+        editor_large_file_cancel = declined;
+        show_native_query(
+            "Warning", "File \"" + format_location(provider, file.path) + "\" is too large (" +
+                format_size(file.size) + ").\nOpen it anyway?",
+            {"Yes", "No"},
+            [this, accepted = std::move(accepted), declined = std::move(declined), return_mode](
+                const std::size_t selected
+            ) {
+                editor_large_file_cancel = {};
+                try {
+                    if (selected == 0U) accepted();
+                    else declined();
+                } catch (const std::exception& error) {
+                    show_native_message("Editor error", error.what(), return_mode);
+                }
+            },
+            return_mode
+        );
     }
 
     void open_editor_buffer(
         const ProviderPtr& provider,
         const std::string& path,
         const bool create,
-        const bool require_existing = false
+        const bool require_existing = false,
+        std::function<void()> after_open = {},
+        const std::optional<Entry>& large_file_approval = std::nullopt
+    ) {
+        const auto return_mode = mode == Mode::prompt ? mode_before_prompt
+            : mode == Mode::editor_menu || mode == Mode::editor_history ? Mode::editor : mode;
+        try {
+            load_editor_buffer(provider, path, create, require_existing, large_file_approval);
+            mode = Mode::editor;
+            status = create ? "New file" : "File opened";
+            if (after_open) after_open();
+        } catch (const EditorLargeFileConfirmationRequired& required) {
+            const auto approval = required.file();
+            confirm_large_editor_file(provider, approval, return_mode,
+                [this, provider, path, create, require_existing, after_open = std::move(after_open), approval] {
+                    open_editor_buffer(provider, path, create, require_existing, after_open, approval);
+                });
+        }
+    }
+
+    void continue_editor_startup(const std::optional<Entry>& large_file_approval = std::nullopt) {
+        auto approval = large_file_approval;
+        while (editor_startup_cursor < editor_startup_files.size()) {
+            const auto file = editor_startup_files[editor_startup_cursor];
+            try {
+                load_editor_buffer(file.location.provider, file.location.path, false, false, approval);
+            } catch (const EditorLargeFileConfirmationRequired& required) {
+                const auto next_approval = required.file();
+                confirm_large_editor_file(file.location.provider, next_approval, Mode::editor,
+                    [this, next_approval] { continue_editor_startup(next_approval); },
+                    [this] {
+                        ++editor_startup_cursor;
+                        continue_editor_startup();
+                    });
+                return;
+            } catch (const std::exception& error) {
+                if (terminal == nullptr) throw;
+                ++editor_startup_cursor;
+                editor_large_file_cancel = [this] { continue_editor_startup(); };
+                show_native_query("Editor error", error.what(), {"OK"}, [this](const std::size_t) {
+                    editor_large_file_cancel = {};
+                    continue_editor_startup();
+                }, Mode::editor);
+                return;
+            }
+            if (file.line != 0U) {
+                editor.goto_line(file.line);
+                editor.home();
+                update_editor_view();
+            }
+            ++editor_startup_opened;
+            ++editor_startup_cursor;
+            approval.reset();
+        }
+        if (editor_startup_opened > 1U) static_cast<void>(switch_editor_buffer(true));
+        if (editor_startup_first_line != 0U) {
+            editor.goto_line(editor_startup_first_line);
+            editor.home();
+            update_editor_view();
+        }
+        editor_startup_placeholder = false;
+        mode = Mode::editor;
+    }
+
+    void load_editor_buffer(
+        const ProviderPtr& provider,
+        const std::string& path,
+        const bool create,
+        const bool require_existing,
+        const std::optional<Entry>& large_file_approval
     ) {
         const bool same_session =
             mode == Mode::editor || mode == Mode::editor_menu ||
@@ -13227,13 +13839,15 @@ struct App::Impl {
             (mode == Mode::prompt && mode_before_prompt == Mode::editor);
         if (!create && same_session && editor.open()) {
             const auto normalized = provider->normalize(path);
-            if (provider->normalize(editor.path()) == normalized) {
+            if (!editor.path().empty() && editor.provider()->id() == provider->id() &&
+                provider->normalize(editor.path()) == normalized) {
                 return;
             }
             for (auto index = editor_session_base; index < editor_buffers.size(); ++index) {
-                if (provider->normalize(editor_buffers[index].path()) == normalized) {
+                if (!editor_buffers[index].path().empty() && editor_buffers[index].provider()->id() == provider->id() &&
+                    provider->normalize(editor_buffers[index].path()) == normalized) {
                     std::swap(editor, editor_buffers[index]);
-                    remember_editor_path(editor.path());
+                    remember_editor_path(editor_location(editor));
                     reset_editor_view_state();
                     return;
                 }
@@ -13257,11 +13871,11 @@ struct App::Impl {
                          : config.editor_save_mode == "in-place" ? EditorSaveMode::in_place
                                                                : EditorSaveMode::atomic);
         next.set_backup_extension(config.editor_backup_extension);
-        if (create || (!require_existing && !provider->exists(path))) {
+        if (create || (!require_existing && !large_file_approval && !provider->exists(path))) {
             next.create(provider, path);
         } else {
-            next.open(provider, path);
-            const auto saved = config.editor_positions.find(next.path());
+            next.open(provider, path, {}, large_file_approval);
+            const auto saved = config.editor_positions.find(editor_location(next));
             if (config.editor_save_position && saved != config.editor_positions.end()) {
                 next.set_position({saved->second.row, saved->second.column});
                 std::set<std::size_t> bookmarks;
@@ -13274,11 +13888,12 @@ struct App::Impl {
             }
         }
         next.search.change_id = next.change_id();
-        if (editor.open()) {
+        if (editor.open() && !editor_startup_placeholder) {
             editor_buffers.push_back(std::move(editor));
         }
         editor = std::move(next);
-        remember_editor_path(editor.path());
+        editor_startup_placeholder = false;
+        remember_editor_path(editor_location(editor));
         reset_editor_view_state();
     }
 
@@ -13301,13 +13916,18 @@ struct App::Impl {
             editor = std::move(editor_buffers.back());
             editor_buffers.pop_back();
         }
-        remember_editor_path(editor.path());
+        remember_editor_path(editor_location(editor));
         reset_editor_view_state();
         status = "Buffer: " + editor.path();
         return true;
     }
 
     void save_editor() {
+        if (editor.provider() &&
+            !has_capability(editor.provider()->capabilities(), ProviderCapability::write)) {
+            show_editor_error(std::runtime_error("this filesystem is read-only; use Save as to save a local copy"));
+            return;
+        }
         if (!config.editor_confirm_save) {
             begin_editor_buffer_save(editor, EditorSavePurpose::save);
             return;
@@ -13353,27 +13973,28 @@ struct App::Impl {
                 return;
             }
             if (purpose == EditorSavePurpose::save_as && editor_save_overwrite &&
-                local->stat_follow(editor_save_path, {}).revision != editor_overwrite_revision) {
+                editor_save_provider->stat_follow(editor_save_path, {}).revision != editor_overwrite_revision) {
                 throw std::runtime_error("Save As destination changed while awaiting confirmation");
             }
             if (preserve_links) {
                 if (purpose == EditorSavePurpose::save_as) {
                     editor_save_buffer->save_as_preserving_links(
-                        editor_save_path, editor_save_overwrite, editor_save_line_ending
+                        editor_save_provider, editor_save_path, editor_save_overwrite, editor_save_line_ending
                     );
                 } else {
                     editor_save_buffer->save_preserving_links(false);
                 }
             } else if (purpose == EditorSavePurpose::save_as) {
                 editor_save_buffer->save_as(
-                    editor_save_path, editor_save_overwrite, editor_save_line_ending
+                    editor_save_provider, editor_save_path, editor_save_overwrite, editor_save_line_ending
                 );
             } else {
                 editor_save_buffer->save(false);
             }
-            if (purpose != EditorSavePurpose::diff_save) remember_editor_path(editor_save_buffer->path());
+            if (purpose != EditorSavePurpose::diff_save) remember_editor_path(editor_location(*editor_save_buffer));
             const auto saved_path = std::filesystem::path(editor_save_buffer->path());
             editor_save_buffer = nullptr;
+            editor_save_provider.reset();
             editor_unnamed_save_buffer = nullptr;
             editor_save_as_continuation.reset();
             prompt_action = PromptAction::none;
@@ -13402,6 +14023,7 @@ struct App::Impl {
             }
         } catch (const std::exception& error) {
             editor_save_buffer = nullptr;
+            editor_save_provider.reset();
             editor_unnamed_save_buffer = nullptr;
             editor_save_as_continuation.reset();
             editor_quit_requested = false;
@@ -13418,6 +14040,7 @@ struct App::Impl {
     ) {
         editor_save_buffer = &buffer;
         editor_save_purpose = purpose;
+        if (purpose != EditorSavePurpose::save_as) editor_save_provider = buffer.provider();
         newline_warning_accepted = false;
         if (buffer.path().empty() && purpose != EditorSavePurpose::save_as) {
             editor_unnamed_save_buffer = &buffer;
@@ -13432,7 +14055,15 @@ struct App::Impl {
     void continue_editor_buffer_save() {
         try {
             if (editor_save_buffer == nullptr) throw std::runtime_error("no buffer to save");
-            if (editor_save_buffer->hardlink_count() > 1U) {
+            if (!editor_save_provider ||
+                !has_capability(editor_save_provider->capabilities(), ProviderCapability::write)) {
+                throw std::runtime_error("this filesystem is read-only; use Save as to save a local copy");
+            }
+            const auto links = editor_save_purpose == EditorSavePurpose::save_as
+                ? (editor_save_provider->exists(editor_save_path)
+                    ? editor_save_provider->stat_follow(editor_save_path, {}).links : 1U)
+                : editor_save_buffer->hardlink_count();
+            if (links > 1U) {
                 editor_link_choice = 0;
                 mode = Mode::editor_link_dialog;
             } else {
@@ -13440,6 +14071,7 @@ struct App::Impl {
             }
         } catch (const std::exception& error) {
             editor_save_buffer = nullptr;
+            editor_save_provider.reset();
             editor_quit_requested = false;
             if (editor_save_purpose == EditorSavePurpose::diff_save) {
                 diff_saving = diff_closing = false;
@@ -13451,18 +14083,20 @@ struct App::Impl {
     void request_editor_save_as() {
         newline_warning_accepted = false;
         auto& buffer = editor_unnamed_save_buffer == nullptr ? editor : *editor_unnamed_save_buffer;
-        auto path = std::filesystem::path(prompt_value);
-        if (path.is_relative()) {
-            path = std::filesystem::path(editor_directory(buffer)) / path;
+        const auto destination = resolve_editor_location(prompt_value, &buffer);
+        if (!has_capability(destination.provider->capabilities(), ProviderCapability::write)) {
+            throw std::runtime_error("this filesystem is read-only; choose a local Save As destination");
         }
-        editor_save_path = local->normalize(path.string());
+        editor_save_path = destination.path;
+        editor_save_provider = destination.provider;
         editor_save_overwrite = false;
         editor_save_buffer = &buffer;
         editor_save_purpose = EditorSavePurpose::save_as;
-        if (!buffer.path().empty() && editor_save_path == local->normalize(buffer.path())) {
+        if (!buffer.path().empty() && buffer.provider() == editor_save_provider &&
+            editor_save_path == buffer.provider()->normalize(buffer.path())) {
             begin_editor_buffer_save(buffer, EditorSavePurpose::save_as);
-        } else if (local->exists(editor_save_path)) {
-            const auto target = local->stat_follow(editor_save_path, {});
+        } else if (editor_save_provider->exists(editor_save_path)) {
+            const auto target = editor_save_provider->stat_follow(editor_save_path, {});
             if (target.kind != EntryKind::file) {
                 throw std::runtime_error(
                     "Save As target is not a regular file: " + editor_save_path
@@ -13489,6 +14123,7 @@ struct App::Impl {
             const bool unnamed = editor_save_as_continuation.has_value();
             editor_quit_requested = false;
             editor_save_buffer = nullptr;
+            editor_save_provider.reset();
             editor_unnamed_save_buffer = nullptr;
             editor_save_as_continuation.reset();
             mode = unnamed ? Mode::editor : editor_save_purpose == EditorSavePurpose::save_as
@@ -13508,14 +14143,15 @@ struct App::Impl {
         if (input == ButtonInput::cancel ||
             (input == ButtonInput::activate && editor_overwrite_choice == 1U)) {
             editor_save_buffer = nullptr;
+            editor_save_provider.reset();
             mode = Mode::prompt;
         } else if (input == ButtonInput::activate) {
             try {
-                if (local->stat_follow(editor_save_path, {}).revision != editor_overwrite_revision) {
+                if (editor_save_provider->stat_follow(editor_save_path, {}).revision != editor_overwrite_revision) {
                     throw std::runtime_error("Save As destination changed while awaiting confirmation");
                 }
                 editor_save_overwrite = true;
-                if (std::filesystem::hard_link_count(editor_save_path) > 1U) {
+                if (editor_save_provider->stat_follow(editor_save_path, {}).links > 1U) {
                     editor_link_choice = 0;
                     mode = Mode::editor_link_dialog;
                 } else {
@@ -13523,6 +14159,7 @@ struct App::Impl {
                 }
             } catch (const std::exception& error) {
                 editor_save_buffer = nullptr;
+                editor_save_provider.reset();
                 show_editor_error(error);
             }
         }
@@ -13537,7 +14174,7 @@ struct App::Impl {
         if (editor_buffers.size() > editor_session_base) {
             editor = std::move(editor_buffers.back());
             editor_buffers.pop_back();
-            remember_editor_path(editor.path());
+            remember_editor_path(editor_location(editor));
             mode = Mode::editor;
             status = "Buffer: " + editor.path();
             return;
@@ -13781,7 +14418,7 @@ struct App::Impl {
                 start_prompt(
                     PromptAction::editor_save_as,
                     "Save as",
-                    editor.path()
+                    editor_location(editor)
                 );
             } else if (item == 6U) {
                 request_editor_quit();
@@ -14256,18 +14893,13 @@ struct App::Impl {
                 return true;
             }
             const auto path = editor_history[editor_list_cursor];
-            if (path == editor.path()) {
-                mode = Mode::editor;
-                return true;
-            }
             try {
+                const auto location = resolve_editor_location(path);
                 open_editor_buffer(
-                    active().provider(),
-                    path,
+                    location.provider,
+                    location.path,
                     false
                 );
-                mode = Mode::editor;
-                status = "File opened";
             } catch (const std::exception& error) {
                 show_editor_error(error);
             }
@@ -14281,7 +14913,7 @@ struct App::Impl {
             editor,
             editor_buffers[editor_session_base + editor_list_cursor - 1U]
         );
-        remember_editor_path(editor.path());
+        remember_editor_path(editor_location(editor));
         reset_editor_view_state();
         mode = Mode::editor;
         status = "Buffer: " + editor.path();
@@ -15105,7 +15737,7 @@ struct App::Impl {
             start_prompt(
                 PromptAction::editor_save_as,
                 "Save as",
-                editor.path()
+                editor_location(editor)
             );
             return true;
         }
@@ -15285,6 +15917,10 @@ struct App::Impl {
         const auto directory = return_mode == Mode::editor ? editor_directory(editor) : active().path();
         mode = return_mode;
         try {
+            if ((return_mode == Mode::editor && editor.provider() != local) ||
+                (return_mode != Mode::editor && active().provider() != local)) {
+                throw std::runtime_error("copy archive members to a local directory before running file commands");
+            }
             const auto command = expand_user_menu_command(
                 match->command,
                 selected_path,
@@ -15502,7 +16138,7 @@ struct App::Impl {
 
     bool handle_bookmarks(const ftxui::Event& event) {
         if (event == ftxui::Event::Insert || event == ftxui::Event::AltA) {
-            const auto path = active().path();
+            const auto path = pane_location(active());
             const auto found = std::ranges::find(config.bookmarks, path);
             if (found == config.bookmarks.end()) {
                 config.bookmarks.push_back(path);
@@ -15551,9 +16187,7 @@ struct App::Impl {
         if (input == ButtonInput::activate &&
             bookmark_cursor < config.bookmarks.size()) {
             try {
-                active().change_directory(
-                    config.bookmarks[bookmark_cursor]
-                );
+                change_panel_directory(active(), config.bookmarks[bookmark_cursor]);
                 mode = Mode::panels;
             } catch (const std::exception& error) {
                 set_error(error);
@@ -16105,6 +16739,8 @@ struct App::Impl {
                     show_file_attributes();
                 } else if (event == ftxui::Event::j) {
                     open_jobs();
+                } else if (event == ftxui::Event::a) {
+                    show_vfs_list();
                 } else if (
                     event == ftxui::Event::Character('!')
                 ) {
@@ -16826,18 +17462,18 @@ struct App::Impl {
                         static_cast<int>(panel_visible_rows())
                     );
                 } else if (config.navigate_with_arrows) {
-                    if (event == ftxui::Event::ArrowLeft) static_cast<void>(active().up());
-                    else static_cast<void>(active().enter());
+                    if (event == ftxui::Event::ArrowLeft) static_cast<void>(panel_up(active()));
+                    else static_cast<void>(enter_panel_entry());
                 }
                 return true;
             } else if (
                 event == ftxui::Event::Special("\x1B[5;5~")
             ) {
-                static_cast<void>(active().up());
+                static_cast<void>(panel_up(active()));
             } else if (
                 event == ftxui::Event::Special("\x1B[6;5~")
             ) {
-                static_cast<void>(active().enter());
+                static_cast<void>(enter_panel_entry());
             } else if (event == ftxui::Event::PageDown) {
                 active().page_cursor(
                     static_cast<int>(panel_page_rows(active()))
@@ -16855,7 +17491,7 @@ struct App::Impl {
                     static_cast<int>(active().entries().size())
                 );
             } else if (event == ftxui::Event::Return) {
-                if (!active().enter() && !panel_search_confirmed) activate_file_association();
+                if (!enter_panel_entry(!panel_search_confirmed) && !panel_search_confirmed) activate_file_association();
             } else if (event == ftxui::Event::AltY) {
                 active().history_back();
             } else if (event == ftxui::Event::AltU) {
@@ -17007,7 +17643,315 @@ struct App::Impl {
         return true;
     }
 
+    std::optional<std::string_view> lookup_keymap_action(
+        const KeymapContext context,
+        const ftxui::Event& event
+    ) const {
+        if (!keymap) return std::nullopt;
+        const auto section = keymap->sections().find(context);
+        if (section == keymap->sections().end()) return std::nullopt;
+        for (const auto& definition : section->second) {
+            for (const auto& key : definition.keys) {
+                if (keymap_event_matches(event, key)) return definition.action;
+            }
+        }
+        return std::nullopt;
+    }
+
+    std::optional<ftxui::Event> remap_widget_key(
+        const KeymapContext context,
+        const ftxui::Event& event
+    ) const {
+        if (!keymap || keymap_dispatching) return event;
+        const auto key = keymap_event_name(event);
+        if (!key) return event;
+        if (const auto action = lookup_keymap_action(context, event)) {
+            for (const auto& binding : original_keymap_bindings()) {
+                if (binding.context == context && binding.action == *action) {
+                    return keymap_named_event(binding.keys.substr(0, binding.keys.find(';')));
+                }
+            }
+            throw std::runtime_error("keymap action " + std::string(*action) +
+                " is not available in " + std::string(keymap_context_name(context)));
+        }
+        for (const auto& binding : original_keymap_bindings()) {
+            if (binding.context == context && binding_has_key(binding.keys, *key)) {
+                if (keymap->contains_action(context, binding.action)) return std::nullopt;
+                break;
+            }
+        }
+        return event;
+    }
+
+    std::vector<KeymapContext> keymap_contexts() const {
+        using enum KeymapContext;
+        switch (mode) {
+            case Mode::panels:
+                if (tree_panel && tree_panel_focused) return {tree, filemanager};
+                if (quick_view_panel && quick_view_focused) {
+                    return quick_viewer.hex() ? std::vector{viewer_hex, viewer, filemanager}
+                                              : std::vector{viewer, filemanager};
+                }
+                return command_mode ? std::vector{filemanager, input}
+                                    : std::vector{filemanager, panel};
+            case Mode::editor: return {editor};
+            case Mode::viewer:
+                return this->viewer.hex() ? std::vector{viewer_hex, viewer} : std::vector{viewer};
+            case Mode::diff: return {diffviewer};
+            case Mode::directory_tree_dialog: return {tree, dialog};
+            case Mode::editor_menu:
+            case Mode::pulldown:
+            case Mode::user_menu: return {menu, dialog};
+            case Mode::editor_help:
+            case Mode::help: return {help, dialog};
+            case Mode::local_list:
+            case Mode::editor_history:
+            case Mode::editor_buffer_list:
+            case Mode::bookmarks:
+            case Mode::search_results:
+            case Mode::jobs: return {listbox, dialog};
+            case Mode::chattr_dialog: return {chattr, dialog};
+            case Mode::prompt:
+                return prompt_focus == 0U ? std::vector{input, dialog} : std::vector{dialog};
+            case Mode::native_input:
+                return native_input_focus == 0U ? std::vector{input, dialog} : std::vector{dialog};
+            case Mode::operation_dialog:
+                return dialog_focus < 2U ? std::vector{input, dialog} : std::vector{dialog};
+            case Mode::editor_mail_dialog:
+                return mail_focus < 3U ? std::vector{input, dialog} : std::vector{dialog};
+            case Mode::file_search_dialog:
+                if (file_search_focus == 0U) return {input, dialog};
+                if (file_search_focus == 1U) return {radio, dialog};
+                return {dialog};
+            case Mode::editor_search_dialog:
+            case Mode::editor_replace_dialog:
+                if (editor_dialog_focus == 0U ||
+                    (mode == Mode::editor_replace_dialog && editor_dialog_focus == 1U)) return {input, dialog};
+                if (editor_dialog_focus == 2U) return {radio, dialog};
+                return {dialog};
+            case Mode::editor_save_mode_dialog:
+                if (save_mode_focus == 0U) return {radio, dialog};
+                return save_mode_focus == 1U ? std::vector{input, dialog} : std::vector{dialog};
+            case Mode::editor_options_dialog:
+                if (editor_options_focus == 0U) return {radio, dialog};
+                if (editor_options_focus == 4U || editor_options_focus == 15U) return {input, dialog};
+                return {dialog};
+            case Mode::listing_dialog:
+                if (listing_focus == 0U) return {radio, dialog};
+                if (listing_focus == 1U || listing_focus == 2U || listing_focus == 4U) return {input, dialog};
+                return {dialog};
+            case Mode::sort_dialog: return {radio, dialog};
+            case Mode::diff_options:
+                return diff_options_focus == 0U ? std::vector{radio, dialog} : std::vector{dialog};
+            case Mode::configure_dialog:
+                if (configure_focus == 18U) return {input, dialog};
+                if (configure_focus == 19U) return {radio, dialog};
+                return {dialog};
+            default: return {dialog};
+        }
+    }
+
+    void execute_keymap_action(const KeymapContext context, std::string_view action) {
+        using enum KeymapContext;
+        if (action == "ExtendedKeyMap") {
+            if (mode != Mode::panels && mode != Mode::editor) {
+                throw std::runtime_error("this screen has no extended keymap");
+            }
+            keymap_prefix = mode == Mode::editor ? editor_xmap : filemanager_xmap;
+            keymap_prefix_mode = mode;
+            panel_ctrl_x = false;
+            panel_search_mode = false;
+            tree_search_mode = false;
+            status = "Extended keymap";
+            return;
+        }
+        struct DispatchGuard {
+            bool& flag;
+            bool previous;
+            explicit DispatchGuard(bool& value) : flag(value), previous(std::exchange(value, true)) {}
+            ~DispatchGuard() { flag = previous; }
+        } guard(keymap_dispatching);
+        if (action == "Close" && mode == Mode::editor) { request_editor_close(); return; }
+        if (action == "QuitQuiet" && mode == Mode::panels) {
+            if (operation_running.load(std::memory_order_acquire) ||
+                traversal_running.load(std::memory_order_acquire)) {
+                static_cast<void>(handle_panels(ftxui::Event::F10));
+            } else request_app_exit(true);
+            return;
+        }
+        if (action == "Close" || action == "QuitQuiet") action = "Quit";
+        if (action == "Refresh") action = "Reread";
+        if (action == "MenuLastSelected" && mode == Mode::panels) {
+            pulldown_dropped = true;
+            mode = Mode::pulldown;
+            return;
+        }
+        if ((context == panel || context == tree || context == listbox) && action == "Home") action = "Top";
+        if ((context == panel || context == tree || context == listbox) && action == "End") action = "Bottom";
+        if ((context == dialog || context == listbox || context == menu) &&
+            (action == "Enter" || action == "Ok" || (context != dialog && action == "Select"))) {
+            static_cast<void>(handle(ftxui::Event::Return));
+            return;
+        }
+        if (action == "Cancel") {
+            static_cast<void>(handle(ftxui::Event::Escape));
+            return;
+        }
+        auto targets = std::vector{context};
+        if (context == filemanager || context == filemanager_xmap || context == panel) {
+            targets = {context, filemanager, panel, filemanager_xmap};
+        } else if (context == editor_xmap) targets.push_back(editor);
+        else if (context == viewer_hex) targets.push_back(viewer);
+        for (const auto target : targets) {
+            for (const auto& binding : original_keymap_bindings()) {
+                if (binding.context != target || binding.action != action) continue;
+                if (binding.context == filemanager_xmap) panel_ctrl_x = true;
+                static_cast<void>(handle(keymap_named_event(
+                    binding.keys.substr(0, binding.keys.find(';'))
+                )));
+                return;
+            }
+        }
+        if (mode == Mode::editor) {
+            struct MenuCommand { std::string_view action; std::size_t category; int item; };
+            static constexpr MenuCommand commands[]{
+                {"EditFile", 0, 0}, {"EditNew", 0, 1}, {"Close", 0, 2},
+                {"Save", 0, 3}, {"SaveAs", 0, 4}, {"History", 0, 5}, {"Quit", 0, 6},
+                {"InsertFile", 0, 7}, {"BlockSave", 0, 8}, {"UserMenu", 0, 9},
+                {"Undo", 1, 0}, {"Redo", 1, 1}, {"InsertOverwrite", 1, 2},
+                {"Mark", 1, 3}, {"MarkColumn", 1, 4}, {"MarkAll", 1, 5}, {"Unmark", 1, 6},
+                {"Copy", 1, 7}, {"Move", 1, 8}, {"Delete", 1, 9},
+                {"Store", 1, 10}, {"Cut", 1, 11}, {"Paste", 1, 12},
+                {"Top", 1, 13}, {"Bottom", 1, 14},
+                {"Search", 2, 0}, {"SearchContinue", 2, 1}, {"Replace", 2, 2},
+                {"Bookmark", 2, 3}, {"BookmarkNext", 2, 4}, {"BookmarkPrev", 2, 5}, {"BookmarkFlush", 2, 6},
+                {"Goto", 3, 0}, {"MatchBracket", 3, 1}, {"ShowNumbers", 3, 2}, {"SyntaxOnOff", 3, 3},
+                {"SelectCodepage", 3, 7}, {"Reread", 3, 8}, {"MacroStartStopRecord", 3, 9},
+                {"MacroDelete", 3, 10}, {"RepeatStartStopRecord", 3, 11}, {"Mail", 3, 12},
+                {"SpellCheck", 3, 13}, {"SpellCheckCurrentWord", 3, 14}, {"SpellCheckSelectLang", 3, 15},
+                {"InsertLiteral", 4, 0}, {"Date", 4, 1}, {"ParagraphFormat", 4, 2}, {"ExternalCommand", 4, 4},
+                {"WindowNext", 5, 0}, {"ScreenNext", 5, 0},
+                {"WindowPrev", 5, 1}, {"ScreenPrev", 5, 1},
+                {"WindowList", 5, 2}, {"WindowMove", 5, 3}, {"WindowResize", 5, 4}, {"WindowFullscreen", 5, 5},
+                {"Options", 6, 0}, {"SaveSetup", 6, 1}, {"OptionsSaveMode", 6, 2},
+                {"LearnKeys", 6, 3}, {"SyntaxChoose", 6, 4},
+            };
+            for (const auto& command : commands) {
+                if (command.action != action) continue;
+                const auto& items = editor_menu_items()[command.category];
+                const auto found = std::ranges::find(items, command.item, &MenuRow::action);
+                if (found == items.end()) throw std::runtime_error("editor keymap action has no menu command");
+                editor_menu_category = command.category;
+                editor_menu_item = static_cast<std::size_t>(found - items.begin());
+                execute_editor_menu_item();
+                return;
+            }
+        }
+        if (mode == Mode::panels) {
+            if (traversal_running.load(std::memory_order_acquire)) {
+                status = "Search running; Ctrl-C cancels";
+                return;
+            }
+            struct MenuCommand { std::string_view action; std::size_t category; int item; };
+            static constexpr MenuCommand commands[]{
+                {"ViewFile", 1, 18}, {"ViewFiltered", 1, 22}, {"ChangeMode", 1, 8},
+                {"ChangeOwn", 1, 9}, {"ChangeAttributes", 1, 21},
+                {"Link", 1, 11}, {"LinkSymbolic", 1, 12}, {"LinkSymbolicRelative", 1, 13},
+                {"LinkSymbolicEdit", 1, 19}, {"Select", 1, 15}, {"Unselect", 1, 16}, {"SelectInvert", 1, 17},
+                {"Find", 2, 0}, {"CompareDirs", 2, 1}, {"CdQuick", 2, 2},
+                {"HotList", 2, 7}, {"Jobs", 2, 10},
+                {"CompareFiles", 2, 12}, {"ExternalPanelize", 2, 13}, {"DirSize", 2, 14},
+                {"History", 2, 15}, {"EditorViewerHistory", 2, 16}, {"ScreenList", 2, 17},
+                {"EditExtensionsFile", 2, 18}, {"EditFileHighlightFile", 2, 20},
+                {"Options", 3, 20}, {"OptionsLayout", 3, 21}, {"OptionsPanel", 3, 22},
+                {"OptionsConfirm", 3, 23}, {"OptionsDisplayBits", 3, 25}, {"OptionsAppearance", 3, 24},
+                {"LearnKeys", 3, 26}, {"SaveSetup", 3, 3},
+            };
+            for (const auto& command : commands) {
+                if (command.action == action) {
+                    const auto& items = pulldown_items()[command.category];
+                    if (std::ranges::find(items, command.item, &MenuRow::action) == items.end()) {
+                        throw std::runtime_error("keymap action has no available menu command: " + std::string(action));
+                    }
+                    execute_pulldown_action(command.category, command.item);
+                    return;
+                }
+            }
+            if (action == "PanelOtherSync") {
+                install_pane_location(passive(), {active().provider(), active().path()});
+                return;
+            }
+            if (action == "PanelListing" || action == "SetupListingFormat") { show_listing_options(); return; }
+            if (action == "VfsList") { show_vfs_list(); return; }
+            if (action == "OptionsVfs") { show_vfs_options(); return; }
+            if (action == "Sort") { show_sort_options(); return; }
+            if (action == "Filter") { start_prompt(PromptAction::panel_filter, "Panel filter", active().filter()); return; }
+            if (action == "SortReverse") {
+                active().set_sort_options(active().sort_field(), !active().descending(),
+                    active().sort_case_sensitive(), active().executable_first());
+                return;
+            }
+            if (action == "SortByName" || action == "SortByExt" || action == "SortBySize" ||
+                action == "SortByMTime" || action == "SortByVersion") {
+                sort_active(action == "SortByExt" ? SortField::extension : action == "SortBySize" ? SortField::size :
+                    action == "SortByMTime" ? SortField::modified : action == "SortByVersion" ? SortField::version : SortField::name);
+                return;
+            }
+        }
+        throw std::runtime_error("keymap action " + std::string(action) +
+            " is not available in " + std::string(keymap_context_name(context)));
+    }
+
+    bool dispatch_keymap(const ftxui::Event& event) {
+        if (!keymap || event.is_mouse()) return false;
+        const auto key = keymap_event_name(event);
+        if (!key) return false;
+        if (keymap_prefix && keymap_prefix_mode != mode) keymap_prefix.reset();
+        if (keymap_prefix || (mode == Mode::panels && panel_ctrl_x)) {
+            const auto context = keymap_prefix.value_or(KeymapContext::filemanager_xmap);
+            keymap_prefix.reset();
+            panel_ctrl_x = false;
+            status = "Ready";
+            if (*key == "esc") return true;
+            if (const auto action = lookup_keymap_action(context, event)) {
+                execute_keymap_action(context, *action);
+                return true;
+            }
+            for (const auto& binding : original_keymap_bindings()) {
+                if (binding.context == context && binding_has_key(binding.keys, *key) &&
+                    !keymap->contains_action(context, binding.action)) {
+                    execute_keymap_action(context, binding.action);
+                    return true;
+                }
+            }
+            status = "No action for extended key " + *key;
+            return true;
+        }
+        if ((panel_search_mode || tree_search_mode) && mode == Mode::panels &&
+            (event.is_character() || event == ftxui::Event::Backspace ||
+             event == ftxui::Event::Return || event == ftxui::Event::Escape)) return false;
+        if (mode == Mode::viewer && viewer.hex_editing() && event.is_character()) return false;
+        if (mode == Mode::native_key_query || mode == Mode::learn_key || mode == Mode::learn_keys_dialog ||
+            (mode == Mode::editor && editor_window_action != 0)) return false;
+        const auto contexts = keymap_contexts();
+        for (const auto context : contexts) {
+            if (const auto action = lookup_keymap_action(context, event)) {
+                execute_keymap_action(context, *action);
+                return true;
+            }
+        }
+        for (const auto context : contexts) {
+            for (const auto& binding : original_keymap_bindings()) {
+                if (binding.context == context && binding_has_key(binding.keys, *key)) {
+                    return keymap->contains_action(context, binding.action);
+                }
+            }
+        }
+        return false;
+    }
+
     bool handle_input(const ftxui::Event& event) try {
+        archives.prune();
         if (event == ftxui::Event::Custom && !event.is_character()) return false;
         if (!config.single_escape && mode != Mode::native_key_query && mode != Mode::learn_key &&
             mode != Mode::learn_keys_dialog) {
@@ -17022,8 +17966,8 @@ struct App::Impl {
             return true;
         }
         auto translated = event;
-        if ((mode == Mode::panels || mode == Mode::editor || mode == Mode::viewer) &&
-            !event.is_mouse() && !event.input().empty()) {
+        if (mode != Mode::native_key_query && mode != Mode::learn_key &&
+            mode != Mode::learn_keys_dialog && !event.is_mouse() && !event.input().empty()) {
             const auto mapping = config.learned_keys.find(encode_hex_bytes(event.input()));
             if (mapping != config.learned_keys.end()) translated = named_event(mapping->second);
         }
@@ -17034,6 +17978,7 @@ struct App::Impl {
                 return true;
             }
         }
+        if (dispatch_keymap(translated)) return true;
         return handle(translated);
     } catch (const std::exception& error) {
         if (mode == Mode::editor || mode == Mode::editor_menu) {
@@ -17244,39 +18189,21 @@ App::App(
 App::~App() = default;
 
 void App::open_viewer(const std::string& path) {
-    const auto resolved =
-        std::filesystem::path(path).is_absolute()
-            ? path
-            : impl_->active().provider()->join(
-                  impl_->active().path(),
-                  path
-              );
-    impl_->load_viewer(impl_->active().provider(), resolved);
+    const auto location = impl_->resolve_location(path);
+    impl_->load_viewer(location.provider, location.path);
     impl_->viewer_search_needle.clear();
     impl_->exit_after_viewer = true;
     impl_->mode = Mode::viewer;
 }
 
 void App::open_editor(const std::string& path, const std::size_t line) {
-    const auto resolved =
-        path.empty() || std::filesystem::path(path).is_absolute()
-            ? path
-            : impl_->active().provider()->join(
-                  impl_->active().path(),
-                  path
-              );
-    impl_->open_editor_buffer(
-        impl_->active().provider(),
-        resolved,
-        path.empty()
-    );
-    impl_->exit_after_editor = true;
-    impl_->mode = Mode::editor;
-    if (line != 0U) {
-        impl_->editor.goto_line(line);
-        impl_->editor.home();
-        impl_->update_editor_view();
+    if (!path.empty()) {
+        open_editor_files({{path, line}});
+        return;
     }
+    impl_->open_editor_buffer(impl_->local, "", true);
+    impl_->editor.base_directory = std::filesystem::current_path().string();
+    impl_->exit_after_editor = true;
 }
 
 void App::open_editors(const std::vector<std::string>& paths, const std::size_t first_line) {
@@ -17288,26 +18215,32 @@ void App::open_editors(const std::vector<std::string>& paths, const std::size_t 
 void App::open_editor_files(const std::vector<EditorFile>& files, const std::size_t first_line) {
     if (files.empty()) {
         open_editor("", first_line);
-        impl_->editor.base_directory = std::filesystem::current_path().string();
         return;
     }
-    std::vector<EditorFile> unique;
-    const auto provider = impl_->active().provider();
+    std::vector<Impl::EditorStartupFile> unique;
     for (const auto& [path, line] : files) {
         if (path.empty()) throw std::invalid_argument("file name is empty");
-        const auto resolved = provider->normalize(std::filesystem::path(path).is_absolute()
-            ? path : provider->join(impl_->active().path(), path));
-        if (std::ranges::none_of(unique, [&](const auto& file) { return file.path == resolved; })) {
-            unique.push_back({resolved, line});
+        auto location = impl_->resolve_location(path);
+        location.path = location.provider->normalize(location.path);
+        if (std::ranges::none_of(unique, [&](const auto& file) {
+                return file.location.provider->id() == location.provider->id() &&
+                       file.location.path == location.path;
+            })) {
+            unique.push_back({std::move(location), line});
         }
     }
-    for (const auto& [path, line] : unique) open_editor(path, line);
-    if (unique.size() > 1U) static_cast<void>(impl_->switch_editor_buffer(true));
-    if (first_line != 0U) {
-        impl_->editor.goto_line(first_line);
-        impl_->editor.home();
-        impl_->update_editor_view();
+    impl_->editor_startup_files = std::move(unique);
+    impl_->editor_startup_cursor = 0;
+    impl_->editor_startup_first_line = first_line;
+    impl_->editor_startup_opened = 0;
+    impl_->exit_after_editor = true;
+    impl_->mode = Mode::editor;
+    if (!impl_->editor.open()) {
+        impl_->open_editor_buffer(impl_->local, "", true);
+        impl_->editor.base_directory = std::filesystem::current_path().string();
+        impl_->editor_startup_placeholder = true;
     }
+    impl_->continue_editor_startup();
 }
 
 void App::open_diff(const std::string& first, const std::string& second) {
@@ -17319,9 +18252,7 @@ void App::open_diff(const std::string& first, const std::string& second) {
 }
 
 std::string App::active_path() const {
-    return impl_->active_index == 0
-               ? impl_->left.path()
-               : impl_->right.path();
+    return impl_->pane_location(impl_->active_index == 0 ? impl_->left : impl_->right);
 }
 
 int App::run() {
@@ -17402,6 +18333,7 @@ int App::run() {
             std::move(component),
             [&](const ftxui::Event& event) {
                 const auto handled = impl_->handle_input(event);
+                impl_->finish_editor_open_confirmation();
                 if (impl_->shell_exit_requested) {
                     impl_->shell_exit_requested = false;
                     impl_->request_app_exit();

@@ -143,21 +143,23 @@ bool word_character(
 void EditorModel::open(
     ProviderPtr provider,
     std::string path,
-    const Cancellation& cancellation
+    const Cancellation& cancellation,
+    const std::optional<Entry>& large_file_approval
 ) {
     if (!provider) {
         throw std::invalid_argument("editor provider is null");
     }
+    cancellation.throw_if_requested();
     const auto entry = provider->stat_follow(path, cancellation);
     if (entry.kind != EntryKind::file) {
         throw std::runtime_error("editor requires a regular file");
     }
-    constexpr std::uint64_t maximum = 16U * 1024U * 1024U;
-    if (entry.size > maximum) {
-        throw std::runtime_error(
-            "internal editor limit is 16 MiB"
-        );
+    if (entry.size > large_file_threshold &&
+        (!large_file_approval || large_file_approval->path != entry.path ||
+         large_file_approval->revision != entry.revision || large_file_approval->size != entry.size)) {
+        throw EditorLargeFileConfirmationRequired(entry);
     }
+    cancellation.throw_if_requested();
     std::ostringstream output;
     provider->read(
         entry.path,
@@ -167,22 +169,31 @@ void EditorModel::open(
         cancellation
     );
     const auto loaded = std::move(output).str();
-    if (loaded.size() != entry.size) {
+    cancellation.throw_if_requested();
+    const auto current = provider->stat_follow(path, cancellation);
+    if (loaded.size() != entry.size || current.path != entry.path ||
+        current.size != entry.size || current.revision != entry.revision) {
         throw std::runtime_error(
             "file changed while it was being opened"
         );
     }
+    EditorModel next;
+    next.line_separator_ = loaded.find('\n') == std::string::npos &&
+                                  loaded.find('\r') != std::string::npos
+                              ? '\r' : '\n';
+    next.set_content(loaded);
+    auto storage_path = entry.path;
+    auto revision = entry.revision;
+    cancellation.throw_if_requested();
     provider_ = std::move(provider);
     path_ = std::move(path);
-    storage_path_ = entry.path;
-    revision_ = entry.revision;
+    storage_path_ = std::move(storage_path);
+    revision_ = std::move(revision);
     encoding_.clear();
     storage_offsets_.clear();
     bookmarks_.clear();
-    line_separator_ = loaded.find('\n') == std::string::npos &&
-                              loaded.find('\r') != std::string::npos
-                          ? '\r' : '\n';
-    set_content(loaded);
+    line_separator_ = next.line_separator_;
+    lines_ = std::move(next.lines_);
     row_ = 0;
     column_ = 0;
     over_column_ = 0;
@@ -2270,7 +2281,6 @@ void EditorModel::backup_target(
     if (expected && original.revision != *expected) {
         throw std::runtime_error("destination changed since it was opened: " + path);
     }
-    if (original.size > 16U * 1024U * 1024U) throw std::runtime_error("backup input exceeds the editor size limit");
     if (backup_extension_.empty()) throw std::runtime_error("backup extension is empty");
     const auto backup = path + backup_extension_;
     const bool exists = provider_->exists(backup);
@@ -2357,6 +2367,41 @@ void EditorModel::save_as_preserving_links(
     const Cancellation& cancellation
 ) {
     save_as_impl(std::move(path), force, ending, true, cancellation);
+}
+
+void EditorModel::save_as(
+    ProviderPtr provider, std::string path, const bool force,
+    const EditorLineEnding ending, const Cancellation& cancellation
+) {
+    save_as_with_provider(std::move(provider), std::move(path), force, ending, false, cancellation);
+}
+
+void EditorModel::save_as_preserving_links(
+    ProviderPtr provider, std::string path, const bool force,
+    const EditorLineEnding ending, const Cancellation& cancellation
+) {
+    save_as_with_provider(std::move(provider), std::move(path), force, ending, true, cancellation);
+}
+
+void EditorModel::save_as_with_provider(
+    ProviderPtr provider, std::string path, const bool force,
+    const EditorLineEnding ending, const bool preserve_links,
+    const Cancellation& cancellation
+) {
+    if (!provider_) throw std::runtime_error("editor is not open");
+    if (!provider) throw std::invalid_argument("Save As provider is null");
+    if (provider == provider_) {
+        save_as_impl(std::move(path), force, ending, preserve_links, cancellation);
+        return;
+    }
+    auto next = *this;
+    next.provider_ = std::move(provider);
+    next.path_.clear();
+    next.storage_path_.clear();
+    next.revision_.clear();
+    next.new_file_ = true;
+    next.save_as_impl(std::move(path), force, ending, preserve_links, cancellation);
+    *this = std::move(next);
 }
 
 void EditorModel::save_as_impl(

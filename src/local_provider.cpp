@@ -12,6 +12,7 @@
 #include <fcntl.h>
 #include <grp.h>
 #include <linux/fs.h>
+#include <limits>
 #include <pwd.h>
 #include <sstream>
 #include <stdexcept>
@@ -130,6 +131,79 @@ std::string revision_for(const struct stat& status) {
            std::to_string(status.st_ctim.tv_nsec);
 }
 
+std::optional<struct stat> destination_status(const std::filesystem::path& path) {
+    struct stat status{};
+    return lstat_if_present(path, status) ? std::optional{status} : std::nullopt;
+}
+
+void validate_copied_source(
+    const std::filesystem::path& path, const struct stat& expected,
+    const int descriptor = -1
+) {
+    const auto matches = [&](const struct stat& current) {
+        return revision_for(current) == revision_for(expected) &&
+               current.st_mode == expected.st_mode && current.st_rdev == expected.st_rdev;
+    };
+    struct stat current{};
+    if (!lstat_if_present(path, current) || !matches(current) ||
+        (descriptor >= 0 && (fstat(descriptor, &current) != 0 || !matches(current)))) {
+        throw std::runtime_error("source changed while copying: " + path.string());
+    }
+}
+
+std::chrono::system_clock::time_point modified_for(const struct stat& status) {
+    return std::chrono::system_clock::time_point{
+        std::chrono::seconds(status.st_mtim.tv_sec) +
+        std::chrono::nanoseconds(status.st_mtim.tv_nsec)
+    };
+}
+
+std::array<timespec, 2> modification_times(
+    const std::chrono::system_clock::time_point modified
+) {
+    const auto seconds = std::chrono::floor<std::chrono::seconds>(modified.time_since_epoch());
+    const auto nanos = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        modified.time_since_epoch() - seconds
+    );
+    return {{{.tv_sec = 0, .tv_nsec = UTIME_OMIT},
+             {.tv_sec = static_cast<time_t>(seconds.count()), .tv_nsec = static_cast<long>(nanos.count())}}};
+}
+
+class DirectorySync final {
+public:
+    explicit DirectorySync(const std::filesystem::path& path)
+        : path_(path),
+          descriptor_(open(path.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)) {
+        if (descriptor_ < 0) {
+            throw std::system_error(errno, std::generic_category(), "open output directory: " + path.string());
+        }
+    }
+
+    ~DirectorySync() { static_cast<void>(close(descriptor_)); }
+    DirectorySync(const DirectorySync&) = delete;
+    DirectorySync& operator=(const DirectorySync&) = delete;
+
+    void sync() const {
+        if (fsync(descriptor_) != 0) {
+            throw std::system_error(errno, std::generic_category(), "sync output directory: " + path_.string());
+        }
+    }
+
+    void sync_published(const std::filesystem::path& destination) const {
+        try {
+            sync();
+        } catch (const std::system_error& error) {
+            throw std::system_error(
+                error.code(), "destination was published but directory sync failed: " + destination.string()
+            );
+        }
+    }
+
+private:
+    std::filesystem::path path_;
+    int descriptor_;
+};
+
 std::string identity_name(
     const uid_t uid,
     const gid_t gid,
@@ -196,6 +270,24 @@ bool rename_no_replace(
     );
 }
 
+void publish_output(
+    const std::filesystem::path& temporary,
+    const std::filesystem::path& destination,
+    const bool overwrite,
+    const std::optional<struct stat>& expected
+) {
+    if (overwrite && expected) {
+        struct stat current{};
+        if (!lstat_if_present(destination, current) ||
+            revision_for(current) != revision_for(*expected)) {
+            throw std::runtime_error("destination changed while copying or saving: " + destination.string());
+        }
+        std::filesystem::rename(temporary, destination);
+    } else if (!rename_no_replace(temporary, destination)) {
+        throw std::runtime_error("destination exists: " + destination.string());
+    }
+}
+
 int open_regular_file(const std::filesystem::path& path) {
     const int descriptor = open(
         path.c_str(),
@@ -222,31 +314,144 @@ int open_regular_file(const std::filesystem::path& path) {
     return descriptor;
 }
 
-class DescriptorInputBuffer final : public std::streambuf {
-public:
-    explicit DescriptorInputBuffer(const int descriptor)
-        : descriptor_(descriptor) {
-        setg(buffer_.data(), buffer_.data(), buffer_.data());
-    }
+bool unsupported_extent_seek(const int error) {
+    return error == EINVAL || error == ENOTSUP || error == EOPNOTSUPP || error == ENOSYS;
+}
 
-protected:
-    int_type underflow() override {
-        const auto count = read(
-            descriptor_,
-            buffer_.data(),
-            buffer_.size()
-        );
-        if (count <= 0) {
-            return traits_type::eof();
+std::uint64_t copy_sparse_data(
+    const int source, const int destination, const off_t size,
+    const bool preallocate, const Cancellation& cancellation,
+    const ProgressCallback& progress, const std::filesystem::path& destination_path
+) {
+    std::array<char, 64U * 1024U> buffer{};
+    off_t position = 0;
+    bool seek_extents = true;
+    const auto report = [&] {
+        if (progress) {
+            progress({
+                .bytes_done = static_cast<std::uint64_t>(position),
+                .bytes_total = static_cast<std::uint64_t>(size),
+                .files_total = 1,
+                .current_path = destination_path.string(),
+            });
         }
-        setg(buffer_.data(), buffer_.data(), buffer_.data() + count);
-        return traits_type::to_int_type(*gptr());
+        cancellation.throw_if_requested();
+    };
+    while (position < size) {
+        cancellation.throw_if_requested();
+        off_t end = size;
+        if (seek_extents) {
+            const auto data = lseek(source, position, SEEK_DATA);
+            if (data < 0) {
+                const auto error = errno;
+                if (error == EINTR) continue;
+                if (error == ENXIO) {
+                    position = size;
+                    report();
+                    break;
+                }
+                if (unsupported_extent_seek(error)) {
+                    seek_extents = false;
+                    continue;
+                }
+                throw std::system_error(error, std::generic_category(), "seek copied source data");
+            }
+            if (data < position || data > size) {
+                throw std::runtime_error("source extent changed while copying");
+            }
+            if (data != position) {
+                position = data;
+                report();
+            }
+            if (position == size) break;
+            end = lseek(source, position, SEEK_HOLE);
+            if (end < 0) {
+                const auto error = errno;
+                if (error == EINTR) continue;
+                if (!unsupported_extent_seek(error)) {
+                    throw std::system_error(error, std::generic_category(), "seek copied source hole");
+                }
+                seek_extents = false;
+                end = size;
+            }
+            if (end <= position) {
+                throw std::runtime_error("source extent changed while copying");
+            }
+            end = std::min(end, size);
+        }
+        while (position < end) {
+            cancellation.throw_if_requested();
+            const auto requested = static_cast<std::size_t>(
+                std::min<off_t>(end - position, static_cast<off_t>(buffer.size()))
+            );
+            const auto count = pread(source, buffer.data(), requested, position);
+            if (count < 0 && errno == EINTR) continue;
+            if (count < 0) {
+                throw std::system_error(errno, std::generic_category(), "read copied source");
+            }
+            if (count == 0) {
+                throw std::runtime_error("source ended before expected length while copying");
+            }
+            const auto bytes = static_cast<std::size_t>(count);
+            // Also retain holes when SEEK_HOLE is unavailable or reports a dense extent.
+            const auto zero = [&](const std::size_t begin, const std::size_t end_offset) {
+                return std::all_of(buffer.data() + begin, buffer.data() + end_offset, [](const char byte) {
+                    return byte == '\0';
+                });
+            };
+            const auto block_end = [&](const std::size_t offset) {
+                constexpr off_t block_size = 4096;
+                const auto remainder = (position + static_cast<off_t>(offset)) % block_size;
+                return std::min(bytes, offset + static_cast<std::size_t>(block_size - remainder));
+            };
+            std::size_t offset = 0;
+            while (offset < bytes) {
+                auto end_offset = block_end(offset);
+                if (zero(offset, end_offset)) {
+                    offset = end_offset;
+                    continue;
+                }
+                const auto begin = offset;
+                offset = end_offset;
+                while (offset < bytes) {
+                    end_offset = block_end(offset);
+                    if (zero(offset, end_offset)) break;
+                    offset = end_offset;
+                }
+                if (preallocate) {
+                    const auto error = posix_fallocate(
+                        destination, position + static_cast<off_t>(begin), static_cast<off_t>(offset - begin)
+                    );
+                    if (error != 0) {
+                        throw std::system_error(error, std::generic_category(), "preallocate copied data");
+                    }
+                }
+                auto written_offset = begin;
+                while (written_offset < offset) {
+                    cancellation.throw_if_requested();
+                    const auto written = pwrite(
+                        destination, buffer.data() + written_offset, offset - written_offset,
+                        position + static_cast<off_t>(written_offset)
+                    );
+                    if (written < 0 && errno == EINTR) continue;
+                    if (written <= 0) {
+                        throw std::system_error(
+                            written == 0 ? EIO : errno, std::generic_category(), "write copied data"
+                        );
+                    }
+                    written_offset += static_cast<std::size_t>(written);
+                }
+            }
+            position += count;
+            report();
+        }
     }
-
-private:
-    int descriptor_;
-    std::array<char, 64U * 1024U> buffer_{};
-};
+    cancellation.throw_if_requested();
+    if (ftruncate(destination, size) != 0) {
+        throw std::system_error(errno, std::generic_category(), "set copied file size");
+    }
+    return static_cast<std::uint64_t>(size);
+}
 
 void remove_tree_at(
     const int parent_descriptor,
@@ -412,6 +617,10 @@ std::filesystem::path LocalProvider::resolve(
 
 std::string LocalProvider::normalize(const std::string_view path) const {
     return resolve(path).string();
+}
+
+std::filesystem::path LocalProvider::native_path(const std::string_view path) const {
+    return resolve_follow(path);
 }
 
 std::filesystem::path LocalProvider::resolve_follow(
@@ -713,16 +922,81 @@ void LocalProvider::write_impl(
     const Cancellation& cancellation, const ProgressCallback& progress,
     const std::optional<std::filesystem::perms> permissions
 ) {
+    cancellation.throw_if_requested();
+    const auto destination = normalize(path);
+    write_staged(
+        destination, length, overwrite, expected_revision, cancellation, progress, permissions,
+        [&](const int descriptor) {
+            std::array<char, 64U * 1024U> buffer{};
+            std::uint64_t written = 0;
+            if (preallocate_space_.load(std::memory_order_relaxed) && length && *length > 0U) {
+                cancellation.throw_if_requested();
+                if (*length > static_cast<std::uint64_t>(std::numeric_limits<off_t>::max())) {
+                    throw std::runtime_error("output is too large to preallocate");
+                }
+                const auto error = posix_fallocate(descriptor, 0, static_cast<off_t>(*length));
+                if (error != 0) throw std::system_error(error, std::generic_category(), "preallocate output");
+            }
+            while (input) {
+                cancellation.throw_if_requested();
+                input.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
+                const auto count = input.gcount();
+                if (count <= 0) {
+                    if (input.bad() || (!input.eof() && input.fail())) {
+                        throw std::runtime_error("failed while reading source data");
+                    }
+                    break;
+                }
+                std::streamsize offset = 0;
+                while (offset < count) {
+                    cancellation.throw_if_requested();
+                    const auto result = ::write(
+                        descriptor, buffer.data() + offset, static_cast<std::size_t>(count - offset)
+                    );
+                    if (result < 0 && errno == EINTR) continue;
+                    if (result <= 0) {
+                        throw std::runtime_error("failed while writing " + destination);
+                    }
+                    offset += result;
+                }
+                written += static_cast<std::uint64_t>(count);
+                if (progress) {
+                    progress({
+                        .bytes_done = written,
+                        .bytes_total = length.value_or(0),
+                        .files_total = 1,
+                        .current_path = destination,
+                    });
+                }
+                cancellation.throw_if_requested();
+            }
+            return written;
+        }
+    );
+}
+
+void LocalProvider::write_staged(
+    const std::string_view path, const std::optional<std::uint64_t> length,
+    const bool overwrite, const std::optional<std::string> expected_revision,
+    const Cancellation& cancellation, const ProgressCallback& progress,
+    const std::optional<std::filesystem::perms> permissions,
+    const std::function<std::uint64_t(int)>& transfer,
+    const std::function<void()>& validate_source,
+    const std::optional<std::chrono::system_clock::time_point> modified
+) {
+    cancellation.throw_if_requested();
     const auto destination = resolve(path);
+    const auto original = destination_status(destination);
+    if (!overwrite && original) {
+        throw std::runtime_error("destination exists: " + destination.string());
+    }
     const auto metadata = output_metadata(destination);
+    if (metadata && (!original || revision_for(metadata->status) != revision_for(*original))) {
+        throw std::runtime_error("destination changed before copying or saving: " + destination.string());
+    }
     const auto destination_permissions =
         permissions ? static_cast<mode_t>(static_cast<unsigned int>(*permissions) & 07777U)
                     : metadata ? metadata->status.st_mode & 07777U : creation_mode();
-    if (!overwrite && exists(destination.string())) {
-        throw std::runtime_error(
-            "destination exists: " + destination.string()
-        );
-    }
     if (expected_revision) {
         const auto current = stat(destination.string(), cancellation);
         if (current.revision != *expected_revision) {
@@ -733,6 +1007,7 @@ void LocalProvider::write_impl(
         }
     }
     std::filesystem::create_directories(destination.parent_path());
+    const DirectorySync parent_directory(destination.parent_path());
     auto pattern =
         (destination.parent_path() / ".mcpp-write-XXXXXX").string();
     std::vector<char> temporary_buffer(pattern.begin(), pattern.end());
@@ -745,8 +1020,6 @@ void LocalProvider::write_impl(
         );
     }
     const std::filesystem::path temporary(temporary_buffer.data());
-    std::array<char, 64U * 1024U> buffer{};
-    std::uint64_t written = 0;
     try {
         if (metadata &&
             (metadata->status.st_uid != geteuid() || metadata->status.st_gid != getegid()) &&
@@ -769,68 +1042,26 @@ void LocalProvider::write_impl(
         if (fchmod(descriptor, static_cast<mode_t>(destination_permissions)) != 0) {
             throw std::system_error(errno, std::generic_category(), "set temporary output permissions");
         }
-        if (preallocate_space_.load(std::memory_order_relaxed) && length && *length > 0U) {
-            cancellation.throw_if_requested();
-            if (*length > static_cast<std::uint64_t>(std::numeric_limits<off_t>::max())) {
-                throw std::runtime_error("output is too large to preallocate");
-            }
-            const auto error = posix_fallocate(descriptor, 0, static_cast<off_t>(*length));
-            if (error != 0) throw std::system_error(error, std::generic_category(), "preallocate output");
-        }
-        while (input) {
-            cancellation.throw_if_requested();
-            input.read(
-                buffer.data(),
-                static_cast<std::streamsize>(buffer.size())
-            );
-            const auto count = input.gcount();
-            if (count <= 0) {
-                if (input.bad() || (!input.eof() && input.fail())) {
-                    throw std::runtime_error(
-                        "failed while reading source data"
-                    );
-                }
-                break;
-            }
-            std::streamsize offset = 0;
-            while (offset < count) {
-                const auto result = ::write(
-                    descriptor,
-                    buffer.data() + offset,
-                    static_cast<std::size_t>(count - offset)
-                );
-                if (result < 0 && errno == EINTR) {
-                    continue;
-                }
-                if (result <= 0) {
-                    throw std::runtime_error(
-                        "failed while writing " +
-                        destination.string()
-                    );
-                }
-                offset += result;
-            }
-            written += static_cast<std::uint64_t>(count);
-            if (progress) {
-                progress({
-                    .bytes_done = written,
-                    .bytes_total = length.value_or(0),
-                    .files_done = 0,
-                    .files_total = 1,
-                    .current_path = destination.string(),
-                });
-            }
-            cancellation.throw_if_requested();
-        }
+        const auto written = transfer(descriptor);
         if (length && written != *length) {
             throw std::runtime_error(
                 "source ended before expected length"
             );
         }
         cancellation.throw_if_requested();
+        if (validate_source) validate_source();
+        if (fchmod(descriptor, static_cast<mode_t>(destination_permissions)) != 0) {
+            throw std::system_error(errno, std::generic_category(), "restore output permissions after writing");
+        }
+        if (modified) {
+            const auto times = modification_times(*modified);
+            if (futimens(descriptor, times.data()) != 0) {
+                throw std::system_error(errno, std::generic_category(), "preserve copied modification time");
+            }
+        }
         if (fsync(descriptor) != 0) {
-            throw std::runtime_error(
-                "failed to commit " + temporary.string()
+            throw std::system_error(
+                errno, std::generic_category(), "failed to commit " + temporary.string()
             );
         }
         cancellation.throw_if_requested();
@@ -851,44 +1082,16 @@ void LocalProvider::write_impl(
                 .current_path = destination.string(),
             });
         }
-        if (overwrite) {
-            if (expected_revision) {
-                const auto current = stat(
-                    destination.string(),
-                    cancellation
-                );
-                if (current.revision != *expected_revision) {
-                    throw std::runtime_error(
-                        "destination changed while saving: " +
-                        destination.string()
-                    );
-                }
+        cancellation.throw_if_requested();
+        if (validate_source) validate_source();
+        if (overwrite && expected_revision) {
+            const auto current = stat(destination.string(), cancellation);
+            if (current.revision != *expected_revision) {
+                throw std::runtime_error("destination changed while saving: " + destination.string());
             }
-            if (metadata) {
-                struct stat current{};
-                if (!lstat_if_present(destination, current) ||
-                    revision_for(current) != revision_for(metadata->status)) {
-                    throw std::runtime_error(
-                        "destination metadata changed while saving: " + destination.string()
-                    );
-                }
-            }
-            std::filesystem::rename(temporary, destination);
-        } else if (syscall(
-                       SYS_renameat2,
-                       AT_FDCWD,
-                       temporary.c_str(),
-                       AT_FDCWD,
-                       destination.c_str(),
-                       RENAME_NOREPLACE
-                   ) != 0) {
-            throw std::runtime_error(
-                errno == EEXIST
-                    ? "destination exists: " + destination.string()
-                    : "cannot commit destination: " +
-                          std::string(std::strerror(errno))
-            );
         }
+        publish_output(temporary, destination, overwrite, original);
+        parent_directory.sync_published(destination);
     } catch (...) {
         if (descriptor >= 0) {
             static_cast<void>(close(descriptor));
@@ -952,15 +1155,8 @@ void LocalProvider::set_modified(
     const std::chrono::system_clock::time_point modified
 ) {
     const auto target = resolve(path);
-    const auto seconds = std::chrono::floor<std::chrono::seconds>(modified.time_since_epoch());
-    const auto nanos = std::chrono::duration_cast<std::chrono::nanoseconds>(
-        modified.time_since_epoch() - seconds
-    );
-    timespec times[2]{};
-    times[0].tv_nsec = UTIME_OMIT;
-    times[1].tv_sec = static_cast<time_t>(seconds.count());
-    times[1].tv_nsec = static_cast<long>(nanos.count());
-    if (utimensat(AT_FDCWD, target.c_str(), times, AT_SYMLINK_NOFOLLOW) != 0) {
+    const auto times = modification_times(modified);
+    if (utimensat(AT_FDCWD, target.c_str(), times.data(), AT_SYMLINK_NOFOLLOW) != 0) {
         throw std::system_error(errno, std::generic_category(), "preserve modification time");
     }
 }
@@ -1050,10 +1246,15 @@ void LocalProvider::copy_hardlink(
         return;
     }
     struct stat original{};
-    if (!lstat_if_present(from, original) || !S_ISREG(original.st_mode)) {
-        throw std::runtime_error("copied hardlink source is not a regular file");
+    if (!lstat_if_present(from, original) ||
+        (!S_ISREG(original.st_mode) && !S_ISFIFO(original.st_mode) &&
+         !S_ISCHR(original.st_mode) && !S_ISBLK(original.st_mode))) {
+        throw std::runtime_error("copied hardlink source has an unsupported file type");
     }
+    const auto previous = destination_status(to);
+    if (!overwrite && previous) throw std::runtime_error("destination exists: " + to.string());
     std::filesystem::create_directories(to.parent_path());
+    const DirectorySync parent_directory(to.parent_path());
     auto pattern = (to.parent_path() / ".mcpp-hardlink-XXXXXX").string();
     if (mkdtemp(pattern.data()) == nullptr) {
         throw std::system_error(errno, std::generic_category(), "stage copied hardlink");
@@ -1067,19 +1268,18 @@ void LocalProvider::copy_hardlink(
             staged.st_dev != original.st_dev || staged.st_ino != original.st_ino) {
             throw std::runtime_error("copied hardlink source changed during publication");
         }
+        const DirectorySync staged_directory(directory);
+        staged_directory.sync();
         cancellation.throw_if_requested();
-        if (overwrite) {
-            std::filesystem::rename(temporary, to);
-        } else if (!rename_no_replace(temporary, to)) {
-            throw std::runtime_error("destination exists: " + to.string());
-        }
+        publish_output(temporary, to, overwrite, previous);
+        std::filesystem::remove(directory);
+        parent_directory.sync_published(to);
     } catch (...) {
         std::error_code ignored;
         std::filesystem::remove(temporary, ignored);
         std::filesystem::remove(directory, ignored);
         throw;
     }
-    std::filesystem::remove(directory);
 }
 
 void LocalProvider::remove(
@@ -1208,6 +1408,116 @@ void LocalProvider::rename(
     std::filesystem::rename(source_path, destination_path);
 }
 
+void LocalProvider::copy_file_from(
+    const LocalProvider& source_provider,
+    const std::string_view source, const std::string_view destination,
+    const bool overwrite, const bool preserve_permissions,
+    const Cancellation& cancellation, const ProgressCallback& progress
+) {
+    cancellation.throw_if_requested();
+    const auto from = source_provider.resolve(source);
+    const auto to = resolve(destination);
+    if (to == root_) {
+        throw std::invalid_argument("refusing to replace provider root with a copied file");
+    }
+    struct stat original{};
+    if (!lstat_if_present(from, original)) {
+        throw std::runtime_error("copy source does not exist: " + from.string());
+    }
+    if (!S_ISREG(original.st_mode) && !S_ISFIFO(original.st_mode) &&
+        !S_ISCHR(original.st_mode) && !S_ISBLK(original.st_mode)) {
+        throw std::runtime_error(
+            std::string(S_ISSOCK(original.st_mode) ? "cannot copy Unix socket: " : "unsupported file type: ") +
+            from.string()
+        );
+    }
+    if (source_provider.same_file(from.string(), *this, to.string())) {
+        throw std::invalid_argument("source and destination are the same file");
+    }
+    const auto permissions = preserve_permissions
+        ? std::optional{static_cast<std::filesystem::perms>(original.st_mode & 07777U)}
+        : std::nullopt;
+    if (S_ISREG(original.st_mode)) {
+        if (original.st_size < 0) throw std::runtime_error("copy source has a negative size");
+        const int descriptor = open_regular_file(from);
+        try {
+            validate_copied_source(from, original, descriptor);
+            write_staged(
+                to.string(), static_cast<std::uint64_t>(original.st_size),
+                overwrite, std::nullopt, cancellation, progress, permissions,
+                [&](const int output) {
+                    return copy_sparse_data(
+                        descriptor, output, original.st_size,
+                        preallocate_space_.load(std::memory_order_relaxed),
+                        cancellation, progress, to
+                    );
+                },
+                [&] { validate_copied_source(from, original, descriptor); },
+                modified_for(original)
+            );
+        } catch (...) {
+            static_cast<void>(close(descriptor));
+            throw;
+        }
+        static_cast<void>(close(descriptor));
+        return;
+    }
+
+    const auto previous = destination_status(to);
+    if (!overwrite && previous) {
+        throw std::runtime_error("destination exists: " + to.string());
+    }
+    const auto mode = permissions ? static_cast<mode_t>(*permissions)
+        : previous && !S_ISLNK(previous->st_mode) ? previous->st_mode & 07777U : creation_mode();
+    std::filesystem::create_directories(to.parent_path());
+    const DirectorySync parent_directory(to.parent_path());
+    auto pattern = (to.parent_path() / ".mcpp-special-XXXXXX").string();
+    if (mkdtemp(pattern.data()) == nullptr) {
+        throw std::system_error(errno, std::generic_category(), "stage copied special file");
+    }
+    const std::filesystem::path directory(pattern);
+    const auto temporary = directory / "node";
+    try {
+        if (S_ISFIFO(original.st_mode)) {
+            if (mkfifo(temporary.c_str(), 0600) != 0) {
+                throw std::system_error(errno, std::generic_category(), "recreate FIFO: " + from.string());
+            }
+        } else if (mknod(temporary.c_str(), (original.st_mode & S_IFMT) | 0600U, original.st_rdev) != 0) {
+            throw std::system_error(
+                errno, std::generic_category(),
+                "cannot recreate device " + from.string() + " (mknod requires permission, normally CAP_MKNOD)"
+            );
+        }
+        if (previous && !S_ISLNK(previous->st_mode) &&
+            (previous->st_uid != geteuid() || previous->st_gid != getegid()) &&
+            lchown(temporary.c_str(), previous->st_uid, previous->st_gid) != 0) {
+            throw std::system_error(errno, std::generic_category(), "preserve special output ownership");
+        }
+        if (chmod(temporary.c_str(), static_cast<mode_t>(mode)) != 0) {
+            throw std::system_error(errno, std::generic_category(), "set copied special file permissions");
+        }
+        const auto times = modification_times(modified_for(original));
+        if (utimensat(AT_FDCWD, temporary.c_str(), times.data(), AT_SYMLINK_NOFOLLOW) != 0) {
+            throw std::system_error(errno, std::generic_category(), "preserve special file modification time");
+        }
+        const DirectorySync staged_directory(directory);
+        staged_directory.sync();
+        if (progress) {
+            progress({.files_total = 1, .current_path = to.string()});
+        }
+        cancellation.throw_if_requested();
+        validate_copied_source(from, original);
+        publish_output(temporary, to, overwrite, previous);
+        std::filesystem::remove(directory);
+        parent_directory.sync_published(to);
+    } catch (...) {
+        std::error_code ignored;
+        std::filesystem::remove(temporary, ignored);
+        std::filesystem::remove(directory, ignored);
+        throw;
+    }
+}
+
 bool LocalProvider::copy_direct(
     const std::string_view source,
     const std::string_view destination,
@@ -1285,35 +1595,7 @@ bool LocalProvider::copy_direct(
         );
         return true;
     }
-    if (source_entry.kind != EntryKind::file) {
-        throw std::runtime_error(
-            "unsupported special file type: " + source_path.string()
-        );
-    }
-    const int source_descriptor = open_regular_file(source_path);
-    try {
-        DescriptorInputBuffer source_buffer(source_descriptor);
-        std::istream input(&source_buffer);
-        write_with_permissions(
-            destination_path.string(),
-            input,
-            source_entry.size,
-            overwrite,
-            cancellation,
-            progress,
-            source_entry.permissions
-        );
-    } catch (...) {
-        close(source_descriptor);
-        throw;
-    }
-    close(source_descriptor);
-    if (source_entry.permissions != std::filesystem::perms::unknown) {
-        set_permissions(
-            destination_path.string(),
-            source_entry.permissions
-        );
-    }
+    copy_file_from(*this, source_path.string(), destination_path.string(), overwrite, true, cancellation, progress);
     return true;
 }
 
