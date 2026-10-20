@@ -349,6 +349,12 @@ layout split drafts remain independent. Applicable clipboard-selection,
 filename-status, paragraph-stop, source-codepage and recent/old date-format
 preferences affect their actual controls. Optional remembered viewer positions
 use data offsets rather than decoded display offsets.
+`double_click_speed` sets the mouse interval in milliseconds. `confirm_view_dir`
+controls confirmation before F3 changes a tagged directory, and
+`use_file_to_guess_type` controls `file`-based extension matching.
+`copymove_persistent_attr` sets the attribute-preservation checkbox default;
+turning it off does not preserve source permissions or timestamps by default.
+Absent optional native keys retain the earlier mcpp behavior.
 
 Compatibility is partial: unsupported settings are diagnosed and preserved,
 not silently applied or removed. Two simultaneous auxiliary displays, missing
@@ -672,6 +678,30 @@ for a key; hiding a still-running command does not trigger that pause.
 `-U` / `--subshell` enables persistent shell integration. These overrides do not
 replace the saved `use_subshell` preference. Other shells retain one-shot
 behavior; persistent ash, ksh, zsh, tcsh and fish remain compatibility work.
+
+## UI translations
+
+Original user-provided GNU `.mo` catalogs can translate the main manager menu
+captions, common native input/message buttons, and Quit/Error titles and exit
+choices. Only explicit built-in label IDs are looked up: filenames, file
+contents, paths, custom menus and resource text are never translation inputs.
+Dialog bodies, most other labels, help and localized accelerators remain English
+or retain their existing shortcuts. **L26 is not complete.**
+
+The absolute catalog root is `MCPP_LOCALEDIR`, otherwise
+`$XDG_DATA_HOME/mcpp/locale` or `$HOME/.local/share/mcpp/locale`. Catalogs are
+`<root>/<locale>/LC_MESSAGES/mcpp.mo`; no current-directory search or installed
+MC resource import occurs. Locale preference is `LC_ALL`, then `LC_MESSAGES`,
+then `LANG`; for a non-C locale, `LANGUAGE` supplies the ordered fallback list.
+C/POSIX, including `C.UTF-8`, keeps English even with `LANGUAGE` set.
+
+Catalogs use GNU revision 0, either byte order, with UTF-8 or ASCII labels.
+Requested non-C message locales need not be installed; no locale or environment
+is changed. Missing catalogs/labels keep English. Invalid catalogs are rejected
+atomically, and invalid labels, plural/context entries and limits produce
+startup diagnostics rather than guessed translations. Plural forms are not
+evaluated. Input is bounded to 4 MiB per catalog and 512 bytes per label, with
+entry/reference/preference limits. No translation catalog is bundled.
 
 ## Skins
 

@@ -99,6 +99,7 @@ add_library(
     src/syntax_rules.cpp
     src/user_menu.cpp
     src/tree_cache.cpp
+    src/translation.cpp
     src/viewer.cpp
     src/viewer_data.cpp
     src/editor.cpp
@@ -241,6 +242,9 @@ if(MCPP_BUILD_TESTS)
     add_executable(mcpp_cli_color_tests tests/test_cli_color_roles.cpp)
     target_link_libraries(mcpp_cli_color_tests PRIVATE mcpp_ui)
     mcpp_target_defaults(mcpp_cli_color_tests)
+    add_executable(mcpp_translation_tests tests/test_translation.cpp)
+    target_link_libraries(mcpp_translation_tests PRIVATE mcpp_core)
+    mcpp_target_defaults(mcpp_translation_tests)
     add_executable(mcpp_native_config_tests tests/test_native_config.cpp)
     target_link_libraries(mcpp_native_config_tests PRIVATE mcpp_core)
     mcpp_target_defaults(mcpp_native_config_tests)
@@ -428,6 +432,11 @@ if(MCPP_BUILD_TESTS)
                         /review/cases/native-config/model/${native_config_case}
             )
         endforeach()
+        add_test(
+            NAME mcpp_native_config_remaining_four
+            COMMAND mcpp_native_config_tests remaining-four
+                    /review/cases/native-config/model/remaining-four
+        )
         add_test(NAME mcpp_operation_job_tests COMMAND mcpp_operation_job_tests)
         add_test(
             NAME mcpp_input_history_tests
@@ -449,6 +458,7 @@ if(MCPP_BUILD_TESTS)
             NAME mcpp_syntax_native_consumption
             COMMAND mcpp_syntax_rules_tests /review/cases/mc-syntax/native-consumption native-consumption
         )
+        add_test(NAME mcpp_translation_tests COMMAND mcpp_translation_tests)
         add_test(
             NAME mcpp_sparse_special_tests
             COMMAND mcpp_sparse_special_tests /review/cases/sparse-special-files

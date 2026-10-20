@@ -1,4 +1,5 @@
 #include "mcpp/config.hpp"
+#include "mcpp/extension.hpp"
 
 #include <cstdlib>
 #include <chrono>
@@ -172,6 +173,94 @@ void invalid_transaction(const fs::path& root) {
         "failed loading changes neither accepted preferences nor source files");
 }
 
+void remaining_four_native(const fs::path& root) {
+    const auto path = root / "ini";
+    write(path, "# keep four-key comment\n[Midnight-Commander]\n"
+        "double_click_speed=50\nconfirm_view_dir=false\nuse_file_to_guess_type=false\n"
+        "copymove_persistent_attr=false\n[Future]\nkeep=literal\\q\n");
+    auto config = mcpp::Config::load(path);
+    require(config.double_click_timeout() == std::chrono::milliseconds(50) &&
+        config.confirm_view_dir.has_value() && !*config.confirm_view_dir &&
+        !config.use_file_to_guess_type && config.copymove_persistent_attr.has_value() &&
+        !*config.copymove_persistent_attr, "four native values are applied, including explicit false");
+    auto rules = mcpp::ExtensionRules::parse(
+        "[mc.ext.ini]\nVersion=4.0\n[typed]\nType=.*\nView=typed-command\n"
+        "[named]\nRegex=[.]txt$\nView=named-command\n");
+    mcpp::Entry entry;
+    entry.kind = mcpp::EntryKind::file;
+    entry.name = "note.txt";
+    entry.path = "/note.txt";
+    std::size_t probes = 0;
+    const auto probe = [&](mcpp::ExtensionType) {
+        ++probes;
+        return std::string("ASCII text");
+    };
+    const auto named = rules.match(entry, mcpp::ExtensionAction::view, true, probe,
+                                   config.use_file_to_guess_type);
+    require(probes == 0U && named && named->command == "named-command",
+        "disabled guessing skips Type matching without disabling filename rules or probing");
+    const auto typed = rules.match(entry, mcpp::ExtensionAction::view, true, probe, true);
+    require(probes == 1U && typed && typed->command == "typed-command",
+        "enabled guessing still probes and applies the Type rule");
+    config.save();
+    const auto restored = mcpp::Config::load(path);
+    require(restored.double_click_timeout() == std::chrono::milliseconds(50) &&
+        restored.confirm_view_dir == false && !restored.use_file_to_guess_type &&
+        restored.copymove_persistent_attr == false, "four native values survive saving");
+    require(read(path).find("# keep four-key comment") != std::string::npos &&
+        read(path).find("keep=literal\\q") != std::string::npos,
+        "four-key saves preserve unknown content");
+    std::cout << "remaining-four native: passed\n";
+}
+
+void remaining_four_legacy(const fs::path& root) {
+    const auto path = root / "config";
+    write(path, "theme=forest\ncommand_history=retained\nfuture_flat=literal\\q\n");
+    auto config = mcpp::Config::load(path);
+    require(!config.double_click_speed && !config.confirm_view_dir &&
+        config.use_file_to_guess_type && !config.copymove_persistent_attr &&
+        config.double_click_timeout() == std::chrono::milliseconds(400),
+        "absent fields retain legacy timing, F3, probe and attribute defaults");
+    config.save();
+    const auto raw = read(path);
+    require(raw.find("double_click_speed=") == std::string::npos &&
+        raw.find("confirm_view_dir=") == std::string::npos &&
+        raw.find("copymove_persistent_attr=") == std::string::npos &&
+        raw.find("future_flat=literal\\q") != std::string::npos,
+        "legacy saves retain absence-dependent behavior and unknown data");
+    const auto restored = mcpp::Config::load(path);
+    require(restored.command_history == config.command_history &&
+        restored.use_file_to_guess_type && !restored.confirm_view_dir &&
+        restored.double_click_timeout() == std::chrono::milliseconds(400),
+        "legacy preferences survive the four-key extension");
+    std::cout << "remaining-four legacy: passed\n";
+}
+
+void remaining_four_invalid(const fs::path& root) {
+    write(root / "good", "theme=forest\ndouble_click_speed=200\nconfirm_view_dir=true\n"
+        "use_file_to_guess_type=true\ncopymove_persistent_attr=true\n");
+    auto retained = mcpp::Config::load(root / "good");
+    for (const auto& [key, value] : {
+             std::pair{"double_click_speed", "-1"}, std::pair{"confirm_view_dir", "maybe"},
+             std::pair{"use_file_to_guess_type", "maybe"}, std::pair{"copymove_persistent_attr", "maybe"}}) {
+        const auto invalid = std::string("[Midnight-Commander]\n") + key + '=' + value + '\n';
+        write(root / "ini", invalid);
+        std::string diagnostic;
+        try {
+            retained = mcpp::Config::load(root / "ini");
+        } catch (const std::exception& error) {
+            diagnostic = error.what();
+        }
+        require(diagnostic.find(std::string("ini:2: [Midnight-Commander] ") + key) != std::string::npos,
+            "invalid four-key values identify their source and setting");
+        require(retained.theme == "forest" && retained.double_click_timeout() == std::chrono::milliseconds(200) &&
+            retained.confirm_view_dir == true && retained.use_file_to_guess_type &&
+            retained.copymove_persistent_attr == true && read(root / "ini") == invalid,
+            "invalid values retain accepted preferences and original bytes");
+    }
+    std::cout << "remaining-four invalid: passed\n";
+}
+
 }  // namespace
 
 int main(const int argc, char** argv) {
@@ -182,6 +271,11 @@ int main(const int argc, char** argv) {
         if (selected == "native") native_roundtrip(root);
         else if (selected == "legacy") legacy_coexistence(root);
         else if (selected == "invalid") invalid_transaction(root);
+        else if (selected == "remaining-four") {
+            remaining_four_native(root / "native");
+            remaining_four_legacy(root / "legacy");
+            remaining_four_invalid(root / "invalid");
+        }
         else throw std::runtime_error("unknown native configuration case");
         std::cout << selected << ": passed\n";
         return 0;

@@ -4,6 +4,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <chrono>
 #include <array>
 #include <filesystem>
 #include <memory>
@@ -31,6 +32,7 @@ struct Config {
     bool confirm_overwrite{true};
     bool confirm_execute{false};
     bool confirm_exit{false};
+    std::optional<bool> confirm_view_dir;
     bool confirm_hotlist_delete{false};
     bool confirm_history_cleanup{true};
     bool directories_first{true};
@@ -90,9 +92,11 @@ struct Config {
     bool classic_progressbar{true};
     bool mkdir_autoname{true};
     bool preallocate_space{false};
+    std::optional<bool> copymove_persistent_attr;
     bool single_escape{true};
     int escape_timeout{1000000};
     std::size_t pause_after_run{1};
+    std::optional<std::size_t> double_click_speed;
     bool use_subshell{true};
     std::optional<bool> subshell_override;
     std::string keymap_file;
@@ -101,6 +105,7 @@ struct Config {
     std::size_t vfs_timeout{60};
     bool use_internal_edit{true};
     bool use_internal_view{true};
+    bool use_file_to_guess_type{true};
     bool viewer_wrap{true};
     std::optional<bool> viewer_mouse_page_scrolling;
     bool viewer_remember_file_position{false};
@@ -180,6 +185,7 @@ struct Config {
     void save() const;
     [[nodiscard]] bool split_is_equal() const;
     void set_split_equal(bool value);
+    [[nodiscard]] std::chrono::milliseconds double_click_timeout() const;
     [[nodiscard]] std::string format_panel_time(
         std::chrono::system_clock::time_point point,
         std::chrono::system_clock::time_point reference = std::chrono::system_clock::now()) const;

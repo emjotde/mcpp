@@ -25,6 +25,7 @@
 #include "mcpp/syntax.hpp"
 #include "mcpp/terminal_input.hpp"
 #include "mcpp/tree_cache.hpp"
+#include "mcpp/translation.hpp"
 #include "mcpp/diff.hpp"
 #include "mcpp/user_menu.hpp"
 #include "local_tools_stream.hpp"
@@ -1665,6 +1666,7 @@ struct DiffSessionState {
 struct App::Impl : ViewerSessionState, DiffSessionState {
     Config config;
     AppOptions launch_options;
+    UiTranslations ui_translations;
     struct PaletteSet {
         Skin panels;
         Skin editor;
@@ -2212,6 +2214,7 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
           right(right_location.provider, right_location.path, nullptr,
                 has_container_parent(*right_location.provider)) {
         for (const auto& diagnostic : config.diagnostics) std::cerr << "mcpp: configuration: " << diagnostic << '\n';
+        initialize_translations();
         prepare_cli_terminal(launch_options.color, launch_options.stickchars);
         initialize_palette();
         active_index = config.current_is_left.value_or(true) ? 0 : 1;
@@ -2297,6 +2300,28 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
 
     Pane& passive() {
         return active_index == 0 ? right : left;
+    }
+
+    void initialize_translations() {
+        std::filesystem::path root;
+        if (const auto* configured_root = std::getenv("MCPP_LOCALEDIR"); configured_root && *configured_root) {
+            root = configured_root;
+        } else if (const auto* data = std::getenv("XDG_DATA_HOME"); data && *data) {
+            root = std::filesystem::path(data) / "mcpp/locale";
+        } else if (const auto* home = std::getenv("HOME"); home && *home) {
+            root = std::filesystem::path(home) / ".local/share/mcpp/locale";
+        }
+        if (root.empty()) return;
+        if (!root.is_absolute()) {
+            std::cerr << "mcpp: translations: catalog root must be absolute; using English: " << root << '\n';
+            return;
+        }
+        ui_translations = UiTranslations::load(root);
+        for (const auto& diagnostic : ui_translations.diagnostics()) {
+            std::cerr << "mcpp: translations: " << diagnostic.message;
+            if (!diagnostic.catalog.empty()) std::cerr << " [" << diagnostic.catalog << ']';
+            std::cerr << " (count " << diagnostic.count << ")\n";
+        }
     }
 
     Location resolve_location(const std::string_view value) {
@@ -2725,7 +2750,7 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
                     const bool activate =
                         last_click_pane == context &&
                         last_click_index == index &&
-                        now - last_click < std::chrono::milliseconds(400);
+                        now - last_click < config.double_click_timeout();
                     last_click_pane = context;
                     last_click_index = index;
                     last_click = now;
@@ -3868,7 +3893,8 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
             if (found != active().entries().end()) entry.name = found->name;
         }
         const auto selected = extension_rules.match(entry, action, provider == local,
-            [path](const ExtensionType type) { return probe_extension_type(path, type); });
+            [path](const ExtensionType type) { return probe_extension_type(path, type); },
+            config.use_file_to_guess_type);
         if (!selected) return false;
         mode = return_mode;
         if (selected->command.empty()) {
@@ -3907,6 +3933,31 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
         if (raw || !dispatch_extension_action(provider, path, ExtensionAction::view, return_mode)) {
             view_file(provider, path, return_mode);
         }
+    }
+
+    void request_directory_view() {
+        const auto pane_index = active_index;
+        const auto provider = active().provider();
+        const auto directory = active().path();
+        const auto* entry = active().current();
+        if (entry == nullptr) return;
+        const auto path = entry->path;
+        auto enter = [this, pane_index, provider, directory, path] {
+            const auto* current = active().current();
+            if (active_index != pane_index || active().provider() != provider ||
+                active().path() != directory || current == nullptr || current->path != path) {
+                status = "Panel changed; directory view cancelled";
+                return;
+            }
+            mode = Mode::panels;
+            static_cast<void>(enter_panel_entry());
+        };
+        if (config.confirm_view_dir.value_or(false) && active().marked_count() != 0U) {
+            show_native_query("Confirmation", "Files are tagged. Change directory?", {"Yes", "No"},
+                [enter = std::move(enter)](const std::size_t selected) {
+                    if (selected == 0U) enter();
+                });
+        } else enter();
     }
 
     void edit_file_with_extensions(
@@ -5394,7 +5445,7 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
         bind_input_history(destination_input, move_operation ? "file.move-destination" : "file.copy-destination");
         destination_input.reset(dialog_destination, true);
         mask_input.reset(dialog_source_mask, true);
-        dialog_preserve_attributes = true;
+        dialog_preserve_attributes = config.copymove_persistent_attr.value_or(true);
         dialog_preserve_symlinks = true;
         dialog_stable_symlinks = false;
         dialog_dive_into_subdirectories = false;
@@ -7914,8 +7965,10 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
         return native_window(native_input_title, vbox({
             vbox(std::move(rows)),
             separator(),
-            hbox({native_button("OK", true, native_input_focus == 1U, native_input_boxes[1]),
-                  text(" "), native_button("Cancel", false, native_input_focus == 2U, native_input_boxes[2])}) | center,
+            hbox({native_button(ui_translations.text(UiLabel::ok), true,
+                                native_input_focus == 1U, native_input_boxes[1]),
+                  text(" "), native_button(ui_translations.text(UiLabel::cancel), false,
+                                            native_input_focus == 2U, native_input_boxes[2])}) | center,
         }), std::min(width, std::max(1, Terminal::Size().dimx - 2)));
     }
 
@@ -8028,7 +8081,7 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
         return native_window(native_message_title, vbox({
             paragraph(display_text(native_message_text)),
             separator(),
-            native_button("OK", true, true, native_message_button) | center,
+            native_button(ui_translations.text(UiLabel::ok), true, true, native_message_button) | center,
         }), std::min(68, std::max(1, Terminal::Size().dimx - 2)));
     }
 
@@ -9076,7 +9129,8 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
 
     void request_app_exit(const bool quiet = false) {
         if (config.confirm_exit && !quiet) {
-            show_native_query("Quit", "Do you really want to quit?", {"Yes", "No"},
+            show_native_query(ui_translations.text(UiLabel::quit), "Do you really want to quit?",
+                {ui_translations.text(UiLabel::yes), ui_translations.text(UiLabel::no)},
                 [this](const std::size_t selected) { if (selected == 0U) exit_terminal(); });
         } else exit_terminal();
     }
@@ -9086,7 +9140,7 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
         if (!config.hintbar_visible && terminal != nullptr &&
             (mode == Mode::panels || mode == Mode::pulldown)) {
             const auto message = std::string(error.what());
-            post_ui([this, message] { show_native_message("Error", message); });
+            post_ui([this, message] { show_native_message(ui_translations.text(UiLabel::error), message); });
         }
     }
 
@@ -9997,7 +10051,7 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
         dialog_exact = exact && sources.size() == 1U;
         dialog_destination = pane_location(passive());
         if (!dialog_destination.ends_with('/')) dialog_destination += '/';
-        dialog_preserve_attributes = true;
+        dialog_preserve_attributes = config.copymove_persistent_attr.value_or(true);
         dialog_preserve_symlinks = true;
         dialog_shell_patterns = config.shell_patterns;
         dialog_stable_symlinks = false;
@@ -12933,7 +12987,11 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
             const auto* entry = active().current();
             switch (action) {
                 case 0:
-                    if (entry != nullptr &&
+                    if (entry != nullptr && config.confirm_view_dir.has_value() &&
+                        (entry->kind == EntryKind::directory || entry->target_is_directory)) {
+                        request_directory_view();
+                        return;
+                    } else if (entry != nullptr &&
                         can_open_file(*entry)) {
                         view_file_with_extensions(active().provider(), entry->path, Mode::panels);
                         return;
@@ -14639,13 +14697,18 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
                             : "Hint: Tab changes your current panel."
                       : status + progress_text;
         Elements menu_elements;
+        constexpr std::array menu_labels{
+            UiLabel::left, UiLabel::file, UiLabel::command, UiLabel::options, UiLabel::right
+        };
         for (std::size_t index = 0; index < top_menu_names.size(); ++index) {
             const bool selected = mode == Mode::pulldown && index == pulldown_category;
-            auto item = mnemonic_label(
-                top_menu_names[index],
-                top_menu_mnemonics[index],
-                selected ? std::nullopt : std::optional<ftxui::Color>{palette().menu_hot}
-            );
+            const auto& caption = ui_translations.text(menu_labels[index]);
+            auto item = caption == english_ui_label(menu_labels[index])
+                ? mnemonic_label(
+                    top_menu_names[index], top_menu_mnemonics[index],
+                    selected ? std::nullopt : std::optional<ftxui::Color>{palette().menu_hot})
+                : glyph_text(std::string(index == 0U ? "  " : "") + caption +
+                             (index == 4U ? " " : "     "));
             if (selected) {
                 item = paint(std::move(item), palette().menu_selected) | bold;
             }
@@ -19468,7 +19531,7 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
                                 10 + *tree_panel &&
                             last_click_path == path &&
                             now - last_click <
-                                std::chrono::milliseconds(400);
+                                config.double_click_timeout();
                         last_click = now;
                         last_click_pane = 10 + *tree_panel;
                         last_click_path = path;
@@ -19562,7 +19625,7 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
                             if (last_click_pane == active_index &&
                                 last_click_index == index &&
                                 now - last_click <
-                                    std::chrono::milliseconds(400)) {
+                                    config.double_click_timeout()) {
                                 activate_file_association();
                             }
                             last_click = now;
@@ -20023,7 +20086,10 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
                        event == ftxui::Event::Special("\x1B[1;2R") ||
                        event == ftxui::Event::Special("\x1B[25~")) {
                 const auto* entry = active().current();
-                if (entry != nullptr && can_open_file(*entry)) {
+                if (entry != nullptr && config.confirm_view_dir.has_value() && event == ftxui::Event::F3 &&
+                    (entry->kind == EntryKind::directory || entry->target_is_directory)) {
+                    request_directory_view();
+                } else if (entry != nullptr && can_open_file(*entry)) {
                     view_file_with_extensions(active().provider(), entry->path, Mode::panels,
                                               event != ftxui::Event::F3);
                 }

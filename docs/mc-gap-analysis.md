@@ -324,9 +324,12 @@ focus and CLI precedence, layout apply/Cancel, escaped dates, CP1251 data,
 clipboard/status/paragraph preferences and a 45-byte viewer data position.
 **L18 remains partial** for other unimplemented options;
 unsupported settings are diagnosed and preserved instead of silently accepted.
-Examples still diagnosed include double-click speed/history count, directory-view
-confirmation, file-type guessing, editor size thresholds, persistent copy
-attributes, selection flags and `[Colors]`.
+Four further keys now affect the real controls: double-click milliseconds,
+tagged-directory F3 confirmation, `file`-based type guessing and the copy/move
+attribute-preservation default. Native controls established their meanings;
+absent keys retain legacy behavior and invalid values preserve prior settings.
+History limits, editor size thresholds, selection flags and `[Colors]` remain
+pending.
 
 Local user/editor menus now load native conditions, command blocks, prompts,
 pane/editor macros and view/cd directives, while retaining legacy menu rows.
@@ -471,6 +474,21 @@ load with glyph-aware parsing. History/hidden-file/scrollbar and other unrendere
 glyph roles remain explicitly warned; L23 is not claimed complete. The visual
 results apply to the captured 110x32 truecolor environment, not every terminal
 mode or unknown user-provided skin.
+
+### Initial UI translations
+
+A bounded original GNU `.mo` reader now loads user catalogs once, without
+installed locale data, new dependencies, environment changes or imported MC
+resources. Explicit enum labels cover main manager captions, native
+input/message buttons, exit choices and Quit/Error titles; no arbitrary string,
+filename or file content can be looked up. All rejected catalog/label and
+unsupported plural/context entries produce startup diagnostics; missing labels
+retain later-language or English fallback.
+
+Only revision-0 UTF-8/ASCII catalogs are supported, with explicit size, entry,
+label and locale-preference limits. Most UI text, message bodies, help, plural
+and contextual messages and localized accelerators remain outside this initial
+delivery. **L26 remains partial.**
 
 ### Additional compatibility gaps
 

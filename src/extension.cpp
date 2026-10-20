@@ -350,7 +350,8 @@ ExtensionRules ExtensionRules::load(const std::filesystem::path& path) {
 
 std::optional<ExtensionCommand> ExtensionRules::match(
     const Entry& entry, const ExtensionAction action, const bool local,
-    const std::function<std::string(ExtensionType)>& probe
+    const std::function<std::string(ExtensionType)>& probe,
+    const bool use_file_to_guess_type
 ) const {
     if (!data_) return std::nullopt;
     std::array<std::optional<std::string>, 2> types;
@@ -358,6 +359,7 @@ std::optional<ExtensionCommand> ExtensionRules::match(
     const bool directory = entry.kind == EntryKind::directory ||
                            (entry.kind == EntryKind::symlink && entry.target_is_directory);
     const auto type_matches = [&](const Expression& expression, const ExtensionType kind) {
+        if (!use_file_to_guess_type) return false;
         if (!local) throw std::runtime_error("copy archive members to a local directory before extension Type/Mime matching");
         if (!probe) throw std::runtime_error("extension Type/Mime matching requires the optional 'file' tool");
         const auto index = static_cast<std::size_t>(kind);

@@ -230,7 +230,7 @@ auto panel_bool_settings(Configuration& config) {
 template <typename Configuration>
 auto general_bool_settings(Configuration& config) {
     using Pointer = decltype(&config.verbose_operation);
-    return std::array<std::pair<std::string_view, Pointer>, 19>{{
+    return std::array<std::pair<std::string_view, Pointer>, 20>{{
         {"verbose_operation", &config.verbose_operation}, {"compute_totals", &config.compute_totals},
         {"classic_progressbar", &config.classic_progressbar}, {"mkdir_autoname", &config.mkdir_autoname},
         {"preallocate_space", &config.preallocate_space}, {"single_escape", &config.single_escape},
@@ -240,7 +240,8 @@ auto general_bool_settings(Configuration& config) {
         {"completion_show_all", &config.completion_show_all}, {"rotating_dash", &config.rotating_dash},
         {"cd_follows_links", &config.cd_follows_links}, {"safe_delete", &config.safe_delete},
         {"safe_overwrite", &config.safe_overwrite}, {"auto_save_setup", &config.auto_save_setup},
-        {"use_subshell", &config.use_subshell}
+        {"use_subshell", &config.use_subshell},
+        {"use_file_to_guess_type", &config.use_file_to_guess_type}
     }};
 }
 
@@ -366,6 +367,18 @@ Config Config::load(const std::filesystem::path& path) {
             result.confirm_execute = parse_bool(value, key);
         } else if (key == "confirm_exit") {
             result.confirm_exit = parse_bool(value, key);
+        } else if (key == "confirm_view_dir") {
+            result.confirm_view_dir = parse_bool(value, key);
+        } else if (key == "copymove_persistent_attr") {
+            result.copymove_persistent_attr = parse_bool(value, key);
+        } else if (key == "double_click_speed") {
+            std::size_t milliseconds = 0;
+            const auto parsed = std::from_chars(value.data(), value.data() + value.size(), milliseconds);
+            if (parsed.ec != std::errc{} || parsed.ptr != value.data() + value.size() ||
+                milliseconds > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+                throw std::runtime_error("double_click_speed must be nonnegative milliseconds");
+            }
+            result.double_click_speed = milliseconds;
         } else if (key == "confirm_hotlist_delete") {
             result.confirm_hotlist_delete = parse_bool(value, key);
         } else if (key == "confirm_history_cleanup") {
@@ -730,6 +743,11 @@ void Config::save(const std::filesystem::path& path) const {
     }
     output << "escape_timeout=" << escape_timeout << '\n'
            << "pause_after_run=" << pause_after_run << '\n';
+    if (confirm_view_dir) output << "confirm_view_dir=" << (*confirm_view_dir ? "true" : "false") << '\n';
+    if (copymove_persistent_attr) {
+        output << "copymove_persistent_attr=" << (*copymove_persistent_attr ? "true" : "false") << '\n';
+    }
+    if (double_click_speed) output << "double_click_speed=" << *double_click_speed << '\n';
     output << "quick_search_mode=" << quick_search_mode << '\n'
            << "saved_left_path=" << encode_value(saved_left_path) << '\n'
            << "saved_right_path=" << encode_value(saved_right_path) << '\n';
@@ -938,6 +956,11 @@ bool Config::split_is_equal() const {
 void Config::set_split_equal(const bool value) {
     equal_split = value;
     (layout_horizontal ? layout_horizontal_equal : layout_vertical_equal) = value;
+}
+
+std::chrono::milliseconds Config::double_click_timeout() const {
+    return std::chrono::milliseconds(
+        static_cast<std::chrono::milliseconds::rep>(double_click_speed.value_or(400U)));
 }
 
 std::string Config::format_panel_time(

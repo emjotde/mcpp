@@ -32,7 +32,8 @@ public:
     [[nodiscard]] static ExtensionRules load(const std::filesystem::path& path);
     [[nodiscard]] std::optional<ExtensionCommand> match(
         const Entry& entry, ExtensionAction action, bool local,
-        const std::function<std::string(ExtensionType)>& probe = {}
+        const std::function<std::string(ExtensionType)>& probe = {},
+        bool use_file_to_guess_type = true
     ) const;
 
 private:
