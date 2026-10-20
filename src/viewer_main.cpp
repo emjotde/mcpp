@@ -26,6 +26,7 @@ int main(const int argc, char** argv) {
                           << "  -S, --skin <name>  Select a skin for this run\n"
                           << "  -K, --keymap <file>  Load MC-format key bindings\n"
                           << "      --nokeymap      Use built-in key bindings only\n"
+                          << "  Use /dev/stdin as the file to view redirected input\n"
                           << "  --             Treat remaining arguments as file names\n";
                 return 0;
             }

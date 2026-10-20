@@ -203,12 +203,16 @@ kills to the end, `Ctrl-W` kills the previous word, and `Ctrl-Y` yanks it back.
 `Alt-P`/`Alt-N` recall session history. In dialogs, `Ctrl-U` clears the field;
 the commander's `Ctrl-U` pane-swap shortcut is unchanged.
 
-Use `Alt-Tab` (or Escape followed by Tab) to complete a dialog path.
-The first press completes the common prefix; a second opens the matching paths.
+Use `Alt-Tab` (or Escape followed by Tab) to complete input.
+The first press completes the common prefix; a second opens the matching list.
 Configuration / Complete: show all opens that list on the first press.
-This completes filesystem paths,
-not shell variables or command names. Editor file dialogs resolve and complete
-relative paths against the edited file's directory.
+Completion supports paths, `$` variables, `~` usernames and `@` hostnames;
+commander command positions also complete builtins, reserved words and executable
+PATH entries. Variables come from the process environment and users/hosts from
+local system data; completion never runs shell hooks, substitutions or commands,
+and performs no network lookup. Quotes, selections, cursor suffixes and UTF-8
+boundaries are retained. Editor paths use the file's directory, while archive
+members retain their provider through completion and F4 acceptance.
 
 Find results can be panelized with the Panelize button or `Alt-P`.
 Left / Right / Panelize restores the last panelized listing; it does not start a
@@ -357,6 +361,20 @@ colors; explicit word checks remain available outside those contexts. If a
 replacement changes delimiters and makes new text eligible, run another
 whole-document check to include it. No MC syntax database is bundled.
 
+## Extension actions
+
+The config directory can contain native `mc.ext.ini` (Version 4.0), legacy
+`mc.ext`, or the existing `extensions` rules, in that precedence. Native
+filename/type/MIME matching selects Open/View/Edit actions and uses the shared
+menu macro/directive engine. Legacy `pattern=command` keeps its full-path
+expansion. Internal View honors a matching View action; external View follows
+VIEWER/PAGER. Native Edit actions run with either editor preference.
+
+Invalid resources and missing helpers report explicit errors, without executing
+a legacy fallback. External archive commands require a local copy; internal
+`%view` reads the archive provider. Compatibility remains bounded by POSIX
+registry regex, documented macro restrictions and a 16 MiB buffered-filter limit.
+
 ## Local archives and copying
 
 Enter opens recognized tar/cpio files; directories and `..` navigate inside,
@@ -394,6 +412,12 @@ read as streams; device creation still needs normal Linux permissions. Unix
 sockets are rejected. Cancellation, source identity, overwrite choices and
 hardlink groups retain their guards. A failed final directory sync is reported
 even if the destination has already been published.
+
+Regular local-file collisions offer native Append and Reget choices when
+applicable. Append publishes the destination followed by the source; Reget
+requires a smaller destination matching the source prefix and copies only the
+remaining suffix. Both stage publication and retain revision/cancellation
+checks. Archive, remote, symlink and special-file append is not advertised.
 
 ## Shell
 
@@ -485,6 +509,14 @@ Fastest, Minimal, and the five native case/tab/space/carriage-return options.
 `<` / `>` adjust the split, and `=` restores equal widths.
 
 ## Viewer controls
+
+Local source growth, truncation and replacement are observed without reopening.
+For redirected input, pass `/dev/stdin` (or an fd alias) to `mcppview` or
+`mcpp --view`; `-` remains a literal filename. Streams spool to private seekable
+storage, remain raw/read-only, and can be left before EOF. Keyboard input comes
+from the terminal rather than the data stream. Source changes while hex edits
+are staged report a conflict instead of resampling a newer save revision;
+changed formatted snapshots require an explicit Raw/Unformat refresh.
 
 `F4` switches text/hex display. `F2` toggles text wrapping or hex editing.
 `F5` Go to supports one-based logical line numbers, percentages, decimal byte

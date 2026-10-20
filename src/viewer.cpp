@@ -5,13 +5,28 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <cerrno>
 #include <cctype>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <fcntl.h>
 #include <iomanip>
+#include <limits>
+#include <linux/magic.h>
+#include <mutex>
+#include <poll.h>
 #include <sstream>
 #include <stdexcept>
 #include <streambuf>
+#include <sys/random.h>
+#include <sys/stat.h>
+#include <sys/sysmacros.h>
+#include <sys/vfs.h>
+#include <system_error>
+#include <thread>
+#include <unistd.h>
 
 #include <ftxui/screen/string.hpp>
 
@@ -19,6 +34,65 @@ namespace mcpp {
 namespace {
 
 constexpr std::size_t window_size = 256U * 1024U;
+
+class Descriptor {
+public:
+    explicit Descriptor(const int value = -1) : value_(value) {}
+    ~Descriptor() { if (value_ >= 0) ::close(value_); }
+    Descriptor(const Descriptor&) = delete;
+    Descriptor& operator=(const Descriptor&) = delete;
+    Descriptor(Descriptor&& other) noexcept : value_(other.release()) {}
+    [[nodiscard]] int get() const noexcept { return value_; }
+    int release() noexcept { return std::exchange(value_, -1); }
+private:
+    int value_;
+};
+
+int private_spool() {
+    const auto* cache = std::getenv("XDG_CACHE_HOME");
+    const auto* home = std::getenv("HOME");
+    std::filesystem::path directory;
+    if (cache != nullptr && std::filesystem::path(cache).is_absolute()) directory = cache;
+    else if (home != nullptr && *home != '\0') directory = std::filesystem::path(home) / ".cache";
+    else throw std::runtime_error("stream viewing needs HOME or an absolute XDG_CACHE_HOME for private storage");
+    directory /= "mcpp";
+    std::filesystem::create_directories(directory);
+    Descriptor parent(::open(directory.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+    if (parent.get() < 0) throw std::system_error(errno, std::generic_category(), "open viewer storage directory");
+    const auto anonymous = ::openat(parent.get(), ".", O_TMPFILE | O_RDWR | O_CLOEXEC, 0600);
+    if (anonymous >= 0) return anonymous;
+    const auto failure = errno;
+    if (failure != EOPNOTSUPP && failure != EINVAL && failure != EISDIR && failure != ENOSYS) {
+        throw std::system_error(failure, std::generic_category(), "create private viewer storage");
+    }
+    std::array<unsigned char, 16> random{};
+    std::size_t obtained = 0;
+    while (obtained < random.size()) {
+        const auto count = ::getrandom(random.data() + obtained, random.size() - obtained, 0);
+        if (count < 0 && errno == EINTR) continue;
+        if (count <= 0) throw std::system_error(errno, std::generic_category(), "name private viewer storage");
+        obtained += static_cast<std::size_t>(count);
+    }
+    std::string name = ".viewer-";
+    constexpr char digits[] = "0123456789abcdef";
+    for (const auto byte : random) { name += digits[byte >> 4U]; name += digits[byte & 15U]; }
+    Descriptor result(::openat(parent.get(), name.c_str(),
+        O_CREAT | O_EXCL | O_NOFOLLOW | O_RDWR | O_CLOEXEC, 0600));
+    if (result.get() < 0) throw std::system_error(errno, std::generic_category(), "create private viewer storage");
+    if (::unlinkat(parent.get(), name.c_str(), 0) != 0) {
+        throw std::system_error(errno, std::generic_category(), "unlink private viewer storage");
+    }
+    return result.release();
+}
+
+bool unreported_size(const int descriptor, const struct stat& status) {
+    struct statfs filesystem{};
+    if (::fstatfs(descriptor, &filesystem) == 0 &&
+        (filesystem.f_type == PROC_SUPER_MAGIC || filesystem.f_type == SYSFS_MAGIC ||
+         filesystem.f_type == DEBUGFS_MAGIC || filesystem.f_type == TRACEFS_MAGIC)) return true;
+    if (status.st_size != 0) return false;
+    return ::lseek(descriptor, 0, SEEK_END) < 0;
+}
 
 class EditedInput final : public std::streambuf {
 public:
@@ -162,6 +236,72 @@ NroffText format_nroff(const std::string_view input) {
 
 }  // namespace
 
+struct ViewerModel::StreamSource {
+    Descriptor input;
+    Descriptor storage;
+    std::atomic<std::uint64_t> available{0};
+    std::atomic<bool> finished{false};
+    bool reported_finished{false};
+    std::mutex error_mutex;
+    std::string error;
+    std::jthread worker;
+
+    StreamSource(Descriptor descriptor, Cancellation cancellation)
+        : input(std::move(descriptor)), storage(private_spool()),
+          worker([this, cancellation = std::move(cancellation)](const std::stop_token stop) {
+              try {
+                  std::array<char, 64U * 1024U> buffer{};
+                  while (!stop.stop_requested() && !cancellation.requested()) {
+                      pollfd item{input.get(), POLLIN, 0};
+                      const auto ready = ::poll(&item, 1, 100);
+                      if (ready < 0 && errno == EINTR) continue;
+                      if (ready < 0) throw std::system_error(errno, std::generic_category(), "poll viewer input");
+                      if (ready == 0) continue;
+                      if (stop.stop_requested() || cancellation.requested()) break;
+                      if ((item.revents & POLLNVAL) != 0) throw std::runtime_error("viewer input descriptor is no longer valid");
+                      const auto count = ::read(input.get(), buffer.data(), buffer.size());
+                      if (count < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) continue;
+                      if (count < 0) throw std::system_error(errno, std::generic_category(), "read viewer input");
+                      if (count == 0) break;
+                      std::size_t position = 0;
+                      while (position < static_cast<std::size_t>(count)) {
+                          if (stop.stop_requested() || cancellation.requested()) break;
+                          const auto offset = available.load(std::memory_order_relaxed);
+                          if (offset > static_cast<std::uint64_t>(std::numeric_limits<off_t>::max()) -
+                                           (static_cast<std::size_t>(count) - position)) {
+                              throw std::runtime_error("viewer input exceeds the seekable storage limit");
+                          }
+                          const auto written = ::pwrite(storage.get(), buffer.data() + position,
+                              static_cast<std::size_t>(count) - position, static_cast<off_t>(offset));
+                          if (written < 0 && errno == EINTR) continue;
+                          if (written <= 0) throw std::system_error(errno, std::generic_category(), "write viewer storage");
+                          position += static_cast<std::size_t>(written);
+                          available.store(offset + static_cast<std::uint64_t>(written), std::memory_order_release);
+                      }
+                  }
+                  if (cancellation.requested() && !stop.stop_requested()) throw OperationCancelled{};
+              } catch (const std::exception& failure) {
+                  std::lock_guard lock(error_mutex);
+                  error = failure.what();
+              }
+              finished.store(true, std::memory_order_release);
+          }) {}
+
+    ~StreamSource() {
+        worker.request_stop();
+        if (worker.joinable()) worker.join();
+    }
+
+    [[nodiscard]] std::string failure() {
+        std::lock_guard lock(error_mutex);
+        return error;
+    }
+
+    [[nodiscard]] std::string storage_path() const {
+        return "/proc/" + std::to_string(::getpid()) + "/fd/" + std::to_string(storage.get());
+    }
+};
+
 void ViewerModel::open(
     ProviderPtr provider,
     std::string path,
@@ -171,7 +311,18 @@ void ViewerModel::open(
         throw std::invalid_argument("viewer provider is null");
     }
     const auto entry = provider->stat_follow(path, cancellation);
-    if (entry.kind != EntryKind::file) {
+    const auto* local = dynamic_cast<LocalProvider*>(provider.get());
+    if (local != nullptr) {
+        Descriptor input(::open(local->native_path(entry.path).c_str(), O_RDONLY | O_NONBLOCK | O_CLOEXEC));
+        if (input.get() < 0) throw std::system_error(errno, std::generic_category(), "open viewer source");
+        struct stat status{};
+        if (::fstat(input.get(), &status) != 0) throw std::system_error(errno, std::generic_category(), "inspect viewer source");
+        if (S_ISFIFO(status.st_mode) || (S_ISREG(status.st_mode) && unreported_size(input.get(), status))) {
+            open_stream(std::move(provider), input.get(), std::move(path), cancellation);
+            return;
+        }
+        if (!S_ISREG(status.st_mode)) throw std::runtime_error("viewer requires a regular file or a readable pipe");
+    } else if (entry.kind != EntryKind::file) {
         throw std::runtime_error("viewer requires a regular file");
     }
     ViewerModel next;
@@ -186,7 +337,101 @@ void ViewerModel::open(
     *this = std::move(next);
 }
 
+void ViewerModel::open_stream(
+    ProviderPtr provider, const int descriptor, std::string name,
+    const Cancellation& cancellation
+) {
+    cancellation.throw_if_requested();
+    if (!provider || dynamic_cast<LocalProvider*>(provider.get()) == nullptr) {
+        throw std::invalid_argument("stream viewing requires a local provider");
+    }
+    if (::isatty(descriptor) != 0) throw std::runtime_error("viewer data input must not be the terminal keyboard");
+    struct stat status{};
+    if (::fstat(descriptor, &status) != 0) throw std::system_error(errno, std::generic_category(), "inspect viewer input");
+    if (!S_ISREG(status.st_mode) && !S_ISFIFO(status.st_mode) &&
+        !(S_ISCHR(status.st_mode) && status.st_rdev == makedev(1, 3))) {
+        throw std::runtime_error("viewer input must be a regular file, pipe, or /dev/null");
+    }
+    Descriptor input(::fcntl(descriptor, F_DUPFD_CLOEXEC, 3));
+    if (input.get() < 0) throw std::system_error(errno, std::generic_category(), "duplicate viewer input");
+    ViewerModel next;
+    next.provider_ = std::move(provider);
+    next.path_ = std::move(name);
+    next.stream_ = std::make_shared<StreamSource>(std::move(input), cancellation);
+    next.hex_ = hex_;
+    next.wrap_ = wrap_;
+    next.magic_ = magic_;
+    *this = std::move(next);
+}
+
+bool ViewerModel::reading() const noexcept {
+    return stream_ != nullptr && !stream_->finished.load(std::memory_order_acquire);
+}
+
+bool ViewerModel::refresh(const Cancellation& cancellation) {
+    cancellation.throw_if_requested();
+    if (!open()) return false;
+    std::uint64_t next_size = source_size_;
+    std::string next_revision = revision_;
+    std::string next_path = storage_path_;
+    std::string error;
+    bool completed = false;
+    if (stream_) {
+        next_size = stream_->available.load(std::memory_order_acquire);
+        error = stream_->failure();
+        const auto finished = stream_->finished.load(std::memory_order_acquire);
+        completed = finished != stream_->reported_finished;
+        stream_->reported_finished = finished;
+    } else if (dynamic_cast<LocalProvider*>(provider_.get()) != nullptr) {
+        try {
+            const auto entry = provider_->stat_follow(path_, cancellation);
+            if (entry.kind != EntryKind::file) throw std::runtime_error("viewer source is no longer a regular file");
+            next_size = entry.size;
+            next_revision = entry.revision;
+            next_path = entry.path;
+        } catch (const OperationCancelled&) {
+            throw;
+        } catch (const std::exception& failure) {
+            error = failure.what();
+        }
+    } else return false;
+    if (dirty() && (next_revision != revision_ || !error.empty())) {
+        const auto first_conflict = !source_conflict_;
+        source_conflict_ = true;
+        source_error_ = "file changed on disk; discard the staged hex edits before reloading or saving";
+        return first_conflict;
+    }
+    if (error.empty() && source_error_.starts_with("source changed;")) error = source_error_;
+    const auto changed = completed || next_size != source_size_ || next_revision != revision_ || error != source_error_;
+    source_error_ = std::move(error);
+    if (source_conflict_) return changed;
+    if (next_size == source_size_ && next_revision == revision_) return changed;
+    const auto old_size = source_size_;
+    source_size_ = next_size;
+    revision_ = std::move(next_revision);
+    storage_path_ = std::move(next_path);
+    previous_offsets_.clear();
+    if (presentation() != nullptr) {
+        source_error_ = "source changed; select Raw/Unformat to refresh the formatted snapshot";
+    } else {
+        select_presentation();
+        if (hex_) {
+            offset_ = std::min(offset_, hex_cursor_) / 16U * 16U;
+            keep_hex_cursor_visible();
+        }
+    }
+    view_end_ = std::min(view_end_, size_);
+    next_search_offset_ = std::min(next_search_offset_, size_);
+    search_begin_ = std::min(search_begin_, size_);
+    if (source_size_ < old_size) {
+        for (auto& bookmark : bookmarks_) bookmark = std::min(bookmark, size_);
+    }
+    if (search_match_ && (search_match_->second > size_ || !stream_)) search_match_.reset();
+    return true;
+}
+
 void ViewerModel::close() {
+    stream_.reset();
     provider_.reset();
     path_.clear();
     storage_path_.clear();
@@ -219,6 +464,8 @@ void ViewerModel::close() {
     hex_low_nibble_ = false;
     edits_.clear();
     revision_.clear();
+    source_conflict_ = false;
+    source_error_.clear();
 }
 
 bool ViewerModel::open() const noexcept {
@@ -246,6 +493,7 @@ void ViewerModel::go_to_end(
     if (!open()) {
         return;
     }
+    static_cast<void>(refresh());
     previous_offsets_.clear();
     horizontal_offset_ = 0;
     const auto height = std::max<std::size_t>(1U, viewport_lines);
@@ -288,6 +536,7 @@ void ViewerModel::scroll_lines(
     if (!open()) {
         return;
     }
+    static_cast<void>(refresh());
     const auto original_offset = offset_;
     viewport_width_ = std::max<std::size_t>(1U, viewport_width);
     const auto maximum = !hex_ && amount > 0
@@ -316,6 +565,9 @@ void ViewerModel::scroll_lines(
             next_offset = std::min(next_offset, maximum);
             if (next_offset <= offset_) {
                 break;
+            }
+            if (previous_offsets_.size() >= 4096U) {
+                previous_offsets_.erase(previous_offsets_.begin(), previous_offsets_.begin() + 2048);
             }
             previous_offsets_.push_back(offset_);
             offset_ = next_offset;
@@ -418,7 +670,45 @@ void ViewerModel::read_view(const std::uint64_t offset, const std::uint64_t leng
         const auto count = static_cast<std::size_t>(std::min<std::uint64_t>(length, content->size() - offset));
         output.write(content->data() + static_cast<std::ptrdiff_t>(offset), static_cast<std::streamsize>(count));
         if (!output) throw std::runtime_error("cannot write viewer presentation");
-    } else provider_->read(storage_path_, offset, length, output, cancellation);
+    } else read_source(offset, length, output, cancellation);
+}
+
+void ViewerModel::read_source(
+    const std::uint64_t offset, const std::uint64_t length,
+    std::ostream& output, const Cancellation& cancellation
+) {
+    if (!stream_) {
+        if (dirty()) validate_edit_source(cancellation);
+        provider_->read(storage_path_, offset, length, output, cancellation);
+        if (dirty()) validate_edit_source(cancellation);
+        return;
+    }
+    if (offset > source_size_) throw std::out_of_range("viewer read is outside the received input");
+    auto remaining = std::min(length, source_size_ - offset);
+    auto position = offset;
+    std::array<char, 64U * 1024U> buffer{};
+    while (remaining > 0U) {
+        cancellation.throw_if_requested();
+        const auto count = ::pread(stream_->storage.get(), buffer.data(),
+            static_cast<std::size_t>(std::min<std::uint64_t>(remaining, buffer.size())),
+            static_cast<off_t>(position));
+        if (count < 0 && errno == EINTR) continue;
+        if (count < 0) throw std::system_error(errno, std::generic_category(), "read viewer storage");
+        if (count == 0) throw std::runtime_error("viewer storage ended before the received input");
+        output.write(buffer.data(), count);
+        if (!output) throw std::runtime_error("cannot write viewer data");
+        position += static_cast<std::uint64_t>(count);
+        remaining -= static_cast<std::uint64_t>(count);
+    }
+}
+
+void ViewerModel::validate_edit_source(const Cancellation& cancellation) const {
+    if (stream_) throw std::runtime_error("streamed viewer data is read-only");
+    if (source_conflict_) throw std::runtime_error(source_error_);
+    const auto entry = provider_->stat_follow(path_, cancellation);
+    if (entry.kind != EntryKind::file || entry.path != storage_path_ || entry.revision != revision_) {
+        throw std::runtime_error("file changed on disk; refresh before editing or discard the staged hex edits");
+    }
 }
 
 std::string ViewerModel::read_all(const Cancellation& cancellation) {
@@ -465,10 +755,13 @@ std::uint64_t ViewerModel::source_view_end() const { return source_position(view
 
 void ViewerModel::refresh_presentation(const bool magic, const bool nroff, std::string codepage,
                                        const Cancellation& cancellation) {
+    if (reading() && (nroff || (!codepage.empty() && codepage != "UTF-8"))) {
+        throw std::runtime_error("wait for end of input before formatting or changing the stream codepage");
+    }
     std::optional<std::string> parsed;
-    if (magic) {
+    if (magic && !reading()) {
         std::ostringstream initial;
-        provider_->read(storage_path_, 0, std::min<std::uint64_t>(12, source_size_), initial, cancellation);
+        read_source(0, std::min<std::uint64_t>(12, source_size_), initial, cancellation);
         const auto header = std::move(initial).str();
         std::string tool;
         if (header.starts_with(std::string("\x1f\x8b", 2))) tool = "gzip";
@@ -477,8 +770,10 @@ void ViewerModel::refresh_presentation(const bool magic, const bool nroff, std::
         else if (header.starts_with(std::string("\x28\xb5\x2f\xfd", 4))) tool = "zstd";
         if (!tool.empty()) {
             if (dynamic_cast<LocalProvider*>(provider_.get()) == nullptr) throw std::runtime_error("parsed viewing requires a local file");
-            const auto result = capture_command({tool, "-cd", "--", storage_path_},
-                std::filesystem::path(storage_path_).parent_path(), cancellation, 64U * 1024U * 1024U);
+            const auto source = stream_ ? stream_->storage_path() : storage_path_;
+            const auto directory = stream_ ? std::filesystem::current_path() : std::filesystem::path(storage_path_).parent_path();
+            const auto result = capture_command({tool, "-cd", "--", source},
+                directory, cancellation, 64U * 1024U * 1024U);
             if (result.status != 0) throw std::runtime_error(tool + " exited " + std::to_string(result.status) + ": " + result.error);
             parsed = result.output;
         }
@@ -493,7 +788,7 @@ void ViewerModel::refresh_presentation(const bool magic, const bool nroff, std::
         else {
             if (source_size_ > 64U * 1024U * 1024U) throw std::runtime_error("formatted viewing is limited to 64 MiB; raw viewing remains available");
             std::ostringstream output;
-            provider_->read(storage_path_, 0, source_size_, output, cancellation);
+            read_source(0, source_size_, output, cancellation);
             input = std::move(output).str();
             if (input.size() != source_size_) throw std::runtime_error("file changed while formatting the viewer");
             for (const auto& [offset, byte] : edits_) {
@@ -529,11 +824,13 @@ void ViewerModel::refresh_presentation(const bool magic, const bool nroff, std::
     codepage_offsets_ = std::move(codepage_offsets);
     decoded_content_ = std::move(decoded_content);
     presentation_dirty_ = false;
+    if (source_error_.starts_with("source changed;")) source_error_.clear();
     select_presentation();
 }
 
 void ViewerModel::toggle_magic(const Cancellation& cancellation) {
     if (dirty()) throw std::runtime_error("save or discard hex edits before changing parse mode");
+    if (reading() && !magic_) throw std::runtime_error("wait for end of input before parsing the stream");
     refresh_presentation(!magic_, nroff_, encoding_, cancellation);
     goto_offset(0);
 }
@@ -612,6 +909,7 @@ void ViewerModel::goto_line(
     if (!open()) {
         throw std::runtime_error("viewer is not open");
     }
+    static_cast<void>(refresh(cancellation));
     if (requested == 0U) {
         throw std::invalid_argument("line numbers start at 1");
     }
@@ -668,6 +966,7 @@ std::uint64_t ViewerModel::line_number(const Cancellation& cancellation) {
 }
 
 unsigned int ViewerModel::position_percent() const noexcept {
+    if (reading() && size_ == 0U) return 0U;
     const auto position = hex_ ? hex_cursor_ : source_view_end();
     const auto total = hex_ && size_ > 0U ? size_ - 1U : data_size();
     return total == 0U ? 100U : static_cast<unsigned int>(std::min(
@@ -678,6 +977,10 @@ unsigned int ViewerModel::position_percent() const noexcept {
 void ViewerModel::toggle_hex_editing() {
     if (!open()) {
         throw std::runtime_error("viewer is not open");
+    }
+    if (!hex_editing_) {
+        static_cast<void>(refresh());
+        validate_edit_source({});
     }
     if (!hex_editing_ && !has_capability(provider_->capabilities(), ProviderCapability::write)) {
         throw std::runtime_error("this filesystem is read-only");
@@ -770,12 +1073,14 @@ void ViewerModel::set_byte(const std::uint64_t offset, const unsigned char value
     if (!hex_editing_ || offset >= size_) {
         throw std::runtime_error("no editable byte at the hex cursor");
     }
+    validate_edit_source({});
     std::ostringstream bytes;
     provider_->read(storage_path_, offset, 1U, bytes, {});
     const auto original = std::move(bytes).str();
     if (original.size() != 1U) {
         throw std::runtime_error("file changed while editing hex data");
     }
+    validate_edit_source({});
     search_match_.reset();
     last_text_page_.reset();
     navigation_changed();
@@ -797,6 +1102,7 @@ void ViewerModel::edit_hex_digit(const char digit) {
     if (size_ == 0U) {
         throw std::runtime_error("cannot overwrite bytes in an empty file");
     }
+    validate_edit_source({});
     const auto bytes = window_at(hex_cursor_, 1U, {});
     if (bytes.empty()) {
         throw std::runtime_error("hex cursor is outside the file");
@@ -836,6 +1142,7 @@ void ViewerModel::save_changes(
     if (!dirty()) {
         return;
     }
+    validate_edit_source(cancellation);
     if (parsed()) throw std::runtime_error("parsed data cannot be saved as raw hex edits");
     if (const auto* local = dynamic_cast<const LocalProvider*>(provider_.get())) {
         local->ensure_writable(storage_path_);
@@ -859,6 +1166,8 @@ void ViewerModel::save_changes(
     revision_ = provider_->stat(storage_path_, cancellation).revision;
     edits_.clear();
     window_.clear();
+    source_conflict_ = false;
+    source_error_.clear();
 }
 
 void ViewerModel::discard_changes() {
@@ -870,6 +1179,9 @@ void ViewerModel::discard_changes() {
     text_content_.reset();
     presentation_styles_.clear();
     presentation_dirty_ = !hex_ && (nroff_ || (!encoding_.empty() && encoding_ != "UTF-8"));
+    source_conflict_ = false;
+    source_error_.clear();
+    static_cast<void>(refresh());
 }
 
 void ViewerModel::set_wrap(const bool value) {
@@ -1083,6 +1395,11 @@ void ViewerModel::load_window(
     if (!provider_) {
         return;
     }
+    if (offset >= size_) {
+        window_.clear();
+        window_offset_ = offset;
+        return;
+    }
     std::ostringstream output;
     read_view(
         offset,
@@ -1103,6 +1420,7 @@ std::vector<std::string> ViewerModel::lines(
     const std::size_t height,
     const Cancellation& cancellation
 ) {
+    static_cast<void>(refresh(cancellation));
     if (presentation_dirty_) refresh_presentation(magic_, nroff_, encoding_, cancellation);
     text_highlights_.clear();
     text_style_rows_.clear();
@@ -1200,6 +1518,7 @@ std::optional<std::uint64_t> ViewerModel::find(
     if (!open() || needle.empty()) {
         return std::nullopt;
     }
+    static_cast<void>(refresh(cancellation));
     const auto requested = std::string(needle);
     last_search_options_ = {.mode=EditorSearchMode::normal, .case_sensitive=case_sensitive};
     const bool repeat =
@@ -1277,6 +1596,7 @@ std::optional<std::uint64_t> ViewerModel::find(
     const Cancellation& cancellation, const bool wrap, const bool all_charsets
 ) {
     if (!open() || needle.empty()) return std::nullopt;
+    static_cast<void>(refresh(cancellation));
     const bool continuing = advanced_search_pattern_ == needle && last_search_options_.mode == options.mode &&
         last_search_options_.case_sensitive == options.case_sensitive &&
         last_search_options_.whole_words == options.whole_words && last_search_all_charsets_ == all_charsets && !last_search_.empty();

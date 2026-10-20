@@ -138,7 +138,7 @@ std::optional<struct stat> destination_status(const std::filesystem::path& path)
 
 void validate_copied_source(
     const std::filesystem::path& path, const struct stat& expected,
-    const int descriptor = -1
+    const int descriptor = -1, const std::string_view role = "source"
 ) {
     const auto matches = [&](const struct stat& current) {
         return revision_for(current) == revision_for(expected) &&
@@ -147,7 +147,7 @@ void validate_copied_source(
     struct stat current{};
     if (!lstat_if_present(path, current) || !matches(current) ||
         (descriptor >= 0 && (fstat(descriptor, &current) != 0 || !matches(current)))) {
-        throw std::runtime_error("source changed while copying: " + path.string());
+        throw std::runtime_error(std::string(role) + " changed while copying: " + path.string());
     }
 }
 
@@ -321,16 +321,21 @@ bool unsupported_extent_seek(const int error) {
 std::uint64_t copy_sparse_data(
     const int source, const int destination, const off_t size,
     const bool preallocate, const Cancellation& cancellation,
-    const ProgressCallback& progress, const std::filesystem::path& destination_path
+    const ProgressCallback& progress, const std::filesystem::path& destination_path,
+    const off_t source_offset = 0, const off_t destination_offset = 0
 ) {
+    if (source_offset < 0 || size < source_offset || destination_offset < 0 ||
+        destination_offset > std::numeric_limits<off_t>::max() - (size - source_offset)) {
+        throw std::runtime_error("copied file range is too large");
+    }
     std::array<char, 64U * 1024U> buffer{};
-    off_t position = 0;
+    off_t position = source_offset;
     bool seek_extents = true;
     const auto report = [&] {
         if (progress) {
             progress({
-                .bytes_done = static_cast<std::uint64_t>(position),
-                .bytes_total = static_cast<std::uint64_t>(size),
+                .bytes_done = static_cast<std::uint64_t>(position - source_offset),
+                .bytes_total = static_cast<std::uint64_t>(size - source_offset),
                 .files_total = 1,
                 .current_path = destination_path.string(),
             });
@@ -401,7 +406,9 @@ std::uint64_t copy_sparse_data(
             };
             const auto block_end = [&](const std::size_t offset) {
                 constexpr off_t block_size = 4096;
-                const auto remainder = (position + static_cast<off_t>(offset)) % block_size;
+                const auto remainder = (
+                    destination_offset + (position - source_offset) + static_cast<off_t>(offset)
+                ) % block_size;
                 return std::min(bytes, offset + static_cast<std::size_t>(block_size - remainder));
             };
             std::size_t offset = 0;
@@ -420,7 +427,8 @@ std::uint64_t copy_sparse_data(
                 }
                 if (preallocate) {
                     const auto error = posix_fallocate(
-                        destination, position + static_cast<off_t>(begin), static_cast<off_t>(offset - begin)
+                        destination, destination_offset + (position - source_offset) + static_cast<off_t>(begin),
+                        static_cast<off_t>(offset - begin)
                     );
                     if (error != 0) {
                         throw std::system_error(error, std::generic_category(), "preallocate copied data");
@@ -431,7 +439,7 @@ std::uint64_t copy_sparse_data(
                     cancellation.throw_if_requested();
                     const auto written = pwrite(
                         destination, buffer.data() + written_offset, offset - written_offset,
-                        position + static_cast<off_t>(written_offset)
+                        destination_offset + (position - source_offset) + static_cast<off_t>(written_offset)
                     );
                     if (written < 0 && errno == EINTR) continue;
                     if (written <= 0) {
@@ -447,10 +455,61 @@ std::uint64_t copy_sparse_data(
         }
     }
     cancellation.throw_if_requested();
-    if (ftruncate(destination, size) != 0) {
+    if (ftruncate(destination, destination_offset + (size - source_offset)) != 0) {
         throw std::system_error(errno, std::generic_category(), "set copied file size");
     }
-    return static_cast<std::uint64_t>(size);
+    return static_cast<std::uint64_t>(size - source_offset);
+}
+
+void validate_reget_prefix(
+    const int source, const int destination, const off_t prefix_size,
+    const std::uint64_t source_size, const Cancellation& cancellation,
+    const ProgressCallback& progress, const std::filesystem::path& destination_path
+) {
+    std::array<char, 64U * 1024U> source_bytes{};
+    std::array<char, 64U * 1024U> destination_bytes{};
+    off_t position = 0;
+    const auto read_exact = [&](const int descriptor, char* data, const std::size_t count) {
+        std::size_t done = 0;
+        while (done < count) {
+            cancellation.throw_if_requested();
+            const auto read = pread(
+                descriptor, data + done, count - done, position + static_cast<off_t>(done)
+            );
+            if (read < 0 && errno == EINTR) continue;
+            if (read < 0) {
+                throw std::system_error(errno, std::generic_category(), "read reget prefix");
+            }
+            if (read == 0) {
+                throw std::runtime_error("file ended while checking reget prefix");
+            }
+            done += static_cast<std::size_t>(read);
+        }
+    };
+    while (position < prefix_size) {
+        cancellation.throw_if_requested();
+        const auto count = static_cast<std::size_t>(
+            std::min<off_t>(prefix_size - position, static_cast<off_t>(source_bytes.size()))
+        );
+        read_exact(source, source_bytes.data(), count);
+        read_exact(destination, destination_bytes.data(), count);
+        if (!std::equal(source_bytes.begin(), source_bytes.begin() + static_cast<std::ptrdiff_t>(count),
+                        destination_bytes.begin())) {
+            throw std::runtime_error(
+                "cannot reget: destination is not a prefix of the source: " + destination_path.string()
+            );
+        }
+        position += static_cast<off_t>(count);
+        if (progress) {
+            progress({
+                .bytes_done = static_cast<std::uint64_t>(position),
+                .bytes_total = source_size,
+                .files_total = 1,
+                .current_path = destination_path.string(),
+            });
+        }
+    }
+    cancellation.throw_if_requested();
 }
 
 void remove_tree_at(
@@ -1237,7 +1296,8 @@ void LocalProvider::create_directory(const std::string_view path) {
 
 void LocalProvider::copy_hardlink(
     const std::string_view source, const std::string_view destination,
-    const bool overwrite, const Cancellation& cancellation
+    const bool overwrite, const Cancellation& cancellation,
+    const std::optional<std::string> expected_destination_revision
 ) {
     const auto from = resolve(source);
     const auto to = resolve(destination);
@@ -1253,6 +1313,10 @@ void LocalProvider::copy_hardlink(
     }
     const auto previous = destination_status(to);
     if (!overwrite && previous) throw std::runtime_error("destination exists: " + to.string());
+    if (expected_destination_revision &&
+        (!previous || revision_for(*previous) != *expected_destination_revision)) {
+        throw std::runtime_error("destination changed since the collision decision: " + to.string());
+    }
     std::filesystem::create_directories(to.parent_path());
     const DirectorySync parent_directory(to.parent_path());
     auto pattern = (to.parent_path() / ".mcpp-hardlink-XXXXXX").string();
@@ -1412,7 +1476,10 @@ void LocalProvider::copy_file_from(
     const LocalProvider& source_provider,
     const std::string_view source, const std::string_view destination,
     const bool overwrite, const bool preserve_permissions,
-    const Cancellation& cancellation, const ProgressCallback& progress
+    const Cancellation& cancellation, const ProgressCallback& progress,
+    const CopyMode mode,
+    const std::optional<std::string> expected_source_revision,
+    const std::optional<std::string> expected_destination_revision
 ) {
     cancellation.throw_if_requested();
     const auto from = source_provider.resolve(source);
@@ -1424,6 +1491,9 @@ void LocalProvider::copy_file_from(
     if (!lstat_if_present(from, original)) {
         throw std::runtime_error("copy source does not exist: " + from.string());
     }
+    if (expected_source_revision && revision_for(original) != *expected_source_revision) {
+        throw std::runtime_error("source changed before copying: " + from.string());
+    }
     if (!S_ISREG(original.st_mode) && !S_ISFIFO(original.st_mode) &&
         !S_ISCHR(original.st_mode) && !S_ISBLK(original.st_mode)) {
         throw std::runtime_error(
@@ -1434,40 +1504,109 @@ void LocalProvider::copy_file_from(
     if (source_provider.same_file(from.string(), *this, to.string())) {
         throw std::invalid_argument("source and destination are the same file");
     }
+    const auto previous = destination_status(to);
+    if (expected_destination_revision &&
+        (!previous || revision_for(*previous) != *expected_destination_revision)) {
+        throw std::runtime_error("destination changed since the collision decision: " + to.string());
+    }
+    if (mode != CopyMode::replace &&
+        (!overwrite || !expected_destination_revision || !S_ISREG(original.st_mode) ||
+         !previous || !S_ISREG(previous->st_mode))) {
+        throw std::invalid_argument("append and reget require existing regular local files and a collision decision");
+    }
     const auto permissions = preserve_permissions
         ? std::optional{static_cast<std::filesystem::perms>(original.st_mode & 07777U)}
         : std::nullopt;
     if (S_ISREG(original.st_mode)) {
         if (original.st_size < 0) throw std::runtime_error("copy source has a negative size");
+        const auto prefix_size = mode == CopyMode::replace ? 0 : previous->st_size;
+        if (prefix_size < 0 ||
+            (mode == CopyMode::append &&
+             original.st_size > std::numeric_limits<off_t>::max() - prefix_size)) {
+            throw std::runtime_error("appended file is too large");
+        }
+        if (mode == CopyMode::reget && prefix_size >= original.st_size) {
+            throw std::invalid_argument("reget requires a destination smaller than the source");
+        }
+        const auto output_size = mode == CopyMode::append
+            ? prefix_size + original.st_size : original.st_size;
+        const auto source_offset = mode == CopyMode::reget ? prefix_size : 0;
         const int descriptor = open_regular_file(from);
+        int prefix_descriptor = -1;
         try {
             validate_copied_source(from, original, descriptor);
+            if (mode != CopyMode::replace) {
+                prefix_descriptor = open_regular_file(to);
+                validate_copied_source(to, *previous, prefix_descriptor, "destination");
+            }
+            const auto validate = [&] {
+                validate_copied_source(from, original, descriptor);
+                if (prefix_descriptor >= 0) {
+                    validate_copied_source(to, *previous, prefix_descriptor, "destination");
+                }
+            };
+            if (mode == CopyMode::reget) {
+                validate_reget_prefix(
+                    descriptor, prefix_descriptor, prefix_size,
+                    static_cast<std::uint64_t>(original.st_size), cancellation, progress, to
+                );
+                validate();
+            }
+            const auto report = [&](const TransferProgress& value) {
+                if (!progress) return;
+                auto logical = value;
+                if (mode == CopyMode::append) {
+                    logical.bytes_done = value.bytes_done > static_cast<std::uint64_t>(prefix_size)
+                        ? value.bytes_done - static_cast<std::uint64_t>(prefix_size) : 0U;
+                }
+                logical.bytes_total = static_cast<std::uint64_t>(original.st_size);
+                progress(logical);
+            };
             write_staged(
-                to.string(), static_cast<std::uint64_t>(original.st_size),
-                overwrite, std::nullopt, cancellation, progress, permissions,
+                to.string(), static_cast<std::uint64_t>(output_size),
+                overwrite, expected_destination_revision, cancellation, report, permissions,
                 [&](const int output) {
-                    return copy_sparse_data(
+                    const auto preallocate = preallocate_space_.load(std::memory_order_relaxed);
+                    if (prefix_descriptor >= 0) {
+                        copy_sparse_data(
+                            prefix_descriptor, output, prefix_size, preallocate, cancellation,
+                            [&](const TransferProgress& value) {
+                                auto retained = value;
+                                if (mode == CopyMode::reget) {
+                                    retained.bytes_done = static_cast<std::uint64_t>(prefix_size);
+                                }
+                                report(retained);
+                            }, to
+                        );
+                    }
+                    copy_sparse_data(
                         descriptor, output, original.st_size,
-                        preallocate_space_.load(std::memory_order_relaxed),
-                        cancellation, progress, to
+                        preallocate, cancellation,
+                        [&](const TransferProgress& value) {
+                            auto staged = value;
+                            staged.bytes_done += static_cast<std::uint64_t>(prefix_size);
+                            report(staged);
+                        }, to, source_offset, prefix_size
                     );
+                    return static_cast<std::uint64_t>(output_size);
                 },
-                [&] { validate_copied_source(from, original, descriptor); },
+                validate,
                 modified_for(original)
             );
         } catch (...) {
+            if (prefix_descriptor >= 0) static_cast<void>(close(prefix_descriptor));
             static_cast<void>(close(descriptor));
             throw;
         }
+        if (prefix_descriptor >= 0) static_cast<void>(close(prefix_descriptor));
         static_cast<void>(close(descriptor));
         return;
     }
 
-    const auto previous = destination_status(to);
     if (!overwrite && previous) {
         throw std::runtime_error("destination exists: " + to.string());
     }
-    const auto mode = permissions ? static_cast<mode_t>(*permissions)
+    const auto permission_mode = permissions ? static_cast<mode_t>(*permissions)
         : previous && !S_ISLNK(previous->st_mode) ? previous->st_mode & 07777U : creation_mode();
     std::filesystem::create_directories(to.parent_path());
     const DirectorySync parent_directory(to.parent_path());
@@ -1493,7 +1632,7 @@ void LocalProvider::copy_file_from(
             lchown(temporary.c_str(), previous->st_uid, previous->st_gid) != 0) {
             throw std::system_error(errno, std::generic_category(), "preserve special output ownership");
         }
-        if (chmod(temporary.c_str(), static_cast<mode_t>(mode)) != 0) {
+        if (chmod(temporary.c_str(), static_cast<mode_t>(permission_mode)) != 0) {
             throw std::system_error(errno, std::generic_category(), "set copied special file permissions");
         }
         const auto times = modification_times(modified_for(original));

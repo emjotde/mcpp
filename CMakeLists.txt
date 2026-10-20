@@ -62,8 +62,10 @@ add_library(
     mcpp_core
     src/archive_provider.cpp
     src/command_line.cpp
+    src/completion.cpp
     src/config.cpp
     src/entry.cpp
+    src/extension.cpp
     src/listing.cpp
     src/compare.cpp
     src/diff.cpp
@@ -156,6 +158,15 @@ if(MCPP_BUILD_TESTS)
     add_executable(mcpp_native_menu_tests tests/test_native_menu.cpp)
     target_link_libraries(mcpp_native_menu_tests PRIVATE mcpp_core)
     mcpp_target_defaults(mcpp_native_menu_tests)
+    add_executable(mcpp_extension_tests tests/test_extensions.cpp)
+    target_link_libraries(mcpp_extension_tests PRIVATE mcpp_core)
+    mcpp_target_defaults(mcpp_extension_tests)
+    add_executable(mcpp_viewer_source_tests tests/test_viewer_sources.cpp)
+    target_link_libraries(mcpp_viewer_source_tests PRIVATE mcpp_core)
+    mcpp_target_defaults(mcpp_viewer_source_tests)
+    add_executable(mcpp_append_resume_tests tests/test_append_resume.cpp)
+    target_link_libraries(mcpp_append_resume_tests PRIVATE mcpp_core)
+    mcpp_target_defaults(mcpp_append_resume_tests)
     add_executable(mcpp_hotlist_tests tests/test_hotlist.cpp)
     target_link_libraries(mcpp_hotlist_tests PRIVATE mcpp_core)
     mcpp_target_defaults(mcpp_hotlist_tests)
@@ -178,6 +189,7 @@ if(MCPP_BUILD_TESTS)
             /review/cases/agent-archive-operations
             /review/cases/sparse-special-files
             /review/cases/input-histories
+            /review/cases/append-resume
         )
         add_test(
             NAME mcpp_keymap_tests
@@ -205,6 +217,21 @@ if(MCPP_BUILD_TESTS)
             COMMAND mcpp_editor_lock_tests /review/cases/editor-locks/model
         )
         add_test(NAME mcpp_native_menu_tests COMMAND mcpp_native_menu_tests)
+        add_test(NAME mcpp_extension_tests COMMAND mcpp_extension_tests)
+        add_test(NAME mcpp_append_resume_bytes COMMAND mcpp_append_resume_tests bytes)
+        add_test(NAME mcpp_append_resume_safety COMMAND mcpp_append_resume_tests safety)
+        set_tests_properties(
+            mcpp_append_resume_bytes mcpp_append_resume_safety
+            PROPERTIES WORKING_DIRECTORY /review/cases/append-resume
+        )
+        add_test(
+            NAME mcpp_viewer_source_growing
+            COMMAND mcpp_viewer_source_tests growing /review/cases/streamed-viewer/growing
+        )
+        add_test(
+            NAME mcpp_viewer_source_stream
+            COMMAND mcpp_viewer_source_tests stream /review/cases/streamed-viewer/stream
+        )
         add_test(
             NAME mcpp_hotlist_tests
             COMMAND mcpp_hotlist_tests /review/cases/hierarchical-hotlists

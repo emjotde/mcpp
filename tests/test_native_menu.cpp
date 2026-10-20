@@ -121,6 +121,13 @@ void macros_and_arguments() {
     check(output.status == 0 && output.output == nul_values(
         {name, name, name, name, "pre" + name + "/post", name}),
         "quoted, adjacent, and nested expansions preserve one exact argument");
+    auto opposite = pane;
+    opposite.other.file->name = "opposite ' $(printf SHOULD_NOT_RUN)\nname.dat";
+    const auto opposite_command = mcpp::expand_native_menu("printf '%%s\\0' %p %P \"%P\" '%P'", opposite);
+    const auto opposite_output = mcpp::capture_shell(opposite_command.command, std::filesystem::current_path());
+    check(opposite_output.status == 0 && opposite_output.output == nul_values({
+        name, opposite.other.file->name, opposite.other.file->name, opposite.other.file->name,
+    }), "%P mirrors opposite-pane %p filenames, not full paths, with argument-safe quoting");
     const auto tagged = mcpp::expand_native_menu("printf '%%s\\0' %t %u %t %s %T %U %T %S", pane);
     const auto tags = mcpp::capture_shell(tagged.command, std::filesystem::current_path());
     check(tags.status == 0 && tags.output == nul_values({

@@ -9,6 +9,12 @@ namespace mcpp {
 
 class LocalProvider final : public Provider {
 public:
+    enum class CopyMode {
+        replace,
+        append,
+        reget,
+    };
+
     explicit LocalProvider(
         std::filesystem::path root = std::filesystem::path("/")
     );
@@ -53,13 +59,17 @@ public:
     );
     void copy_hardlink(
         std::string_view source, std::string_view destination,
-        bool overwrite, const Cancellation& cancellation
+        bool overwrite, const Cancellation& cancellation,
+        std::optional<std::string> expected_destination_revision = {}
     );
     void copy_file_from(
         const LocalProvider& source_provider,
         std::string_view source, std::string_view destination,
         bool overwrite, bool preserve_permissions,
-        const Cancellation& cancellation, const ProgressCallback& progress
+        const Cancellation& cancellation, const ProgressCallback& progress,
+        CopyMode mode = CopyMode::replace,
+        std::optional<std::string> expected_source_revision = {},
+        std::optional<std::string> expected_destination_revision = {}
     );
     [[nodiscard]] std::vector<Entry> list(
         std::string_view path,

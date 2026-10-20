@@ -292,7 +292,7 @@ Macro read_macro(const std::string_view command, const std::size_t begin) {
         ++index;
     } else {
         result.code = command[index];
-        if (std::string_view("fpxbdFDTtuUsSmkeciny").find(result.code) == std::string_view::npos) {
+        if (std::string_view("fpPxbdFDTtuUsSmkeciny").find(result.code) == std::string_view::npos) {
             throw std::invalid_argument("unsupported user-menu macro: %" + std::string(1, result.code));
         }
     }
@@ -649,7 +649,7 @@ NativeMenuExpansion expand_native_menu(
             values.push_back(environment_value(macro.argument));
         } else {
             const auto code = macro.code;
-            const bool other = code == 'F' || code == 'D' || code == 'T' || code == 'U' || code == 'S';
+            const bool other = code == 'F' || code == 'P' || code == 'D' || code == 'T' || code == 'U' || code == 'S';
             const auto& pane = other ? context.other : context.active;
             if (other && !pane.local && result.action != NativeMenuAction::change_directory) {
                 throw std::invalid_argument("other-pane file macros are unavailable for archive or remote directories");
@@ -658,6 +658,7 @@ NativeMenuExpansion expand_native_menu(
             switch (code) {
                 case 'f':
                 case 'p':
+                case 'P':
                 case 'F': values.push_back(file_name(pane)); break;
                 case 'd':
                 case 'D': values.push_back(pane.directory); break;

@@ -5,6 +5,7 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -12,8 +13,15 @@ namespace mcpp {
 
 enum class CollisionDecision {
     overwrite,
+    append,
+    reget,
     skip,
     cancel,
+};
+
+struct CollisionOptions {
+    bool append{false};
+    bool reget{false};
 };
 
 using CollisionResolver = std::function<CollisionDecision(
@@ -54,6 +62,13 @@ struct OperationResult {
 
 class OperationEngine {
 public:
+    [[nodiscard]] static CollisionOptions collision_options(
+        const Provider& source_provider,
+        const Entry& source,
+        const Provider& destination_provider,
+        const Entry& destination
+    );
+
     void copy(
         Provider& source_provider,
         const std::vector<Entry>& sources,
@@ -109,7 +124,21 @@ public:
     ) const;
 
 private:
+    struct Collision {
+        CollisionDecision decision{CollisionDecision::overwrite};
+        std::optional<Entry> destination;
+    };
+
     using LinkCache = std::map<std::string, std::pair<std::string, std::string>>;
+    static Collision resolve_collision(
+        Provider& source_provider,
+        const Entry& source,
+        Provider& destination_provider,
+        std::string_view destination,
+        const OperationOptions& options,
+        const Cancellation& cancellation,
+        std::optional<Collision> current = {}
+    );
     static TransferProgress measure(
         Provider& provider,
         const std::vector<Entry>& entries,
@@ -127,9 +156,11 @@ private:
         TransferProgress& state,
         const ProgressCallback& progress,
         std::string& skip_reason,
-        bool overwrite_current = false,
+        std::optional<Collision> collision_current = {},
         std::vector<Entry> ancestors = {},
-        std::shared_ptr<LinkCache> links = {}
+        std::shared_ptr<LinkCache> links = {},
+        Entry* transferred_source = nullptr,
+        CollisionDecision* transferred_decision = nullptr
     );
     static bool copy_entry_once(
         Provider& source_provider,
@@ -141,9 +172,11 @@ private:
         TransferProgress& state,
         const ProgressCallback& progress,
         std::string& skip_reason,
-        bool overwrite_current,
+        std::optional<Collision> collision_current,
         std::vector<Entry> ancestors,
-        const std::shared_ptr<LinkCache>& links
+        const std::shared_ptr<LinkCache>& links,
+        Entry* transferred_source,
+        CollisionDecision* transferred_decision
     );
 };
 

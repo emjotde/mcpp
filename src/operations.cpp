@@ -180,6 +180,18 @@ void validate_move_target(
     }
 }
 
+void validate_move_source(
+    Provider& provider,
+    const Entry& source,
+    const Cancellation& cancellation
+) {
+    if (dynamic_cast<LocalProvider*>(&provider) != nullptr &&
+        !source.revision.empty() &&
+        provider.stat(source.path, cancellation).revision != source.revision) {
+        throw std::runtime_error("source changed after copying; source was not removed: " + source.path);
+    }
+}
+
 bool rename_fallback_allowed(
     const std::filesystem::filesystem_error& error,
     Provider& source_provider,
@@ -379,39 +391,6 @@ void accumulate_removal(
     }
 }
 
-bool should_overwrite(
-    Provider& source_provider,
-    const Entry& source,
-    Provider& destination_provider,
-    const std::string& destination,
-    const OperationOptions& options,
-    const Cancellation& cancellation
-) {
-    if (!destination_provider.exists(destination)) {
-        return false;
-    }
-    if (options.overwrite) {
-        return true;
-    }
-    if (!options.collision) {
-        throw std::runtime_error(
-            "destination exists: " + destination
-        );
-    }
-    const auto destination_entry =
-        destination_provider.stat(destination, cancellation);
-    switch (options.collision(source, destination_entry)) {
-        case CollisionDecision::overwrite:
-            return true;
-        case CollisionDecision::skip:
-            return false;
-        case CollisionDecision::cancel:
-            throw OperationCancelled{};
-    }
-    static_cast<void>(source_provider);
-    return false;
-}
-
 class DescriptorBuffer final : public std::streambuf {
 public:
     explicit DescriptorBuffer(
@@ -528,6 +507,72 @@ private:
 
 }  // namespace
 
+CollisionOptions OperationEngine::collision_options(
+    const Provider& source_provider,
+    const Entry& source,
+    const Provider& destination_provider,
+    const Entry& destination
+) {
+    const bool regular_local =
+        dynamic_cast<const LocalProvider*>(&source_provider) != nullptr &&
+        dynamic_cast<const LocalProvider*>(&destination_provider) != nullptr &&
+        source.kind == EntryKind::file && destination.kind == EntryKind::file;
+    return {
+        .append = regular_local,
+        .reget = regular_local && destination.size < source.size,
+    };
+}
+
+OperationEngine::Collision OperationEngine::resolve_collision(
+    Provider& source_provider,
+    const Entry& source,
+    Provider& destination_provider,
+    const std::string_view destination,
+    const OperationOptions& options,
+    const Cancellation& cancellation,
+    std::optional<Collision> current
+) {
+    cancellation.throw_if_requested();
+    auto collision = current ? std::move(*current) : Collision{};
+    if (!current && destination_provider.exists(destination)) {
+        collision.destination = destination_provider.stat(destination, cancellation);
+        if (!options.overwrite) {
+            if (!options.collision) {
+                throw std::runtime_error("destination exists: " + std::string(destination));
+            }
+            collision.decision = options.collision(source, *collision.destination);
+        }
+    }
+    if (collision.decision == CollisionDecision::cancel) {
+        throw OperationCancelled{};
+    }
+    cancellation.throw_if_requested();
+    if (collision.decision == CollisionDecision::skip) {
+        return collision;
+    }
+    if (collision.decision == CollisionDecision::append ||
+        collision.decision == CollisionDecision::reget) {
+        const auto available = collision.destination
+            ? collision_options(source_provider, source, destination_provider, *collision.destination)
+            : CollisionOptions{};
+        if (collision.decision == CollisionDecision::append && !available.append) {
+            throw std::invalid_argument("append requires existing regular local files");
+        }
+        if (collision.decision == CollisionDecision::reget && !available.reget) {
+            throw std::invalid_argument("reget requires a smaller existing regular local destination");
+        }
+    }
+    if (collision.destination) {
+        if (!destination_provider.exists(destination) ||
+            destination_provider.stat(destination, cancellation).revision != collision.destination->revision) {
+            throw std::runtime_error("destination changed since the collision decision: " + std::string(destination));
+        }
+    } else if (current && destination_provider.exists(destination)) {
+        throw std::runtime_error("destination appeared before copying: " + std::string(destination));
+    }
+    return collision;
+}
+
 TransferProgress OperationEngine::measure(
     Provider& provider,
     const std::vector<Entry>& entries,
@@ -551,16 +596,17 @@ bool OperationEngine::copy_entry(
     TransferProgress& state,
     const ProgressCallback& progress,
     std::string& skip_reason,
-    const bool overwrite_current,
+    std::optional<Collision> collision_current,
     std::vector<Entry> ancestors,
-    std::shared_ptr<LinkCache> links
+    std::shared_ptr<LinkCache> links,
+    Entry* transferred_source,
+    CollisionDecision* transferred_decision
 ) {
     if (!links) {
         links = std::make_shared<LinkCache>();
     }
     const auto before = state;
     const bool existed_before = destination_provider.exists(destination);
-    bool allow_current = overwrite_current;
     auto current_source = source;
     bool refresh_source = false;
     for (;;) {
@@ -569,10 +615,11 @@ bool OperationEngine::copy_entry(
                 current_source = source_provider.stat(source.path, cancellation);
                 refresh_source = false;
             }
+            if (transferred_source != nullptr) *transferred_source = current_source;
             return copy_entry_once(
                 source_provider, current_source, destination_provider, destination,
                 options, cancellation, state, progress, skip_reason,
-                allow_current, ancestors, links
+                collision_current, ancestors, links, transferred_source, transferred_decision
             );
         } catch (const OperationCancelled&) {
             throw;
@@ -588,12 +635,16 @@ bool OperationEngine::copy_entry(
                     state = before;
                     skip_reason.clear();
                     refresh_source = true;
+                    collision_current.reset();
                     if (!existed_before &&
                         (source.kind == EntryKind::directory ||
                          (!options.preserve_symlinks && source.target_is_directory)) &&
                         destination_provider.exists(destination) &&
                         destination_provider.stat(destination, cancellation).kind == EntryKind::directory) {
-                        allow_current = true;
+                        collision_current = Collision{
+                            .decision = CollisionDecision::overwrite,
+                            .destination = destination_provider.stat(destination, cancellation),
+                        };
                     }
                     continue;
                 case OperationErrorDecision::skip:
@@ -616,9 +667,11 @@ bool OperationEngine::copy_entry_once(
     TransferProgress& state,
     const ProgressCallback& progress,
     std::string& skip_reason,
-    const bool overwrite_current,
+    std::optional<Collision> collision_current,
     std::vector<Entry> ancestors,
-    const std::shared_ptr<LinkCache>& links
+    const std::shared_ptr<LinkCache>& links,
+    Entry* transferred_source,
+    CollisionDecision* transferred_decision
 ) {
     cancellation.throw_if_requested();
     require_capability(destination_provider, ProviderCapability::write, "copy destination");
@@ -640,29 +693,28 @@ bool OperationEngine::copy_entry_once(
             "cannot copy a directory into itself"
         );
     }
-    const bool destination_exists =
-        destination_provider.exists(destination_path);
-    const bool overwrite =
-        destination_exists && overwrite_current
-            ? true
-            : destination_exists
-            ? should_overwrite(
-                  source_provider,
-                  source,
-                  destination_provider,
-                  destination_path,
-                  options,
-                  cancellation
-              )
-            : false;
-    if (destination_exists && !overwrite) {
+    const auto collision = resolve_collision(
+        source_provider, source, destination_provider, destination_path,
+        options, cancellation, std::move(collision_current)
+    );
+    if (collision.decision == CollisionDecision::skip) {
         skip_reason = "destination exists: " + destination_path;
         return false;
     }
+    const bool destination_exists = collision.destination.has_value();
+    const bool overwrite = destination_exists;
+    if (transferred_decision != nullptr) *transferred_decision = collision.decision;
 
     state.current_path = source.path;
     emit_progress(progress, state);
     auto effective_source = source;
+    if (collision.decision != CollisionDecision::overwrite) {
+        effective_source = source_provider.stat(source.path, cancellation);
+        if (effective_source.kind != EntryKind::file) {
+            throw std::runtime_error("append or reget source is no longer a regular file: " + source.path);
+        }
+        if (transferred_source != nullptr) *transferred_source = effective_source;
+    }
     if (source.kind == EntryKind::symlink && !options.preserve_symlinks) {
         effective_source = source_provider.stat_follow(source.path, cancellation);
         if (same_move_file(source_provider, effective_source.path,
@@ -670,6 +722,11 @@ bool OperationEngine::copy_entry_once(
             skip_reason = "source and destination are the same file";
             return false;
         }
+    }
+    if (collision.destination &&
+        (effective_source.kind == EntryKind::directory) !=
+            (collision.destination->kind == EntryKind::directory)) {
+        throw std::invalid_argument("cannot copy between a directory and a non-directory");
     }
     if (effective_source.kind != EntryKind::directory) {
         state.bytes_total = std::max(state.bytes_total, state.bytes_done + effective_source.size);
@@ -679,10 +736,13 @@ bool OperationEngine::copy_entry_once(
     auto* local_destination = dynamic_cast<LocalProvider*>(&destination_provider);
     auto* archive_source = dynamic_cast<ArchiveProvider*>(&source_provider);
     auto* archive_destination = dynamic_cast<ArchiveProvider*>(&destination_provider);
+    const auto expected_destination_revision = collision.destination
+        ? std::optional{collision.destination->revision} : std::nullopt;
     // Local revisions include st_dev as well as st_ino. Archive revisions
     // identify the virtual object and its version, not the whole repack.
     const auto link_key = source_provider.id() + "|" + source.revision;
     const bool track_links =
+        collision.decision == CollisionDecision::overwrite &&
         (local_source != nullptr || archive_source != nullptr) &&
         (local_destination != nullptr || archive_destination != nullptr) &&
         options.preserve_symlinks &&
@@ -696,7 +756,10 @@ bool OperationEngine::copy_entry_once(
         if (cached != links->end() && destination_provider.exists(cached->second.first) &&
             destination_provider.stat(cached->second.first, cancellation).revision == cached->second.second) {
             if (local_destination != nullptr) {
-                local_destination->copy_hardlink(cached->second.first, destination_path, overwrite, cancellation);
+                local_destination->copy_hardlink(
+                    cached->second.first, destination_path, overwrite, cancellation,
+                    expected_destination_revision
+                );
             } else {
                 archive_destination->copy_hardlink(cached->second.first, destination_path, overwrite, cancellation);
             }
@@ -717,6 +780,10 @@ bool OperationEngine::copy_entry_once(
 
     if (local_source != nullptr && local_destination != nullptr &&
         (effective_source.kind == EntryKind::file || effective_source.kind == EntryKind::other)) {
+        const auto copy_mode = collision.decision == CollisionDecision::append
+            ? LocalProvider::CopyMode::append
+            : collision.decision == CollisionDecision::reget
+                ? LocalProvider::CopyMode::reget : LocalProvider::CopyMode::replace;
         local_destination->copy_file_from(
             *local_source, effective_source.path, destination_path, overwrite,
             options.preserve_permissions, cancellation,
@@ -725,7 +792,11 @@ bool OperationEngine::copy_entry_once(
                 overall.bytes_done += value.bytes_done;
                 overall.current_path = value.current_path.empty() ? source.path : value.current_path;
                 emit_progress(progress, overall);
-            }
+            },
+            copy_mode,
+            copy_mode == LocalProvider::CopyMode::replace || effective_source.revision.empty()
+                ? std::nullopt : std::optional{effective_source.revision},
+            expected_destination_revision
         );
         remember_link();
         state.bytes_done += effective_source.size;
@@ -823,7 +894,7 @@ bool OperationEngine::copy_entry_once(
                     state,
                     progress,
                     skip_reason,
-                    false,
+                    {},
                     ancestors,
                     links
                 ) && copied_all;
@@ -958,7 +1029,7 @@ void OperationEngine::copy(
                 state,
                 progress,
                 skip_reason,
-                false,
+                {},
                 {},
                 links
             );
@@ -1076,37 +1147,22 @@ void OperationEngine::move(
                 );
                 continue;
             }
-            bool overwrite = options.overwrite;
-            if (destination_provider.exists(destination) &&
-                !overwrite) {
-                if (!options.collision) {
-                    throw std::runtime_error(
-                        "destination exists: " + destination
-                    );
-                }
-                switch (options.collision(
-                    source,
-                    destination_provider.stat(destination, cancellation)
-                )) {
-                    case CollisionDecision::overwrite:
-                        overwrite = true;
-                        break;
-                    case CollisionDecision::skip:
-                        record_skipped(
-                            result,
-                            source,
-                            "destination exists: " + destination
-                        );
-                        continue;
-                    case CollisionDecision::cancel:
-                        throw OperationCancelled{};
-                }
-            }
-            std::string rename_skip;
-            const auto renamed = rename_with_retry(
+            const auto collision = resolve_collision(
                 source_provider, source, destination_provider, destination,
-                overwrite, options, cancellation, rename_skip
+                options, cancellation
             );
+            if (collision.decision == CollisionDecision::skip) {
+                record_skipped(result, source, "destination exists: " + destination);
+                continue;
+            }
+            const bool overwrite = collision.destination.has_value();
+            std::string rename_skip;
+            const auto renamed = collision.decision == CollisionDecision::overwrite
+                ? rename_with_retry(
+                      source_provider, source, destination_provider, destination,
+                      overwrite, options, cancellation, rename_skip
+                  )
+                : RenameOutcome::fallback;
             if (renamed == RenameOutcome::skipped) {
                 record_skipped(result, source, std::move(rename_skip));
                 continue;
@@ -1149,32 +1205,31 @@ void OperationEngine::move(
             }
             try {
                 std::string skip_reason;
+                auto transferred_source = source;
+                auto transferred_decision = CollisionDecision::overwrite;
                 const auto copied = copy_entry(
                     source_provider,
                     source,
                     destination_provider,
                     destination,
-                    {
-                        .overwrite = options.overwrite,
-                        .preserve_permissions =
-                            options.preserve_permissions,
-                        .preserve_symlinks =
-                            options.preserve_symlinks,
-                        .collision = options.collision,
-                        .error = options.error,
-                    },
+                    options,
                     cancellation,
                     state,
                     progress,
                     skip_reason,
-                    overwrite,
+                    collision,
                     {},
-                    links
+                    links,
+                    &transferred_source,
+                    &transferred_decision
                 );
                 if (copied) {
                     if (remove_with_retry(
                             source_provider, source, cancellation, {}, options.error,
                             [&] {
+                                if (transferred_decision != CollisionDecision::overwrite) {
+                                    validate_move_source(source_provider, transferred_source, cancellation);
+                                }
                                 validate_move_target(
                                     source_provider, source, destination_provider,
                                     destination, cancellation
@@ -1222,6 +1277,8 @@ void OperationEngine::move(
                 continue;
             }
             std::string skip_reason;
+            auto transferred_source = source;
+            auto transferred_decision = CollisionDecision::overwrite;
             const auto copied = copy_entry(
                 source_provider,
                 source,
@@ -1232,14 +1289,19 @@ void OperationEngine::move(
                 state,
                 progress,
                 skip_reason,
-                false,
                 {},
-                links
+                {},
+                links,
+                &transferred_source,
+                &transferred_decision
             );
             if (copied) {
                 if (remove_with_retry(
                         source_provider, source, cancellation, {}, options.error,
                         [&] {
+                            if (transferred_decision != CollisionDecision::overwrite) {
+                                validate_move_source(source_provider, transferred_source, cancellation);
+                            }
                             validate_move_target(
                                 source_provider, source, destination_provider,
                                 destination, cancellation
@@ -1350,31 +1412,15 @@ void OperationEngine::move_exact(
         );
         return;
     }
-    bool overwrite = options.overwrite;
-    if (destination_provider.exists(destination) && !overwrite) {
-        if (!options.collision) {
-            throw std::runtime_error(
-                "destination exists: " + std::string(destination)
-            );
-        }
-        switch (options.collision(
-            source,
-            destination_provider.stat(destination, cancellation)
-        )) {
-            case CollisionDecision::overwrite:
-                overwrite = true;
-                break;
-            case CollisionDecision::skip:
-                record_skipped(
-                    result,
-                    source,
-                    "destination exists: " + std::string(destination)
-                );
-                return;
-            case CollisionDecision::cancel:
-                throw OperationCancelled{};
-        }
+    const auto collision = resolve_collision(
+        source_provider, source, destination_provider, destination,
+        options, cancellation
+    );
+    if (collision.decision == CollisionDecision::skip) {
+        record_skipped(result, source, "destination exists: " + std::string(destination));
+        return;
     }
+    const bool overwrite = collision.destination.has_value();
     auto state = options.compute_totals
                      ? measure(source_provider, {source}, cancellation, static_cast<bool>(options.error))
                      : TransferProgress{};
@@ -1386,6 +1432,7 @@ void OperationEngine::move_exact(
         return;
     }
     if (&source_provider == &destination_provider &&
+        collision.decision == CollisionDecision::overwrite &&
         has_capability(
             source_provider.capabilities(),
             ProviderCapability::rename
@@ -1436,24 +1483,24 @@ void OperationEngine::move_exact(
     }
     bool copied = false;
     std::string skip_reason;
+    auto transferred_source = source;
+    auto transferred_decision = CollisionDecision::overwrite;
     try {
         copied = copy_entry(
             source_provider,
             source,
             destination_provider,
             destination,
-            {
-                .overwrite = options.overwrite,
-                .preserve_permissions = options.preserve_permissions,
-                .preserve_symlinks = options.preserve_symlinks,
-                .collision = options.collision,
-                .error = options.error,
-            },
+            options,
             cancellation,
             state,
             progress,
             skip_reason,
-            overwrite
+            collision,
+            {},
+            {},
+            &transferred_source,
+            &transferred_decision
         );
     } catch (const SkipCurrent&) {
         record_skipped(result, source, "user requested skip");
@@ -1463,6 +1510,9 @@ void OperationEngine::move_exact(
         if (remove_with_retry(
                 source_provider, source, cancellation, {}, options.error,
                 [&] {
+                    if (transferred_decision != CollisionDecision::overwrite) {
+                        validate_move_source(source_provider, transferred_source, cancellation);
+                    }
                     validate_move_target(
                         source_provider, source, destination_provider,
                         destination, cancellation

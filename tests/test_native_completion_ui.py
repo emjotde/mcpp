@@ -3,6 +3,7 @@ import gzip
 import json
 import os
 import sys
+import tarfile
 import unittest
 from unittest.mock import patch
 
@@ -595,6 +596,157 @@ class NativeCompletionUI(unittest.TestCase):
                 self.assertEqual(path.read_bytes(), b"mail body\n")
                 click(t, "[ Cancel ]")
                 t.wait_editor(dirty=True)
+
+    def completion_line(self, terminal, expected):
+        terminal.wait(lambda: terminal.text().splitlines()[-2].rstrip().endswith(expected),
+                      "Command line completes to " + expected)
+
+    def completion_evidence(self, terminal):
+        evidence = Path("/review/evidence/shell-completion")
+        evidence.mkdir(parents=True, exist_ok=True)
+        terminal.save(str(evidence / self._testMethodName))
+
+    def test_shell_completion_commands_and_argument_fallback(self):
+        root, left, right = self.fixture()
+        tools = root / "tools"
+        tools.mkdir()
+        (tools / "l15-tool").write_text("#!/bin/sh\nexit 0\n")
+        (tools / "l15-tool").chmod(0o700)
+        (tools / "l15-text").write_text("not executable\n")
+        (left / "l15-tool.txt").write_text("filename fallback\n")
+        (left / "expor-file").write_text("not a command\n")
+        with patch.dict(os.environ, {"PATH": str(tools) + ":/usr/bin:/bin"}):
+            with self.terminal(root, [left, right],
+                               "use_subshell=false\ncompletion_show_all=false\n") as t:
+                t.wait_for("Name")
+                for index, (before, after) in enumerate((
+                    ("l15-t", "l15-tool"),
+                    ("expor", "export"),
+                    ("A=1 true | whil", "A=1 true | while"),
+                    ("echo l15-t", "echo l15-tool.txt"),
+                )):
+                    if index:
+                        t.press("Home", "C-k")
+                    t.type(before)
+                    t.raw(b"\x1b\t")
+                    self.completion_line(t, after)
+                self.completion_evidence(t)
+
+    def test_shell_completion_local_names_and_list_filter(self):
+        root, left, right = self.fixture()
+        with patch.dict(os.environ, {"MCPP_L15_ALPHA": "unused", "MCPP_L15_ALPINE": "unused"}):
+            with self.terminal(root, [left, right],
+                               "use_subshell=false\ncompletion_show_all=false\n") as t:
+                t.wait_for("Name")
+                t.type("echo $MCPP_L15_")
+                t.raw(b"\x1b\t")
+                self.completion_line(t, "echo $MCPP_L15_ALP")
+                t.raw(b"\x1b\t")
+                t.wait_for("Completion")
+                t.type("MCPP_L15_ALPINE")
+                t.press("BSpace", "End", "Enter")
+                t.wait_for("Completion", present=False)
+                self.completion_line(t, "echo $MCPP_L15_ALPINE")
+                for before, after in (
+                    ("echo ${MCPP_L15_ALPH", "echo ${MCPP_L15_ALPHA}"),
+                    ("echo ~roo", "echo ~root/"),
+                    ("echo @localh", "echo @localhost"),
+                ):
+                    t.press("Home", "C-k")
+                    t.type(before)
+                    t.raw(b"\x1b\t")
+                    self.completion_line(t, after)
+                t.press("F7")
+                t.wait_for("New directory")
+                t.press("C-u")
+                t.type("$MCPP_L15_ALPH")
+                t.raw(b"\x1b\t")
+                t.wait_for("> $MCPP_L15_ALPHA")
+                self.completion_evidence(t)
+                t.press("Escape")
+                t.wait_for("New directory", present=False)
+
+    def test_shell_completion_quotes_suffix_selection_and_show_all(self):
+        root, left, right = self.fixture()
+        for name in ("préfixα", "préfixβ", "report space.txt"):
+            (left / name).write_text("literal filename\n")
+        with self.terminal(root, [left, right],
+                           "use_subshell=false\ncompletion_show_all=true\n") as t:
+            t.wait_for("Name")
+            t.press("F7")
+            t.wait_for("New directory")
+            t.press("C-u")
+            t.type("pré")
+            t.raw(b"\x1b\t")
+            t.wait_for("Completion")
+            t.type("préfixβ")
+            t.press("Enter")
+            t.wait_for("Completion", present=False)
+            t.wait_for("> préfixβ")
+            t.type("X")
+            t.wait_for("> préfixβX")
+            t.press("Escape")
+            t.wait_for("New directory", present=False)
+            t.type('echo "report sTAIL" after')
+            t.press("Home", *(["Right"] * len('echo "report s')))
+            t.raw(b"\x1b[1;2C" * 4)
+            t.raw(b"\x1b\t")
+            self.completion_line(t, 'echo "report space.txt" after')
+            t.type("X")
+            self.completion_line(t, 'echo "report space.txtX" after')
+            t.press("Home", "C-k")
+            t.type("echo report\\ s")
+            t.raw(b"\x1b\t")
+            self.completion_line(t, "echo report\\ space.txt")
+            self.completion_evidence(t)
+
+    def test_shell_completion_archive_namespace_and_source_error(self):
+        root, left, right = self.fixture()
+        member = root / "archive-member.txt"
+        member.write_text("archive completion\n")
+        archive = left / "bundle.tar"
+        with tarfile.open(archive, "w", format=tarfile.USTAR_FORMAT) as output:
+            output.add(member, arcname=member.name)
+        (left / "archive-host-only.txt").write_text("wrong provider\n")
+        with self.terminal(root, [left, right],
+                           "ask_new_filename=true\nuse_subshell=false\ncompletion_show_all=false\n") as t:
+            t.wait_for("bundle.tar")
+            select_file(t, "bundle.tar")
+            t.press("Enter")
+            t.wait_for("archive-member.txt")
+            t.press("F4")
+            t.wait_for("Enter file name:")
+            t.press("C-u")
+            t.type("archive-m")
+            t.raw(b"\x1b\t")
+            def native_path_completed():
+                rows = t.text().splitlines()
+                return any("Enter file name:" in label and "archive-member.txt" in field
+                           for label, field in zip(rows, rows[1:]))
+            t.wait(native_path_completed, "The native input completes an archive member")
+            t.press("Enter")
+            t.wait_editor(bytes=len(b"archive completion\n"))
+            t.press("F10")
+            t.wait_for("Name")
+            t.press("F4")
+            t.wait_for("Enter file name:")
+            t.press("C-u")
+            t.type(str(archive) + "/utar://archive-m")
+            t.raw(b"\x1b\t")
+            t.wait_for("/utar://archive-member.txt")
+            t.press("Enter")
+            t.wait_editor(bytes=len(b"archive completion\n"))
+            t.press("F10")
+            t.wait_for("Name")
+            t.press("F4")
+            t.wait_for("Enter file name:")
+            t.press("C-u")
+            t.type("missing-l15/file")
+            t.raw(b"\x1b\t")
+            t.wait_for("archive member")
+            self.completion_evidence(t)
+            t.press("Escape")
+            t.wait_for("Enter file name:", present=False)
 
 
 if __name__ == "__main__":

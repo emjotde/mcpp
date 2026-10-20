@@ -30,7 +30,18 @@ public:
         std::string path,
         const Cancellation& cancellation = {}
     );
+    // Duplicates the descriptor; the caller retains ownership.
+    void open_stream(
+        ProviderPtr provider,
+        int descriptor,
+        std::string name,
+        const Cancellation& cancellation = {}
+    );
     void close();
+    [[nodiscard]] bool refresh(const Cancellation& cancellation = {});
+    [[nodiscard]] bool streamed() const noexcept { return stream_ != nullptr; }
+    [[nodiscard]] bool reading() const noexcept;
+    [[nodiscard]] const std::string& source_error() const noexcept { return source_error_; }
     void go_to_start();
     void go_to_end(std::size_t viewport_width, std::size_t viewport_lines);
     void scroll_lines(int amount, std::size_t viewport_width);
@@ -142,6 +153,9 @@ private:
     [[nodiscard]] std::uint64_t last_text_page(std::size_t width, std::size_t rows);
     void read_view(std::uint64_t offset, std::uint64_t length, std::ostream& output,
                    const Cancellation& cancellation);
+    void read_source(std::uint64_t offset, std::uint64_t length, std::ostream& output,
+                     const Cancellation& cancellation);
+    void validate_edit_source(const Cancellation& cancellation) const;
     void refresh_presentation(bool magic, bool nroff, std::string codepage, const Cancellation& cancellation);
     void select_presentation();
     [[nodiscard]] const std::string* presentation() const noexcept;
@@ -157,7 +171,9 @@ private:
         std::uint64_t offset;
     };
 
+    struct StreamSource;
     ProviderPtr provider_;
+    std::shared_ptr<StreamSource> stream_;
     std::string path_;
     std::string storage_path_;
     std::uint64_t size_{0};
@@ -202,6 +218,8 @@ private:
     std::optional<LastTextPage> last_text_page_;
     std::map<std::uint64_t, unsigned char> edits_;
     std::string revision_;
+    bool source_conflict_{false};
+    std::string source_error_;
 };
 
 }  // namespace mcpp
