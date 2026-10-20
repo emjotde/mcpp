@@ -63,6 +63,8 @@ endfunction()
 add_library(
     mcpp_core
     src/archive_provider.cpp
+    src/extfs_provider.cpp
+    src/extfs_helper.cpp
     src/transform_provider.cpp
     src/command_line.cpp
     src/color_resource.cpp
@@ -154,6 +156,12 @@ if(MCPP_BUILD_TESTS)
     add_executable(mcpp_archive_tests tests/test_archive_provider.cpp)
     target_link_libraries(mcpp_archive_tests PRIVATE mcpp_core)
     mcpp_target_defaults(mcpp_archive_tests)
+    add_executable(mcpp_archive_complete_tests tests/test_archive_complete.cpp)
+    target_link_libraries(mcpp_archive_complete_tests PRIVATE mcpp_core)
+    mcpp_target_defaults(mcpp_archive_complete_tests)
+    add_executable(mcpp_extfs_tests tests/test_extfs_provider.cpp)
+    target_link_libraries(mcpp_extfs_tests PRIVATE mcpp_core)
+    mcpp_target_defaults(mcpp_extfs_tests)
     add_executable(mcpp_transform_tests tests/test_transform_provider.cpp)
     target_link_libraries(mcpp_transform_tests PRIVATE mcpp_core)
     mcpp_target_defaults(mcpp_transform_tests)
@@ -262,6 +270,18 @@ if(MCPP_BUILD_TESTS)
             NAME mcpp_archive_tests
             COMMAND mcpp_archive_tests /review/cases/agent-archives
         )
+        add_test(
+            NAME mcpp_archive_complete_tests
+            COMMAND mcpp_archive_complete_tests /review/cases/archive-complete-model-81945 formats snapshots
+        )
+        foreach(extfs_case IN ITEMS snapshot mutation rejection)
+            add_test(
+                NAME mcpp_extfs_${extfs_case}
+                COMMAND mcpp_extfs_tests ${extfs_case}
+                        /review/cases/extfs-local-${extfs_case}
+                        ${CMAKE_CURRENT_SOURCE_DIR}/tests/extfs_fixture.py
+            )
+        endforeach()
         foreach(transform_case IN ITEMS local namespace errors)
             add_test(
                 NAME mcpp_transform_${transform_case}
@@ -681,6 +701,17 @@ if(MCPP_BUILD_TESTS)
                     ${CMAKE_CURRENT_BINARY_DIR}/archives-ui
             )
             set_tests_properties(mcpp_archives_ui PROPERTIES TIMEOUT 180)
+            add_test(
+                NAME mcpp_extfs_ui
+                COMMAND
+                    ${MCPP_PYTHON_EXECUTABLE}
+                    -B
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_extfs_ui.py
+                    $<TARGET_FILE:mcpp>
+                    --mcpp-only
+                    --tmux ${MCPP_TMUX_EXECUTABLE}
+            )
+            set_tests_properties(mcpp_extfs_ui PROPERTIES TIMEOUT 90)
             add_test(
                 NAME mcpp_hex_cursor_ui
                 COMMAND

@@ -334,6 +334,28 @@ void EditorModel::set_behavior(EditorBehavior behavior) {
     break_undo_group();
 }
 
+std::optional<std::pair<std::size_t, std::size_t>> EditorModel::paragraph_rows() const {
+    const auto blank = [](const std::string& line) {
+        return std::ranges::all_of(line, [](const unsigned char character) { return std::isspace(character) != 0; });
+    };
+    if (lines_.empty() || blank(lines_[row_])) return std::nullopt;
+    auto first = row_, last = row_;
+    while (first > 0U && !blank(lines_[first - 1U])) --first;
+    while (last + 1U < lines_.size() && !blank(lines_[last + 1U])) ++last;
+    if (behavior_.stop_format_chars.empty()) return std::pair{first, last};
+    for (auto row = first; row <= last; ++row) {
+        for (std::size_t offset = 0; offset < behavior_.stop_format_chars.size();) {
+            const auto next = next_character(behavior_.stop_format_chars, offset);
+            if (lines_[row].starts_with(std::string_view(behavior_.stop_format_chars).substr(offset, next - offset))) {
+                if (row <= row_) return std::nullopt;
+                return std::pair{first, row - 1U};
+            }
+            offset = next;
+        }
+    }
+    return std::pair{first, last};
+}
+
 void EditorModel::break_undo_group() noexcept {
     if (edit_depth_ == 0U) ++undo_epoch_;
 }
@@ -1492,13 +1514,9 @@ void EditorModel::wrap_typed_text() {
 }
 
 void EditorModel::reflow_paragraph() {
-    const auto blank = [](const std::string& line) {
-        return std::ranges::all_of(line, [](const unsigned char character) { return std::isspace(character) != 0; });
-    };
-    if (blank(lines_[row_])) return;
-    auto first = row_, last = row_;
-    while (first > 0U && !blank(lines_[first - 1U])) --first;
-    while (last + 1U < lines_.size() && !blank(lines_[last + 1U])) ++last;
+    const auto rows = paragraph_rows();
+    if (!rows) return;
+    const auto [first, last] = *rows;
     const EditorPosition begin{first, 0}, end{last, lines_[last].size()};
     const auto original = text_range(begin, end);
     const auto indent_end = lines_[first].find_first_not_of(" \t");

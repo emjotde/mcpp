@@ -1,5 +1,7 @@
 #include "mcpp/archive_provider.hpp"
 
+#include "archive_data.hpp"
+#include "local_tools_stream.hpp"
 #include "mcpp/local_provider.hpp"
 #include "mcpp/local_tools.hpp"
 
@@ -12,6 +14,7 @@
 #include <cstring>
 #include <deque>
 #include <fcntl.h>
+#include <fstream>
 #include <grp.h>
 #include <iostream>
 #include <limits>
@@ -25,6 +28,7 @@
 #include <sys/file.h>
 #include <sys/random.h>
 #include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <system_error>
 #include <tuple>
 #include <unistd.h>
@@ -36,6 +40,11 @@ namespace {
 using Clock = std::chrono::system_clock;
 using Time = Clock::time_point;
 namespace fs = std::filesystem;
+using archive_detail::Content;
+using archive_detail::Data;
+using archive_detail::Extent;
+using archive_detail::content_range;
+using archive_detail::zero_range;
 
 [[noreturn]] void invalid(const std::string& reason) {
     throw std::runtime_error("archive: " + reason);
@@ -107,27 +116,37 @@ public:
                std::to_string(directory_.get()) / name;
     }
     void discard() noexcept { retain_ = false; }
-    void write(
-        const char* name, const std::string_view bytes,
-        const Cancellation& cancellation
-    ) const {
-        Descriptor output(::openat(
+    [[nodiscard]] int create(const char* name) const {
+        const auto result = ::openat(
             directory_.get(), name, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600
-        ));
-        check_system(output.get(), "create archive draft");
-        std::size_t offset = 0;
-        while (offset < bytes.size()) {
-            cancellation.throw_if_requested();
-            const auto count = ::write(
-                output.get(), bytes.data() + offset,
-                std::min<std::size_t>(bytes.size() - offset, 64U * 1024U)
-            );
-            if (count < 0 && errno == EINTR) continue;
-            if (count <= 0) throw std::system_error(errno, std::generic_category(), "write archive draft");
-            offset += static_cast<std::size_t>(count);
-        }
+        );
+        check_system(result, "create archive draft");
+        return result;
+    }
+    void write(const char* name, const Data& bytes, const Cancellation& cancellation) const {
+        Descriptor output(create(name));
+        archive_detail::write_storage(bytes, output.get(), 0, bytes.size(), 0, cancellation);
+        check_system(::ftruncate(output.get(), static_cast<off_t>(bytes.size())), "size archive draft");
         check_system(::fsync(output.get()), "sync archive draft");
         check_system(::fsync(directory_.get()), "sync archive draft entry");
+    }
+    void special(const mode_t mode, const dev_t device) const {
+        if (S_ISFIFO(mode)) check_system(::mkfifoat(directory_.get(), "snapshot", 0600), "prepare archive FIFO");
+        else check_system(::mknodat(directory_.get(), "snapshot", (mode & S_IFMT) | 0600U, device),
+                          "recreate archive device (mknod requires permission, normally CAP_MKNOD)");
+    }
+    void metadata(const Entry& entry) const {
+        check_system(::fchmodat(directory_.get(), "snapshot", static_cast<mode_t>(entry.permissions), 0),
+                     "set archive member snapshot permissions");
+        const auto seconds = std::chrono::floor<std::chrono::seconds>(entry.modified.time_since_epoch());
+        const auto nanos = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            entry.modified.time_since_epoch() - seconds);
+        const std::array<timespec, 2> times{{
+            {.tv_sec = 0, .tv_nsec = UTIME_OMIT},
+            {.tv_sec = static_cast<time_t>(seconds.count()), .tv_nsec = static_cast<long>(nanos.count())}
+        }};
+        check_system(::utimensat(directory_.get(), "snapshot", times.data(), AT_SYMLINK_NOFOLLOW),
+                     "set archive member snapshot modification time");
     }
 
 private:
@@ -330,9 +349,11 @@ void check_link_text(const std::string_view target, const ArchiveLimits& limits)
 
 struct Node {
     Entry entry;
-    std::shared_ptr<const std::string> bytes;
+    std::shared_ptr<const Content> bytes;
     std::string hardlink;
     bool implicit{false};
+    std::uint32_t device_major{0};
+    std::uint32_t device_minor{0};
     std::uint64_t object{0};
     std::uint64_t version{1};
 };
@@ -355,7 +376,7 @@ Node new_node(const EntryKind kind, const std::uint64_t object) {
     node.entry.modified = Clock::now();
     node.entry.accessed = node.entry.modified;
     node.entry.changed = node.entry.modified;
-    if (kind == EntryKind::file) node.bytes = std::make_shared<const std::string>();
+    if (kind == EntryKind::file) node.bytes = std::make_shared<const Content>();
     return node;
 }
 
@@ -444,7 +465,8 @@ std::string require_path(const Model& model, const std::string& path, const bool
 
 void validate_model(const Model& model, const ArchiveLimits& limits, const Cancellation& cancellation) {
     if (model.empty() || model.size() - 1U > limits.members) invalid("archive exceeds the member limit");
-    std::size_t total = 0;
+    std::uint64_t total = 0;
+    std::size_t extents = 0;
     std::set<std::uint64_t> counted;
     for (const auto& [key, node] : model) {
         cancellation.throw_if_requested();
@@ -464,18 +486,26 @@ void validate_model(const Model& model, const ArchiveLimits& limits, const Cance
                 invalid("archive file data exceeds the expanded byte limit");
             }
             total += node.bytes->size();
+            if (node.bytes->extents.size() > limits.sparse_extents - extents) {
+                invalid("archive exceeds the sparse extent limit");
+            }
+            extents += node.bytes->extents.size();
         }
     }
 }
 
 using Pax = std::map<std::string, std::string, std::less<>>;
+using SparseMap = std::vector<std::pair<std::uint64_t, std::uint64_t>>;
 
-Pax parse_pax(const std::string_view bytes) {
+Pax parse_pax(const std::string_view bytes, SparseMap* sparse, const ArchiveLimits& limits) {
     static const std::set<std::string_view> supported{
         "path", "linkpath", "size", "uid", "gid", "uname", "gname",
-        "mtime", "atime", "ctime", "hdrcharset"
+        "mtime", "atime", "ctime", "hdrcharset", "GNU.sparse.major", "GNU.sparse.minor",
+        "GNU.sparse.name", "GNU.sparse.realsize", "GNU.sparse.size", "GNU.sparse.numblocks",
+        "GNU.sparse.map", "GNU.sparse.offset", "GNU.sparse.numbytes"
     };
     Pax result;
+    std::optional<std::uint64_t> sparse_offset;
     for (std::size_t offset = 0; offset < bytes.size();) {
         const auto space = bytes.find(' ', offset);
         if (space == std::string_view::npos) invalid("invalid PAX record length");
@@ -491,9 +521,18 @@ Pax parse_pax(const std::string_view bytes) {
         if (!supported.contains(key)) invalid("unsupported PAX metadata: " + std::string(key));
         auto value = std::string(record.substr(equal + 1U, record.size() - equal - 2U));
         if (value.find('\0') != std::string::npos) invalid("NUL in PAX metadata");
-        if (!result.emplace(std::string(key), std::move(value)).second) invalid("duplicate PAX key");
+        if (key.starts_with("GNU.sparse.") && sparse == nullptr) invalid("global sparse PAX metadata");
+        if (key == "GNU.sparse.offset") {
+            if (sparse_offset) invalid("unpaired PAX sparse offset");
+            sparse_offset = unsigned_number(value, 10, "PAX sparse offset");
+        } else if (key == "GNU.sparse.numbytes") {
+            if (!sparse_offset || sparse->size() >= limits.sparse_extents) invalid("invalid or excessive PAX sparse map");
+            sparse->emplace_back(*sparse_offset, unsigned_number(value, 10, "PAX sparse length"));
+            sparse_offset.reset();
+        } else if (!result.emplace(std::string(key), std::move(value)).second) invalid("duplicate PAX key");
         offset += static_cast<std::size_t>(length);
     }
+    if (sparse_offset) invalid("unpaired PAX sparse offset");
     return result;
 }
 
@@ -512,28 +551,87 @@ void check_tar_checksum(const std::string_view header) {
     }
 }
 
-std::size_t padded(const std::size_t size, const std::size_t alignment) {
-    if (size > std::numeric_limits<std::size_t>::max() - (alignment - 1U)) invalid("archive size overflow");
+std::uint64_t padded(const std::uint64_t size, const std::uint64_t alignment) {
+    if (size > std::numeric_limits<std::uint64_t>::max() - (alignment - 1U)) invalid("archive size overflow");
     return (size + alignment - 1U) / alignment * alignment;
 }
 
+std::shared_ptr<const Content> sparse_content(
+    const std::shared_ptr<const Data>& bytes, const SparseMap& map,
+    const std::uint64_t logical, const std::uint64_t stored, const std::uint64_t size,
+    const ArchiveLimits& limits
+) {
+    if (logical > limits.expanded_bytes ||
+        logical > static_cast<std::uint64_t>(std::numeric_limits<off_t>::max()) ||
+        map.size() > limits.sparse_extents) {
+        invalid("sparse member exceeds its size or extent limit");
+    }
+    auto result = std::make_shared<Content>();
+    result->data = bytes;
+    result->length = logical;
+    auto position = stored;
+    std::uint64_t end = 0;
+    for (const auto& [offset, length] : map) {
+        if (offset < end || offset > logical || length > logical - offset ||
+            length > size - (position - stored)) {
+            invalid("overlapping, out-of-range, or truncated sparse map");
+        }
+        end = offset + length;
+        if (length != 0U) result->extents.push_back({offset, length, position});
+        position += length;
+    }
+    if (position - stored != size) invalid("sparse map does not describe all stored member data");
+    return result;
+}
+
+void gnu_sparse_map(const std::string_view header, const std::size_t count, SparseMap& map,
+                    const ArchiveLimits& limits) {
+    for (std::size_t index = 0; index < count; ++index) {
+        const auto offset = nonnegative_tar_number(header.substr(index * 24U, 12));
+        const auto length = nonnegative_tar_number(header.substr(index * 24U + 12U, 12));
+        if (offset == 0U && length == 0U) continue;
+        if (map.size() >= limits.sparse_extents) invalid("archive exceeds the sparse extent limit");
+        map.emplace_back(offset, length);
+    }
+}
+
+bool sparse_extension(const char byte) {
+    if (byte != '\0' && byte != '\1') invalid("invalid GNU sparse extension flag");
+    return byte == '\1';
+}
+
+std::uint64_t sparse_line(
+    const Data& bytes, std::uint64_t& position, const std::uint64_t end,
+    const Cancellation& cancellation
+) {
+    const auto text = bytes.bytes(position,
+        static_cast<std::size_t>(std::min<std::uint64_t>(32U, end - position)), cancellation);
+    const auto newline = text.find('\n');
+    if (newline == std::string::npos) invalid("unterminated or oversized sparse map number");
+    position += newline + 1U;
+    return unsigned_number(std::string_view(text).substr(0, newline), 10, "sparse map number");
+}
+
 ParseState parse_tar(
-    const std::string_view bytes, const ArchiveLimits& limits,
+    const std::shared_ptr<const Data>& bytes, const ArchiveLimits& limits,
     const Cancellation& cancellation
 ) {
     ParseState state;
     Pax global;
     Pax local;
+    SparseMap local_sparse;
     std::optional<std::string> long_name;
     std::optional<std::string> long_link;
     bool pending_extension = false;
     std::size_t records = 0;
-    std::size_t offset = 0;
-    while (offset <= bytes.size() && bytes.size() - offset >= 512U) {
+    std::uint64_t offset = 0;
+    while (offset <= bytes->size() && bytes->size() - offset >= 512U) {
         cancellation.throw_if_requested();
-        const auto header = bytes.substr(offset, 512);
+        const auto header_bytes = bytes->bytes(offset, 512, cancellation);
+        const std::string_view header(header_bytes);
         if (all_zero(header)) {
-            if (pending_extension || bytes.size() - offset < 1024U || !all_zero(bytes.substr(offset))) {
+            if (pending_extension || bytes->size() - offset < 1024U ||
+                !zero_range(*bytes, offset, bytes->size() - offset, cancellation)) {
                 invalid("truncated tar terminator, dangling extension, or trailing archive data");
             }
             return state;
@@ -560,26 +658,48 @@ ParseState parse_tar(
         const bool extension = type == 'x' || type == 'g' || type == 'L' || type == 'K';
         if (!extension) {
             for (const auto& [key, value] : local) {
-                if (value.empty()) fields.erase(key);
+                if (value.empty() && !key.starts_with("GNU.sparse.")) fields.erase(key);
                 else fields.insert_or_assign(key, value);
             }
             if (const auto found = fields.find("size"); found != fields.end()) size = unsigned_number(found->second, 10, "PAX size");
         }
         offset += 512U;
-        if (size > limits.expanded_bytes || size > bytes.size() - offset) invalid("truncated or oversized tar member");
-        const auto member_size = static_cast<std::size_t>(size);
-        const auto body = bytes.substr(offset, member_size);
-        const auto stored_size = padded(member_size, 512U);
-        if (stored_size > bytes.size() - offset) invalid("truncated tar padding");
-        if (!all_zero(bytes.substr(offset + member_size, stored_size - member_size))) invalid("nonzero tar member padding");
+        SparseMap sparse = local_sparse;
+        if (type == 'S') {
+            if (!gnu || !sparse.empty() ||
+                std::any_of(fields.begin(), fields.end(), [](const auto& field) {
+                    return field.first.starts_with("GNU.sparse.");
+                })) invalid("conflicting GNU sparse formats");
+            gnu_sparse_map(header.substr(386, 96), 4, sparse, limits);
+            auto extended = sparse_extension(header[482]);
+            std::size_t sparse_headers = 0;
+            while (extended) {
+                if (bytes->size() - offset < 512U) invalid("truncated GNU sparse extension");
+                const auto block = bytes->bytes(offset, 512, cancellation);
+                gnu_sparse_map(block, 21, sparse, limits);
+                extended = sparse_extension(block[504]);
+                if (!all_zero(std::string_view(block).substr(505))) invalid("nonzero GNU sparse extension padding");
+                offset += 512U;
+                if (++sparse_headers > limits.metadata_bytes / 512U) {
+                    invalid("too many GNU sparse extension headers");
+                }
+            }
+        }
+        if (size > limits.expanded_bytes || size > bytes->size() - offset) invalid("truncated or oversized tar member");
+        const auto body_offset = offset;
+        const auto stored_size = padded(size, 512U);
+        if (stored_size > bytes->size() - offset) invalid("truncated tar padding");
+        if (!zero_range(*bytes, offset + size, stored_size - size, cancellation)) invalid("nonzero tar member padding");
         offset += stored_size;
         if (extension) {
+            if (size > limits.metadata_bytes) invalid("tar extension exceeds the metadata byte limit");
+            const auto body = bytes->bytes(body_offset, static_cast<std::size_t>(size), cancellation);
             pending_extension = true;
             if (type == 'x') {
                 if (!local.empty()) invalid("stacked local PAX headers");
-                local = parse_pax(body);
+                local = parse_pax(body, &local_sparse, limits);
             } else if (type == 'g') {
-                for (auto& [key, value] : parse_pax(body)) {
+                for (auto& [key, value] : parse_pax(body, nullptr, limits)) {
                     if (key == "path" || key == "linkpath" || key == "size") invalid("global PAX path or size is unsupported");
                     if (value.empty()) global.erase(key);
                     else global.insert_or_assign(key, std::move(value));
@@ -604,20 +724,31 @@ ParseState parse_tar(
         }
         if (const auto found = fields.find("path"); found != fields.end()) name = found->second;
         if (const auto found = fields.find("linkpath"); found != fields.end()) link = found->second;
+        const bool pax_sparse = !sparse.empty() ||
+            std::any_of(fields.begin(), fields.end(), [](const auto& field) {
+                return field.first.starts_with("GNU.sparse.");
+            });
+        if (const auto found = fields.find("GNU.sparse.name"); found != fields.end()) name = found->second;
         if (const auto found = fields.find("hdrcharset"); found != fields.end() &&
             found->second != "BINARY" && found->second != "ISO-IR 10646 2000 UTF-8") {
             invalid("unsupported PAX character set");
         }
         EntryKind kind;
+        std::uint32_t type_mode = 0;
         switch (type) {
-            case '\0': case '0': case '1': kind = EntryKind::file; break;
+            case '\0': case '0': case '1': case '7': case 'S': kind = EntryKind::file; break;
             case '2': kind = EntryKind::symlink; break;
             case '5': kind = EntryKind::directory; break;
-            default: invalid("unsupported tar member type (special, sparse, or incremental file)");
+            case '3': kind = EntryKind::other; type_mode = S_IFCHR; break;
+            case '4': kind = EntryKind::other; type_mode = S_IFBLK; break;
+            case '6': kind = EntryKind::other; type_mode = S_IFIFO; break;
+            default: invalid("unsupported tar member type (incremental or multivolume archive)");
         }
-        if (type != '\0' && type != '0' && size != 0U) invalid("data on a non-regular tar member");
+        const bool regular_data = type == '\0' || type == '0' || type == '7' || type == 'S';
+        if ((!regular_data && size != 0U) || (pax_sparse && !regular_data)) invalid("data or sparse map on a non-regular tar member");
         auto node = new_node(kind, state.next_object++);
         auto& entry = node.entry;
+        if (type_mode != 0U) entry.mode = type_mode;
         const auto mode = nonnegative_tar_number(header.substr(100, 8));
         if (mode > 07777U) invalid("unsupported tar permission bits");
         entry.permissions = static_cast<fs::perms>(mode);
@@ -632,7 +763,15 @@ ParseState parse_tar(
         if (gnu) {
             entry.accessed = parse_time(std::to_string(tar_number(header.substr(345, 12))));
             entry.changed = parse_time(std::to_string(tar_number(header.substr(357, 12))));
-            if (!all_zero(header.substr(386, 109))) invalid("unsupported GNU sparse or incremental metadata");
+            if (nonnegative_tar_number(header.substr(369, 12)) != 0U || !all_zero(header.substr(381, 5)) ||
+                !all_zero(header.substr(495)) || (type != 'S' && !all_zero(header.substr(386, 109)))) {
+                invalid("unsupported GNU incremental or multivolume metadata");
+            }
+        }
+        node.device_major = uint32_number(nonnegative_tar_number(header.substr(329, 8)), "tar device major");
+        node.device_minor = uint32_number(nonnegative_tar_number(header.substr(337, 8)), "tar device minor");
+        if (kind != EntryKind::other && (node.device_major != 0U || node.device_minor != 0U)) {
+            invalid("device number on a non-device tar member");
         }
         for (const auto& [key, value] : fields) {
             if (key == "uid") entry.uid = uint32_number(unsigned_number(value, 10, "PAX uid"), "PAX uid");
@@ -652,10 +791,67 @@ ParseState parse_tar(
         } else if (type == '1') {
             node.hardlink = member_path(link, false, limits);
         } else if (kind == EntryKind::file) {
-            node.bytes = std::make_shared<const std::string>(body);
+            auto data_offset = body_offset;
+            auto data_size = size;
+            std::uint64_t logical = size;
+            if (type == 'S') {
+                logical = nonnegative_tar_number(header.substr(483, 12));
+            } else if (pax_sparse) {
+                if (fields.contains("GNU.sparse.major") || fields.contains("GNU.sparse.minor")) {
+                    if (!fields.contains("GNU.sparse.major") || !fields.contains("GNU.sparse.minor") ||
+                        fields.at("GNU.sparse.major") != "1" || fields.at("GNU.sparse.minor") != "0" ||
+                        !fields.contains("GNU.sparse.realsize") || fields.contains("GNU.sparse.map") ||
+                        fields.contains("GNU.sparse.size") || fields.contains("GNU.sparse.numblocks") ||
+                        !sparse.empty()) invalid("unsupported or conflicting PAX sparse version");
+                    logical = unsigned_number(fields.at("GNU.sparse.realsize"), 10, "sparse logical size");
+                    auto map_end = body_offset;
+                    const auto count = sparse_line(*bytes, map_end, body_offset + size, cancellation);
+                    if (count > limits.sparse_extents) invalid("archive exceeds the sparse extent limit");
+                    for (std::uint64_t index = 0; index < count; ++index) {
+                        const auto start = sparse_line(*bytes, map_end, body_offset + size, cancellation);
+                        const auto length = sparse_line(*bytes, map_end, body_offset + size, cancellation);
+                        sparse.emplace_back(start, length);
+                        if (map_end - body_offset > limits.metadata_bytes) invalid("sparse map exceeds the metadata byte limit");
+                    }
+                    const auto map_size = padded(map_end - body_offset, 512U);
+                    if (map_size > size || !zero_range(*bytes, map_end,
+                        map_size - (map_end - body_offset), cancellation)) invalid("invalid PAX sparse map padding");
+                    data_offset += map_size;
+                    data_size -= map_size;
+                } else {
+                    if (!fields.contains("GNU.sparse.size") || !fields.contains("GNU.sparse.numblocks") ||
+                        fields.contains("GNU.sparse.realsize")) invalid("incomplete PAX sparse metadata");
+                    logical = unsigned_number(fields.at("GNU.sparse.size"), 10, "sparse logical size");
+                    if (const auto map = fields.find("GNU.sparse.map"); map != fields.end()) {
+                        if (!sparse.empty()) invalid("conflicting PAX sparse maps");
+                        const std::string_view text(map->second);
+                        for (std::size_t begin = 0; begin < text.size();) {
+                            const auto comma = text.find(',', begin);
+                            if (comma == std::string_view::npos) invalid("unpaired PAX sparse map value");
+                            const auto next = text.find(',', comma + 1U);
+                            const auto start = unsigned_number(text.substr(begin, comma - begin), 10, "sparse offset");
+                            const auto length = unsigned_number(text.substr(comma + 1U,
+                                next == std::string_view::npos ? text.size() - comma - 1U : next - comma - 1U),
+                                10, "sparse length");
+                            if (sparse.size() >= limits.sparse_extents) invalid("archive exceeds the sparse extent limit");
+                            sparse.emplace_back(start, length);
+                            if (next == std::string_view::npos) break;
+                            begin = next + 1U;
+                            if (begin == text.size()) invalid("trailing comma in PAX sparse map");
+                        }
+                    }
+                    if (sparse.size() != unsigned_number(fields.at("GNU.sparse.numblocks"), 10, "sparse block count")) {
+                        invalid("PAX sparse map count mismatch");
+                    }
+                }
+            }
+            node.bytes = type == 'S' || pax_sparse
+                ? sparse_content(bytes, sparse, logical, data_offset, data_size, limits)
+                : content_range(bytes, body_offset, size, limits.sparse_extents, cancellation);
         }
         state.insert(key, std::move(node), limits);
         local.clear();
+        local_sparse.clear();
         long_name.reset();
         long_link.reset();
         pending_extension = false;
@@ -672,8 +868,9 @@ void resolve_hardlinks(ParseState& state, const Cancellation& cancellation) {
         for (;;) {
             if (!visited.insert(target).second) invalid("cyclic tar hardlink");
             const auto found = state.model.find(target);
-            if (found == state.model.end() || found->second.entry.kind != EntryKind::file) {
-                invalid("tar hardlink does not refer to a regular archive member");
+            if (found == state.model.end() ||
+                (found->second.entry.kind != EntryKind::file && found->second.entry.kind != EntryKind::other)) {
+                invalid("tar hardlink does not refer to a file or special archive member");
             }
             if (!found->second.hardlink.empty()) {
                 target = found->second.hardlink;
@@ -682,89 +879,157 @@ void resolve_hardlinks(ParseState& state, const Cancellation& cancellation) {
             node.bytes = found->second.bytes;
             node.object = found->second.object;
             node.entry = found->second.entry;
+            node.device_major = found->second.device_major;
+            node.device_minor = found->second.device_minor;
             node.hardlink.clear();
             break;
         }
     }
 }
 
+std::optional<ArchiveFormat> cpio_format(const std::string_view bytes) {
+    if (bytes.starts_with("070701")) return ArchiveFormat::cpio_newc;
+    if (bytes.starts_with("070702")) return ArchiveFormat::cpio_crc;
+    if (bytes.starts_with("070707")) return ArchiveFormat::cpio_odc;
+    if (bytes.starts_with(std::string_view("\xc7\x71", 2))) return ArchiveFormat::cpio_binary_le;
+    if (bytes.starts_with(std::string_view("\x71\xc7", 2))) return ArchiveFormat::cpio_binary_be;
+    return std::nullopt;
+}
+
+std::uint32_t checksum_data(
+    const Data& bytes, const std::uint64_t offset, const std::uint64_t length,
+    const Cancellation& cancellation
+) {
+    std::uint32_t checksum = 0;
+    archive_detail::storage_ranges(bytes.descriptor(), offset, length, [&](auto position, auto remaining) {
+        while (remaining > 0U) {
+            const auto block = bytes.bytes(position,
+                static_cast<std::size_t>(std::min<std::uint64_t>(remaining, 64U * 1024U)), cancellation);
+            if (block.empty()) invalid("truncated checksummed member");
+            for (const unsigned char byte : block) checksum += byte;
+            position += block.size();
+            remaining -= block.size();
+        }
+    }, cancellation);
+    return checksum;
+}
+
+std::uint32_t checksum_content(const Content& content, const Cancellation& cancellation) {
+    std::uint32_t result = 0;
+    for (const auto& extent : content.extents) {
+        result += checksum_data(*content.data, extent.stored, extent.length, cancellation);
+    }
+    return result;
+}
+
 ParseState parse_cpio(
-    const std::string_view bytes, const ArchiveLimits& limits,
-    ArchiveFormat& format, const Cancellation& cancellation
+    const std::shared_ptr<const Data>& bytes, const ArchiveLimits& limits,
+    const ArchiveFormat format, const Cancellation& cancellation
 ) {
     ParseState state;
     struct Group {
         std::uint64_t object{0};
         Entry metadata;
-        std::shared_ptr<const std::string> bytes;
+        std::shared_ptr<const Content> bytes;
+        std::uint32_t device_major{0};
+        std::uint32_t device_minor{0};
         std::uint64_t declared_links{0};
         std::uint64_t members{0};
     };
     using Identity = std::tuple<std::uint64_t, std::uint64_t, std::uint64_t>;
     std::map<Identity, Group> groups;
     std::map<std::uint64_t, const Group*> groups_by_object;
-    std::size_t offset = 0;
-    bool first = true;
-    while (offset <= bytes.size() && bytes.size() - offset >= 110U) {
+    const bool modern = format == ArchiveFormat::cpio_newc || format == ArchiveFormat::cpio_crc;
+    const bool crc = format == ArchiveFormat::cpio_crc;
+    const bool odc = format == ArchiveFormat::cpio_odc;
+    const std::uint64_t header_size = modern ? 110U : odc ? 76U : 26U;
+    const std::uint64_t alignment = modern ? 4U : odc ? 1U : 2U;
+    std::uint64_t offset = 0;
+    while (offset <= bytes->size() && bytes->size() - offset >= header_size) {
         cancellation.throw_if_requested();
-        const auto header = bytes.substr(offset, 110);
-        const bool crc = header.substr(0, 6) == "070702";
-        if (!crc && header.substr(0, 6) != "070701") invalid("unsupported or mixed cpio header format");
-        if (first) {
-            format = crc ? ArchiveFormat::cpio_crc : ArchiveFormat::cpio_newc;
-            first = false;
-        } else if (crc != (format == ArchiveFormat::cpio_crc)) invalid("mixed newc/CRC cpio archive");
+        const auto header_bytes = bytes->bytes(offset, static_cast<std::size_t>(header_size), cancellation);
+        const std::string_view header(header_bytes);
+        if (cpio_format(header) != format) invalid("unsupported or mixed cpio header format");
         std::array<std::uint64_t, 13> fields{};
-        for (std::size_t index = 0; index < fields.size(); ++index) {
-            fields[index] = unsigned_number(header.substr(6U + index * 8U, 8), 16, "cpio field");
+        if (modern) {
+            for (std::size_t index = 0; index < fields.size(); ++index) {
+                fields[index] = unsigned_number(header.substr(6U + index * 8U, 8), 16, "cpio field");
+            }
+        } else if (odc) {
+            const auto number = [&](const std::size_t start, const std::size_t length = 6U) {
+                return unsigned_number(header.substr(start, length), 8, "odc cpio field");
+            };
+            const auto device = number(6);
+            const auto rdevice = number(42);
+            fields = {number(12), number(18), number(24), number(30), number(36), number(48, 11),
+                      number(65, 11), device >> 8U, device & 255U, rdevice >> 8U, rdevice & 255U,
+                      number(59), 0};
+        } else {
+            const bool little = format == ArchiveFormat::cpio_binary_le;
+            const auto word = [&](const std::size_t index) {
+                const auto first = static_cast<unsigned char>(header[index * 2U]);
+                const auto second = static_cast<unsigned char>(header[index * 2U + 1U]);
+                return static_cast<std::uint64_t>(little ? first | (second << 8U) : (first << 8U) | second);
+            };
+            const auto device = word(1);
+            const auto rdevice = word(7);
+            fields = {word(2), word(3), word(4), word(5), word(6), (word(8) << 16U) | word(9),
+                      (word(11) << 16U) | word(12), device >> 8U, device & 255U,
+                      rdevice >> 8U, rdevice & 255U, word(10), 0};
+            if (fields[6] > static_cast<std::uint64_t>(std::numeric_limits<std::int32_t>::max())) {
+                invalid("V7 binary cpio member exceeds its signed 32-bit size range");
+            }
         }
         const auto [ino, mode, uid, gid, links, mtime, size, devmajor, devminor, rdevmajor, rdevminor, name_size, checksum] =
             std::tuple{fields[0], fields[1], fields[2], fields[3], fields[4], fields[5], fields[6],
                        fields[7], fields[8], fields[9], fields[10], fields[11], fields[12]};
-        offset += 110U;
-        if (name_size < 1U || name_size > limits.path_bytes + 4U || name_size > bytes.size() - offset) {
+        offset += header_size;
+        if (name_size < 1U || name_size > limits.path_bytes + 4U || name_size > bytes->size() - offset) {
             invalid("truncated or overlong cpio member name");
         }
-        const auto raw_name = bytes.substr(offset, static_cast<std::size_t>(name_size));
+        const auto raw_name = bytes->bytes(offset, static_cast<std::size_t>(name_size), cancellation);
         if (raw_name.back() != '\0' || raw_name.substr(0, raw_name.size() - 1U).find('\0') != std::string_view::npos) {
             invalid("invalid NUL in cpio member name");
         }
-        const auto name = raw_name.substr(0, raw_name.size() - 1U);
-        const auto data_offset = padded(offset + static_cast<std::size_t>(name_size), 4);
-        if (data_offset > bytes.size() || !all_zero(bytes.substr(offset + static_cast<std::size_t>(name_size),
-                                                               data_offset - offset - static_cast<std::size_t>(name_size)))) {
+        const auto name = std::string_view(raw_name).substr(0, raw_name.size() - 1U);
+        const auto data_offset = padded(offset + name_size, alignment);
+        if (data_offset > bytes->size() ||
+            !zero_range(*bytes, offset + name_size, data_offset - offset - name_size, cancellation)) {
             invalid("invalid cpio name padding");
         }
         offset = data_offset;
-        if (size > limits.expanded_bytes || size > bytes.size() - offset) invalid("truncated or oversized cpio member");
-        const auto body = bytes.substr(offset, static_cast<std::size_t>(size));
-        const auto next_offset = padded(offset + static_cast<std::size_t>(size), 4);
-        if (next_offset > bytes.size() ||
-            !all_zero(bytes.substr(offset + static_cast<std::size_t>(size), next_offset - offset - static_cast<std::size_t>(size)))) {
+        if (size > limits.expanded_bytes || size > bytes->size() - offset) invalid("truncated or oversized cpio member");
+        const auto body_offset = offset;
+        const auto next_offset = padded(offset + size, alignment);
+        if (next_offset > bytes->size() ||
+            !zero_range(*bytes, offset + size, next_offset - offset - size, cancellation)) {
             invalid("invalid cpio data padding");
         }
         offset = next_offset;
-        std::uint32_t actual_checksum = 0;
-        if (crc) for (const unsigned char byte : body) actual_checksum += byte;
+        const auto actual_checksum = crc ? checksum_data(*bytes, body_offset, size, cancellation) : 0U;
         if (checksum != actual_checksum) invalid("cpio checksum mismatch");
         if (name == "TRAILER!!!") {
-            if (size != 0U || !all_zero(bytes.substr(offset))) invalid("invalid cpio trailer or trailing archive data");
+            if (size != 0U || !zero_range(*bytes, offset, bytes->size() - offset, cancellation)) {
+                invalid("invalid cpio trailer or trailing archive data");
+            }
             for (const auto& [identity, group] : groups) {
                 static_cast<void>(identity);
                 if (group.members > group.declared_links) invalid("cpio hardlink count exceeds its declared link count");
             }
             for (auto& [key, node] : state.model) {
                 static_cast<void>(key);
-                if (node.entry.kind != EntryKind::file) continue;
+                if (node.entry.kind != EntryKind::file && node.entry.kind != EntryKind::other) continue;
                 if (const auto found = groups_by_object.find(node.object); found != groups_by_object.end()) {
                     const auto& group = *found->second;
-                    node.bytes = group.bytes ? group.bytes : std::make_shared<const std::string>();
+                    node.bytes = group.bytes ? group.bytes : node.bytes;
                     node.entry = group.metadata;
+                    node.device_major = group.device_major;
+                    node.device_minor = group.device_minor;
                 }
             }
             return state;
         }
-        if (links == 0U || rdevmajor != 0U || rdevminor != 0U || (mode & ~std::uint64_t{0177777}) != 0U) {
+        if (links == 0U || (mode & ~std::uint64_t{0177777}) != 0U) {
             invalid("unsupported cpio identity or mode");
         }
         EntryKind kind;
@@ -772,46 +1037,61 @@ ParseState parse_cpio(
             case S_IFREG: kind = EntryKind::file; break;
             case S_IFDIR: kind = EntryKind::directory; break;
             case S_IFLNK: kind = EntryKind::symlink; break;
-            default: invalid("unsupported cpio special file");
+            case S_IFIFO: case S_IFCHR: case S_IFBLK: case S_IFSOCK: kind = EntryKind::other; break;
+            default: invalid("unsupported cpio file type (PWB and vendor extensions are not V7 cpio)");
         }
-        if (kind == EntryKind::directory && size != 0U) invalid("data on cpio directory");
+        if ((kind == EntryKind::directory || kind == EntryKind::other) && size != 0U) {
+            invalid("data on a cpio directory or special member");
+        }
         if (kind == EntryKind::symlink && links != 1U) invalid("hardlinked cpio symlink is unsupported");
         auto node = new_node(kind, state.next_object++);
         auto& entry = node.entry;
         entry.permissions = static_cast<fs::perms>(mode & 07777U);
         entry.mode = static_cast<std::uint32_t>(mode);
-        entry.uid = static_cast<std::uint32_t>(uid);
-        entry.gid = static_cast<std::uint32_t>(gid);
+        entry.uid = uint32_number(uid, "cpio uid");
+        entry.gid = uint32_number(gid, "cpio gid");
+        if (S_ISCHR(mode) || S_ISBLK(mode)) {
+            node.device_major = uint32_number(rdevmajor, "cpio device major");
+            node.device_minor = uint32_number(rdevminor, "cpio device minor");
+        }
         entry.owner = std::to_string(uid);
         entry.group = std::to_string(gid);
         entry.modified = parse_time(std::to_string(mtime));
         entry.accessed = entry.modified;
         entry.changed = entry.modified;
         if (kind == EntryKind::symlink) {
+            if (size > limits.path_bytes) invalid("overlong cpio symlink target");
+            const auto body = bytes->bytes(body_offset, static_cast<std::size_t>(size), cancellation);
             check_link_text(body, limits);
-            entry.target = std::string(body);
-        } else if (kind == EntryKind::file && links > 1U) {
+            entry.target = body;
+        } else if ((kind == EntryKind::file || kind == EntryKind::other) && links > 1U) {
             const Identity identity{devmajor, devminor, ino};
             auto [found, inserted] = groups.try_emplace(identity);
             auto& group = found->second;
             if (inserted) {
                 group.object = node.object;
                 group.metadata = entry;
+                group.device_major = node.device_major;
+                group.device_minor = node.device_minor;
                 group.declared_links = links;
                 groups_by_object.emplace(group.object, &group);
             } else if (group.metadata.mode != entry.mode || group.metadata.uid != entry.uid ||
                        group.metadata.gid != entry.gid || group.metadata.modified != entry.modified ||
-                       group.declared_links != links) {
+                       group.declared_links != links || group.device_major != node.device_major ||
+                       group.device_minor != node.device_minor) {
                 invalid("inconsistent cpio hardlink metadata");
             }
-            if (!body.empty()) {
-                if (group.bytes && *group.bytes != body) invalid("conflicting cpio hardlink data");
-                group.bytes = std::make_shared<const std::string>(body);
+            if (size != 0U) {
+                auto body = content_range(bytes, body_offset, size, limits.sparse_extents, cancellation);
+                if (group.bytes && !archive_detail::equal(*group.bytes, *body, cancellation)) {
+                    invalid("conflicting cpio hardlink data");
+                }
+                group.bytes = std::move(body);
             }
             ++group.members;
             node.object = group.object;
         } else if (kind == EntryKind::file) {
-            node.bytes = std::make_shared<const std::string>(body);
+            node.bytes = content_range(bytes, body_offset, size, limits.sparse_extents, cancellation);
         }
         state.insert(member_path(name, kind == EntryKind::directory, limits), std::move(node), limits);
     }
@@ -820,20 +1100,39 @@ ParseState parse_cpio(
 
 class ArchiveOutput {
 public:
-    explicit ArchiveOutput(const std::size_t limit) : limit_(limit) {}
+    explicit ArchiveOutput(const std::uint64_t limit) : limit_(limit), bytes_(std::make_shared<Data>()) {}
     void append(const std::string_view value) {
-        if (value.size() > limit_ - bytes_.size()) invalid("serialized archive exceeds the expanded byte limit");
-        bytes_.append(value);
+        check(value.size());
+        bytes_->append(value);
     }
-    void zeros(const std::size_t count) {
-        if (count > limit_ - bytes_.size()) invalid("serialized archive exceeds the expanded byte limit");
-        bytes_.append(count, '\0');
+    void zeros(const std::uint64_t count) {
+        check(count);
+        bytes_->resize(bytes_->size() + count);
     }
-    void align(const std::size_t alignment) { zeros(padded(bytes_.size(), alignment) - bytes_.size()); }
-    [[nodiscard]] std::string finish() && { return std::move(bytes_); }
+    void append(const Content& content, const Cancellation& cancellation) {
+        check(content.size());
+        const auto begin = bytes_->size();
+        for (const auto& extent : content.extents) {
+            archive_detail::copy_storage(content.data->descriptor(), *bytes_, extent.stored,
+                extent.length, begin + extent.offset, cancellation);
+        }
+        bytes_->resize(begin + content.size());
+    }
+    void stored(const Content& content, const Cancellation& cancellation) {
+        for (const auto& extent : content.extents) {
+            check(extent.length);
+            archive_detail::copy_storage(content.data->descriptor(), *bytes_, extent.stored,
+                extent.length, bytes_->size(), cancellation);
+        }
+    }
+    void align(const std::uint64_t alignment) { zeros(padded(bytes_->size(), alignment) - bytes_->size()); }
+    [[nodiscard]] std::shared_ptr<const Data> finish() && { return std::move(bytes_); }
 private:
-    std::size_t limit_;
-    std::string bytes_;
+    void check(const std::uint64_t count) const {
+        if (count > limit_ - bytes_->size()) invalid("serialized archive exceeds the expanded byte limit");
+    }
+    std::uint64_t limit_;
+    std::shared_ptr<Data> bytes_;
 };
 
 void tar_octal(std::string& header, const std::size_t offset, const std::size_t width, std::uint64_t number) {
@@ -849,8 +1148,9 @@ void tar_octal(std::string& header, const std::size_t offset, const std::size_t 
 }
 
 std::string tar_header(
-    const std::string_view name, const char type, const std::size_t size,
-    const std::uint32_t permissions
+    const std::string_view name, const char type, const std::uint64_t size,
+    const std::uint32_t permissions, const std::uint32_t device_major = 0,
+    const std::uint32_t device_minor = 0
 ) {
     if (name.size() > 100U) invalid("internal tar header name is too long");
     std::string header(512, '\0');
@@ -858,14 +1158,26 @@ std::string tar_header(
     tar_octal(header, 100, 8, permissions & 07777U);
     tar_octal(header, 108, 8, 0);
     tar_octal(header, 116, 8, 0);
-    tar_octal(header, 124, 12, size);
+    tar_octal(header, 124, 12, size <= 077777777777ULL ? size : 0U);
     tar_octal(header, 136, 12, 0);
     header.replace(148, 8, 8, ' ');
     header[156] = type;
     header.replace(257, 6, std::string_view("ustar\0", 6));
     header.replace(263, 2, "00");
-    tar_octal(header, 329, 8, 0);
-    tar_octal(header, 337, 8, 0);
+    const auto device_field = [&](const std::size_t offset, const std::uint32_t number) {
+        if (number <= 07777777U) tar_octal(header, offset, 8, number);
+        else {
+            std::uint64_t remaining = number;
+            for (std::size_t index = 8; index > 0;) {
+                --index;
+                header[offset + index] = static_cast<char>(remaining & 255U);
+                remaining >>= 8U;
+            }
+            header[offset] = static_cast<char>(static_cast<unsigned char>(header[offset]) | 0x80U);
+        }
+    };
+    device_field(329, device_major);
+    device_field(337, device_minor);
     std::uint64_t checksum = 0;
     for (const unsigned char byte : header) checksum += byte;
     tar_octal(header, 148, 7, checksum);
@@ -889,7 +1201,7 @@ std::string archive_member_name(const std::string& key, const bool directory) {
     return "./" + key.substr(1) + (directory ? "/" : "");
 }
 
-std::string serialize_tar(
+std::shared_ptr<const Data> serialize_tar(
     const Model& model, const ArchiveLimits& limits,
     const Cancellation& cancellation
 ) {
@@ -900,8 +1212,14 @@ std::string serialize_tar(
         const auto& entry = node.entry;
         char type = entry.kind == EntryKind::directory ? '5' :
                     entry.kind == EntryKind::symlink ? '2' : '0';
+        if (entry.kind == EntryKind::other) {
+            if (S_ISFIFO(entry.mode)) type = '6';
+            else if (S_ISCHR(entry.mode)) type = '3';
+            else if (S_ISBLK(entry.mode)) type = '4';
+            else invalid("tar cannot represent this special file type");
+        }
         std::string target = entry.target;
-        if (entry.kind == EntryKind::file) {
+        if (entry.kind == EntryKind::file || entry.kind == EntryKind::other) {
             const auto [first, inserted] = first_links.emplace(node.object, key);
             if (!inserted) {
                 type = '1';
@@ -917,12 +1235,32 @@ std::string serialize_tar(
                           pax_record("atime", time_text(entry.accessed)) +
                           pax_record("ctime", time_text(entry.changed));
         if (type == '1' || type == '2') pax += pax_record("linkpath", target);
+        const bool sparse = type == '0' && node.bytes->sparse();
+        std::string map;
+        auto size = type == '0' ? node.bytes->size() : 0U;
+        if (sparse) {
+            map = std::to_string(node.bytes->extents.size()) + "\n";
+            for (const auto& extent : node.bytes->extents) {
+                map += std::to_string(extent.offset) + "\n" + std::to_string(extent.length) + "\n";
+                if (map.size() > limits.metadata_bytes) invalid("sparse map exceeds the metadata byte limit");
+            }
+            size = padded(map.size(), 512U) + node.bytes->stored_size();
+            pax += pax_record("GNU.sparse.major", "1") + pax_record("GNU.sparse.minor", "0") +
+                   pax_record("GNU.sparse.name", name) + pax_record("GNU.sparse.realsize", std::to_string(node.bytes->size()));
+        }
+        if (size > 077777777777ULL) pax += pax_record("size", std::to_string(size));
+        if (pax.size() > limits.metadata_bytes) invalid("tar extension exceeds the metadata byte limit");
         output.append(tar_header("PaxHeaders/mcpp", 'x', pax.size(), 0600));
         output.append(pax);
         output.align(512);
-        const auto size = type == '0' ? node.bytes->size() : 0U;
-        output.append(tar_header("mcpp-member", type, size, static_cast<std::uint32_t>(entry.permissions)));
-        if (size != 0U) output.append(*node.bytes);
+        output.append(tar_header("mcpp-member", type, size, static_cast<std::uint32_t>(entry.permissions),
+            type == '3' || type == '4' ? node.device_major : 0U,
+            type == '3' || type == '4' ? node.device_minor : 0U));
+        if (sparse) {
+            output.append(map);
+            output.align(512);
+            output.stored(*node.bytes, cancellation);
+        } else if (size != 0U) output.append(*node.bytes, cancellation);
         output.align(512);
     }
     output.zeros(1024);
@@ -942,18 +1280,59 @@ std::string hexadecimal(const std::uint64_t number) {
 
 void cpio_record(
     ArchiveOutput& output, const std::string_view name, const std::string_view data,
-    const std::array<std::uint64_t, 13>& fields, const bool crc
+    const Content* content, const std::array<std::uint64_t, 13>& fields,
+    const ArchiveFormat format, const Cancellation& cancellation
 ) {
-    output.append(crc ? "070702" : "070701");
-    for (const auto field : fields) output.append(hexadecimal(field));
+    const bool modern = format == ArchiveFormat::cpio_newc || format == ArchiveFormat::cpio_crc;
+    const bool odc = format == ArchiveFormat::cpio_odc;
+    std::string header;
+    if (modern) {
+        header = format == ArchiveFormat::cpio_crc ? "070702" : "070701";
+        for (const auto field : fields) header += hexadecimal(field);
+    } else {
+        if (fields[9] > 0x3ffffffU || fields[10] > 255U) invalid("device number exceeds the old cpio range");
+        const auto device = (fields[9] << 8U) | fields[10];
+        const std::array<std::uint64_t, 10> legacy{
+            0, fields[0], fields[1], fields[2], fields[3], fields[4], device, fields[5], fields[11], fields[6]
+        };
+        if (odc) {
+            header = "070707";
+            for (std::size_t index = 0; index < legacy.size(); ++index) {
+                const std::size_t width = index == 7U || index == 9U ? 11U : 6U;
+                std::array<char, 24> buffer{};
+                const auto converted = std::to_chars(buffer.data(), buffer.data() + buffer.size(), legacy[index], 8);
+                const auto count = static_cast<std::size_t>(converted.ptr - buffer.data());
+                if (converted.ec != std::errc{} || count > width) invalid("member metadata exceeds the odc cpio field range");
+                header.append(width - count, '0');
+                header.append(buffer.data(), count);
+            }
+        } else {
+            if (fields[6] > static_cast<std::uint64_t>(std::numeric_limits<std::int32_t>::max()) ||
+                fields[5] > std::numeric_limits<std::uint32_t>::max()) invalid("member exceeds the V7 binary cpio range");
+            const std::array<std::uint64_t, 13> words{
+                070707, 0, fields[0], fields[1], fields[2], fields[3], fields[4], device,
+                fields[5] >> 16U, fields[5] & 65535U, fields[11], fields[6] >> 16U, fields[6] & 65535U
+            };
+            for (const auto word : words) {
+                if (word > 65535U) invalid("member metadata exceeds the V7 binary cpio field range");
+                const auto low = static_cast<char>(word & 255U);
+                const auto high = static_cast<char>(word >> 8U);
+                header.push_back(format == ArchiveFormat::cpio_binary_le ? low : high);
+                header.push_back(format == ArchiveFormat::cpio_binary_le ? high : low);
+            }
+        }
+    }
+    output.append(header);
     output.append(name);
     output.zeros(1);
-    output.align(4);
-    output.append(data);
-    output.align(4);
+    const auto alignment = modern ? 4U : odc ? 1U : 2U;
+    output.align(alignment);
+    if (content != nullptr) output.append(*content, cancellation);
+    else output.append(data);
+    output.align(alignment);
 }
 
-std::string serialize_cpio(
+std::shared_ptr<const Data> serialize_cpio(
     const Model& model, const ArchiveFormat format, const ArchiveLimits& limits,
     const Cancellation& cancellation
 ) {
@@ -966,40 +1345,46 @@ std::string serialize_cpio(
     std::map<std::uint64_t, FileInfo> files;
     std::uint64_t next_inode = 1;
     for (const auto& [key, node] : model) {
-        if (node.entry.kind != EntryKind::file) continue;
+        if (node.entry.kind != EntryKind::file && node.entry.kind != EntryKind::other) continue;
         auto& information = files[node.object];
         if (information.inode == 0U) information.inode = next_inode++;
         ++information.links;
         information.last = key;
     }
     const bool crc = format == ArchiveFormat::cpio_crc;
+    const bool modern = format == ArchiveFormat::cpio_newc || crc;
     for (const auto& [key, node] : model) {
         cancellation.throw_if_requested();
         const auto& entry = node.entry;
         const auto name = archive_member_name(key, false);
         std::string_view data;
+        const Content* content = nullptr;
         auto inode = next_inode++;
         std::uint64_t links = entry.kind == EntryKind::directory ? 2U : 1U;
-        if (entry.kind == EntryKind::file) {
+        if (entry.kind == EntryKind::file || entry.kind == EntryKind::other) {
             const auto& information = files.at(node.object);
             inode = information.inode;
             links = information.links;
-            if (key == information.last) data = *node.bytes;
+            if (entry.kind == EntryKind::file && (!modern || key == information.last)) content = node.bytes.get();
         } else if (entry.kind == EntryKind::symlink) {
             data = entry.target;
         }
         const auto seconds = std::chrono::duration_cast<std::chrono::seconds>(entry.modified.time_since_epoch()).count();
-        if (seconds < 0 || static_cast<std::uint64_t>(seconds) > std::numeric_limits<std::uint32_t>::max()) {
-            invalid("cpio modification time exceeds its unsigned 32-bit range");
+        if (seconds < 0) {
+            invalid("cpio cannot represent negative modification times");
         }
         std::uint32_t checksum = 0;
-        if (crc) for (const unsigned char byte : data) checksum += byte;
-        cpio_record(output, name, data, {
+        if (crc) {
+            if (content != nullptr) checksum = checksum_content(*content, cancellation);
+            else for (const unsigned char byte : data) checksum += byte;
+        }
+        cpio_record(output, name, data, content, {
             inode, entry.mode, entry.uid, entry.gid, links, static_cast<std::uint64_t>(seconds),
-            data.size(), 0, 0, 0, 0, name.size() + 1U, checksum
-        }, crc);
+            content != nullptr ? content->size() : data.size(), 0, 0,
+            node.device_major, node.device_minor, name.size() + 1U, checksum
+        }, format, cancellation);
     }
-    cpio_record(output, "TRAILER!!!", {}, {0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 11, 0}, crc);
+    cpio_record(output, "TRAILER!!!", {}, nullptr, {0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 11, 0}, format, cancellation);
     output.align(512);
     return std::move(output).finish();
 }
@@ -1028,41 +1413,104 @@ std::string compression_tool(const ArchiveCompression compression) {
     invalid(std::string("required compression tool is unavailable: ") + name);
 }
 
-std::string convert_compression(
+class DataSink final : public std::ostream {
+public:
+    DataSink(Data& data, const std::uint64_t limit) : std::ostream(nullptr), buffer_(data, limit) {
+        rdbuf(&buffer_);
+        exceptions(std::ios::badbit | std::ios::failbit);
+    }
+private:
+    class Buffer final : public std::streambuf {
+    public:
+        Buffer(Data& data, const std::uint64_t limit) : data_(data), limit_(limit) {}
+    protected:
+        std::streamsize xsputn(const char* bytes, const std::streamsize count) override {
+            if (count < 0 || static_cast<std::uint64_t>(count) > limit_ - data_.size()) {
+                invalid("streamed archive exceeds its configured byte limit");
+            }
+            data_.append({bytes, static_cast<std::size_t>(count)});
+            return count;
+        }
+        int_type overflow(const int_type byte) override {
+            if (!traits_type::eq_int_type(byte, traits_type::eof())) {
+                const char value = traits_type::to_char_type(byte);
+                xsputn(&value, 1);
+            }
+            return traits_type::not_eof(byte);
+        }
+    private:
+        Data& data_;
+        std::uint64_t limit_;
+    };
+    Buffer buffer_;
+};
+
+std::shared_ptr<const Data> convert_compression(
     const ArchiveCompression compression, const bool decompress,
-    const DraftDirectory& directory, const std::string_view input,
-    const std::size_t limit, const Cancellation& cancellation
+    const Data& input, const std::uint64_t limit, const Cancellation& cancellation
 ) {
     const auto tool = compression_tool(compression);
     std::vector<std::string> arguments{tool};
     if (decompress && compression == ArchiveCompression::xz) {
-        arguments.push_back("--memlimit-decompress=" + std::to_string(limit));
+        arguments.push_back("--memlimit-decompress=268435456");
     }
     if (decompress && compression == ArchiveCompression::zstd) {
-        arguments.push_back("--memory=" + std::to_string(limit));
+        arguments.push_back("--memory=268435456");
     }
+    if (!decompress && compression == ArchiveCompression::gzip) arguments.push_back("-n");
     arguments.push_back(decompress ? "-dc" : "-c");
-    const auto result = capture_command(
-        arguments, directory.anchored({}), cancellation,
-        limit, directory.anchored(input)
-    );
+    arguments.push_back("--");
+    arguments.push_back(input.path());
+    auto data = std::make_shared<Data>();
+    DataSink output(*data, limit);
+    const auto result = capture_command_to(output, arguments, ".", cancellation);
     if (result.status != 0) {
         invalid(tool + (decompress ? " decompression" : " compression") +
                 " failed (" + std::to_string(result.status) + "): " + result.error);
     }
-    return result.output;
+    output.flush();
+    return data;
 }
 
-std::string read_archive(
-    LocalProvider& local, const fs::path& path, const Entry& expected,
-    const std::size_t limit, const Cancellation& cancellation
+std::shared_ptr<const Data> read_archive(
+    Provider& source, const std::string& path, const Entry& expected,
+    const std::uint64_t limit, const Cancellation& cancellation
 ) {
     if (expected.kind != EntryKind::file) invalid("the archive must be a regular file, not a symlink");
     if (expected.size > limit) invalid("archive exceeds the physical byte limit");
-    std::ostringstream output(std::ios::binary);
-    local.read(path.string(), 0, expected.size + 1U, output, cancellation);
-    auto bytes = std::move(output).str();
-    if (bytes.size() != expected.size || local.stat(path.string(), cancellation).revision != expected.revision) {
+    std::shared_ptr<Data> bytes;
+    if (const auto* local = dynamic_cast<const LocalProvider*>(&source)) {
+        const auto native = local->native_path(path);
+        Descriptor input(::open(native.c_str(), O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC));
+        check_system(input.get(), "open archive snapshot source");
+        struct stat before{};
+        struct stat named{};
+        check_system(::fstat(input.get(), &before), "inspect archive snapshot source");
+        check_system(::lstat(native.c_str(), &named), "inspect archive snapshot name");
+        if (!S_ISREG(before.st_mode) || before.st_size < 0 ||
+            before.st_ino != expected.inode || static_cast<std::uint64_t>(before.st_size) != expected.size ||
+            before.st_dev != named.st_dev || before.st_ino != named.st_ino ||
+            source.stat(path, cancellation).revision != expected.revision) {
+            invalid("archive changed before its snapshot was captured");
+        }
+        bytes = std::make_shared<Data>();
+        archive_detail::copy_storage(input.get(), *bytes, 0, expected.size, 0, cancellation);
+        struct stat after{};
+        check_system(::fstat(input.get(), &after), "reinspect archive snapshot source");
+        if (before.st_dev != after.st_dev || before.st_ino != after.st_ino ||
+            before.st_size != after.st_size || before.st_mode != after.st_mode ||
+            before.st_uid != after.st_uid || before.st_gid != after.st_gid || before.st_nlink != after.st_nlink ||
+            before.st_mtim.tv_sec != after.st_mtim.tv_sec || before.st_mtim.tv_nsec != after.st_mtim.tv_nsec ||
+            before.st_ctim.tv_sec != after.st_ctim.tv_sec || before.st_ctim.tv_nsec != after.st_ctim.tv_nsec) {
+            invalid("archive changed while its snapshot was captured");
+        }
+    } else {
+        bytes = viewer_detail::capture(expected.size, [&](const auto offset, const auto length,
+            std::ostream& output, const Cancellation& stop) { source.read(path, offset, length, output, stop); }, cancellation);
+    }
+    const auto current = dynamic_cast<const LocalProvider*>(&source) != nullptr
+        ? source.stat(path, cancellation) : source.stat_follow(path, cancellation);
+    if (current.revision != expected.revision || bytes->size() != expected.size) {
         invalid("archive changed while it was being read");
     }
     return bytes;
@@ -1095,41 +1543,68 @@ std::pair<std::uint32_t, std::string> owner_identity(const std::string& name, co
 
 class ArchiveProvider::Impl {
 public:
-    Impl(fs::path archive, ArchiveOpenOptions settings, const Cancellation& cancellation)
-        : options(std::move(settings)) {
+    Impl(ProviderPtr provider, std::string path, ArchiveOpenOptions settings, const Cancellation& cancellation)
+        : options(std::move(settings)), source(std::move(provider)) {
         const auto& bounds = options.limits;
         if (bounds.archive_bytes == 0U || bounds.expanded_bytes < 1024U ||
             bounds.members == 0U || bounds.members > (std::numeric_limits<std::size_t>::max() - 16U) / 4U ||
             bounds.path_bytes == 0U || bounds.path_bytes > 65536U ||
-            bounds.archive_bytes >= static_cast<std::size_t>(std::numeric_limits<std::streamsize>::max()) ||
-            bounds.expanded_bytes >= static_cast<std::size_t>(std::numeric_limits<std::streamsize>::max())) {
+            bounds.metadata_bytes < 512U || bounds.metadata_bytes > 64U * 1024U * 1024U ||
+            bounds.sparse_extents == 0U || bounds.sparse_extents > 1000000U ||
+            bounds.archive_bytes > static_cast<std::uint64_t>(std::numeric_limits<off_t>::max()) ||
+            bounds.expanded_bytes > static_cast<std::uint64_t>(std::numeric_limits<off_t>::max())) {
             invalid("invalid archive limits");
         }
-        if (archive.empty() || archive.native().find('\0') != std::string::npos) invalid("invalid archive filename");
+        if (!source || path.empty() || path.find('\0') != std::string::npos) invalid("invalid archive source");
         if (options.draft_directory.empty() || options.draft_directory.native().find('\0') != std::string::npos) {
             invalid("invalid archive draft directory");
         }
         options.draft_directory = fs::absolute(options.draft_directory);
-        file = local.normalize(fs::absolute(archive).string());
-        const auto initial = local.stat(file.string(), cancellation);
-        source_bytes = read_archive(local, file, initial, bounds.archive_bytes, cancellation);
+        source_path = source->normalize(path);
+        const auto* native = dynamic_cast<const LocalProvider*>(source.get());
+        if (native != nullptr) file = native->native_path(source_path);
+        else if (options.writable) invalid("nested and non-local archives are read-only");
+        const auto initial = native != nullptr ? source->stat(source_path, cancellation)
+                                               : source->stat_follow(source_path, cancellation);
+        if (initial.kind != EntryKind::file || initial.size > bounds.archive_bytes) {
+            invalid("archive source is not a regular file within its physical byte limit");
+        }
+        if (const auto* archive = dynamic_cast<const ArchiveProvider*>(source.get())) {
+            std::shared_ptr<const Content> content;
+            {
+                const std::lock_guard lock(archive->impl_->mutex);
+                const auto key = require_path(archive->impl_->model, archive->normalize(source_path), true);
+                content = archive->impl_->model.at(key).bytes;
+                if (!content) invalid("nested archive source is not a regular file");
+            }
+            auto snapshot = std::make_shared<Data>();
+            for (const auto& extent : content->extents) {
+                archive_detail::copy_storage(content->data->descriptor(), *snapshot, extent.stored,
+                    extent.length, extent.offset, cancellation);
+            }
+            snapshot->resize(content->size());
+            if (source->stat_follow(source_path, cancellation).revision != initial.revision) {
+                invalid("nested archive changed while it was being captured");
+            }
+            source_bytes = std::move(snapshot);
+        } else source_bytes = read_archive(*source, source_path, initial, bounds.archive_bytes, cancellation);
         revision = initial.revision;
+        const auto identity_part = [](const std::string& value) { return std::to_string(value.size()) + ":" + value; };
+        identity = "archive:" + identity_part(source->id()) + identity_part(source_path) + identity_part(initial.revision);
         entry_revision_base = initial.revision;
-        compression = detect_compression(source_bytes);
-        std::string expanded;
+        compression = detect_compression(source_bytes->bytes(0, 6, cancellation));
+        std::shared_ptr<const Data> expanded;
         if (compression != ArchiveCompression::none) {
-            DraftDirectory snapshot(options.draft_directory, false);
-            snapshot.write("snapshot", source_bytes, cancellation);
-            expanded = convert_compression(compression, true, snapshot, "snapshot", bounds.expanded_bytes, cancellation);
+            expanded = convert_compression(compression, true, *source_bytes, bounds.expanded_bytes, cancellation);
         } else {
-            if (source_bytes.size() > bounds.expanded_bytes) invalid("archive exceeds the expanded byte limit");
+            if (source_bytes->size() > bounds.expanded_bytes) invalid("archive exceeds the expanded byte limit");
             expanded = source_bytes;
         }
         ParseState parsed;
-        if (std::string_view(expanded).starts_with("070701") || std::string_view(expanded).starts_with("070702")) {
+        if (const auto detected = cpio_format(expanded->bytes(0, 6, cancellation))) {
+            format = *detected;
             parsed = parse_cpio(expanded, bounds, format, cancellation);
         } else {
-            if (std::string_view(expanded).starts_with("070707")) invalid("old ASCII cpio is unsupported; use newc or CRC");
             format = ArchiveFormat::tar;
             parsed = parse_tar(expanded, bounds, cancellation);
             resolve_hardlinks(parsed, cancellation);
@@ -1176,6 +1651,9 @@ public:
         if (result.kind == EntryKind::file) {
             result.size = node.bytes->size();
             result.links = link_counts.at(node.object);
+        } else if (result.kind == EntryKind::other) {
+            result.size = 0;
+            result.links = link_counts.at(node.object);
         } else if (result.kind == EntryKind::symlink) {
             result.size = result.target.size();
             const auto target = resolve(model, key, true);
@@ -1187,7 +1665,7 @@ public:
         link_counts.clear();
         for (const auto& [key, node] : model) {
             static_cast<void>(key);
-            if (node.entry.kind == EntryKind::file) ++link_counts[node.object];
+            if (node.entry.kind == EntryKind::file || node.entry.kind == EntryKind::other) ++link_counts[node.object];
         }
     }
 
@@ -1211,14 +1689,14 @@ public:
                                                : serialize_cpio(candidate, format, options.limits, cancellation);
         DraftDirectory draft(options.draft_directory, true);
         last_draft = draft.path("raw");
-        draft.write("raw", raw, cancellation);
-        std::string encoded;
+        draft.write("raw", *raw, cancellation);
+        std::shared_ptr<const Data> encoded;
         if (compression == ArchiveCompression::none) {
-            if (raw.size() > options.limits.archive_bytes) invalid("new archive exceeds the physical byte limit; draft: " + last_draft->string());
+            if (raw->size() > options.limits.archive_bytes) invalid("new archive exceeds the physical byte limit; draft: " + last_draft->string());
             encoded = std::move(raw);
         } else {
-            encoded = convert_compression(compression, false, draft, "raw", options.limits.archive_bytes, cancellation);
-            draft.write("candidate", encoded, cancellation);
+            encoded = convert_compression(compression, false, *raw, options.limits.archive_bytes, cancellation);
+            draft.write("candidate", *encoded, cancellation);
             last_draft = draft.path("candidate");
         }
         cancellation.throw_if_requested();
@@ -1229,13 +1707,16 @@ public:
         if (current.kind != EntryKind::file || current.links != 1U || current.revision != revision) {
             invalid("archive changed since opening; retained draft: " + last_draft->string());
         }
-        if (read_archive(local, file, current, options.limits.archive_bytes, cancellation) != source_bytes) {
+        if (!archive_detail::equal(*read_archive(local, file.string(), current, options.limits.archive_bytes, cancellation),
+                                  *source_bytes, cancellation)) {
             invalid("archive content changed since opening; retained draft: " + last_draft->string());
         }
-        std::istringstream input(encoded, std::ios::binary);
-        local.write(file.string(), input, encoded.size(), true, revision, cancellation, {});
+        std::ifstream input(encoded->path(), std::ios::binary);
+        if (!input) invalid("cannot open encoded archive snapshot for publication");
+        local.write(file.string(), input, encoded->size(), true, revision, cancellation, {});
         const auto saved = local.stat(file.string(), {});
-        if (read_archive(local, file, saved, options.limits.archive_bytes, {}) != encoded) {
+        if (!archive_detail::equal(*read_archive(local, file.string(), saved, options.limits.archive_bytes, {}),
+                                  *encoded, {})) {
             invalid("archive changed immediately after publication; retained draft: " + last_draft->string());
         }
         Descriptor parent(::open(file.parent_path().c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC));
@@ -1252,6 +1733,9 @@ public:
     mutable std::mutex mutex;
     LocalProvider local;
     ArchiveOpenOptions options;
+    ProviderPtr source;
+    std::string source_path;
+    std::string identity;
     fs::path file;
     ArchiveFormat format{ArchiveFormat::tar};
     ArchiveCompression compression{ArchiveCompression::none};
@@ -1260,17 +1744,26 @@ public:
     std::uint64_t next_object{1};
     std::string revision;
     std::string entry_revision_base;
-    std::string source_bytes;
+    std::shared_ptr<const Data> source_bytes;
     std::optional<fs::path> last_draft;
 };
 
 ArchiveProvider::ArchiveProvider(
     fs::path archive, ArchiveOpenOptions options, const Cancellation& cancellation
-) : impl_(std::make_unique<Impl>(std::move(archive), std::move(options), cancellation)) {}
+) : ArchiveProvider(std::make_shared<LocalProvider>(), fs::absolute(archive).string(),
+                    std::move(options), cancellation) {
+    if (archive.empty()) invalid("invalid archive filename");
+}
+
+ArchiveProvider::ArchiveProvider(
+    ProviderPtr source, std::string path, ArchiveOpenOptions options, const Cancellation& cancellation
+) : impl_(std::make_unique<Impl>(std::move(source), std::move(path), std::move(options), cancellation)) {}
 
 ArchiveProvider::~ArchiveProvider() = default;
 
 fs::path ArchiveProvider::archive_path() const { return impl_->file; }
+ProviderPtr ArchiveProvider::source_provider() const { return impl_->source; }
+std::string ArchiveProvider::source_path() const { return impl_->source_path; }
 ArchiveFormat ArchiveProvider::format() const { return impl_->format; }
 ArchiveCompression ArchiveProvider::compression() const { return impl_->compression; }
 std::optional<fs::path> ArchiveProvider::last_draft() const {
@@ -1282,7 +1775,9 @@ std::uint64_t ArchiveProvider::hardlink_count(const std::string_view path) const
     const std::lock_guard lock(impl_->mutex);
     const auto key = require_path(impl_->model, normalize(path), true);
     const auto& node = impl_->model.at(key);
-    if (node.entry.kind != EntryKind::file) path_error(key, std::errc::invalid_argument);
+    if (node.entry.kind != EntryKind::file && node.entry.kind != EntryKind::other) {
+        path_error(key, std::errc::invalid_argument);
+    }
     return impl_->link_counts.at(node.object);
 }
 
@@ -1299,7 +1794,9 @@ void ArchiveProvider::validate_directory_target(
     const std::string_view destination
 ) const {
     const auto validate = [&] {
-        if (impl_->file != destination_provider.impl_->file) return;
+        if (impl_->file.empty() || destination_provider.impl_->file.empty()) {
+            if (impl_->identity != destination_provider.impl_->identity) return;
+        } else if (impl_->file != destination_provider.impl_->file) return;
         const auto from = require_path(impl_->model, normalize(source), true);
         if (impl_->model.at(from).entry.kind != EntryKind::directory) return;
         const auto requested = destination_provider.normalize(destination);
@@ -1319,8 +1816,11 @@ void ArchiveProvider::validate_directory_target(
     }
 }
 
-std::string ArchiveProvider::id() const { return "archive:" + impl_->file.string(); }
-std::string ArchiveProvider::display_name() const { return impl_->file.string() + "!"; }
+std::string ArchiveProvider::id() const { return impl_->identity; }
+std::string ArchiveProvider::display_name() const {
+    return (impl_->file.empty() ? impl_->source->display_name() + ":" + impl_->source_path
+                               : impl_->file.string()) + "!";
+}
 ProviderCapability ArchiveProvider::capabilities() const {
     return impl_->options.writable
         ? ProviderCapability::read | ProviderCapability::write | ProviderCapability::remove |
@@ -1378,7 +1878,7 @@ bool ArchiveProvider::exists(const std::string_view path) const {
 SpaceInfo ArchiveProvider::space(const std::string_view path) const {
     const std::lock_guard lock(impl_->mutex);
     static_cast<void>(require_path(impl_->model, normalize(path), true));
-    return impl_->local.space(impl_->file.string());
+    return impl_->source->space(impl_->source_path);
 }
 void ArchiveProvider::read(
     const std::string_view path, const std::uint64_t offset, const std::uint64_t length,
@@ -1391,17 +1891,54 @@ void ArchiveProvider::read(
     if (node.entry.kind != EntryKind::file) path_error(key, std::errc::invalid_argument);
     const auto snapshot = node.bytes;
     lock.unlock();
-    const auto& bytes = *snapshot;
-    if (offset >= bytes.size()) return;
-    const auto size = std::min<std::uint64_t>(length, bytes.size() - static_cast<std::size_t>(offset));
-    std::uint64_t done = 0;
-    while (done < size) {
-        cancellation.throw_if_requested();
-        const auto count = static_cast<std::size_t>(std::min<std::uint64_t>(size - done, 64U * 1024U));
-        output.write(bytes.data() + static_cast<std::size_t>(offset + done), static_cast<std::streamsize>(count));
-        if (!output) invalid("failed writing archive member data to the output stream");
-        done += count;
+    snapshot->read(offset, length, output, cancellation);
+}
+
+bool ArchiveProvider::copy_to_local(
+    const std::string_view source, LocalProvider& destination_provider,
+    const std::string_view destination, const bool overwrite, const bool preserve_permissions,
+    const Cancellation& cancellation, const ProgressCallback& progress,
+    const std::optional<std::string> expected_source_revision,
+    const std::optional<std::string> expected_destination_revision
+) const {
+    cancellation.throw_if_requested();
+    Node snapshot;
+    {
+        const std::lock_guard lock(impl_->mutex);
+        const auto key = require_path(impl_->model, normalize(source), true);
+        if (expected_source_revision && impl_->entry(key).revision != *expected_source_revision) {
+            invalid("member changed before copying: " + key);
+        }
+        snapshot = impl_->model.at(key);
     }
+    const auto& entry = snapshot.entry;
+    if (entry.kind != EntryKind::file && entry.kind != EntryKind::other) return false;
+    if (S_ISSOCK(entry.mode)) invalid("cannot copy Unix socket: " + std::string(source));
+    if (entry.kind == EntryKind::file && preserve_permissions &&
+        (entry.permissions & fs::perms::owner_read) == fs::perms::none) return false;
+    DraftDirectory directory(impl_->options.draft_directory, false);
+    if (entry.kind == EntryKind::file) {
+        Descriptor output(directory.create("snapshot"));
+        snapshot.bytes->write_to(output.get(), cancellation);
+        check_system(::fsync(output.get()), "sync archive member snapshot");
+    } else {
+        if (!S_ISFIFO(entry.mode) && !S_ISCHR(entry.mode) && !S_ISBLK(entry.mode)) {
+            invalid("unsupported special archive member: " + std::string(source));
+        }
+        const auto device = makedev(snapshot.device_major, snapshot.device_minor);
+        if (major(device) != snapshot.device_major || minor(device) != snapshot.device_minor) {
+            invalid("archive device number exceeds the host device range");
+        }
+        directory.special(entry.mode, device);
+    }
+    auto metadata = entry;
+    if (!preserve_permissions && entry.kind == EntryKind::file) metadata.permissions = fs::perms{0600};
+    directory.metadata(metadata);
+    LocalProvider local;
+    destination_provider.copy_file_from(local, directory.anchored("snapshot").string(), destination,
+        overwrite, preserve_permissions, cancellation, progress, LocalProvider::CopyMode::replace,
+        std::nullopt, expected_destination_revision);
+    return true;
 }
 
 void ArchiveProvider::write(
@@ -1442,7 +1979,7 @@ void ArchiveProvider::write_impl(
     }
     const auto revision = impl_->revision;
     if (length && *length > impl_->options.limits.expanded_bytes) invalid("member exceeds the expanded byte limit");
-    std::string bytes;
+    auto bytes = std::make_shared<Data>();
     std::array<char, 64U * 1024U> buffer{};
     while (input) {
         cancellation.throw_if_requested();
@@ -1453,19 +1990,19 @@ void ArchiveProvider::write_impl(
             break;
         }
         const auto size = static_cast<std::size_t>(count);
-        if (size > impl_->options.limits.expanded_bytes - bytes.size()) invalid("member exceeds the expanded byte limit");
-        bytes.append(buffer.data(), size);
+        if (size > impl_->options.limits.expanded_bytes - bytes->size()) invalid("member exceeds the expanded byte limit");
+        bytes->append({buffer.data(), size});
         if (progress) {
             lock.unlock();
-            progress({bytes.size(), length.value_or(0), 0, 1, key});
+            progress({bytes->size(), length.value_or(0), 0, 1, key});
             lock.lock();
             if (impl_->revision != revision) invalid("archive view changed during the progress callback");
         }
         cancellation.throw_if_requested();
     }
     if (input.bad() || (!input.eof() && input.fail())) invalid("failed reading archive member input");
-    if (length && *length != bytes.size()) invalid("member input length does not match its declared length");
-    const auto replacement = std::make_shared<const std::string>(std::move(bytes));
+    if (length && *length != bytes->size()) invalid("member input length does not match its declared length");
+    const auto replacement = content_range(bytes, 0, bytes->size(), impl_->options.limits.sparse_extents, cancellation);
     auto candidate = impl_->model;
     if (preserve_links) {
         const auto object = old->second.object;
@@ -1685,7 +2222,10 @@ void ArchiveProvider::copy_hardlink(
     impl_->writable();
     cancellation.throw_if_requested();
     const auto from = require_path(impl_->model, normalize(source), false);
-    if (impl_->model.at(from).entry.kind != EntryKind::file) invalid("hardlinks require a regular archive file");
+    if (impl_->model.at(from).entry.kind != EntryKind::file &&
+        impl_->model.at(from).entry.kind != EntryKind::other) {
+        invalid("hardlinks require a regular or special archive member");
+    }
     const auto to = impl_->destination(impl_->model, destination);
     const auto existing = impl_->model.find(to);
     if (existing != impl_->model.end()) {
@@ -1735,6 +2275,12 @@ std::shared_ptr<ArchiveProvider> open_archive_provider(
     const fs::path& archive, ArchiveOpenOptions options, const Cancellation& cancellation
 ) {
     return std::make_shared<ArchiveProvider>(archive, std::move(options), cancellation);
+}
+
+std::shared_ptr<ArchiveProvider> open_archive_provider(
+    ProviderPtr source, std::string path, ArchiveOpenOptions options, const Cancellation& cancellation
+) {
+    return std::make_shared<ArchiveProvider>(std::move(source), std::move(path), std::move(options), cancellation);
 }
 
 }  // namespace mcpp

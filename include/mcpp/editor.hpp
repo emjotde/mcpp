@@ -36,6 +36,7 @@ struct EditorBehavior {
     bool group_undo{false};
     EditorWrapMode wrap{EditorWrapMode::none};
     std::size_t wrap_length{72};
+    std::string stop_format_chars{};
 };
 
 class EditorLargeFileConfirmationRequired final : public std::runtime_error {
@@ -79,6 +80,7 @@ public:
     void set_display_position(std::size_t row, std::size_t column);
     void set_behavior(EditorBehavior behavior);
     [[nodiscard]] const EditorBehavior& behavior() const noexcept { return behavior_; }
+    [[nodiscard]] std::optional<std::pair<std::size_t, std::size_t>> paragraph_rows() const;
     void break_undo_group() noexcept;
     [[nodiscard]] std::size_t byte_size() const noexcept;
     [[nodiscard]] std::size_t cursor_offset() const noexcept;

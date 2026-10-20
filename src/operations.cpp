@@ -1,6 +1,8 @@
 #include "mcpp/operations.hpp"
 #include "mcpp/archive_provider.hpp"
+#include "mcpp/extfs_provider.hpp"
 #include "mcpp/local_provider.hpp"
+#include "mcpp/location.hpp"
 
 #include <algorithm>
 #include <cerrno>
@@ -230,6 +232,31 @@ bool directory_destination(
            entry.target_is_directory;
 }
 
+void validate_local_container_target(
+    const LocalProvider& source_provider,
+    const std::string_view source,
+    const Provider& current_provider,
+    const std::string_view current_path,
+    const unsigned int depth = 0U
+) {
+    if (depth > 16U) {
+        throw std::invalid_argument("too many nested container sources");
+    }
+    if (const auto* local = dynamic_cast<const LocalProvider*>(&current_provider)) {
+        source_provider.validate_directory_target(source, *local, current_path);
+        return;
+    }
+    const auto captured = source_location(current_provider);
+    if (!captured) {
+        throw std::invalid_argument("cannot validate this container's backing directory");
+    }
+    if (!captured->provider) {
+        throw std::invalid_argument("container has no captured source provider");
+    }
+    validate_local_container_target(
+        source_provider, source, *captured->provider, captured->path, depth + 1U);
+}
+
 void validate_directory_target(
     Provider& source_provider,
     const std::string_view source,
@@ -248,14 +275,20 @@ void validate_directory_target(
     }
     const auto* archive_source = dynamic_cast<const ArchiveProvider*>(&source_provider);
     const auto* archive_destination = dynamic_cast<const ArchiveProvider*>(&destination_provider);
+    const auto* extfs_source = dynamic_cast<const ExtfsProvider*>(&source_provider);
+    const auto* extfs_destination = dynamic_cast<const ExtfsProvider*>(&destination_provider);
+    if (extfs_source != nullptr && extfs_destination != nullptr &&
+        extfs_source->stat(source, {}).kind == EntryKind::directory) {
+        extfs_source->validate_directory_target(source, *extfs_destination, destination);
+        return;
+    }
     if (archive_source != nullptr && archive_destination != nullptr &&
         archive_source->stat(source, {}).kind == EntryKind::directory) {
         archive_source->validate_directory_target(source, *archive_destination, destination);
-    } else if (local_source != nullptr && archive_destination != nullptr) {
-        const LocalProvider filesystem;
-        local_source->validate_directory_target(
-            source, filesystem, archive_destination->archive_path().string()
-        );
+    } else if (local_source != nullptr &&
+               (archive_destination != nullptr || extfs_destination != nullptr)) {
+        validate_local_container_target(
+            *local_source, source, destination_provider, destination);
     }
 }
 
@@ -316,9 +349,12 @@ void validate_move_target(
 void validate_move_source(
     Provider& provider,
     const Entry& source,
-    const Cancellation& cancellation
+    const Cancellation& cancellation,
+    const bool guard_local
 ) {
-    if (dynamic_cast<LocalProvider*>(&provider) != nullptr &&
+    if (((guard_local && dynamic_cast<LocalProvider*>(&provider) != nullptr) ||
+         dynamic_cast<ArchiveProvider*>(&provider) != nullptr ||
+         dynamic_cast<ExtfsProvider*>(&provider) != nullptr) &&
         !source.revision.empty() &&
         provider.stat(source.path, cancellation).revision != source.revision) {
         throw std::runtime_error("source changed after copying; source was not removed: " + source.path);
@@ -937,6 +973,17 @@ bool OperationEngine::copy_entry_once(
         skip_reason = "source and destination are the same file";
         return false;
     }
+    const auto* extfs_source = dynamic_cast<const ExtfsProvider*>(&source_provider);
+    const auto* extfs_destination = dynamic_cast<const ExtfsProvider*>(&destination_provider);
+    if (source.kind == EntryKind::symlink && options.preserve_symlinks) {
+        if (extfs_destination != nullptr) {
+            throw std::runtime_error("extfs cannot create symlinks; choose follow links");
+        }
+        if (extfs_source != nullptr && source.target.starts_with('/')) {
+            throw std::runtime_error(
+                "absolute extfs symlinks refer to the container root; choose follow links");
+        }
+    }
     if (source.kind == EntryKind::directory &&
         source_provider.id() == destination_provider.id() &&
         is_descendant_path(
@@ -1002,7 +1049,7 @@ bool OperationEngine::copy_entry_once(
         (local_destination != nullptr || archive_destination != nullptr) &&
         options.preserve_symlinks &&
         (source.kind == EntryKind::file ||
-         (source.kind == EntryKind::other && local_source != nullptr && local_destination != nullptr)) &&
+         (source.kind == EntryKind::other && local_destination != nullptr)) &&
         (links->contains(link_key) || (local_source != nullptr
             ? local_source->hardlink_count(source.path)
             : archive_source->hardlink_count(source.path)) > 1U);
@@ -1071,6 +1118,25 @@ bool OperationEngine::copy_entry_once(
             preserve_time(destination_provider, destination_path, source);
         }
         state.bytes_done += source.size;
+        ++state.files_done;
+        emit_completed_progress(progress, state);
+        return true;
+    }
+    if (archive_source != nullptr && local_destination != nullptr &&
+        collision.decision == CollisionDecision::overwrite &&
+        (effective_source.kind == EntryKind::file || effective_source.kind == EntryKind::other) &&
+        archive_source->copy_to_local(
+            effective_source.path, *local_destination, destination_path, overwrite,
+            options.preserve_permissions, cancellation,
+            [&](const TransferProgress& value) {
+                auto overall = state;
+                overall.bytes_done += value.bytes_done;
+                overall.current_path = value.current_path.empty() ? source.path : value.current_path;
+                emit_progress(progress, overall);
+            },
+            effective_source.revision, expected_destination_revision)) {
+        remember_link();
+        state.bytes_done += effective_source.size;
         ++state.files_done;
         emit_completed_progress(progress, state);
         return true;
@@ -1246,7 +1312,8 @@ bool OperationEngine::copy_entry_once(
         } else {
             destination_provider.write(
                 destination_path, input, effective_source.size, overwrite,
-                std::nullopt, cancellation, callback
+                extfs_destination != nullptr ? expected_destination_revision : std::nullopt,
+                cancellation, callback
             );
         }
     }
@@ -1507,10 +1574,9 @@ void OperationEngine::move(
                     if (remove_with_retry(
                             source_provider, source, cancellation, {}, options.error,
                             [&] {
-                                if (transferred_decision != CollisionDecision::overwrite ||
-                                    (options.stable_symlinks && source.kind == EntryKind::symlink)) {
-                                    validate_move_source(source_provider, transferred_source, cancellation);
-                                }
+                                validate_move_source(source_provider, transferred_source, cancellation,
+                                    transferred_decision != CollisionDecision::overwrite ||
+                                    (options.stable_symlinks && source.kind == EntryKind::symlink));
                                 validate_move_target(
                                     source_provider, source, destination_provider,
                                     destination, cancellation
@@ -1580,10 +1646,9 @@ void OperationEngine::move(
                 if (remove_with_retry(
                         source_provider, source, cancellation, {}, options.error,
                         [&] {
-                            if (transferred_decision != CollisionDecision::overwrite ||
-                                (options.stable_symlinks && source.kind == EntryKind::symlink)) {
-                                validate_move_source(source_provider, transferred_source, cancellation);
-                            }
+                            validate_move_source(source_provider, transferred_source, cancellation,
+                                transferred_decision != CollisionDecision::overwrite ||
+                                (options.stable_symlinks && source.kind == EntryKind::symlink));
                             validate_move_target(
                                 source_provider, source, destination_provider,
                                 destination, cancellation
@@ -1873,10 +1938,9 @@ void OperationEngine::move_exact(
         if (remove_with_retry(
                 source_provider, source, cancellation, {}, options.error,
                 [&] {
-                    if (transferred_decision != CollisionDecision::overwrite ||
-                        (options.stable_symlinks && source.kind == EntryKind::symlink)) {
-                        validate_move_source(source_provider, transferred_source, cancellation);
-                    }
+                    validate_move_source(source_provider, transferred_source, cancellation,
+                        transferred_decision != CollisionDecision::overwrite ||
+                        (options.stable_symlinks && source.kind == EntryKind::symlink));
                     validate_move_target(
                         source_provider, source, destination_provider,
                         destination, cancellation

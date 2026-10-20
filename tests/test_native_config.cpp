@@ -1,6 +1,7 @@
 #include "mcpp/config.hpp"
 
 #include <cstdlib>
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -36,13 +37,16 @@ void native_roundtrip(const fs::path& root) {
         "# retained comment\n[Midnight-Commander]\nverbose=0\nconfirm_delete=false\n"
         "editor_tab_spacing=4\neditor_return_does_auto_indent=true\neditor_option_save_mode=1\n"
         "editor_option_auto_para_formatting=true\neditor_option_typewriter_wrap=false\n"
+        "editor_drop_selection_on_copy=true\neditor_state_full_filename=false\n"
+        "editor_stop_format_chars=-+*\\\\>\nmcview_remember_file_position=true\nfilepos_max_saved_entries=2\n"
         "skin=default\nkeymap=keys\nwrap_mode=false\nmouse_move_pages_viewer=true\nftpfs_retry_seconds=17\n"
         "[Panels]\nshow_dot_files=false\nmix_all_files=true\n"
         "[Layout]\nhorizontal_split=false\nvertical_equal=false\nhorizontal_equal=true\n"
-        "left_panel_size=31\n[DiffView]\ndiff_quality=2\ndiff_ignore_case=true\ntab_size=4\n"
-        "[Misc]\nspell_language=NONE\n[Future]\nkeep=some\\q=value\n");
+        "left_panel_size=31\n[DiffView]\ndiff_quality=2\ndiff_ignore_case=true\ntab_size=4\ndiff_ignore_tws=true\n"
+        "[Misc]\nspell_language=NONE\nsource_codepage=CP1251\n"
+        "timeformat_recent=RECENT-%Y\ntimeformat_old=OLD-%Y\n[Future]\nkeep=some\\q=value\n");
     write(root / "panels.ini",
-        "[New Left Panel]\ndisplay=listing\nlist_mode=user\nuser_format=half type name | size\n"
+        "[New Left Panel]\ndisplay=tree\nlist_mode=user\nuser_format=half type name | size\n"
         "sort_order=mtime\nreverse=true\nbrief_cols=3\n"
         "[Dirs]\ncurrent_is_left=false\nother_dir=/retained\\sdir\n"
         "[Future panel]\nuntouched=literal\\\\value\n");
@@ -54,21 +58,36 @@ void native_roundtrip(const fs::path& root) {
         "native editor settings use the existing editor options");
     require(!config.split_is_equal() && config.panel_left_size == 31 &&
         config.layout_horizontal_equal == true, "independent native split settings are retained");
-    require(config.panel_listing[0] == mcpp::ListingFormat::custom &&
+    require(config.panel_display[0] == mcpp::PanelDisplay::tree &&
+        config.panel_listing[0] == mcpp::ListingFormat::custom &&
         config.panel_sort[0] == mcpp::SortField::modified && config.panel_descending[0] == true,
         "panels.ini applies native listing and sorting");
     require(config.current_is_left == false && config.other_directory == "/retained dir" &&
         !config.viewer_wrap && config.viewer_mouse_page_scrolling == true &&
         config.diff_quality == 2U && config.diff_ignore_case && config.diff_tab_size == 4U &&
         config.editor_spelling_language == "NONE", "native directory, viewer, diff and spelling settings are applied");
+    require(config.editor_drop_selection_on_copy && !config.editor_state_full_filename &&
+        config.editor_stop_format_chars == "-+*\\>" && config.viewer_remember_file_position &&
+        config.source_codepage == "CP1251" && config.diff_strip_trailing_cr &&
+        config.max_saved_positions == 2U, "additional native editor, viewer, encoding and diff settings are applied");
+    const auto reference = std::chrono::system_clock::from_time_t(1700000000);
+    require(config.format_panel_time(reference - std::chrono::hours(1), reference).starts_with("RECENT-") &&
+        config.format_panel_time(reference - std::chrono::hours(24 * 200), reference).starts_with("OLD-") &&
+        config.format_panel_time(reference + std::chrono::hours(1), reference).starts_with("OLD-"),
+        "native recent, old and future panel timestamps use their configured formats");
     require(config.diagnostics.size() == 3U, "unsupported settings have explicit diagnostics");
     config.theme_override = "paper";
     config.keymap_override = "launch.keymap";
     config.keymap_disabled = true;
     config.subshell_override = false;
     config.editor_positions["/document"] = {2U, 3U, {1U}};
+    const std::string archive_location = "/example.zip/uzip://nested/document";
+    config.viewer_positions[archive_location] = 123U;
+    config.viewer_positions["/older"] = 9U;
+    config.viewer_history = {archive_location};
     config.editor_history = {"/saved\nname"};
     config.editor_macros["example"] = "kept\nmacro";
+    config.panel_display = {mcpp::PanelDisplay::listing, mcpp::PanelDisplay::quick_view};
     config.save();
     const auto restored = mcpp::Config::load(path);
     require(restored.theme == "default" && !restored.theme_override && restored.keymap_file == "keys" &&
@@ -78,6 +97,11 @@ void native_roundtrip(const fs::path& root) {
         restored.editor_positions.at("/document").bookmarks == std::vector<std::size_t>{1U} &&
         restored.editor_history == config.editor_history && restored.editor_macros == config.editor_macros,
         "private editor state survives a native round-trip");
+    require(restored.panel_display[1] == mcpp::PanelDisplay::quick_view &&
+        restored.viewer_positions.at(archive_location) == 123U && !restored.viewer_positions.contains("/older") &&
+        restored.editor_drop_selection_on_copy && !restored.editor_state_full_filename &&
+        restored.source_codepage == "CP1251" && restored.diff_strip_trailing_cr,
+        "native displays and settings round-trip, keeping namespace-aware positions within the configured bound");
     require(read(path).find("keep=some\\q=value") != std::string::npos &&
         read(path).find("ftpfs_retry_seconds=17") != std::string::npos &&
         read(path).find("# retained comment") != std::string::npos &&
@@ -105,10 +129,12 @@ void legacy_coexistence(const fs::path& root) {
     require(read(legacy).find("future_flat=literal\\q") != std::string::npos,
         "flat configuration retains unknown options");
     write(legacy, original);
-    write(directory / "ini", "[Midnight-Commander]\nconfirm_exit=true\n[Panels]\nshow_dot_files=false\n");
+    write(directory / "ini", "[Midnight-Commander]\nconfirm_exit=true\n[Panels]\nshow_dot_files=false\n"
+        "[New Right Panel]\ndisplay=info\n");
     require(mcpp::default_config_path() == directory / "ini", "native ini is discovered before legacy config");
     auto native = mcpp::Config::load(mcpp::default_config_path());
     require(native.confirm_exit && native.theme == "forest" && native.editor_tab_width == 6U &&
+        native.panel_display[1] == mcpp::PanelDisplay::information &&
         native.panel_sort[0] == mcpp::SortField::extension && !native.panel_hidden[0].value_or(native.show_hidden) &&
         native.saved_left_path == "/retained" && native.editor_positions.at("/saved").row == 4U,
         "native overrides keep other existing pane and editor preferences");
@@ -128,9 +154,9 @@ void legacy_coexistence(const fs::path& root) {
 void invalid_transaction(const fs::path& root) {
     write(root / "good", "theme=forest\neditor_tab_width=6\n");
     auto retained = mcpp::Config::load(root / "good");
-    const std::string invalid = "[Midnight-Commander]\neditor_tab_spacing=0\n";
+    const std::string invalid = "[Midnight-Commander]\neditor_tab_spacing=4\n";
     write(root / "ini", invalid);
-    write(root / "panels.ini", "[New Left Panel]\nlist_mode=brief\n");
+    write(root / "panels.ini", "[New Left Panel]\ndisplay=information\n");
     const auto panels = read(root / "panels.ini");
     std::string diagnostic;
     try {
@@ -138,8 +164,9 @@ void invalid_transaction(const fs::path& root) {
     } catch (const std::exception& error) {
         diagnostic = error.what();
     }
-    require(diagnostic.find("ini:2: [Midnight-Commander] editor_tab_spacing") != std::string::npos &&
-        diagnostic.find("1 through 32") != std::string::npos, "invalid values identify the resource, line and option");
+    require(diagnostic.find("panels.ini:2: [New Left Panel] display") != std::string::npos &&
+        diagnostic.find("unsupported saved panel display: information") != std::string::npos,
+        "invalid values identify the resource, line and option without guessing display aliases");
     require(retained.theme == "forest" && retained.editor_tab_width == 6U &&
         read(root / "ini") == invalid && read(root / "panels.ini") == panels,
         "failed loading changes neither accepted preferences nor source files");

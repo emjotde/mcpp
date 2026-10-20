@@ -781,8 +781,8 @@ void hostile_inputs() {
         {{"one", '1', {}, "two"}, {"two", '1', {}, "one"}},
         {{"one", '2', {}, "two"}, {"two", '2', {}, "one"}},
         {{"plain", '0', "data", {}}, {"sym", '2', {}, "plain"}, {"hard", '1', {}, "sym"}},
-        {{"device", '3', {}, {}}},
-        {{"fifo", '6', {}, {}}},
+        {{"device", '3', "invalid payload", {}}},
+        {{"fifo", '6', "invalid payload", {}}},
         {{"sparse", 'S', {}, {}}},
         {{"PaxHeaders/bad", 'x', pax("GNU.sparse.realsize", "100"), {}}, {"file", '0', "bad", {}}},
         {{"PaxHeaders/bad", 'x', pax("path", "../outside-sentinel"), {}}, {"file", '0', "bad", {}}},
@@ -823,7 +823,7 @@ void hostile_inputs() {
         {{"bad\0name"s, S_IFREG | 0644U, "bad", 1, 1}},
         {{"link", S_IFLNK | 0777U, "../outside-sentinel", 1, 1}},
         {{"dir", S_IFLNK | 0777U, "target", 1, 1}, {"dir/file", S_IFREG | 0644U, "bad", 2, 1}},
-        {{"fifo", S_IFIFO | 0644U, {}, 1, 1}},
+        {{"fifo", S_IFIFO | 0644U, "invalid payload", 1, 1}},
         {{"one", S_IFREG | 0644U, "one", 1, 2}, {"two", S_IFREG | 0644U, "different", 1, 2}},
         {{"one", S_IFREG | 0644U, {}, 1, 0}},
         {{"one", S_IFREG | 0644U, {}, 1, 2}, {"two", S_IFREG | 0600U, "content", 1, 2}},
@@ -843,7 +843,7 @@ void hostile_inputs() {
     put("bad-crc.cpio", crc);
     rejects([&] { mcpp::ArchiveProvider provider("bad-crc.cpio", options()); }, "cpio CRC verified");
     put("old-ascii.cpio", "070707unsupported");
-    rejects([&] { mcpp::ArchiveProvider provider("old-ascii.cpio", options()); }, "old ASCII cpio explicit rejection");
+    rejects([&] { mcpp::ArchiveProvider provider("old-ascii.cpio", options()); }, "malformed old ASCII cpio rejected");
     put("missing-trailer.cpio", cpio_fixture(cpio_members(), false).substr(0, 110));
     rejects([&] { mcpp::ArchiveProvider provider("missing-trailer.cpio", options()); }, "truncated cpio rejected");
 }

@@ -1,13 +1,16 @@
 #pragma once
 
 #include "mcpp/provider.hpp"
+#include "mcpp/extfs_provider.hpp"
 #include "mcpp/transform_provider.hpp"
 
 #include <chrono>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <string_view>
+#include <tuple>
 
 namespace mcpp {
 
@@ -27,9 +30,17 @@ public:
         std::string_view archive_path,
         const Cancellation& cancellation = {}
     );
+    [[nodiscard]] ProviderPtr open(
+        const Location& source,
+        const Cancellation& cancellation = {}
+    );
     [[nodiscard]] ProviderPtr open_transform(
         const Location& source, std::string_view converter,
         std::string_view parameter = {},
+        const Cancellation& cancellation = {}
+    );
+    [[nodiscard]] ProviderPtr open_extfs(
+        const Location& source, std::string_view helper,
         const Cancellation& cancellation = {}
     );
     [[nodiscard]] std::string format(const ProviderPtr& provider, std::string_view path) const;
@@ -40,14 +51,15 @@ public:
 private:
     struct Record {
         ProviderPtr provider;
-        std::string archive_path;
+        std::string source_location;
         std::chrono::steady_clock::time_point last_used;
     };
     ProviderPtr local_;
     std::chrono::seconds timeout_;
     mutable std::mutex mutex_;
-    std::map<std::pair<std::string, std::string>, Record> records_;
+    std::map<std::tuple<ProviderPtr, std::string, std::string>, Record> records_;
     TransformCache transformations_;
+    ExtfsCache external_filesystems_;
 };
 
 [[nodiscard]] Location open_location(
@@ -67,6 +79,7 @@ private:
 );
 
 [[nodiscard]] std::string format_location(const ProviderPtr& provider, std::string_view path);
+[[nodiscard]] std::optional<Location> source_location(const Provider& provider);
 [[nodiscard]] bool is_archive_location(std::string_view value) noexcept;
 [[nodiscard]] bool is_transform_location(std::string_view value) noexcept;
 // Includes unsupported/remote schemes so callers do not mangle them with host

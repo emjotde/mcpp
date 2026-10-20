@@ -4,19 +4,24 @@
 
 #include <cstddef>
 #include <filesystem>
+#include <limits>
 #include <memory>
 #include <optional>
 
 namespace mcpp {
 
-enum class ArchiveFormat { tar, cpio_newc, cpio_crc };
+class LocalProvider;
+
+enum class ArchiveFormat { tar, cpio_newc, cpio_crc, cpio_odc, cpio_binary_le, cpio_binary_be };
 enum class ArchiveCompression { none, gzip, bzip2, xz, zstd };
 
 struct ArchiveLimits {
-    std::size_t archive_bytes{64U * 1024U * 1024U};
-    std::size_t expanded_bytes{256U * 1024U * 1024U};
+    std::uint64_t archive_bytes{static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())};
+    std::uint64_t expanded_bytes{static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())};
     std::size_t members{100000U};
     std::size_t path_bytes{4096U};
+    std::size_t metadata_bytes{16U * 1024U * 1024U};
+    std::size_t sparse_extents{1000000U};
 };
 
 struct ArchiveOpenOptions {
@@ -27,10 +32,12 @@ struct ArchiveOpenOptions {
     std::filesystem::path draft_directory{".mcpp-archive-drafts"};
 };
 
-// A bounded, in-memory view of a local archive, not a host extraction directory.
+// An indexed, privately spooled archive snapshot, not a host extraction directory.
 // Supports regular files, directories, safe relative symlinks and hardlinks in
-// tar (ustar, common GNU/PAX headers) and newc/CRC cpio. Special files, sparse
-// files, ambiguous paths, and unsupported metadata are rejected explicitly.
+// tar (ustar, GNU/PAX including GNU sparse 0.0/0.1/1.0) and newc/CRC, odc and
+// V7 binary cpio. Special entries retain their actual mode and device numbers;
+// reading them as ordinary files is an error. Index/metadata limits stay bounded.
+// Byte limits are configurable; data is never accumulated in a whole-file string.
 //
 // Writable operations publish one complete archive before returning, using
 // LocalProvider's expected-revision/atomic-replacement guard. Other programs
@@ -49,17 +56,38 @@ public:
         ArchiveOpenOptions options = {},
         const Cancellation& cancellation = {}
     );
+    // Captures a regular member from its actual provider. A non-local source
+    // is always read-only; no virtual member path is interpreted as a host path.
+    ArchiveProvider(
+        ProviderPtr source, std::string path,
+        ArchiveOpenOptions options = {},
+        const Cancellation& cancellation = {}
+    );
     ~ArchiveProvider() override;
     ArchiveProvider(const ArchiveProvider&) = delete;
     ArchiveProvider& operator=(const ArchiveProvider&) = delete;
 
+    // Empty for a non-local source. Use the captured source accessors for
+    // nested VFS navigation/formatting, never a parsed provider ID.
     [[nodiscard]] std::filesystem::path archive_path() const;
+    [[nodiscard]] ProviderPtr source_provider() const;
+    [[nodiscard]] std::string source_path() const;
     [[nodiscard]] ArchiveFormat format() const;
     [[nodiscard]] ArchiveCompression compression() const;
     [[nodiscard]] std::optional<std::filesystem::path> last_draft() const;
-    // Both helpers follow virtual symlinks and require an existing regular file.
+    // Follows virtual symlinks; counts regular or special virtual hardlinks.
     [[nodiscard]] std::uint64_t hardlink_count(std::string_view path) const;
-    // Requires a writable provider, host archive, and at least one member write
+    // Sparse-aware archive-to-local copy through LocalProvider's normal atomic
+    // publication and special-file rules. Returns false when the generic stream
+    // path is needed (a regular member without owner-read permission).
+    bool copy_to_local(
+        std::string_view source, LocalProvider& destination_provider,
+        std::string_view destination, bool overwrite, bool preserve_permissions,
+        const Cancellation& cancellation, const ProgressCallback& progress,
+        std::optional<std::string> expected_source_revision = {},
+        std::optional<std::string> expected_destination_revision = {}
+    ) const;
+    // Requires a regular member, writable provider, host archive, and a member write
     // bit (0222). Archived uid/gid are metadata, not host access credentials.
     // Both file-save methods enforce this member check before consuming input.
     void ensure_writable(std::string_view path) const;
@@ -168,6 +196,10 @@ private:
 [[nodiscard]] bool is_archive_filename(std::string_view name) noexcept;
 [[nodiscard]] std::shared_ptr<ArchiveProvider> open_archive_provider(
     const std::filesystem::path& archive, ArchiveOpenOptions options = {},
+    const Cancellation& cancellation = {}
+);
+[[nodiscard]] std::shared_ptr<ArchiveProvider> open_archive_provider(
+    ProviderPtr source, std::string path, ArchiveOpenOptions options = {},
     const Cancellation& cancellation = {}
 );
 

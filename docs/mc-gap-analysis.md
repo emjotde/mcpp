@@ -102,12 +102,13 @@ are retained; they are not bugs to remove in pursuit of default MC behavior.
 | L19 | Closed for implemented commands: MC-format resources, overlays, key aliases/terminal decoding, all 16 contexts, manager/editor extended maps, action rebinding/removal, and actual dispatch across the four frontends and focused controls. `-K` / `--keymap` and `--nokeymap` are launch-only; unavailable commands fail explicitly rather than invoking another action. |
 | L25 | Closed: independently written contextual help has linked topics, an index, back navigation, scrolling and mouse controls. Manager/dialog drafts, editor/custom keys, raw key capture and dirty-viewer return are checked. MC `.hlp` import and full-text help search are not implemented. |
 | L27 | Closed: whole-document and current-word checking, dictionary selection, native suggestions/Add word/Replace/Skip/Cancel controls, and persisted personal dictionaries through standard `aspell(1)`. Byte offsets are validated, replacements are undoable, marks/search settings remain separate, and errors retain the draft and retryable dialog. |
+| L29 | Closed for standard local cpio formats: newc/CRC, odc and V7 binary little/big-endian indexing/publication, safe links and special kinds, nested snapshots, ordinary viewing/extraction and captured-parent return. Streamed data replaces the former byte caps; natural header field ranges and explicit metadata limits remain. Ambiguous PWB/vendor extensions are not claimed supported. |
 | L30 | Closed for local single-file transformations: native `source/name://suffix` paths, original standard compression converters and trusted local `/1` registry helpers, read-only provider snapshots, revision-aware caching and captured-namespace resolution. Viewer/editor/diff and actual F5 Source-mask copying retain provider identity; readonly F6 fails before writes. Inputs/outputs are currently bounded to 64 MiB; non-local helper flags remain outside the paused remote scope. |
 | L33 | Closed for the currently supported local providers: cached revisions, active-provider retention, unused timeout, private cache creation, native Active VFS list and timeout setting, and logical URI/alias preservation. Changed containers open a new snapshot; remote options stay outside the current scope. |
 | L34 | Closed: independent viewer/diff sessions appear alongside editor buffers in the native screen list and next/previous cycling. Dirty bytes, search/cursor/bookmarks, streams, comparison/editor return identity, save/link/conflict decisions and final standalone exits retain their own state. Labels fit the actual dialog content width without hiding filenames. |
 
-Standalone frontends are **4/4**. **Twenty-two of the 34 baseline work packages are
-closed; 12 baseline packages remain open**. This is a feature backlog, not an
+Standalone frontends are **4/4**. **Twenty-three of the 34 baseline work packages are
+closed; 11 baseline packages remain open**. This is a feature backlog, not an
 overall parity percentage. Additional gaps discovered afterward are listed
 separately, rather than silently changing the baseline denominator.
 The broader command-line option set is still L03, not implicitly completed by
@@ -240,11 +241,12 @@ reports readonly archives; Save As can publish a guarded local copy without
 changing the source. Extracted files retain requested modes, modification times,
 safe symlinks and hardlink groups.
 
-Two of the five local VFS families are therefore available in bounded form, but
-**L28/L29 remain partial**, not closed: nested archives, sparse/special archive
-members, older cpio variants and streaming beyond the documented archive limits
-remain. Standard GNU tar `./` prefixes work; traversal and ambiguous canonical
-names are rejected. sfs, extfs and ext2 undelete are still open.
+That initial delivery made two local VFS families available in bounded form.
+The later archive work below adds nested archives, sparse/special members,
+older cpio formats and streamed data beyond the former byte caps. Standard GNU
+tar `./` prefixes still work; traversal and ambiguous canonical names are
+rejected. The single-file transformation family is delivered separately;
+source-based extfs now exists, while ext2 undelete is still missing.
 
 The hex viewer now highlights the matching byte in both hex and ASCII columns.
 Only the input column receives the terminal cursor; mouse/nibble placement,
@@ -256,6 +258,34 @@ controller expectations. Later archive namespace fixes were checked only in
 their affected cases; no second full run is claimed or required for this batch.
 Future work uses a build and a few relevant checks, not broad repeated suites.
 
+### Expanded archives and source-based external helpers
+
+Nested tar/cpio sources now retain the actual provider, normalized member path
+and revision in their cache keys and return paths. GNU sparse tar variants,
+odc and V7 binary little/big-endian cpio preserve their data/kinds, including
+sparse holes and safe FIFO extraction. Private seekable storage replaces the
+former 64 MiB encoded/256 MiB expanded caps. Member/path/metadata/extent and
+natural format/disk limits remain enforced. Ambiguous PWB/vendor cpio,
+incremental/multivolume tar and unsupported PAX extensions remain explicit
+format limits; the zstd command path was not runtime-checked in this environment.
+
+Native source-based extfs helpers now provide listing, copyout and accepted
+copyin/rm/mkdir/rmdir through guarded private candidates. Actual extension
+`%cd`, Quick cd, viewing, copying and root-parent navigation pass. Source-less
+`+`, `run`, special nodes, link creation/linked-member replacement, metadata
+changes and native rename remain unsupported; **L31 remains partial**. Named
+ownership and the listing's single timestamp are metadata, not host credentials
+or independent atime/ctime. Container/member/listing/time/memory bounds are
+documented in the README.
+
+Recursive copies validate the real backing-provider chain before creating a
+destination; virtual absolute symlinks cannot silently become host links.
+Fallback archive/extfs moves verify the copied source revision before removal.
+The focused mutation case proves a newer source and the valid copied destination
+both survive. Shared Release/Werror, archive formats/snapshots, three extfs
+selectors and the reserved archive/extfs UI workflows pass; no full suite or
+native-reference rerun was added.
+
 ### Native resource work
 
 Native `mcpp/ini` and `panels.ini` now apply supported local options while
@@ -264,9 +294,18 @@ New installations use the native files; existing flat setups retain their
 format unless a native `ini` is supplied. Launch overrides remain transient.
 Private saves are atomic per file, not crash-atomic across both files, and MC's
 own configuration directory is never changed. Three small model cases and
-configured startup/Save Setup/restart pass. **L18 remains partial** for saved
-non-listing panel displays and other unmapped options; unsupported options are
-diagnosed and preserved instead of silently accepted.
+configured startup/Save Setup/restart passed the initial delivery. The follow-up
+applies saved listing/Tree/Quick view/Info displays, physical focus, independent
+layout drafts, clipboard/status/paragraph/codepage preferences, date formats and
+remembered viewer data offsets. Only one auxiliary panel and the supported
+codepages are accepted. The focused startup/save/restart workflow passes Tree
+focus and CLI precedence, layout apply/Cancel, escaped dates, CP1251 data,
+clipboard/status/paragraph preferences and a 45-byte viewer data position.
+**L18 remains partial** for other unimplemented options;
+unsupported settings are diagnosed and preserved instead of silently accepted.
+Examples still diagnosed include double-click speed/history count, directory-view
+confirmation, file-type guessing, editor size thresholds, persistent copy
+attributes, selection flags and `[Colors]`.
 
 Local user/editor menus now load native conditions, command blocks, prompts,
 pane/editor macros and view/cd directives, while retaining legacy menu rows.

@@ -3,6 +3,7 @@
 #include "mcpp/entry.hpp"
 
 #include <cstddef>
+#include <cstdint>
 #include <array>
 #include <filesystem>
 #include <memory>
@@ -15,6 +16,8 @@
 namespace mcpp {
 
 struct ConfigSource;
+
+enum class PanelDisplay { listing, quick_view, information, tree };
 
 struct SavedEditorPosition {
     std::size_t row{0};
@@ -33,6 +36,7 @@ struct Config {
     bool directories_first{true};
     SortField sort{SortField::name};
     bool sort_descending{false};
+    std::array<PanelDisplay, 2> panel_display{PanelDisplay::listing, PanelDisplay::listing};
     std::array<ListingFormat, 2> panel_listing{ListingFormat::full, ListingFormat::full};
     std::array<std::string, 2> panel_columns{"half type name | size | perm", "half type name | size | perm"};
     std::array<std::size_t, 2> panel_brief_columns{2, 2};
@@ -99,6 +103,11 @@ struct Config {
     bool use_internal_view{true};
     bool viewer_wrap{true};
     std::optional<bool> viewer_mouse_page_scrolling;
+    bool viewer_remember_file_position{false};
+    std::optional<std::string> source_codepage;
+    std::optional<std::string> timeformat_recent;
+    std::optional<std::string> timeformat_old;
+    std::optional<std::size_t> max_saved_positions;
     bool ask_new_filename{false};
     bool auto_menus{false};
     bool drop_menus{false};
@@ -129,6 +138,8 @@ struct Config {
     bool editor_visible_tabs{true};
     bool editor_visible_trailing_spaces{true};
     bool editor_persistent_selection{true};
+    bool editor_drop_selection_on_copy{false};
+    bool editor_state_full_filename{true};
     bool editor_cursor_beyond_eol{false};
     bool editor_group_undo{true};
     std::size_t editor_wrap_mode{0};
@@ -146,6 +157,7 @@ struct Config {
     bool editor_check_newline{false};
     std::string editor_syntax_language{"auto"};
     std::string editor_spelling_language;
+    std::optional<std::string> editor_stop_format_chars;
     std::vector<std::string> bookmarks;
     std::vector<std::string> editor_history;
     std::vector<std::string> viewer_history;
@@ -157,6 +169,7 @@ struct Config {
         {"Modified git files", "git ls-files --modified"}
     };
     std::map<std::string, SavedEditorPosition> editor_positions;
+    std::map<std::string, std::uint64_t> viewer_positions;
     std::map<std::string, std::string> learned_keys;
     std::map<std::string, std::string> editor_macros;
     std::vector<std::string> diagnostics;
@@ -167,6 +180,9 @@ struct Config {
     void save() const;
     [[nodiscard]] bool split_is_equal() const;
     void set_split_equal(bool value);
+    [[nodiscard]] std::string format_panel_time(
+        std::chrono::system_clock::time_point point,
+        std::chrono::system_clock::time_point reference = std::chrono::system_clock::now()) const;
 };
 
 [[nodiscard]] std::filesystem::path default_config_path();

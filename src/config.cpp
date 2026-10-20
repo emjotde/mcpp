@@ -11,11 +11,14 @@
 #include <cctype>
 #include <cstring>
 #include <cstdlib>
+#include <ctime>
 #include <fstream>
 #include <iomanip>
 #include <fcntl.h>
 #include <sstream>
 #include <map>
+#include <limits>
+#include <set>
 #include <stdexcept>
 #include <string_view>
 #include <sys/stat.h>
@@ -116,6 +119,60 @@ ListingFormat parse_listing(const std::string& value) {
     throw std::runtime_error("invalid listing format: " + value);
 }
 
+std::string_view display_name(const PanelDisplay display) {
+    switch (display) {
+        case PanelDisplay::listing: return "listing";
+        case PanelDisplay::quick_view: return "quickview";
+        case PanelDisplay::information: return "info";
+        case PanelDisplay::tree: return "tree";
+    }
+    throw std::runtime_error("invalid panel display");
+}
+
+PanelDisplay parse_display(const std::string& value) {
+    if (value == "listing") return PanelDisplay::listing;
+    if (value == "quickview") return PanelDisplay::quick_view;
+    if (value == "info") return PanelDisplay::information;
+    if (value == "tree") return PanelDisplay::tree;
+    throw std::runtime_error("unsupported saved panel display: " + value);
+}
+
+std::string format_panel_date(const std::string& format, const std::tm& time) {
+    if (format.empty()) return {};
+    if (format.find_first_of("\r\n\t") != std::string::npos || format.find('\0') != std::string::npos) {
+        throw std::runtime_error("panel time formats must fit a single line");
+    }
+    std::array<char, 4096> buffer{};
+    const auto size = std::strftime(buffer.data(), buffer.size(), format.c_str(), &time);
+    if (size == 0U) throw std::runtime_error("panel time format exceeds 4095 bytes");
+    if (std::string_view(buffer.data(), size).find_first_of("\r\n\t") != std::string_view::npos) {
+        throw std::runtime_error("panel time formats must fit a single line");
+    }
+    return {buffer.data(), size};
+}
+
+std::set<std::string> saved_position_paths(const Config& config) {
+    std::set<std::string> paths;
+    const auto include = [&](const std::string& path) {
+        if (!config.max_saved_positions || paths.size() < *config.max_saved_positions) paths.insert(path);
+    };
+    for (const auto& path : config.editor_history) {
+        if (config.editor_positions.contains(path) || config.viewer_positions.contains(path)) include(path);
+    }
+    for (const auto& path : config.viewer_history) {
+        if (config.editor_positions.contains(path) || config.viewer_positions.contains(path)) include(path);
+    }
+    for (const auto& [path, position] : config.editor_positions) {
+        static_cast<void>(position);
+        include(path);
+    }
+    for (const auto& [path, position] : config.viewer_positions) {
+        static_cast<void>(position);
+        include(path);
+    }
+    return paths;
+}
+
 std::string encode_value(const std::string_view value) {
     std::string result;
     result.reserve(value.size());
@@ -190,7 +247,7 @@ auto general_bool_settings(Configuration& config) {
 template <typename Configuration>
 auto editor_bool_settings(Configuration& config) {
     using Pointer = decltype(&config.editor_fake_half_tabs);
-    return std::array<std::pair<std::string_view, Pointer>, 10>{{
+    return std::array<std::pair<std::string_view, Pointer>, 12>{{
         {"editor_fake_half_tabs", &config.editor_fake_half_tabs},
         {"editor_backspace_through_tabs", &config.editor_backspace_through_tabs},
         {"editor_fill_tabs_with_spaces", &config.editor_fill_tabs_with_spaces},
@@ -199,6 +256,8 @@ auto editor_bool_settings(Configuration& config) {
         {"editor_visible_tabs", &config.editor_visible_tabs},
         {"editor_visible_trailing_spaces", &config.editor_visible_trailing_spaces},
         {"editor_persistent_selection", &config.editor_persistent_selection},
+        {"editor_drop_selection_on_copy", &config.editor_drop_selection_on_copy},
+        {"editor_state_full_filename", &config.editor_state_full_filename},
         {"editor_cursor_beyond_eol", &config.editor_cursor_beyond_eol},
         {"editor_group_undo", &config.editor_group_undo}
     }};
@@ -359,6 +418,31 @@ Config Config::load(const std::filesystem::path& path) {
             result.viewer_wrap = parse_bool(value, key);
         } else if (key == "viewer_mouse_page_scrolling") {
             result.viewer_mouse_page_scrolling = parse_bool(value, key);
+        } else if (key == "viewer_remember_file_position") {
+            result.viewer_remember_file_position = parse_bool(value, key);
+        } else if (key == "source_codepage") {
+            auto encoding = decode_value(value);
+            if (encoding == "~" || encoding == "Other_8_bit") encoding.clear();
+            if (!encoding.empty() &&
+                std::ranges::find(supported_codepages(), encoding, &Codepage::id) == supported_codepages().end()) {
+                throw std::runtime_error("unsupported file encoding: " + encoding);
+            }
+            result.source_codepage = std::move(encoding);
+        } else if (key == "timeformat_recent" || key == "timeformat_old") {
+            auto format = decode_value(value);
+            std::tm time{};
+            time.tm_year = 126;
+            time.tm_mday = 1;
+            static_cast<void>(format_panel_date(format, time));
+            (key == "timeformat_recent" ? result.timeformat_recent : result.timeformat_old) = std::move(format);
+        } else if (key == "max_saved_positions") {
+            std::size_t limit = 0;
+            const auto parsed = std::from_chars(value.data(), value.data() + value.size(), limit);
+            if (parsed.ec != std::errc{} || parsed.ptr != value.data() + value.size() ||
+                limit > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+                throw std::runtime_error("filepos_max_saved_entries must be a nonnegative integer");
+            }
+            result.max_saved_positions = limit;
         } else if (key == "escape_timeout" || key == "pause_after_run") {
             int number = 0;
             const auto parsed = std::from_chars(value.data(), value.data() + value.size(), number);
@@ -378,7 +462,9 @@ Config Config::load(const std::filesystem::path& path) {
         } else if (key.starts_with("left_") || key.starts_with("right_")) {
             const auto index = key.starts_with("left_") ? 0U : 1U;
             const auto field = key.substr(index == 0U ? 5U : 6U);
-            if (field == "listing") {
+            if (field == "display") {
+                result.panel_display[index] = parse_display(value);
+            } else if (field == "listing") {
                 result.panel_listing[index] = parse_listing(value);
             } else if (field == "columns") {
                 result.panel_columns[index] = decode_value(value);
@@ -469,8 +555,6 @@ Config Config::load(const std::filesystem::path& path) {
             native_wrap_seen = true;
             (key == "native_typewriter_wrap" ? typewriter_wrap : paragraph_wrap) = parse_bool(value, key);
             wrap_location = config_setting_location(document, line);
-        } else if (key == "native_panel_display") {
-            if (value != "listing") throw std::runtime_error("unsupported saved panel display: " + value);
         } else if (key == "diff_tab_size") {
             result.diff_tab_size = parse_width(value, key);
         } else if (key == "diff_quality") {
@@ -499,6 +583,12 @@ Config Config::load(const std::filesystem::path& path) {
         } else if (key == "editor_spelling_language") {
             result.editor_spelling_language = decode_value(value);
             validate_spelling_language(result.editor_spelling_language);
+        } else if (key == "editor_stop_format_chars") {
+            result.editor_stop_format_chars = decode_value(value);
+            if (result.editor_stop_format_chars->find('\0') != std::string::npos ||
+                result.editor_stop_format_chars->find_first_of("\r\n") != std::string::npos) {
+                throw std::runtime_error("editor_stop_format_chars must fit a single line");
+            }
         } else if (key == "bookmark") {
             result.bookmarks.push_back(decode_value(value));
         } else if (key == "editor_history") {
@@ -528,6 +618,17 @@ Config Config::load(const std::filesystem::path& path) {
             if (!fields.eof() || name.empty()) throw std::runtime_error("invalid named setting: " + key);
             (key == "learned_key" ? result.learned_keys : result.editor_macros)[decode_value(name)] =
                 decode_value(data);
+        } else if (key == "viewer_position") {
+            const auto colon = value.find(':');
+            std::uint64_t offset = 0;
+            if (colon == std::string::npos || colon + 1U == value.size()) {
+                throw std::runtime_error("invalid saved viewer position");
+            }
+            const auto parsed = std::from_chars(value.data(), value.data() + colon, offset);
+            if (parsed.ec != std::errc{} || parsed.ptr != value.data() + colon) {
+                throw std::runtime_error("invalid saved viewer byte offset");
+            }
+            result.viewer_positions[decode_value(value.substr(colon + 1U))] = offset;
         } else if (key == "editor_position") {
             const auto colon = value.find(':');
             if (colon == std::string::npos || colon + 1U == value.size()) {
@@ -560,6 +661,10 @@ Config Config::load(const std::filesystem::path& path) {
     };
     apply_document(loaded->primary, false);
     if (loaded->panels) apply_document(*loaded->panels, true);
+    if (result.panel_display[0] != PanelDisplay::listing && result.panel_display[1] != PanelDisplay::listing) {
+        throw std::runtime_error(path.string() +
+            ": mcpp supports one saved auxiliary panel; one panel must use display=listing");
+    }
     if (native_wrap_seen) {
         if (typewriter_wrap && paragraph_wrap) {
             throw std::runtime_error(wrap_location + ": typewriter wrap and automatic paragraph formatting cannot both be enabled");
@@ -571,6 +676,9 @@ Config Config::load(const std::filesystem::path& path) {
 }
 
 void Config::save(const std::filesystem::path& path) const {
+    if (panel_display[0] != PanelDisplay::listing && panel_display[1] != PanelDisplay::listing) {
+        throw std::runtime_error("mcpp supports one saved auxiliary panel; one panel must use display=listing");
+    }
     std::ostringstream output;
     output << "show_hidden=" << (show_hidden ? "true" : "false")
            << '\n'
@@ -631,11 +739,17 @@ void Config::save(const std::filesystem::path& path) const {
     if (viewer_mouse_page_scrolling) {
         output << "viewer_mouse_page_scrolling=" << (*viewer_mouse_page_scrolling ? "true" : "false") << '\n';
     }
+    output << "viewer_remember_file_position=" << (viewer_remember_file_position ? "true" : "false") << '\n';
+    if (source_codepage) output << "source_codepage=" << encode_value(*source_codepage) << '\n';
+    if (timeformat_recent) output << "timeformat_recent=" << encode_value(*timeformat_recent) << '\n';
+    if (timeformat_old) output << "timeformat_old=" << encode_value(*timeformat_old) << '\n';
+    if (max_saved_positions) output << "max_saved_positions=" << *max_saved_positions << '\n';
     output << "editor_backup_extension=" << encode_value(editor_backup_extension) << '\n'
            << "editor_check_newline=" << (editor_check_newline ? "true" : "false") << '\n';
     output << "reverse_files_only=" << (reverse_files_only ? "true" : "false") << '\n';
     output << "editor_syntax_language=" << editor_syntax_language << '\n';
     output << "editor_spelling_language=" << encode_value(editor_spelling_language) << '\n';
+    if (editor_stop_format_chars) output << "editor_stop_format_chars=" << encode_value(*editor_stop_format_chars) << '\n';
     output << "layout_horizontal=" << (layout_horizontal ? "true" : "false") << '\n'
            << "equal_split=" << (equal_split ? "true" : "false") << '\n'
            << "panel_left_size=" << panel_left_size << '\n'
@@ -650,7 +764,8 @@ void Config::save(const std::filesystem::path& path) const {
     if (layout_horizontal_equal) output << "layout_horizontal_equal=" << (*layout_horizontal_equal ? "true" : "false") << '\n';
     for (std::size_t index = 0; index < 2U; ++index) {
         const auto prefix = index == 0U ? "left_" : "right_";
-        output << prefix << "listing=" << listing_name(panel_listing[index]) << '\n'
+        output << prefix << "display=" << display_name(panel_display[index]) << '\n'
+               << prefix << "listing=" << listing_name(panel_listing[index]) << '\n'
                << prefix << "columns=" << encode_value(panel_columns[index]) << '\n'
                << prefix << "brief_columns=" << panel_brief_columns[index] << '\n'
                << prefix << "user_mini_status=" << (panel_user_mini_status[index] ? "true" : "false") << '\n'
@@ -689,10 +804,15 @@ void Config::save(const std::filesystem::path& path) const {
         output << "panelize_command=" << std::quoted(encode_value(label)) << ' '
                << std::quoted(encode_value(command)) << '\n';
     }
+    const auto position_paths = saved_position_paths(*this);
     for (const auto& [file, position] : editor_positions) {
+        if (!position_paths.contains(file)) continue;
         output << "editor_position=" << position.row << ',' << position.column;
         for (const auto row : position.bookmarks) output << ',' << row;
         output << ':' << encode_value(file) << '\n';
+    }
+    for (const auto& [file, position] : viewer_positions) {
+        if (position_paths.contains(file)) output << "viewer_position=" << position << ':' << encode_value(file) << '\n';
     }
     for (const auto& [key, action] : learned_keys) {
         output << "learned_key=" << std::quoted(encode_value(key)) << ' '
@@ -818,6 +938,18 @@ bool Config::split_is_equal() const {
 void Config::set_split_equal(const bool value) {
     equal_split = value;
     (layout_horizontal ? layout_horizontal_equal : layout_vertical_equal) = value;
+}
+
+std::string Config::format_panel_time(
+    const std::chrono::system_clock::time_point point,
+    const std::chrono::system_clock::time_point reference
+) const {
+    const auto value = std::chrono::system_clock::to_time_t(point);
+    std::tm local{};
+    if (localtime_r(&value, &local) == nullptr) return "--- -- --:--";
+    const bool recent = point <= reference && point >= reference - std::chrono::hours(24 * 183);
+    const auto& format = recent ? timeformat_recent : timeformat_old;
+    return format_panel_date(format.value_or("%b %d %H:%M"), local);
 }
 
 std::filesystem::path default_config_path() {

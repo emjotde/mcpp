@@ -102,6 +102,7 @@ public:
     [[nodiscard]] std::uint64_t view_end() const noexcept;
     [[nodiscard]] std::uint64_t source_view_end() const;
     [[nodiscard]] std::uint64_t data_size() const noexcept;
+    [[nodiscard]] std::uint64_t data_position() const;
     [[nodiscard]] std::size_t horizontal_offset() const noexcept;
     [[nodiscard]] const std::string& path() const noexcept;
     [[nodiscard]] const ProviderPtr& provider() const noexcept { return provider_; }

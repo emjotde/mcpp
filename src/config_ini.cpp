@@ -13,7 +13,7 @@
 namespace mcpp {
 namespace {
 
-enum class Conversion { plain, string, inverted, save_mode, listing, sort, typewriter, paragraph };
+enum class Conversion { plain, string, inverted, save_mode, listing, sort, typewriter, paragraph, codepage };
 
 struct NativeOption {
     std::string_view section;
@@ -32,6 +32,8 @@ constexpr NativeOption native_options[]{
     {"Midnight-Commander", "use_internal_edit", "use_internal_edit"},
     {"Midnight-Commander", "wrap_mode", "viewer_wrap"},
     {"Midnight-Commander", "mouse_move_pages_viewer", "viewer_mouse_page_scrolling"},
+    {"Midnight-Commander", "mcview_remember_file_position", "viewer_remember_file_position"},
+    {"Midnight-Commander", "filepos_max_saved_entries", "max_saved_positions"},
     {"Midnight-Commander", "confirm_delete", "confirm_delete"},
     {"Midnight-Commander", "confirm_overwrite", "confirm_overwrite"},
     {"Midnight-Commander", "confirm_execute", "confirm_execute"},
@@ -57,6 +59,9 @@ constexpr NativeOption native_options[]{
     {"Midnight-Commander", "editor_edit_confirm_save", "editor_confirm_save"},
     {"Midnight-Commander", "editor_syntax_highlighting", "editor_syntax"},
     {"Midnight-Commander", "editor_persistent_selections", "editor_persistent_selection"},
+    {"Midnight-Commander", "editor_drop_selection_on_copy", "editor_drop_selection_on_copy"},
+    {"Midnight-Commander", "editor_state_full_filename", "editor_state_full_filename"},
+    {"Midnight-Commander", "editor_stop_format_chars", "editor_stop_format_chars", Conversion::string},
     {"Midnight-Commander", "editor_cursor_beyond_eol", "editor_cursor_beyond_eol"},
     {"Midnight-Commander", "editor_cursor_after_inserted_block", "editor_cursor_after_inserted_block"},
     {"Midnight-Commander", "editor_visible_tabs", "editor_visible_tabs"},
@@ -88,6 +93,9 @@ constexpr NativeOption native_options[]{
     {"Layout", "vertical_equal", "layout_vertical_equal"},
     {"Layout", "horizontal_equal", "layout_horizontal_equal"},
     {"Misc", "spell_language", "editor_spelling_language", Conversion::string},
+    {"Misc", "source_codepage", "source_codepage", Conversion::codepage},
+    {"Misc", "timeformat_recent", "timeformat_recent", Conversion::string},
+    {"Misc", "timeformat_old", "timeformat_old", Conversion::string},
     {"Panels", "show_mini_info", "show_mini_status"},
     {"Panels", "kilobyte_si", "use_si_units"},
     {"Panels", "mix_all_files", "directories_first", Conversion::inverted},
@@ -113,11 +121,13 @@ constexpr NativeOption native_options[]{
     {"DiffView", "diff_tab_expansion", "diff_ignore_tab_expansion"},
     {"DiffView", "diff_ignore_space_change", "diff_ignore_space_change"},
     {"DiffView", "diff_ignore_all_space", "diff_ignore_all_space"},
+    {"DiffView", "diff_ignore_tws", "diff_strip_trailing_cr"},
     {"DiffView", "show_numbers", "diff_show_numbers"},
     {"DiffView", "show_symbols", "diff_show_symbols"},
 };
 
 constexpr NativeOption panel_options[]{
+    {"", "display", "display"},
     {"", "reverse", "descending"},
     {"", "case_sensitive", "case_sensitive"},
     {"", "exec_first", "executable_first"},
@@ -205,6 +215,10 @@ std::string encode_native(const std::string_view value) {
 std::string convert_input(const NativeOption& option, const std::string& value) {
     switch (option.conversion) {
         case Conversion::string: return encode_flat(decode_string(value, true));
+        case Conversion::codepage: {
+            const auto decoded = decode_string(value, true);
+            return decoded == "~" || decoded == "Other_8_bit" ? "" : encode_flat(decoded);
+        }
         case Conversion::inverted: return boolean(value) ? "false" : "true";
         case Conversion::save_mode:
             if (value == "0") return "in-place";
@@ -226,6 +240,7 @@ std::string convert_input(const NativeOption& option, const std::string& value) 
 std::string convert_output(const NativeOption& option, const std::string& value) {
     switch (option.conversion) {
         case Conversion::string: return encode_native(decode_string(value, false));
+        case Conversion::codepage: return value.empty() ? "Other_8_bit" : encode_native(decode_string(value, false));
         case Conversion::inverted: return boolean(value) ? "false" : "true";
         case Conversion::save_mode:
             if (value == "in-place") return "0";
@@ -318,10 +333,6 @@ std::optional<std::pair<std::string, std::string>> translate_config_setting(
     if (line.key.empty()) return std::nullopt;
     if (!native || line.section.empty() || line.section == "mcpp") return std::pair{line.key, line.value};
     if (panel_section(line.section)) {
-        if (line.key == "display") {
-            if (line.value != "listing") throw std::runtime_error("unsupported saved panel display: " + line.value);
-            return std::pair{std::string("native_panel_display"), line.value};
-        }
         for (const auto& option : panel_options) {
             if (option.key == line.key) {
                 return std::pair{std::string(line.section == "New Left Panel" ? "left_" : "right_") +
@@ -376,7 +387,6 @@ std::string serialize_config_document(
         }
         for (const auto* section : {"New Left Panel", "New Right Panel"}) {
             const std::string prefix = std::string_view(section) == "New Left Panel" ? "left_" : "right_";
-            if (panels_only || !separate_panels) add(section, "display", "listing");
             for (const auto& option : panel_options) {
                 const auto field = prefix + std::string(option.flat);
                 auto found = values.find(field);

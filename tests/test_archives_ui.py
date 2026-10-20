@@ -3,6 +3,7 @@ import hashlib
 import io
 import os
 import stat
+import subprocess
 import sys
 import tarfile
 import unittest
@@ -303,6 +304,108 @@ class ArchivesUI(unittest.TestCase):
             terminal.press("F10")
             terminal.wait_file(terminal.exit_file, b"0\n")
         self.assertIn("vfs_timeout=17\n", config.read_text())
+
+    def test_nested_sparse_and_old_cpio_ordinary_controls(self):
+        root, left, right = self.fixture()
+        source = root / "source"
+        source.mkdir()
+        inner = source / "inner.tar"
+        make_tar(inner)
+        with tarfile.open(inner, "a", format=tarfile.PAX_FORMAT) as archive:
+            fifo = tarfile.TarInfo("pipe")
+            fifo.type = tarfile.FIFOTYPE
+            fifo.mode = 0o640
+            fifo.mtime = 1700000030
+            archive.addfile(fifo)
+
+        def odc(name, data, inode=1, mode=stat.S_IFREG | 0o640):
+            encoded = name.encode() + b"\0"
+            fields = (0, inode, mode, os.getuid(), os.getgid(), 1, 0,
+                      1700000030, len(encoded), len(data))
+            return (b"070707" + b"".join(
+                (f"{value:011o}" if index in (7, 9) else f"{value:06o}").encode()
+                for index, value in enumerate(fields)
+            ) + encoded + data)
+
+        (source / "legacy.cpio").write_bytes(
+            odc("legacy.txt", PAYLOAD) + odc("TRAILER!!!", b"", 0, 0)
+        )
+        sparse_bytes = 64 * 1024 + 17
+        sparse_prefix = b"archive sparse view\n"
+        with (source / "sparse.txt").open("wb") as output:
+            output.write(sparse_prefix)
+            output.seek(sparse_bytes - 4)
+            output.write(b"TAIL")
+        subprocess.run(
+            ["/usr/bin/tar", "--format=pax", "--sparse", "--sparse-version=1.0",
+             "--hole-detection=seek", "-cf", str(source / "sparse.tar"),
+             "-C", str(source), "sparse.txt"], check=True, capture_output=True,
+        )
+        path = left / "outer.tar"
+        with tarfile.open(path, "w", format=tarfile.PAX_FORMAT) as archive:
+            for name in ("inner.tar", "legacy.cpio", "sparse.tar"):
+                archive.add(source / name, arcname=name)
+        before = hashlib.sha256(path.read_bytes()).digest()
+        with TerminalSession(MANAGER, TMUX, root / "ui", [left, right], record_exit=True) as terminal:
+            self.open_archive(terminal, "outer.tar")
+            select_file(terminal, "inner.tar")
+            terminal.press("Enter")
+            terminal.wait_for("inner.tar/utar://")
+            select_file(terminal, "linked.txt")
+            terminal.press("F3")
+            terminal.wait_for("archive contents stay in the archive")
+            terminal.press("F10")
+            terminal.wait_for("archive contents stay in the archive", present=False)
+            terminal.press("C-a", "F5")
+            terminal.wait_for("Copy:")
+            terminal.press("Enter")
+            terminal.wait_file(right / "folder/data.txt", PAYLOAD)
+            terminal.wait_file(right / "linked.txt", PAYLOAD)
+            terminal.wait(lambda: (right / "pipe").exists(), "FIFO is extracted through ordinary F5")
+            self.assertTrue(stat.S_ISFIFO((right / "pipe").lstat().st_mode))
+            self.assertEqual((right / "linked.txt").stat().st_ino, (right / "folder/data.txt").stat().st_ino)
+            terminal.wait_for("progress", present=False)
+            terminal.save("nested-extracted")
+            terminal.raw(b"\x1b[5;5~")
+            terminal.wait_for("inner.tar/utar://", present=False)
+            select_file(terminal, "legacy.cpio")
+            terminal.press("Enter")
+            terminal.wait_for("legacy.cpio/ucpio://")
+            select_file(terminal, "legacy.txt")
+            terminal.press("F3")
+            terminal.wait_for("archive contents stay in the archive")
+            terminal.press("F10")
+            terminal.wait_for("archive contents stay in the archive", present=False)
+            terminal.press("F5")
+            terminal.wait_for("Copy:")
+            terminal.press("Enter")
+            terminal.wait_file(right / "legacy.txt", PAYLOAD)
+            terminal.wait_for("progress", present=False)
+            terminal.raw(b"\x1b[5;5~")
+            terminal.wait_for("legacy.cpio/ucpio://", present=False)
+            select_file(terminal, "sparse.tar")
+            terminal.press("Enter")
+            terminal.wait_for("sparse.tar/utar://")
+            select_file(terminal, "sparse.txt")
+            terminal.press("F3")
+            terminal.wait_for("archive sparse view")
+            terminal.press("F10")
+            terminal.wait_for("archive sparse view", present=False)
+            terminal.press("F5")
+            terminal.wait_for("Copy:")
+            terminal.press("Enter")
+            expected = sparse_prefix + bytes(sparse_bytes - len(sparse_prefix) - 4) + b"TAIL"
+            terminal.wait_file(right / "sparse.txt", expected)
+            self.assertLess((right / "sparse.txt").stat().st_blocks, 64)
+            terminal.wait_for("progress", present=False)
+            terminal.raw(b"\x1b[5;5~")
+            terminal.wait_for("sparse.tar/utar://", present=False)
+            terminal.raw(b"\x1b[5;5~")
+            terminal.wait_for("/utar://", present=False)
+            terminal.wait_for("outer.tar")
+            terminal.press("F10")
+            terminal.wait_file(terminal.exit_file, b"0\n")
+        self.assertEqual(hashlib.sha256(path.read_bytes()).digest(), before)
 
 
 if __name__ == "__main__":

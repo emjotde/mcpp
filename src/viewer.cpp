@@ -649,6 +649,10 @@ std::uint64_t ViewerModel::source_position(std::uint64_t position) const {
     return std::min(position, data_size());
 }
 
+std::uint64_t ViewerModel::data_position() const {
+    return source_position(hex_ ? hex_cursor_ : offset_);
+}
+
 void ViewerModel::set_view_end(const std::uint64_t position) {
     const auto source = source_position(position);
     view_end_ = position;

@@ -723,26 +723,6 @@ std::string format_time(
     return buffer.data();
 }
 
-std::string format_panel_time(
-    const std::chrono::system_clock::time_point point
-) {
-    const auto value = std::chrono::system_clock::to_time_t(point);
-    std::tm local{};
-    if (localtime_r(&value, &local) == nullptr) {
-        return "--- -- --:--";
-    }
-    std::array<char, 24> buffer{};
-    if (std::strftime(
-            buffer.data(),
-            buffer.size(),
-            "%b %d %H:%M",
-            &local
-        ) == 0U) {
-        return "--- -- --:--";
-    }
-    return buffer.data();
-}
-
 std::string truncate_text(
     const std::string& value,
     const std::size_t width
@@ -1754,6 +1734,7 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
     std::array<ftxui::Box, 8> confirmation_boxes{};
     bool layout_horizontal{false};
     bool layout_equal{true};
+    std::array<bool, 2> layout_equal_drafts{true, true};
     int layout_left_size{0};
     int layout_top_size{0};
     std::array<bool, 6> layout_visible{};
@@ -2107,6 +2088,7 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
     std::array<bool, 10> function_key_enabled{};
     std::optional<int> quick_view_panel;
     bool quick_view_focused{false};
+    bool quick_view_encoding_initialized{false};
     std::optional<int> information_panel;
     bool information_panel_focused{false};
     std::optional<int> tree_panel;
@@ -2225,9 +2207,9 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
           left_location(open_location(left_path, local, &archives)),
           right_location(open_location(right_path, local, &archives)),
           left(left_location.provider, left_location.path, nullptr,
-               dynamic_cast<const ArchiveProvider*>(left_location.provider.get()) != nullptr),
+               source_location(*left_location.provider).has_value()),
           right(right_location.provider, right_location.path, nullptr,
-                dynamic_cast<const ArchiveProvider*>(right_location.provider.get()) != nullptr) {
+                source_location(*right_location.provider).has_value()) {
         for (const auto& diagnostic : config.diagnostics) std::cerr << "mcpp: configuration: " << diagnostic << '\n';
         prepare_cli_terminal(launch_options.color, launch_options.stickchars);
         initialize_palette();
@@ -2305,6 +2287,7 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
         initialize_archive_parent(right);
         left_location = {};
         right_location = {};
+        restore_panel_configuration();
     }
 
     Pane& active() {
@@ -2339,36 +2322,68 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
         throw std::logic_error("pane does not belong to this application");
     }
 
-    std::string archive_file_path(const ProviderPtr& provider) const {
-        const auto* archive = dynamic_cast<const ArchiveProvider*>(provider.get());
-        if (archive == nullptr) throw std::invalid_argument("location is not an archive");
-        const auto location = archives.format(provider, "/");
-        const auto separator = location.rfind(archive->format() == ArchiveFormat::tar ? "/utar://" : "/ucpio://");
-        if (separator == std::string::npos) throw std::logic_error("archive location has no VFS delimiter");
-        return location.substr(0, separator);
+    Location container_file_location(const ProviderPtr& provider) const {
+        if (!provider) throw std::invalid_argument("container provider is null");
+        auto source = source_location(*provider);
+        for (unsigned depth = 0; depth < 16U; ++depth) {
+            if (!source || !source->provider) {
+                throw std::runtime_error("container has no captured parent directory");
+            }
+            const auto directory = source->provider->parent(source->path);
+            if (source->provider->stat_follow(directory, {}).kind == EntryKind::directory) return *source;
+            source = source_location(*source->provider);
+        }
+        throw std::runtime_error("too many nested container parents");
     }
 
     Pane make_archive_parent(const Pane& pane) {
-        const auto path = archive_file_path(pane.provider());
-        Pane parent(local, local->parent(path), &pane);
-        const auto found = std::ranges::find(parent.entries(), path, &Entry::path);
+        const auto source = container_file_location(pane.provider());
+        Pane parent(source.provider, source.provider->parent(source.path), &pane,
+                    source_location(*source.provider).has_value());
+        const auto found = std::ranges::find(parent.entries(), source.path, &Entry::path);
         if (found != parent.entries().end()) {
             parent.move_cursor(static_cast<int>(found - parent.entries().begin()));
         }
         return parent;
     }
 
-    void initialize_archive_parent(Pane& pane) {
-        if (dynamic_cast<const ArchiveProvider*>(pane.provider().get()) != nullptr) {
-            archive_parents[pane_identity(pane)].push_back(make_archive_parent(pane));
+    std::vector<Pane> make_archive_parents(const Pane& pane) {
+        std::vector<Pane> parents;
+        if (!source_location(*pane.provider())) return parents;
+        for (unsigned depth = 0; depth < 16U; ++depth) {
+            auto parent = make_archive_parent(parents.empty() ? pane : parents.back());
+            const bool nested = source_location(*parent.provider()).has_value();
+            parents.push_back(std::move(parent));
+            if (!nested) {
+                std::ranges::reverse(parents);
+                return parents;
+            }
         }
+        throw std::runtime_error("too many nested container parents");
+    }
+
+    void initialize_archive_parent(Pane& pane) {
+        archive_parents[pane_identity(pane)] = make_archive_parents(pane);
+    }
+
+    std::string source_execution_directory(Location location) const {
+        for (unsigned depth = 0; depth < 16U; ++depth) {
+            if (!location.provider) throw std::invalid_argument("execution provider is null");
+            if (location.provider == local) return location.path;
+            if (const auto* filesystem = dynamic_cast<const LocalProvider*>(location.provider.get())) {
+                return filesystem->native_path(location.path).string();
+            }
+            const auto source = source_location(*location.provider);
+            if (!source || !source->provider) {
+                throw std::runtime_error("virtual location has no local execution directory");
+            }
+            location = {source->provider, source->provider->parent(source->path)};
+        }
+        throw std::runtime_error("too many nested execution directories");
     }
 
     std::string pane_execution_directory(const Pane& pane) const {
-        if (dynamic_cast<const ArchiveProvider*>(pane.provider().get()) != nullptr) {
-            return local->parent(archive_file_path(pane.provider()));
-        }
-        return pane.navigation_path();
+        return source_execution_directory({pane.provider(), pane.navigation_path()});
     }
 
     void install_pane_location(Pane& pane, Location location) {
@@ -2376,16 +2391,19 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
             pane.change_directory(std::move(location.path));
             return;
         }
-        const bool archive = dynamic_cast<const ArchiveProvider*>(location.provider.get()) != nullptr;
+        const bool archive = source_location(*location.provider).has_value();
         Pane next(location.provider, std::move(location.path), &pane, archive);
         std::vector<Pane> parents;
         if (archive) {
-            const auto container = archive_file_path(next.provider());
-            if (pane.provider() == local && pane.path() == local->parent(container)) {
+            const auto source = container_file_location(next.provider());
+            if (pane.provider() == source.provider && pane.path() == source.provider->parent(source.path)) {
+                auto& saved = archive_parents[pane_identity(pane)];
+                saved.reserve(saved.size() + 1U);
+                parents = std::move(saved);
                 parents.push_back(std::move(next));
                 pane.swap_contents(parents.back());
             } else {
-                parents.push_back(make_archive_parent(next));
+                parents = make_archive_parents(next);
                 pane.swap_contents(next);
             }
         } else {
@@ -2395,10 +2413,10 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
     }
 
     bool panel_up(Pane& pane) {
-        if (dynamic_cast<const ArchiveProvider*>(pane.provider().get()) == nullptr ||
+        if (!source_location(*pane.provider()) ||
             pane.provider()->parent(pane.path()) != pane.path()) return pane.up();
         auto& parents = archive_parents[pane_identity(pane)];
-        if (parents.empty()) parents.push_back(make_archive_parent(pane));
+        if (parents.empty()) parents = make_archive_parents(pane);
         pane.swap_contents(parents.back());
         try {
             pane.refresh({}, true);
@@ -2420,17 +2438,17 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
         if (active().enter()) return true;
         if (!open_archive) return false;
         if (!can_open_file(*selected) || !is_archive_filename(selected->name)) return false;
-        if (active().provider() != local) throw std::runtime_error("nested archives are not supported yet");
         const auto path = selected->path;
+        const auto provider = active().provider();
         const auto directory = active().path();
         const auto id = pane_ids[active_index];
         auto opened = std::make_shared<ProviderPtr>();
-        start_local_task("Reading archive", [this, path, opened](const Cancellation& cancellation) {
-            *opened = archives.open(path, cancellation);
+        start_local_task("Reading archive", [this, provider, path, opened](const Cancellation& cancellation) {
+            *opened = archives.open(Location{provider, path}, cancellation);
             return CommandOutput{};
-        }, [this, opened, directory, id](CommandOutput) {
+        }, [this, opened, provider, directory, id](CommandOutput) {
             auto& pane = pane_ids[0] == id ? left : right;
-            if (pane.provider() != local || pane.path() != directory) {
+            if (pane.provider() != provider || pane.path() != directory) {
                 throw std::runtime_error("pane changed while the archive was being opened");
             }
             install_pane_location(pane, {*opened, "/"});
@@ -2446,7 +2464,7 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
     Location resolve_relative_location(const Location& base, std::string value) {
         Location destination;
         if (is_virtual_location(value)) {
-            if (is_archive_location(value) && std::filesystem::path(value).is_absolute()) {
+            if (std::filesystem::path(value).is_absolute()) {
                 return resolve_location(value);
             }
             return open_location(value, base, &archives);
@@ -2458,9 +2476,10 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
                 const auto name = component.generic_string();
                 if (name.empty() || name == ".") continue;
                 if (name == "..") {
-                    if (dynamic_cast<const ArchiveProvider*>(destination.provider.get()) != nullptr &&
+                    if (source_location(*destination.provider) &&
                         destination.provider->parent(destination.path) == destination.path) {
-                        destination = {local, local->parent(archive_file_path(destination.provider))};
+                        const auto source = container_file_location(destination.provider);
+                        destination = {source.provider, source.provider->parent(source.path)};
                     } else destination.path = destination.provider->parent(destination.path);
                 } else destination.path = destination.provider->join(destination.path, name);
             }
@@ -2472,8 +2491,7 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
         auto destination = resolve_pane_location(pane, value);
         const auto entry = destination.provider->stat_follow(destination.path, {});
         if (entry.kind == EntryKind::file && is_archive_filename(entry.name)) {
-            if (destination.provider != local) throw std::runtime_error("nested archives are not supported yet");
-            destination = {archives.open(destination.path), "/"};
+            destination = {archives.open(destination), "/"};
         } else if (entry.kind != EntryKind::directory) {
             throw std::runtime_error("not a directory: " + value);
         }
@@ -2747,11 +2765,10 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
 
     std::string editor_directory(const EditorBuffer& buffer) const {
         const auto& pane = active_index == 0 ? left : right;
-        if (dynamic_cast<const ArchiveProvider*>(buffer.provider().get()) != nullptr) {
-            return local->parent(archive_file_path(buffer.provider()));
+        if (!buffer.path().empty()) {
+            return source_execution_directory({buffer.provider(), buffer.provider()->parent(buffer.path())});
         }
-        if (!buffer.path().empty()) return local->parent(buffer.path());
-        return buffer.base_directory.empty() ? pane.navigation_path() : buffer.base_directory;
+        return buffer.base_directory.empty() ? pane_execution_directory(pane) : buffer.base_directory;
     }
 
     std::string editor_location(const EditorBuffer& buffer) const {
@@ -2762,16 +2779,14 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
         const std::string& value, const EditorBuffer* source = nullptr
     ) {
         const auto& buffer = source == nullptr ? editor : *source;
-        if (value.find("://") != std::string::npos || std::filesystem::path(value).is_absolute()) {
+        if (std::filesystem::path(value).is_absolute()) {
             return resolve_location(value);
         }
         if (buffer.open() && !buffer.path().empty() && buffer.provider() != local) {
             const auto provider = buffer.provider();
-            const auto path = (std::filesystem::path(provider->parent(buffer.path())) / value)
-                                  .lexically_normal().generic_string();
-            return {provider, provider->normalize(path)};
+            return resolve_relative_location({provider, provider->parent(buffer.path())}, value);
         }
-        return {local, local->join(editor_directory(buffer), value)};
+        return resolve_relative_location({local, editor_directory(buffer)}, value);
     }
 
     std::string editor_relative_path(const std::string& path) const {
@@ -3100,8 +3115,7 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
                 : resolve_relative_location(invocation->source_directory, destination);
             const auto entry = location.provider->stat_follow(location.path, {});
             if (entry.kind == EntryKind::file && is_archive_filename(entry.name)) {
-                if (location.provider != local) throw std::runtime_error("nested archives are not supported yet");
-                location = {archives.open(location.path), "/"};
+                location = {archives.open(location), "/"};
             } else if (entry.kind != EntryKind::directory) {
                 throw std::runtime_error("not a directory: " + destination);
             }
@@ -3184,6 +3198,7 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
     void show_editor_encoding() {
         show_codepage_chooser(editor.encoding(), Mode::editor, [this](const std::string& codepage) {
             editor.set_encoding(codepage);
+            config.source_codepage = codepage;
             spelling_issues.clear();
             spelling_match.reset();
             reset_editor_view_state();
@@ -3750,8 +3765,7 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
                     {invocation->provider, invocation->provider->parent(invocation->path)}, destination);
             const auto entry = location.provider->stat_follow(location.path, {});
             if (entry.kind == EntryKind::file && is_archive_filename(entry.name)) {
-                if (location.provider != local) throw std::runtime_error("nested archives are not supported yet");
-                location = {archives.open(location.path), "/"};
+                location = {archives.open(location), "/"};
             } else if (entry.kind != EntryKind::directory) {
                 throw std::runtime_error("not a directory: " + destination);
             }
@@ -4349,13 +4363,9 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
         std::pair<EditorPosition, EditorPosition> range;
         std::string source = selected.value_or("");
         if (paragraph && !selected) {
-            const auto blank = [](const std::string& line) {
-                return std::ranges::all_of(line, [](const unsigned char byte) { return std::isspace(byte) != 0; });
-            };
-            auto first = editor.row(), last = first;
-            if (blank(editor.lines()[first])) return;
-            while (first > 0U && !blank(editor.lines()[first - 1U])) --first;
-            while (last + 1U < editor.lines().size() && !blank(editor.lines()[last + 1U])) ++last;
+            const auto rows = editor.paragraph_rows();
+            if (!rows) return;
+            const auto [first, last] = *rows;
             range = {{first, 0}, last + 1U < editor.lines().size() ? EditorPosition{last + 1U, 0}
                                                                 : EditorPosition{last, editor.lines()[last].size()}};
             source = editor.text_range(range.first, range.second);
@@ -5428,6 +5438,32 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
         status = descending ? "Sort descending" : "Sort ascending";
     }
 
+    void restore_panel_configuration() {
+        if (config.panel_display[0] != PanelDisplay::listing && config.panel_display[1] != PanelDisplay::listing) {
+            throw std::runtime_error("mcpp supports one saved auxiliary panel; one panel must use display=listing");
+        }
+        const auto focused = config.current_is_left.value_or(true) ? 0 : 1;
+        for (int index = 0; index < 2; ++index) {
+            switch (config.panel_display[static_cast<std::size_t>(index)]) {
+                case PanelDisplay::listing: break;
+                case PanelDisplay::quick_view: show_quick_view(index); break;
+                case PanelDisplay::information: show_information_panel(index); break;
+                case PanelDisplay::tree: show_tree_panel(index); break;
+            }
+        }
+        quick_view_focused = quick_view_panel == focused;
+        information_panel_focused = information_panel == focused;
+        tree_panel_focused = tree_panel == focused;
+        active_index = quick_view_focused || information_panel_focused || tree_panel_focused ? 1 - focused : focused;
+    }
+
+    int focused_panel_index() const {
+        if (tree_panel && tree_panel_focused) return *tree_panel;
+        if (quick_view_panel && quick_view_focused) return *quick_view_panel;
+        if (information_panel && information_panel_focused) return *information_panel;
+        return active_index;
+    }
+
     void store_panel_options_in_config() {
         config.command_history = command_history;
         config.show_hidden = left.show_hidden();
@@ -5443,15 +5479,17 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
             config.panel_directories_first[id] = pane.directories_first();
             config.panel_case_sensitive[id] = pane.sort_case_sensitive();
             config.panel_executable_first[id] = pane.executable_first();
+            config.panel_display[id] = tree_panel == static_cast<int>(index) ? PanelDisplay::tree
+                : quick_view_panel == static_cast<int>(index) ? PanelDisplay::quick_view
+                : information_panel == static_cast<int>(index) ? PanelDisplay::information : PanelDisplay::listing;
         }
         if (config.auto_save_panels_setup) {
             config.saved_left_path = pane_location(left);
             config.saved_right_path = pane_location(right);
         }
-        if (config.current_is_left || config.other_directory) {
-            config.current_is_left = active_index == 0;
-            config.other_directory = pane_location(active_index == 0 ? right : left);
-        }
+        const auto focused = focused_panel_index();
+        config.current_is_left = focused == 0;
+        if (config.other_directory) config.other_directory = pane_location(focused == 0 ? right : left);
     }
 
     EditorBehavior editor_behavior() const {
@@ -5463,8 +5501,19 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
             .cursor_beyond_eol=config.editor_cursor_beyond_eol,
             .group_undo=config.editor_group_undo,
             .wrap=static_cast<EditorWrapMode>(config.editor_wrap_mode),
-            .wrap_length=config.editor_wrap_length
+            .wrap_length=config.editor_wrap_length,
+            .stop_format_chars=config.editor_stop_format_chars.value_or("")
         };
+    }
+
+    void apply_source_codepage(EditorModel& target) const {
+        if (config.source_codepage) target.set_encoding(*config.source_codepage);
+    }
+
+    void apply_source_codepage(ViewerModel& target) const {
+        if (config.source_codepage && target.encoding() != *config.source_codepage) {
+            target.set_encoding(*config.source_codepage);
+        }
     }
 
     void store_editor_options_in_config() {
@@ -5477,6 +5526,7 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
         config.editor_history = editor_history;
         remember_editor_position(editor);
         for (const auto& buffer : editor_buffers) remember_editor_position(buffer);
+        store_viewer_positions_in_config();
     }
 
     void remember_editor_position(const EditorBuffer& buffer) {
@@ -6100,6 +6150,27 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
         return false;
     }
 
+    void remember_viewer_position(const ViewerModel& target, const bool transient) {
+        if (!config.viewer_remember_file_position || transient || !target.open() || target.streamed() ||
+            target.path().empty()) return;
+        config.viewer_positions[archives.format(target.provider(), target.path())] = target.data_position();
+    }
+
+    void restore_viewer_position(ViewerModel& target, const bool transient) const {
+        if (!config.viewer_remember_file_position || transient || !target.open() || target.streamed()) return;
+        const auto saved = config.viewer_positions.find(archives.format(target.provider(), target.path()));
+        if (saved != config.viewer_positions.end()) {
+            target.goto_data_offset(std::min(saved->second, target.data_size()));
+        }
+    }
+
+    void store_viewer_positions_in_config() {
+        for (const auto& session : inactive_viewers) {
+            remember_viewer_position(session.viewer, static_cast<bool>(session.viewer_temporary_file));
+        }
+        remember_viewer_position(viewer, static_cast<bool>(viewer_temporary_file));
+    }
+
     void load_viewer(const ProviderPtr& provider, const std::string& path, const bool replace = false) {
         ViewerSessionState next;
         if (replace) next = viewer_session();
@@ -6113,6 +6184,9 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
             next.viewer_temporary_file = viewer_temporary_file;
             next.viewer_display_name = viewer_display_name;
         }
+        if (!replace && !next.viewer_temporary_file) apply_source_codepage(next.viewer);
+        remember_viewer_position(viewer, static_cast<bool>(viewer_temporary_file));
+        restore_viewer_position(next.viewer, static_cast<bool>(next.viewer_temporary_file));
         next.viewer_navigation_provider = provider;
         next.viewer_navigation_files.clear();
         if (next.viewer.streamed()) {
@@ -6307,6 +6381,8 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
         auto next = std::make_shared<DiffSessionState>();
         next->diff_files[0].open(first.provider, first.path);
         next->diff_files[1].open(second.provider, second.path);
+        apply_source_codepage(next->diff_files[0]);
+        apply_source_codepage(next->diff_files[1]);
         next->diff_options = {config.diff_quality, config.diff_ignore_case, config.diff_ignore_tab_expansion,
                         config.diff_ignore_space_change, config.diff_ignore_all_space, config.diff_strip_trailing_cr};
         next->diff_split = ftxui::Terminal::Size().dimx / 2;
@@ -6772,10 +6848,25 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
             const bool changed = event == Event::CtrlZ ? buffer.undo() : buffer.redo();
             if (changed) rebuild_diff();
         } else if (event == Event::CtrlR) {
-            for (auto& buffer : diff_files) {
-                if (!buffer.dirty()) { const auto path = buffer.path(); buffer.open(local, path); }
+            auto files = diff_files;
+            for (auto& buffer : files) {
+                if (!buffer.dirty()) {
+                    const auto path = buffer.path();
+                    const auto encoding = buffer.encoding();
+                    buffer.open(local, path);
+                    buffer.set_encoding(encoding);
+                }
             }
-            rebuild_diff();
+            DiffModel comparison;
+            comparison.compare(files[0], files[1], diff_options);
+            diff_files = std::move(files);
+            file_diff = std::move(comparison);
+            const auto maximum = file_diff.rows().size() > diff_visible_rows()
+                ? file_diff.rows().size() - diff_visible_rows() : 0U;
+            diff_top = std::min(diff_top, maximum);
+            diff_hunk = file_diff.hunks().empty() ? 0U : std::min(diff_hunk, file_diff.hunks().size() - 1U);
+            diff_search_cursor.reset();
+            diff_search_match.reset();
         }
         else if (event == Event::CtrlU) { diff_order ^= 1U; diff_search_cursor.reset(); diff_search_match.reset(); }
         else if (event == Event::AltE) {
@@ -6786,6 +6877,7 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
                 comparison.compare(files[0], files[1], diff_options);
                 diff_files = std::move(files);
                 file_diff = std::move(comparison);
+                config.source_codepage = codepage;
                 diff_top = diff_hunk = diff_horizontal = 0;
                 diff_search_cursor.reset();
                 diff_search_match.reset();
@@ -8278,7 +8370,9 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
             mode = Mode::configure_dialog;
         } else if (action == 21) {
             layout_horizontal = config.layout_horizontal;
-            layout_equal = config.split_is_equal();
+            layout_equal_drafts = {config.layout_vertical_equal.value_or(config.equal_split),
+                                   config.layout_horizontal_equal.value_or(config.equal_split)};
+            layout_equal = layout_equal_drafts[layout_horizontal ? 1U : 0U];
             layout_left_size = split_left_width();
             layout_top_size = split_top_height();
             layout_visible = {config.menubar_visible, config.command_prompt, config.keybar_visible,
@@ -8790,7 +8884,16 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
         split = std::clamp(split + amount, minimum, std::max(minimum, total - minimum));
     }
 
+    void choose_layout_orientation(const bool horizontal) {
+        layout_equal_drafts[layout_horizontal ? 1U : 0U] = layout_equal;
+        layout_horizontal = horizontal;
+        layout_equal = layout_equal_drafts[layout_horizontal ? 1U : 0U];
+    }
+
     void apply_layout() {
+        layout_equal_drafts[layout_horizontal ? 1U : 0U] = layout_equal;
+        config.layout_vertical_equal = layout_equal_drafts[0];
+        config.layout_horizontal_equal = layout_equal_drafts[1];
         config.layout_horizontal = layout_horizontal;
         config.set_split_equal(layout_equal);
         config.panel_left_size = layout_left_size;
@@ -8817,8 +8920,11 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
         const auto equal_changed = [&] {
             layout_equal = !layout_equal;
             if (layout_equal) {
-                layout_left_size = Terminal::Size().dimx / 2;
-                layout_top_size = file_manager_body_height() / 2;
+                if (layout_horizontal) {
+                    layout_top_size = std::max(1, Terminal::Size().dimy - static_cast<int>(layout_visible[0]) -
+                        static_cast<int>(layout_visible[1]) - static_cast<int>(layout_visible[2]) -
+                        static_cast<int>(layout_visible[3])) / 2;
+                } else layout_left_size = Terminal::Size().dimx / 2;
             }
         };
         if (event.is_mouse()) {
@@ -8827,7 +8933,7 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
             if (mouse.button != Mouse::Left || mouse.motion != Mouse::Pressed) return true;
             for (std::size_t index = 0; index < layout_boxes.size(); ++index) {
                 if (!layout_boxes[index].Contain(mouse.x, mouse.y)) continue;
-                if (index < 2U) { layout_focus = 0; layout_horizontal = index == 1U; }
+                if (index < 2U) { layout_focus = 0; choose_layout_orientation(index == 1U); }
                 else if (index == 2U) { layout_focus = 1; equal_changed(); }
                 else if (index < 5U) {
                     if (!layout_equal) { layout_focus = index - 1U; adjust_layout_split(index == 3U ? -1 : 1); }
@@ -8845,7 +8951,7 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
                 layout_focus = event == Event::Tab ? (layout_focus + 1U) % 12U : (layout_focus + 11U) % 12U;
             } while (layout_equal && (layout_focus == 2U || layout_focus == 3U));
         } else if (layout_focus == 0U && (event == Event::ArrowUp || event == Event::ArrowDown)) {
-            layout_horizontal = !layout_horizontal;
+            choose_layout_orientation(!layout_horizontal);
         } else if (event == Event::Return || event == Event::Character(' ')) {
             if (layout_focus == 11U) mode = Mode::panels;
             else if (layout_focus == 2U || layout_focus == 3U) adjust_layout_split(layout_focus == 2U ? -1 : 1);
@@ -8854,8 +8960,8 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
             else if (layout_focus >= 4U && layout_focus <= 9U) layout_visible[layout_focus - 4U] = !layout_visible[layout_focus - 4U];
         } else if (event.is_character() && event.character().size() == 1U) {
             const auto key = static_cast<char>(std::tolower(static_cast<unsigned char>(event.character()[0])));
-            if (key == 'v') { layout_horizontal = false; layout_focus = 0; }
-            else if (key == 'h') { layout_horizontal = true; layout_focus = 0; }
+            if (key == 'v') { choose_layout_orientation(false); layout_focus = 0; }
+            else if (key == 'h') { choose_layout_orientation(true); layout_focus = 0; }
             else if (key == 'e') { equal_changed(); layout_focus = 1; }
             else if (const auto index = std::string_view("mpkixs").find(key); index != std::string_view::npos) {
                 layout_visible[index] = !layout_visible[index];
@@ -9790,13 +9896,7 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
                 auto path = std::string(directory);
                 Location location;
                 if (path.find("://") != std::string::npos) {
-                    if (std::filesystem::path(path).is_relative()) {
-                        if (source != local) throw std::runtime_error("nested archives are not supported yet");
-                        const auto slash = path.rfind('/', path.find("://"));
-                        if (slash == std::string::npos) throw std::invalid_argument("VFS path has no archive name");
-                        path = local->join(completion_base.path, path.substr(0, slash)) + path.substr(slash);
-                    }
-                    location = resolve_location(path);
+                    location = resolve_relative_location(completion_base, path);
                 } else if (local_absolute && std::filesystem::path(path).is_absolute()) {
                     location = {local, local->normalize(path)};
                 } else {
@@ -10694,9 +10794,9 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
             value << std::oct << std::setfill('0') << std::setw(6) << entry.mode;
             return value.str();
         }
-        if (field == "mtime") return format_panel_time(entry.modified);
-        if (field == "atime") return format_panel_time(entry.accessed);
-        if (field == "ctime") return format_panel_time(entry.changed);
+        if (field == "mtime") return display_text(config.format_panel_time(entry.modified));
+        if (field == "atime") return display_text(config.format_panel_time(entry.accessed));
+        if (field == "ctime") return display_text(config.format_panel_time(entry.changed));
         if (field == "inode") return std::to_string(entry.inode);
         if (field == "nlink") return std::to_string(entry.links);
         if (field == "nuid") return std::to_string(entry.uid);
@@ -11625,9 +11725,11 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
             1, header_width -
                    static_cast<int>(editor_flags.size() + position_status.size())
         ));
+        const auto status_filename = config.editor_state_full_filename || editor.path().empty()
+            ? editor_location(editor) : std::filesystem::path(editor.path()).filename().string();
         auto status_header = hbox({
                       text(path_label(
-                          display_text(editor_location(editor)), filename_width
+                          display_text(status_filename), filename_width
                       )) | bold | flex,
                       text(editor_flags),
                       text(position_status),
@@ -13940,6 +14042,10 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
         if (entry->path != quick_view_path) {
             try {
                 quick_viewer.open(active().provider(), entry->path);
+                if (!quick_view_encoding_initialized) {
+                    apply_source_codepage(quick_viewer);
+                    quick_view_encoding_initialized = true;
+                }
                 quick_view_search_needle.clear();
                 quick_view_path = entry->path;
             } catch (const std::exception& error) {
@@ -15192,6 +15298,7 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
     }
 
     void close_viewer() {
+        remember_viewer_position(viewer, static_cast<bool>(viewer_temporary_file));
         viewer_save_closes = false;
         if (viewer_switch_pending) {
             const auto path = std::move(*viewer_switch_pending);
@@ -15505,6 +15612,7 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
             if (event == Event::AltE) {
                 show_codepage_chooser(viewer.encoding(), Mode::viewer, [this](const std::string& value) {
                     viewer.set_encoding(value);
+                    config.source_codepage = value;
                 });
                 return true;
             }
@@ -15979,8 +16087,10 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
         next.set_backup_extension(config.editor_backup_extension);
         if (create || (!require_existing && !large_file_approval && !provider->exists(path))) {
             next.create(provider, path);
+            apply_source_codepage(next);
         } else {
             next.open(provider, path, {}, large_file_approval);
+            apply_source_codepage(next);
             const auto saved = config.editor_positions.find(editor_location(next));
             if (config.editor_save_position && saved != config.editor_positions.end()) {
                 next.set_position({saved->second.row, saved->second.column});
@@ -16425,7 +16535,7 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
                 );
                 if (cut) {
                     static_cast<void>(editor.delete_selection());
-                }
+                } else if (config.editor_drop_selection_on_copy) editor.clear_selection();
                 status = cut
                              ? "Block cut to clipboard"
                              : "Block copied to clipboard";
@@ -19463,7 +19573,10 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
                 if (event == ftxui::Event::F8) { quick_viewer.toggle_magic(); return true; }
                 if (event == ftxui::Event::AltE) {
                     show_codepage_chooser(quick_viewer.encoding(), Mode::panels,
-                        [this](const std::string& value) { quick_viewer.set_encoding(value); });
+                        [this](const std::string& value) {
+                            quick_viewer.set_encoding(value);
+                            config.source_codepage = value;
+                        });
                     return true;
                 }
                 if (event == ftxui::Event::F6 ||
@@ -20536,6 +20649,7 @@ void App::open_viewer(const std::string& path) {
         next.viewer = impl_->viewer;
         if (!impl_->viewer.open()) next.viewer.set_wrap(impl_->config.viewer_wrap);
         next.viewer.open_stream(impl_->local, input->data(), path);
+        impl_->apply_source_codepage(next.viewer);
         impl_->install_viewer_session(std::move(next));
         impl_->viewer_stdin = std::move(input);
         impl_->viewer_display_name = "Standard input";
@@ -20721,7 +20835,9 @@ int App::run() {
         operation_guard.finish();
     };
     run_terminal();
-    impl_->store_panel_options_in_config();
+    if (!impl_->exit_after_viewer && !impl_->exit_after_editor && !impl_->exit_after_diff) {
+        impl_->store_panel_options_in_config();
+    }
     impl_->store_editor_options_in_config();
     try {
         if (impl_->tree_cache_used) save_tree_cache(tree_cache_path(), impl_->known_tree_directories);

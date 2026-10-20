@@ -4,8 +4,9 @@
 manager written in C++20. It provides a familiar two-pane workflow without
 using Midnight Commander source code or resources.
 
-Providers cover the local Linux filesystem and bounded, read-only tar/cpio
-archives. Remote work, including Azure Blob Storage and SSH/SFTP, is paused.
+Providers cover the local Linux filesystem, tar/cpio archives, single-file
+conversions and source-based external filesystem helpers. Remote work,
+including Azure Blob Storage and SSH/SFTP, is paused.
 
 ## Current functionality
 
@@ -335,11 +336,17 @@ editor, viewer, and diff settings. Save Setup preserves comments and unknown
 settings, and saves each file privately and atomically. The two-file update is
 not crash-atomic as a pair. Command-line skin and keymap overrides remain
 launch-only unless explicitly changed in the UI.
+Saved listing, Tree, Quick view and Info displays use the existing auxiliary
+panel controls, with one auxiliary panel at a time. Physical focus and the two
+layout split drafts remain independent. Applicable clipboard-selection,
+filename-status, paragraph-stop, source-codepage and recent/old date-format
+preferences affect their actual controls. Optional remembered viewer positions
+use data offsets rather than decoded display offsets.
 
 Compatibility is partial: unsupported settings are diagnosed and preserved,
-not silently applied or removed. Saved non-listing panel displays, legacy
-terminal/codepage options, remote options, and other unmapped MC settings are
-not implemented.
+not silently applied or removed. Two simultaneous auxiliary displays, missing
+editor modes, legacy terminal behavior, unsupported codepages, remote options,
+and other unmapped MC settings are not implemented.
 
 ## Keymaps
 
@@ -491,33 +498,62 @@ Non-local helper flags are rejected explicitly.
 ## Local archives and copying
 
 Enter opens recognized tar/cpio files; directories and `..` navigate inside,
-and `Ctrl-PageUp` at the archive root returns to its containing local directory.
+including nested archives. `Ctrl-PageUp` at a root returns through the captured
+provider chain to the directory that contained it.
 Viewing and copying out use the archive provider, not similarly named host
 paths. File bytes, modes, modification times, safe symlinks and hardlink groups
 are retained when requested. Archives are read-only in the UI, like MC TarFS:
 editor Save reports that restriction, while Save As can publish a local copy.
-External file commands and comparisons require a local copy.
+External file commands and the manager's selected-file comparison require a
+local copy; standalone comparisons also accept explicit virtual file paths.
 
 Native paths work at startup, in directory changes and in saved pane paths:
 
 ```text
 /path/to/sample.tar/utar://directory
 /path/to/sample.cpio/ucpio://directory/file
+/path/to/outer.tar/utar://inner.tar/utar://directory/file
 ```
 
 Active VFS list (`Ctrl-X a`) reopens cached archives. Virtual FS options set
 the timeout for freeing unused providers; active panes, viewers and editor
 buffers keep their snapshots alive. A changed container opens a new revision.
-Command execution from an archive uses its containing local directory and does
-not replace the archive pane with the shell's physical directory.
+Command execution uses the outer containing host directory and does not replace
+the virtual pane with the shell's physical directory.
 
-The archive reader supports ustar/common GNU/PAX tar and newc/CRC cpio.
+The archive reader supports ustar/GNU/PAX tar, GNU sparse variants, newc/CRC,
+odc and V7 little/big-endian binary cpio. Sparse and special members retain their
+actual kinds; extraction preserves holes and uses ordinary FIFO/device/socket
+safety rules instead of reading them as files.
 Compressed variants use installed `gzip`, `bzip2`, `xz`, or `zstd` commands;
-missing tools fail explicitly. Limits are 64 MiB encoded, 256 MiB expanded,
-100,000 members and 4,096 bytes per member path. Nested archives, sparse/special
-archive members, older cpio formats and other local VFS families remain open
-compatibility work. Archive data is indexed in memory, never blindly extracted
-into a host directory.
+missing tools fail explicitly. Data streams through private seekable snapshots,
+without the former 64 MiB encoded/256 MiB expanded caps or whole-file RAM buffers.
+Index limits remain 100,000 members, 4,096-byte paths, 16 MiB metadata and one
+million sparse extents; disk, `off_t` and format field ranges still apply.
+Ambiguous PWB/vendor cpio, incremental/multivolume tar and unsupported PAX
+extensions fail explicitly. No archive is blindly extracted into a host directory.
+
+## External filesystem helpers
+
+Native `container/helper://member` paths use executable source-based extfs
+helpers from `$XDG_DATA_HOME/mc/extfs.d` (normally `~/.local/share/mc/extfs.d`)
+and the installed system MC helper directories. User helpers take precedence;
+no MC helper collection is bundled. Helpers are trusted executable configuration.
+Native extension `%cd`, Quick cd, viewing, copying and root-parent navigation
+retain the actual provider instead of treating virtual `/file` as a host path.
+
+Supported helpers provide list/copyout and, where accepted, copyin/rm/mkdir/rmdir.
+Changes run on private candidates, are relisted and checked, then publish through
+the captured source's revision guard. Helper failures never publish a candidate.
+An absolute extfs symlink belongs to its container root: choose Follow links
+when exporting it, not an absolute host link. A changed source is not removed
+after a fallback move.
+
+Source-less `+` helpers, `run`, special nodes, link creation or linked-member
+replacement, chmod/chown and native rename are currently unsupported. The public
+listing's single timestamp also supplies atime/ctime; named owners are metadata,
+not host authorization. Container/member data is bounded to 64 MiB, listings to
+16 MiB, with 100,000-member/4,096-byte path and helper time/memory limits.
 
 Local copying retains sparse holes where the filesystem supports them, with
 exact logical bytes and size. FIFOs and device nodes are recreated rather than

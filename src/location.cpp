@@ -39,7 +39,7 @@ ArchiveCache::ArchiveCache(
     ProviderPtr local_provider, const std::chrono::seconds timeout,
     TransformOpenOptions transformations
 ) : local_(std::move(local_provider)), timeout_(timeout),
-    transformations_(timeout, std::move(transformations)) {
+    transformations_(timeout, std::move(transformations)), external_filesystems_(timeout) {
     if (!local_) throw std::invalid_argument("local provider is null");
     if (timeout.count() < 0) throw std::invalid_argument("VFS timeout cannot be negative");
 }
@@ -54,14 +54,23 @@ ProviderPtr ArchiveCache::open_transform(
 }
 
 ProviderPtr ArchiveCache::open(const std::string_view archive_path, const Cancellation& cancellation) {
+    return open(Location{local_, local_->normalize(archive_path)}, cancellation);
+}
+
+ProviderPtr ArchiveCache::open_extfs(
+    const Location& source, const std::string_view helper, const Cancellation& cancellation
+) {
+    return external_filesystems_.open(source.provider, source.path,
+        format(source.provider, source.path), helper, cancellation);
+}
+
+ProviderPtr ArchiveCache::open(const Location& source, const Cancellation& cancellation) {
     prune();
-    const auto* local = dynamic_cast<const LocalProvider*>(local_.get());
-    if (local == nullptr) throw std::invalid_argument("archives require a local filesystem path");
-    const auto path = local->normalize(archive_path);
-    const auto entry = local->stat_follow(path, cancellation);
+    if (!source.provider) throw std::invalid_argument("archive source provider is null");
+    const auto path = source.provider->normalize(source.path);
+    const auto entry = source.provider->stat_follow(path, cancellation);
     if (entry.kind != EntryKind::file) throw std::runtime_error("archive is not a regular file: " + path);
-    const auto native = local->native_path(path);
-    const auto key = std::pair{path, entry.revision};
+    const auto key = std::tuple{source.provider, path, entry.revision};
     {
         const std::lock_guard lock(mutex_);
         const auto found = records_.find(key);
@@ -70,13 +79,15 @@ ProviderPtr ArchiveCache::open(const std::string_view archive_path, const Cancel
             return found->second.provider;
         }
     }
-    auto provider = open_archive_provider(native, {.draft_directory=archive_draft_directory()}, cancellation);
-    if (local->stat_follow(path, cancellation).revision != entry.revision) {
+    const auto label = format(source.provider, path);
+    auto provider = open_archive_provider(source.provider, path,
+        {.draft_directory=archive_draft_directory()}, cancellation);
+    if (source.provider->stat_follow(path, cancellation).revision != entry.revision) {
         throw std::runtime_error("archive changed while it was being opened: " + path);
     }
     const std::lock_guard lock(mutex_);
     const auto [found, inserted] = records_.try_emplace(
-        key, Record{provider, path, std::chrono::steady_clock::now()}
+        key, Record{provider, label, std::chrono::steady_clock::now()}
     );
     if (!inserted) found->second.last_used = std::chrono::steady_clock::now();
     return found->second.provider;
@@ -85,16 +96,19 @@ ProviderPtr ArchiveCache::open(const std::string_view archive_path, const Cancel
 std::string ArchiveCache::format(const ProviderPtr& provider, const std::string_view path) const {
     const auto* archive = dynamic_cast<const ArchiveProvider*>(provider.get());
     if (archive == nullptr) return format_location(provider, path);
-    const std::lock_guard lock(mutex_);
-    for (const auto& [key, record] : records_) {
-        static_cast<void>(key);
-        if (record.provider == provider) return record.archive_path + archive_suffix(*archive, path);
+    {
+        const std::lock_guard lock(mutex_);
+        for (const auto& [key, record] : records_) {
+            static_cast<void>(key);
+            if (record.provider == provider) return record.source_location + archive_suffix(*archive, path);
+        }
     }
     return format_location(provider, path);
 }
 
 void ArchiveCache::prune() {
     transformations_.prune();
+    external_filesystems_.prune();
     const auto now = std::chrono::steady_clock::now();
     const std::lock_guard lock(mutex_);
     for (auto iterator = records_.begin(); iterator != records_.end();) {
@@ -114,18 +128,21 @@ void ArchiveCache::set_timeout(const std::chrono::seconds timeout) {
         timeout_ = timeout;
     }
     transformations_.set_timeout(timeout);
+    external_filesystems_.set_timeout(timeout);
     prune();
 }
 
 std::vector<std::string> ArchiveCache::locations() {
     prune();
     const auto transformed = transformations_.locations();
+    const auto external = external_filesystems_.locations();
     const std::lock_guard lock(mutex_);
     std::set<std::string> paths(transformed.begin(), transformed.end());
+    paths.insert(external.begin(), external.end());
     for (const auto& [key, record] : records_) {
         static_cast<void>(key);
         const auto* archive = dynamic_cast<const ArchiveProvider*>(record.provider.get());
-        paths.insert(record.archive_path + archive_suffix(*archive, "/"));
+        paths.insert(record.source_location + archive_suffix(*archive, "/"));
     }
     return {paths.begin(), paths.end()};
 }
@@ -133,13 +150,31 @@ std::vector<std::string> ArchiveCache::locations() {
 std::string format_location(const ProviderPtr& provider, const std::string_view path) {
     if (!provider) throw std::invalid_argument("location provider is null");
     if (const auto* archive = dynamic_cast<const ArchiveProvider*>(provider.get())) {
-        return archive->archive_path().string() + archive_suffix(*archive, path);
+        return format_location(archive->source_provider(), archive->source_path()) + archive_suffix(*archive, path);
+    }
+    if (const auto* external = dynamic_cast<const ExtfsProvider*>(provider.get())) {
+        return external->location(path);
     }
     if (const auto* transformed = dynamic_cast<const TransformProvider*>(provider.get())) {
         static_cast<void>(transformed->normalize(path));
         return transformed->location();
     }
     return std::string(path);
+}
+
+std::optional<Location> source_location(const Provider& provider) {
+    if (const auto* archive = dynamic_cast<const ArchiveProvider*>(&provider)) {
+        return Location{archive->source_provider(), archive->source_path()};
+    }
+    if (const auto* external = dynamic_cast<const ExtfsProvider*>(&provider)) {
+        const auto source = external->source();
+        return Location{source.provider, source.path};
+    }
+    if (const auto* transformed = dynamic_cast<const TransformProvider*>(&provider)) {
+        const auto& source = transformed->source();
+        return Location{source.provider, source.path};
+    }
+    return std::nullopt;
 }
 
 bool is_archive_location(const std::string_view value) noexcept {
@@ -190,15 +225,14 @@ Location open_location_impl(
     const auto outer = value.substr(0, slash);
     const auto parameter = value.substr(marker + 3U);
     if (name == "utar" || name == "ucpio") {
-        if (dynamic_cast<const LocalProvider*>(base.provider.get()) == nullptr ||
-            is_virtual_location(outer)) {
-            throw std::invalid_argument("nested archive locations are not supported yet");
+        if (dynamic_cast<const LocalProvider*>(base.provider.get()) != nullptr &&
+            !is_virtual_location(outer)) {
+            const auto literal = plain_location(value, base);
+            if (literal.provider->exists(literal.path)) return literal;
         }
-        const auto literal = plain_location(value, base);
-        if (literal.provider->exists(literal.path)) return literal;
-        const auto source = plain_location(outer, base);
+        const auto source = open_location_impl(outer, base, archives, cancellation, depth + 1U);
         ArchiveCache temporary(base.provider);
-        auto provider = (archives == nullptr ? temporary : *archives).open(source.path, cancellation);
+        auto provider = (archives == nullptr ? temporary : *archives).open(source, cancellation);
         const auto* archive = dynamic_cast<const ArchiveProvider*>(provider.get());
         if ((archive->format() == ArchiveFormat::tar) != (name == "utar")) {
             throw std::invalid_argument("archive format does not match the VFS path");
@@ -208,6 +242,18 @@ Location open_location_impl(
         return {.provider=std::move(provider), .path=member};
     }
     const auto source = open_location_impl(outer, base, archives, cancellation, depth + 1U);
+    if (find_extfs_helper(name)) {
+        ProviderPtr provider;
+        if (archives != nullptr) provider = archives->open_extfs(source, name, cancellation);
+        else {
+            ExtfsCache temporary;
+            provider = temporary.open(source.provider, source.path,
+                format_location(source.provider, source.path), name, cancellation);
+        }
+        const auto member = std::filesystem::path("/" + std::string(parameter))
+                                .lexically_normal().generic_string();
+        return {.provider=std::move(provider), .path=member};
+    }
     ProviderPtr provider;
     if (archives != nullptr) {
         provider = archives->open_transform(source, name, parameter, cancellation);
