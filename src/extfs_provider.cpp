@@ -25,6 +25,7 @@ namespace fs = std::filesystem;
 using extfs::fail;
 using extfs::identity_part;
 using extfs::Workspace;
+using extfs::DirectoryContext;
 
 [[noreturn]] void path_error(const std::string_view path, const std::errc error) {
     throw fs::filesystem_error("extfs member", fs::path(path), std::make_error_code(error));
@@ -480,6 +481,9 @@ class ExtfsProvider::Impl {
 public:
     ExtfsOpenOptions options;
     ExtfsSource source;
+    std::optional<ExtfsOrigin> origin;
+    std::unique_ptr<DirectoryContext> mount;
+    std::unique_ptr<DirectoryContext> working;
     Entry source_entry;
     ExtfsHelper helper;
     std::string identity;
@@ -516,6 +520,7 @@ public:
     }
 
     void source_writable(const Cancellation& cancellation) const {
+        if (origin) fail("source-less helpers are read-only; copy to a local file before editing");
         if (!options.writable) fail("filesystem was opened read-only");
         if (!has_capability(source.provider->capabilities(), ProviderCapability::write)) {
             fail("source provider is read-only");
@@ -560,6 +565,15 @@ public:
     }
 
     [[nodiscard]] Model listing(const Workspace& workspace, const Cancellation& cancellation) const {
+        if (origin) {
+            mount->verify(cancellation);
+            working->verify(cancellation);
+            const auto text = extfs::invoke(helper, workspace, "list", {}, options.limits,
+                cancellation, working->working_path());
+            mount->verify(cancellation);
+            working->verify(cancellation);
+            return parse_listing(text, options.limits, cancellation);
+        }
         const auto before = workspace.get("container", options.limits.container_bytes, cancellation);
         const auto text = extfs::invoke(helper, workspace, "list",
             {(workspace.path() / "container").string()}, options.limits, cancellation);
@@ -574,6 +588,19 @@ public:
         const Cancellation& cancellation
     ) const {
         const auto anchor = file_key(in, key, options.limits);
+        if (origin) {
+            mount->verify(cancellation);
+            working->verify(cancellation);
+            workspace.put("output", {}, cancellation);
+            static_cast<void>(extfs::invoke(helper, workspace, "copyout",
+                {mount->native_path().string(), anchor.substr(1U), (workspace.path() / "output").string()},
+                options.limits, cancellation, working->working_path()));
+            const auto result = workspace.get("output", options.limits.member_bytes, cancellation);
+            if (result.size() != in.at(anchor).entry.size) fail("copyout size differs from the helper listing");
+            mount->verify(cancellation);
+            working->verify(cancellation);
+            return result;
+        }
         const auto before = workspace.get("container", options.limits.container_bytes, cancellation);
         workspace.put("output", {}, cancellation);
         static_cast<void>(extfs::invoke(helper, workspace, "copyout",
@@ -593,10 +620,13 @@ public:
         const auto anchor = file_key(model, key, options.limits);
         auto& node = model.at(anchor);
         if (node.bytes) return node.bytes;
+        if (origin && node.entry.size > options.limits.cached_member_bytes - cached_bytes) {
+            fail("source-less member cache limit reached; reopen a separate view before reading more files");
+        }
         Workspace workspace(options);
-        workspace.put("container", container, cancellation);
+        if (!origin) workspace.put("container", container, cancellation);
         auto bytes = std::make_shared<const std::string>(copyout(workspace, model, anchor, cancellation));
-        if (bytes->size() <= options.limits.container_bytes - cached_bytes) {
+        if (origin || bytes->size() <= options.limits.container_bytes - cached_bytes) {
             node.bytes = bytes;
             cached_bytes += bytes->size();
         }
@@ -656,13 +686,14 @@ ProviderPtr ExtfsCache::open(
     if (path.empty() || path.size() > 65536U || path.find('\0') != std::string_view::npos) fail("invalid source path");
     const auto selected = find_extfs_helper(name, impl_->options);
     if (!selected) fail("executable helper is not installed: " + std::string(name));
-    if (!selected->requires_source) fail("source-less '+' helpers are not enabled; only local containers are supported");
+    if (!selected->requires_source) fail("source-less '+' helper requires a directory origin; use its native name://member path");
     prune();
     ExtfsSource source{provider, provider->normalize(path), {}, std::string(source_location)};
     const auto entry = provider->stat_follow(source.path, cancellation);
     if (entry.kind != EntryKind::file || entry.revision.empty()) fail("source must be a revisioned regular file");
     source.revision = entry.revision;
     const auto reusable = [&](const Impl::Record& record) {
+        if (record.provider->is_source_less()) return false;
         const auto captured = record.provider->source();
         return captured.provider == provider && captured.path == source.path &&
             captured.revision == source.revision && captured.location == source.location &&
@@ -711,6 +742,71 @@ ProviderPtr ExtfsCache::open(
     return opened;
 }
 
+ProviderPtr ExtfsCache::open_source_less(
+    ExtfsOrigin origin, const std::string_view name, const Cancellation& cancellation
+) {
+    cancellation.throw_if_requested();
+    const auto selected = find_extfs_helper(name, impl_->options);
+    if (!selected) fail("executable helper is not installed: " + std::string(name));
+    if (selected->requires_source) fail("helper requires a regular-file container, not a directory origin");
+    auto mount = std::make_unique<DirectoryContext>(std::move(origin.mount), cancellation);
+    auto working = std::make_unique<DirectoryContext>(std::move(origin.working), cancellation);
+    origin = {mount->directory(), working->directory()};
+    const auto mount_identity = mount->identity();
+    const auto working_identity = working->identity();
+    prune();
+    const auto reusable = [&](const Impl::Record& record) {
+        const auto& previous = *record.provider->impl_;
+        if (!previous.origin) return false;
+        const auto same_directory = [](const ExtfsDirectory& left, const ExtfsDirectory& right) {
+            return left.provider == right.provider && left.path == right.path && left.location == right.location;
+        };
+        return same_directory(previous.origin->mount, origin.mount) &&
+            same_directory(previous.origin->working, origin.working) &&
+            previous.mount->identity() == mount_identity &&
+            previous.working->identity() == working_identity &&
+            previous.helper.name == selected->name &&
+            previous.helper.executable == selected->executable && previous.helper.revision == selected->revision;
+    };
+    {
+        const std::lock_guard lock(impl_->mutex);
+        for (auto& record : impl_->records) {
+            if (reusable(record)) {
+                record.last_used = std::chrono::steady_clock::now();
+                return record.provider;
+            }
+        }
+    }
+    auto next = std::make_unique<ExtfsProvider::Impl>();
+    next->options = impl_->options;
+    next->origin = origin;
+    next->mount = std::move(mount);
+    next->working = std::move(working);
+    next->helper = *selected;
+    next->readonly_reason = "source-less helpers are read-only; copy to a local file before editing";
+    Workspace workspace(next->options);
+    next->model = next->listing(workspace, cancellation);
+    static std::atomic_uint64_t sequence{1};
+    const auto directory_identity = [](const DirectoryContext& directory) {
+        const auto& captured = directory.directory();
+        return identity_part(captured.provider->id()) + identity_part(captured.path) +
+            identity_part(captured.location) + identity_part(directory.identity());
+    };
+    next->identity = "extfs-local:" + directory_identity(*next->mount) + directory_identity(*next->working) +
+        identity_part(selected->name) + identity_part(selected->executable.string()) +
+        identity_part(selected->revision) + ":" + std::to_string(sequence.fetch_add(1, std::memory_order_relaxed));
+    std::shared_ptr<ExtfsProvider> opened(new ExtfsProvider(std::move(next)));
+    const std::lock_guard lock(impl_->mutex);
+    for (auto& record : impl_->records) {
+        if (reusable(record)) {
+            record.last_used = std::chrono::steady_clock::now();
+            return record.provider;
+        }
+    }
+    impl_->records.push_back({opened, std::chrono::steady_clock::now()});
+    return opened;
+}
+
 void ExtfsCache::set_timeout(const std::chrono::seconds timeout) {
     if (timeout.count() < 0) throw std::invalid_argument("VFS timeout cannot be negative");
     {
@@ -744,12 +840,22 @@ ExtfsProvider::ExtfsProvider(std::unique_ptr<Impl> impl) : impl_(std::move(impl)
 ExtfsProvider::~ExtfsProvider() = default;
 ExtfsSource ExtfsProvider::source() const {
     const std::lock_guard lock(impl_->mutex);
+    if (impl_->origin) fail("source-less helper has a directory origin, not a container source");
     return impl_->source;
+}
+bool ExtfsProvider::is_source_less() const noexcept { return impl_->origin.has_value(); }
+std::optional<ExtfsOrigin> ExtfsProvider::origin() const {
+    const std::lock_guard lock(impl_->mutex);
+    return impl_->origin;
 }
 const std::string& ExtfsProvider::helper() const noexcept { return impl_->helper.name; }
 std::string ExtfsProvider::location(const std::string_view path) const {
     const auto key = normalize(path);
     const std::lock_guard lock(impl_->mutex);
+    if (impl_->origin) {
+        const auto& mount = impl_->origin->mount.location;
+        return mount + (mount.ends_with('/') ? "" : "/") + impl_->helper.name + "://" + key.substr(1U);
+    }
     return impl_->source.location + "/" + impl_->helper.name + "://" + key.substr(1U);
 }
 std::string ExtfsProvider::id() const { return impl_->identity; }

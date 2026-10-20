@@ -73,18 +73,92 @@ context default red black
     std::cout << "PASS context spelling eligibility, byte offsets and builtin compatibility\n";
 }
 
+void test_native_bytes(const std::filesystem::path& root) {
+    const auto registry = root / "Syntax";
+    write(registry, R"(file . Original\sNative\sBytes
+caseinsensitive
+context default lightgray black
+ keyword ascii brightred
+ keyword café brightgreen
+ keyword \{é\}X yellow
+ keyword R\[éλ\]Y brightcyan
+context <é> </é> brightmagenta black
+ spellcheck
+)");
+    mcpp::SyntaxHighlighter highlighter;
+    highlighter.load_registry(registry, root / "syntax.d");
+    const std::vector<std::string> lines{
+        "ASCII café CAFé CAFÉ éX ΩX RéλY RûΩY", "<é>inside</é> <É>outside</É>"
+    };
+    const auto spans = highlighter.highlight("sample.l22", lines);
+    std::vector<int> expected(lines[0].size(), 7);
+    const auto paint = [&](const std::string_view word, const std::size_t skip, const int color) {
+        const auto start = lines[0].find(word);
+        check(start != std::string::npos, "expected syntax fixture word exists");
+        for (auto byte = start + skip; byte < start + word.size(); ++byte) expected[byte] = color;
+    };
+    paint("ASCII", 0U, 9);
+    paint("café", 0U, 10);
+    paint("CAFé", 0U, 10);
+    paint("éX", 1U, 11);
+    paint("ΩX", 1U, 11);
+    paint("RéλY", 0U, 14);
+    paint("RûΩY", 0U, 14);
+    for (std::size_t byte = 0; byte < expected.size(); ++byte) {
+        check(color_at(spans[0], byte).foreground == expected[byte],
+              "native folding and character sets preserve every original UTF-8 byte offset");
+    }
+    const std::string context = "<é>inside</é>";
+    for (std::size_t byte = 0; byte < lines[1].size(); ++byte) {
+        check(color_at(spans[1], byte).foreground == (byte < context.size() ? 13 : 7),
+              "native context delimiters fold ASCII only, not UTF-8 codepoints");
+    }
+    const auto context_begin = lines[0].size() + 1U;
+    const auto spelling = highlighter.spelling_ranges("sample.l22", lines);
+    check(spelling && *spelling == std::vector<mcpp::SyntaxSpellingRange>{
+        {context_begin, context_begin + context.size()}
+    }, "native byte contexts preserve color-independent spelling eligibility");
+    write(registry, "file . Broken\ncontext default\nunsupported_rule\n");
+    bool rejected = false;
+    try {
+        highlighter.load_registry(registry, root / "syntax.d");
+    } catch (const std::exception& error) {
+        rejected = std::string_view(error.what()).find("unsupported syntax directive") !=
+                   std::string_view::npos;
+    }
+    check(rejected && highlighter.spelling_ranges("sample.l22", lines) == spelling,
+          "failed native reload preserves spelling eligibility");
+    const auto preserved = highlighter.highlight("sample.l22", lines);
+    check(preserved.size() == spans.size(), "failed native reload preserves highlighted rows");
+    for (std::size_t row = 0; row < lines.size(); ++row) {
+        for (std::size_t byte = 0; byte < lines[row].size(); ++byte) {
+            check(color_at(preserved[row], byte) == color_at(spans[row], byte),
+                  "failed native reload preserves every byte color");
+        }
+    }
+    const auto builtin = highlighter.highlight("a.cpp", {"return 1"}, "cpp");
+    check(!builtin[0].empty() && builtin[0][0].style == mcpp::SyntaxStyle::keyword &&
+          !builtin[0][0].color &&
+          !highlighter.spelling_ranges("a.cpp", {"return 1"}, "cpp") &&
+          highlighter.highlight("sample.l22", lines, "plain")[0].empty(),
+          "native byte rules do not change builtin or plain syntax");
+    std::cout << "PASS MC-equivalent ASCII folding, byte sets, spelling, reload and builtin rules\n";
+}
+
 }  // namespace
 
 int main(const int argc, const char* const* argv) {
     try {
-        if (argc != 2 && !(argc == 3 && std::string_view(argv[2]) == "spellcheck")) {
-            throw std::runtime_error("usage: syntax-model owned-fixture-directory [spellcheck]");
+        if (argc != 2 && !(argc == 3 && (std::string_view(argv[2]) == "spellcheck" ||
+                                       std::string_view(argv[2]) == "native-bytes"))) {
+            throw std::runtime_error("usage: syntax-model owned-fixture-directory [spellcheck|native-bytes]");
         }
         const auto root = std::filesystem::path(argv[1]);
         const auto definitions = root / "syntax.d";
         std::filesystem::create_directories(definitions);
         if (argc == 3) {
-            test_spelling_contexts(root);
+            if (std::string_view(argv[2]) == "native-bytes") test_native_bytes(root);
+            else test_spelling_contexts(root);
             return 0;
         }
         const auto registry = root / "Syntax";

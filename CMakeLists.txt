@@ -189,6 +189,15 @@ if(MCPP_BUILD_TESTS)
     add_executable(mcpp_extension_tests tests/test_extensions.cpp)
     target_link_libraries(mcpp_extension_tests PRIVATE mcpp_core)
     mcpp_target_defaults(mcpp_extension_tests)
+    add_executable(mcpp_streamed_command_tests tests/test_streamed_command.cpp)
+    target_link_libraries(mcpp_streamed_command_tests PRIVATE mcpp_core)
+    mcpp_target_defaults(mcpp_streamed_command_tests)
+    add_executable(mcpp_shell_session_driver tests/shell_session_driver.cpp)
+    target_link_libraries(mcpp_shell_session_driver PRIVATE mcpp_core)
+    mcpp_target_defaults(mcpp_shell_session_driver)
+    add_executable(mcpp_extfs_sourceless_tests tests/test_extfs_sourceless.cpp)
+    target_link_libraries(mcpp_extfs_sourceless_tests PRIVATE mcpp_core)
+    mcpp_target_defaults(mcpp_extfs_sourceless_tests)
     add_executable(mcpp_viewer_source_tests tests/test_viewer_sources.cpp)
     target_link_libraries(mcpp_viewer_source_tests PRIVATE mcpp_core)
     mcpp_target_defaults(mcpp_viewer_source_tests)
@@ -321,6 +330,21 @@ if(MCPP_BUILD_TESTS)
             )
         endforeach()
         add_test(NAME mcpp_extension_tests COMMAND mcpp_extension_tests)
+        add_test(
+            NAME mcpp_streamed_command_tests
+            COMMAND mcpp_streamed_command_tests /review/cases/streamed-view-filters-model
+        )
+        set_tests_properties(mcpp_streamed_command_tests PROPERTIES TIMEOUT 15)
+        foreach(source_less_case IN ITEMS origin errors)
+            add_test(
+                NAME mcpp_extfs_sourceless_${source_less_case}
+                COMMAND mcpp_extfs_sourceless_tests ${source_less_case}
+                        /review/cases/extfs-local-sourceless-${source_less_case}
+                        ${CMAKE_CURRENT_SOURCE_DIR}/tests/extfs_sourceless_fixture.py
+                        ${CMAKE_CURRENT_SOURCE_DIR}/tests/extfs_fixture.py
+            )
+            set_tests_properties(mcpp_extfs_sourceless_${source_less_case} PROPERTIES TIMEOUT 30)
+        endforeach()
         add_test(NAME mcpp_append_resume_bytes COMMAND mcpp_append_resume_tests bytes)
         add_test(NAME mcpp_append_resume_safety COMMAND mcpp_append_resume_tests safety)
         set_tests_properties(
@@ -388,6 +412,10 @@ if(MCPP_BUILD_TESTS)
         add_test(
             NAME mcpp_syntax_rules_tests
             COMMAND mcpp_syntax_rules_tests /review/cases/mc-syntax/model
+        )
+        add_test(
+            NAME mcpp_syntax_native_bytes
+            COMMAND mcpp_syntax_rules_tests /review/cases/mc-syntax/native-bytes native-bytes
         )
         add_test(
             NAME mcpp_sparse_special_tests
@@ -460,6 +488,18 @@ if(MCPP_BUILD_TESTS)
     endif()
     find_program(MCPP_PYTHON_EXECUTABLE python3)
     find_program(MCPP_TMUX_EXECUTABLE tmux)
+    if(MCPP_PYTHON_EXECUTABLE AND EXISTS "/review/.operation-regressions-disposable")
+        add_test(
+            NAME mcpp_shell_variants
+            COMMAND
+                ${MCPP_PYTHON_EXECUTABLE}
+                -B
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_shell_variants.py
+                $<TARGET_FILE:mcpp_shell_session_driver>
+                /review/cases/shell-variants-ctest
+        )
+        set_tests_properties(mcpp_shell_variants PROPERTIES TIMEOUT 45)
+    endif()
     if(MCPP_PYTHON_EXECUTABLE AND MCPP_TMUX_EXECUTABLE)
         add_test(
             NAME mcpp_save_setup
@@ -712,6 +752,29 @@ if(MCPP_BUILD_TESTS)
                     --tmux ${MCPP_TMUX_EXECUTABLE}
             )
             set_tests_properties(mcpp_extfs_ui PROPERTIES TIMEOUT 90)
+            add_test(
+                NAME mcpp_extfs_sourceless_ui
+                COMMAND
+                    ${MCPP_PYTHON_EXECUTABLE}
+                    -B
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_extfs_sourceless_ui.py
+                    $<TARGET_FILE:mcpp>
+                    --tmux ${MCPP_TMUX_EXECUTABLE}
+            )
+            set_tests_properties(mcpp_extfs_sourceless_ui PROPERTIES TIMEOUT 90)
+            add_test(
+                NAME mcpp_streamed_views_ui
+                COMMAND
+                    ${MCPP_PYTHON_EXECUTABLE}
+                    -B
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_extensions_ui.py
+                    $<TARGET_FILE:mcpp>
+                    ${MCPP_TMUX_EXECUTABLE}
+                    /review/cases/mc-extensions/streamed-ctest
+                    ExtensionsUI.test_streamed_view_output
+                    ExtensionsUI.test_streamed_view_lifetime_and_failure
+            )
+            set_tests_properties(mcpp_streamed_views_ui PROPERTIES TIMEOUT 90)
             add_test(
                 NAME mcpp_hex_cursor_ui
                 COMMAND

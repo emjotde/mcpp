@@ -43,6 +43,10 @@ public:
         const Location& source, std::string_view helper,
         const Cancellation& cancellation = {}
     );
+    [[nodiscard]] ProviderPtr open_extfs_source_less(
+        ExtfsOrigin origin, std::string_view helper,
+        const Cancellation& cancellation = {}
+    );
     [[nodiscard]] std::string format(const ProviderPtr& provider, std::string_view path) const;
     [[nodiscard]] std::vector<std::string> locations();
     void set_timeout(std::chrono::seconds timeout);
@@ -79,7 +83,9 @@ private:
 );
 
 [[nodiscard]] std::string format_location(const ProviderPtr& provider, std::string_view path);
+// Source-less helpers have directory origins, not a container source file.
 [[nodiscard]] std::optional<Location> source_location(const Provider& provider);
+[[nodiscard]] Location local_execution_directory(Location location);
 [[nodiscard]] bool is_archive_location(std::string_view value) noexcept;
 [[nodiscard]] bool is_transform_location(std::string_view value) noexcept;
 // Includes unsupported/remote schemes so callers do not mangle them with host

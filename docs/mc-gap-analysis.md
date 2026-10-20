@@ -258,7 +258,7 @@ controller expectations. Later archive namespace fixes were checked only in
 their affected cases; no second full run is claimed or required for this batch.
 Future work uses a build and a few relevant checks, not broad repeated suites.
 
-### Expanded archives and source-based external helpers
+### Expanded archives and external helpers
 
 Nested tar/cpio sources now retain the actual provider, normalized member path
 and revision in their cache keys and return paths. GNU sparse tar variants,
@@ -271,9 +271,14 @@ format limits; the zstd command path was not runtime-checked in this environment
 
 Native source-based extfs helpers now provide listing, copyout and accepted
 copyin/rm/mkdir/rmdir through guarded private candidates. Actual extension
-`%cd`, Quick cd, viewing, copying and root-parent navigation pass. Source-less
-`+`, `run`, special nodes, link creation/linked-member replacement, metadata
-changes and native rename remain unsupported; **L31 remains partial**. Named
+`%cd`, Quick cd, viewing, copying and root-parent navigation pass. Local
+source-less `+` helpers now have separate captured mount and working directories,
+read-only list/copyout and retained member bytes. Native bare/prefixed URIs and
+root exits use real directory origins, never fabricated container files.
+The protocol has no global content revision; bounded caches do not refresh
+already retained bytes. `run`, special nodes, link creation/linked-member
+replacement, metadata changes and native rename remain unsupported;
+**L31 remains partial**. Named
 ownership and the listing's single timestamp are metadata, not host credentials
 or independent atime/ctime. Container/member/listing/time/memory bounds are
 documented in the README.
@@ -319,9 +324,14 @@ unsupported, and unsafe or unsupported heredoc forms fail explicitly.
 
 External `Syntax` registries and definitions now feed the actual editor chooser
 and color renderer, with transactional reload, saved selections and legacy-file
-preservation. Registry expressions now use PCRE2. **L22 remains partial**:
-unsupported directives are rejected; keyword/context case folding is
-ASCII-oriented and pattern sets are byte-based. Context `spellcheck` now emits
+preservation. Registry expressions now use PCRE2. **L22 is not yet counted
+closed** pending remaining native-directive checks. Native MC 4.8.30 controls
+confirm the existing ASCII-only case folding and byte-based sets, including
+partial UTF-8-byte matches; those are baseline behavior, not compatibility gaps.
+The editor now keeps UTF-8 characters visible across partial-byte syntax spans,
+with the leading byte's style matching the native control. The focused model,
+native comparison and corrected mcpp comparison pass without changing file
+bytes. Unknown directives fail explicitly. Context `spellcheck` now emits
 color-independent eligible byte ranges and filters whole-document and
 continuation results. Its focused workflow
 preserves UTF-8 offsets, explicit word checking, marks, Undo and saved bytes.
@@ -341,9 +351,13 @@ guards were recompiled and the small model rechecked, without another UI sweep.
 Native extension resources now match Open/View/Edit and execute through the
 shared directive/macro engine, preserving legacy rules, dirty buffers and
 archive provider boundaries. Expressions now use PCRE2. **L21 remains bounded**
-by explicit local-copy requirements for external archive actions and a
-16 MiB buffered-filter limit. Missing helpers and invalid resources remain
-visible errors, not reasons to execute a legacy fallback.
+by explicit local-copy requirements for external archive actions and the
+documented macro restrictions. Extension View, user-menu `%view` and Filtered
+view now stream output to private files without the former 16/64 MiB stdout
+caps. Each screen retains its own read-only output; failed commands do not
+open partial output. Stderr remains bounded. Missing helpers, storage errors
+and invalid resources remain visible errors, not reasons to execute a legacy
+fallback.
 
 ### Command line, regular expressions and single-file transformations
 
@@ -430,7 +444,7 @@ mode or unknown user-provided skin.
 
 | ID | Remaining work | Evidence |
 |---|---|---|
-| L35 | Persistent non-Bash shell variants | Native MC documents ash/dash, ksh variants, zsh, tcsh and fish. mcpp's persistent integration currently targets the approved Bash workflow; other `SHELL` values retain one-shot execution. |
+| L35 | Partial: remaining persistent shell variants | Bash, dash and `sh` resolving to either now retain the selected executable, native startup, state, cwd, drafts and running commands. A cwd error discards the rejected command rather than executing it later on resume. Four small owned-container workflows cover Bash, sh/dash, async builtins/shutdown, and identity/error recovery. Persistent ash, ksh, zsh, tcsh and fish remain unsupported. |
 
 ## Audit fix delivery
 

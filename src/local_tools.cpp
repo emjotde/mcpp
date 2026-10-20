@@ -278,6 +278,14 @@ CommandOutput capture_shell(
     return capture_command({"/bin/bash", "-c", std::string(command)}, directory, cancellation, limit);
 }
 
+CommandOutput capture_shell_to(
+    std::ostream& output, const std::string_view command, const std::filesystem::path& directory,
+    const Cancellation& cancellation, const std::size_t error_limit
+) {
+    return capture_command_to(output, {"/bin/bash", "-c", std::string(command)},
+                              directory, cancellation, error_limit);
+}
+
 std::vector<Declaration> find_declarations(
     const std::filesystem::path& source, const std::string_view word,
     const Cancellation& cancellation

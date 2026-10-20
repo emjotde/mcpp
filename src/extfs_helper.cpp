@@ -1,6 +1,7 @@
 #include "extfs_helper.hpp"
 
 #include "mcpp/local_tools.hpp"
+#include "mcpp/local_provider.hpp"
 
 #include <algorithm>
 #include <array>
@@ -207,6 +208,7 @@ void validate_limits(const ExtfsLimits& limits) {
     constexpr std::size_t maximum = 512U * 1024U * 1024U;
     if (limits.container_bytes == 0U || limits.container_bytes > maximum ||
         limits.member_bytes == 0U || limits.member_bytes > maximum ||
+        limits.cached_member_bytes == 0U || limits.cached_member_bytes > maximum ||
         limits.listing_bytes == 0U || limits.listing_bytes > 64U * 1024U * 1024U ||
         limits.members == 0U || limits.members > 1000000U ||
         limits.path_bytes == 0U || limits.path_bytes > 65536U ||
@@ -226,6 +228,61 @@ void validate_helper(const ExtfsHelper& helper) {
 
 std::string identity_part(const std::string_view value) {
     return std::to_string(value.size()) + ":" + std::string(value);
+}
+
+DirectoryContext::DirectoryContext(ExtfsDirectory directory, const Cancellation& cancellation)
+    : directory_(std::move(directory)) {
+    const auto* local = dynamic_cast<const LocalProvider*>(directory_.provider.get());
+    if (local == nullptr) fail("source-less helper origins must be local directories");
+    if (directory_.path.empty() || directory_.path.size() > 65536U ||
+        directory_.path.find('\0') != std::string::npos || directory_.location.empty() ||
+        directory_.location.size() > 65536U || directory_.location.find('\0') != std::string::npos) {
+        fail("invalid source-less directory origin");
+    }
+    directory_.path = local->normalize(directory_.path);
+    if (local->stat_follow(directory_.path, cancellation).kind != EntryKind::directory) {
+        fail("source-less helper origin is not a directory");
+    }
+    native_ = local->native_path(directory_.path);
+    descriptor_ = ::open(native_.c_str(), O_PATH | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    check(descriptor_, "open source-less helper directory");
+    try {
+        struct stat state{};
+        check(::fstat(descriptor_, &state), "inspect source-less helper directory");
+        device_ = static_cast<std::uintmax_t>(state.st_dev);
+        inode_ = static_cast<std::uintmax_t>(state.st_ino);
+        verify(cancellation);
+    } catch (...) {
+        static_cast<void>(::close(descriptor_));
+        descriptor_ = -1;
+        throw;
+    }
+}
+
+DirectoryContext::~DirectoryContext() {
+    if (descriptor_ >= 0) static_cast<void>(::close(descriptor_));
+}
+
+fs::path DirectoryContext::working_path() const {
+    return fs::path("/proc") / std::to_string(::getpid()) / "fd" / std::to_string(descriptor_);
+}
+
+std::string DirectoryContext::identity() const {
+    return std::to_string(device_) + ":" + std::to_string(inode_);
+}
+
+void DirectoryContext::verify(const Cancellation& cancellation) const {
+    cancellation.throw_if_requested();
+    const auto* local = dynamic_cast<const LocalProvider*>(directory_.provider.get());
+    const auto current = local->native_path(directory_.path);
+    Descriptor descriptor(::open(current.c_str(), O_PATH | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC));
+    check(descriptor.get(), "reopen source-less helper directory");
+    struct stat state{};
+    check(::fstat(descriptor.get(), &state), "recheck source-less helper directory");
+    if (current != native_ || static_cast<std::uintmax_t>(state.st_dev) != device_ ||
+        static_cast<std::uintmax_t>(state.st_ino) != inode_) {
+        fail("source-less directory origin changed; reopen the filesystem");
+    }
 }
 
 Workspace::Workspace(const ExtfsOpenOptions& options)
@@ -334,7 +391,8 @@ std::string Workspace::get(
 std::string invoke(
     const ExtfsHelper& helper, const Workspace& workspace,
     const std::string_view command, const std::vector<std::string>& arguments,
-    const ExtfsLimits& limits, const Cancellation& cancellation
+    const ExtfsLimits& limits, const Cancellation& cancellation,
+    const fs::path& working_directory
 ) {
     validate_helper(helper);
     const auto file_limit = std::max({limits.container_bytes, limits.member_bytes, limits.listing_bytes});
@@ -364,7 +422,7 @@ std::string invoke(
         }
     });
     try {
-        const auto result = capture_command(argv, workspace.path(), stopped,
+        const auto result = capture_command(argv, working_directory.empty() ? workspace.path() : working_directory, stopped,
             command == "list" ? limits.listing_bytes : 65536U);
         timer.request_stop();
         cancellation.throw_if_requested();

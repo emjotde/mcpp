@@ -95,10 +95,97 @@ int parse_number(const std::string& value) {
     return result;
 }
 
+enum class ShellKind { bash, bash_sh, posix };
+
+bool bash_protocol(const ShellKind kind) {
+    return kind != ShellKind::posix;
+}
+
+struct ShellExecutable {
+    std::string path;
+    std::string name;
+    ShellKind kind;
+};
+
+std::optional<ShellExecutable> selected_shell() {
+    const auto* selected = std::getenv("SHELL");
+    const std::string requested = selected == nullptr || *selected == '\0' ? "/bin/bash" : selected;
+    std::filesystem::path executable(requested);
+    if (!executable.has_parent_path()) {
+        const auto* search = std::getenv("PATH");
+        const std::string_view path = search == nullptr ? "/usr/bin:/bin" : search;
+        std::size_t offset = 0;
+        bool found = false;
+        do {
+            const auto end = path.find(':', offset);
+            const auto component = path.substr(offset, end == std::string_view::npos ? end : end - offset);
+            const auto candidate = (component.empty() ? std::filesystem::path(".")
+                                                     : std::filesystem::path(component)) / requested;
+            if (access(candidate.c_str(), X_OK) == 0) {
+                executable = candidate;
+                found = true;
+                break;
+            }
+            if (end == std::string_view::npos) break;
+            offset = end + 1U;
+        } while (offset <= path.size());
+        if (!found) throw std::runtime_error("selected shell is missing or not executable: " + requested);
+    }
+    std::error_code error;
+    const auto resolved = std::filesystem::canonical(executable, error);
+    if (error || !std::filesystem::is_regular_file(resolved, error) ||
+        access(resolved.c_str(), X_OK) != 0) {
+        throw std::runtime_error("selected shell is missing or not executable: " + requested);
+    }
+    const auto name = std::filesystem::path(requested).filename().string();
+    const auto identity = resolved.filename().string();
+    if (identity == "bash") {
+        return ShellExecutable{resolved.string(), name, name == "sh" ? ShellKind::bash_sh : ShellKind::bash};
+    }
+    if (identity == "dash") return ShellExecutable{resolved.string(), name, ShellKind::posix};
+    for (const auto& [known, kind] : {
+             std::pair{"/bin/bash", ShellKind::bash},
+             std::pair{"/usr/bin/bash", ShellKind::bash},
+             std::pair{"/bin/dash", ShellKind::posix},
+             std::pair{"/usr/bin/dash", ShellKind::posix},
+         }) {
+        error.clear();
+        if (std::filesystem::equivalent(resolved, known, error) && !error) {
+            return ShellExecutable{resolved.string(), name,
+                                   kind == ShellKind::bash && name == "sh" ? ShellKind::bash_sh : kind};
+        }
+    }
+    return std::nullopt;
+}
+
+std::string quote_posix(const std::string_view value) {
+    std::string result{"'"};
+    for (const auto character : value) {
+        if (character == '\'') result += "'\\''";
+        else result += character;
+    }
+    result += '\'';
+    return result;
+}
+
+std::string encode_directory(const std::string_view value) {
+    std::string result;
+    result.reserve(value.size() * 5U + 1U);
+    for (const unsigned char character : value) {
+        result += "\\0";
+        result += static_cast<char>('0' + ((character >> 6U) & 7U));
+        result += static_cast<char>('0' + ((character >> 3U) & 7U));
+        result += static_cast<char>('0' + (character & 7U));
+    }
+    result += '\n';
+    return result;
+}
+
 }  // namespace
 
 struct ShellSession::Impl {
     Fd master;
+    Fd slave_control;
     Fd requests;
     Fd notifications;
     pid_t pid{-1};
@@ -115,6 +202,11 @@ struct ShellSession::Impl {
     std::string control;
     std::filesystem::path temporary;
     std::string directory;
+    ShellKind kind{ShellKind::bash};
+    std::string shell_name{"Bash"};
+    bool input_draft{false};
+    std::string canonical_input;
+    bool restoring_input{false};
     bool hidden{false};
     bool draft{false};
     bool initialized{false};
@@ -159,10 +251,15 @@ struct ShellSession::Impl {
             reader.join();
         }
         master.reset();
+        slave_control.reset();
         notifications.reset();
         if (!temporary.empty()) {
             if (unlink((temporary / "bashrc").c_str()) != 0 && errno != ENOENT) {
                 std::cerr << "mcpp: cannot remove shell startup file: "
+                          << std::generic_category().message(errno) << '\n';
+            }
+            if (unlink((temporary / "command").c_str()) != 0 && errno != ENOENT) {
+                std::cerr << "mcpp: cannot remove shell command file: "
                           << std::generic_category().message(errno) << '\n';
             }
             if (rmdir(temporary.c_str()) != 0 && errno != ENOENT) {
@@ -173,6 +270,9 @@ struct ShellSession::Impl {
         }
         hidden = false;
         draft = false;
+        input_draft = false;
+        canonical_input.clear();
+        restoring_input = false;
         initialized = false;
         ready = backgrounded = auto_return = false;
         hidden_directory.clear();
@@ -229,12 +329,59 @@ struct ShellSession::Impl {
     void observe_prompt(const Message& message) {
         status = message.value;
         directory = message.directory;
+        if (kind == ShellKind::posix) ++hidden_count;
+        if (!ready) {
+            input_draft = false;
+            canonical_input.clear();
+        }
         ready = initialized = true;
+    }
+
+    void send_directory(const std::string& value) {
+        write_all(requests.value, bash_protocol(kind) ? value + '\0' : encode_directory(value), true);
+    }
+
+    void write_canonical_control(const std::string_view value, const bool discard_input = false) {
+        termios settings{};
+        if (tcgetattr(slave_control.value, &settings) != 0) fail("read shell input settings");
+        if ((settings.c_lflag & ICANON) == 0) {
+            throw std::runtime_error("persistent dash requires canonical input; disable the shell's line editor");
+        }
+        if (discard_input && tcflush(slave_control.value, TCIFLUSH) != 0) {
+            fail("save unfinished shell input");
+        }
+        auto quiet = settings;
+        quiet.c_lflag &= static_cast<tcflag_t>(~ECHO);
+        if (tcsetattr(slave_control.value, TCSANOW, &quiet) != 0) fail("hide shell control input");
+        try {
+            write_all(master.value, value);
+        } catch (...) {
+            if (tcsetattr(slave_control.value, TCSANOW, &settings) != 0) {
+                std::cerr << "mcpp: cannot restore shell input settings\n";
+            }
+            throw;
+        }
+        if (tcsetattr(slave_control.value, TCSANOW, &settings) != 0) fail("restore shell input settings");
+    }
+
+    void toggle() {
+        if (bash_protocol(kind)) write_all(master.value, "\017");
+        else write_canonical_control("__mcpp_toggle\n", true);
     }
 
     bool submit_pending_command() {
         if (pending_command.empty()) return false;
-        write_all(master.value, "\033[200~" + pending_command + "\033[201~\r");
+        if (bash_protocol(kind)) {
+            write_all(master.value, "\033[200~" + pending_command + "\033[201~\r");
+        } else {
+            const auto path = temporary / "command";
+            Fd command_file(open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW, 0600));
+            if (command_file.value < 0) fail("create persistent shell command file");
+            write_all(command_file.value, pending_command);
+            write_all(command_file.value, "\n");
+            command_file.reset();
+            write_canonical_control(". " + quote_posix(path.string()) + "\n");
+        }
         pending_command.clear();
         ready = false;
         auto_return = true;
@@ -265,16 +412,22 @@ struct ShellSession::Impl {
             const auto final_directory = directory;
             const bool started = initialized;
             stop();
-            if (!started) throw std::runtime_error("Bash exited before providing a prompt (exit " +
+            if (!started) throw std::runtime_error(shell_name + " exited before providing a prompt (exit " +
                                                    std::to_string(status) + ")");
             return ShellResult{final_directory, status, true, false};
         }
-        if (output_closed.load()) throw std::runtime_error("Bash closed its terminal unexpectedly");
+        if (output_closed.load()) throw std::runtime_error(shell_name + " closed its terminal unexpectedly");
         return result;
     }
 
     void start(const std::string& cwd) {
         stop();
+        const auto executable = selected_shell();
+        if (!executable) {
+            throw std::runtime_error("persistent shell is unsupported for the selected SHELL; use --nosubshell");
+        }
+        kind = executable->kind;
+        shell_name = executable->name;
         output_closed.store(false);
         {
             std::lock_guard lock(output_mutex);
@@ -318,6 +471,8 @@ struct ShellSession::Impl {
         if (slave.value < 0) {
             fail("open shell pseudo-terminal");
         }
+        slave_control.reset(fcntl(slave.value, F_DUPFD_CLOEXEC, 0));
+        if (slave_control.value < 0) fail("retain shell input terminal");
         termios settings{};
         if (tcgetattr(STDIN_FILENO, &settings) != 0 ||
             tcsetattr(slave.value, TCSANOW, &settings) != 0) {
@@ -373,6 +528,36 @@ builtin bind -x '"\C-o":__mcpp_toggle'
 builtin bind 'set enable-bracketed-paste on'
 PROMPT_COMMAND=(__mcpp_before_prompt "${PROMPT_COMMAND[@]}" __mcpp_prompt)
 )");
+        if (kind == ShellKind::bash_sh) {
+            script.erase(0, script.find("if ! IFS="));
+        }
+        if (kind == ShellKind::posix) {
+            script = R"(__mcpp_read_directory() {
+    IFS= command read -r __mcpp_path <&@IN@ || command exit
+    __mcpp_path=$(command printf '%b.' "$__mcpp_path")
+    __mcpp_path=${__mcpp_path%.}
+}
+__mcpp_read_directory
+command cd -- "$__mcpp_path" || command exit 126
+__mcpp_prompt() {
+    command printf 'P\000%d\000%s\000' "$1" "$PWD" >&@OUT@
+    return "$1"
+}
+__mcpp_toggle() {
+    __mcpp_saved_status=$?
+    __mcpp_changed=0
+    command printf '\033]777;mcpp-sync:@SYNC@\007' > /dev/tty || command exit 125
+    command printf 'H\000%s\0000\000' "$PWD" >&@OUT@
+    __mcpp_read_directory
+    if [ "$PWD" != "$__mcpp_path" ]; then
+        command cd -- "$__mcpp_path" || __mcpp_changed=$?
+    fi
+    command printf 'R\000%s\000%d\000' "$PWD" "$__mcpp_changed" >&@OUT@
+    return "$__mcpp_saved_status"
+}
+PS1='$(__mcpp_prompt "$?")'"${PS1-\$ }"'@MARK@'
+)";
+        }
         for (const auto& [token, value] : {
                  std::pair{std::string("@IN@"), child_requests.value},
                  std::pair{std::string("@OUT@"), child_notifications.value},
@@ -387,12 +572,11 @@ PROMPT_COMMAND=(__mcpp_before_prompt "${PROMPT_COMMAND[@]}" __mcpp_prompt)
         if (const auto offset = script.find("@SYNC@"); offset != std::string::npos) {
             script.replace(offset, 6U, sync_token);
         }
+        if (const auto offset = script.find("@MARK@"); offset != std::string::npos) {
+            script.replace(offset, 6U, sync_marker);
+        }
         write_all(rc.value, script);
         rc.reset();
-        const auto* executable = std::getenv("SHELL");
-        if (executable == nullptr || *executable == '\0') {
-            executable = "/bin/bash";
-        }
         pid = fork();
         if (pid < 0) {
             fail("fork persistent shell");
@@ -407,15 +591,21 @@ PROMPT_COMMAND=(__mcpp_before_prompt "${PROMPT_COMMAND[@]}" __mcpp_prompt)
                 chdir(cwd.c_str()) != 0) {
                 _exit(126);
             }
-            execlp(
-                executable, "bash", "--rcfile", startup.c_str(), "-i",
-                static_cast<char*>(nullptr)
-            );
+            if (kind == ShellKind::bash) {
+                execl(executable->path.c_str(), executable->name.c_str(), "--rcfile",
+                      startup.c_str(), "-i", static_cast<char*>(nullptr));
+            } else {
+                execl(executable->path.c_str(), executable->name.c_str(), "-i",
+                      static_cast<char*>(nullptr));
+            }
             _exit(127);
         }
         directory = cwd;
         status = 0;
-        write_all(requests.value, cwd + '\0', true);
+        send_directory(cwd);
+        if (kind != ShellKind::bash) {
+            write_all(master.value, ". " + quote_posix(startup.string()) + "\n");
+        }
         const auto child_pid = pid;
         reader = std::jthread([this, child_pid](const std::stop_token token) {
             try {
@@ -543,7 +733,7 @@ PROMPT_COMMAND=(__mcpp_before_prompt "${PROMPT_COMMAND[@]}" __mcpp_prompt)
         bool synchronizing = backgrounded && ready;
         if (synchronizing) {
             auto_return = false;
-            write_all(master.value, "\017");
+            toggle();
         }
         if (backgrounded) {
             const auto foreground = tcgetpgrp(master.value);
@@ -554,7 +744,7 @@ PROMPT_COMMAND=(__mcpp_before_prompt "${PROMPT_COMMAND[@]}" __mcpp_prompt)
             backgrounded = false;
         }
         if (hidden) {
-            write_all(requests.value, requested_directory + '\0', true);
+            send_directory(requested_directory);
             hidden = false;
         }
         const auto submit = [&] {
@@ -576,7 +766,7 @@ PROMPT_COMMAND=(__mcpp_before_prompt "${PROMPT_COMMAND[@]}" __mcpp_prompt)
                 }
                 stop();
                 flush_output();
-                if (!started) throw std::runtime_error("Bash exited before providing a prompt (exit " +
+                if (!started) throw std::runtime_error(shell_name + " exited before providing a prompt (exit " +
                                                        std::to_string(status) + ")");
                 return {directory, status, true};
             }
@@ -602,10 +792,10 @@ PROMPT_COMMAND=(__mcpp_before_prompt "${PROMPT_COMMAND[@]}" __mcpp_prompt)
                     if (message->kind == 'H') {
                         ++hidden_count;
                         directory = message->directory;
-                        draft = message->value != 0;
+                        draft = message->value != 0 || (kind == ShellKind::posix && input_draft);
                         hidden = true;
                         if (synchronizing) {
-                            write_all(requests.value, requested_directory + '\0', true);
+                            send_directory(requested_directory);
                             hidden = false;
                             synchronizing = false;
                             continue;
@@ -613,25 +803,38 @@ PROMPT_COMMAND=(__mcpp_before_prompt "${PROMPT_COMMAND[@]}" __mcpp_prompt)
                         auto_return = false;
                         flush_output(true);
                         if (directory_failed) {
+                            pending_command.clear();
                             throw std::runtime_error("shell cannot change directory to " + requested_directory);
                         }
                         return {directory, status, false, false};
                     }
                     if (message->kind == 'R') {
                         directory = message->directory;
+                        restoring_input = kind == ShellKind::posix;
                         if (message->value != 0) {
                             directory_failed = true;
-                            write_all(master.value, "\017");
-                        } else if (!pending_command.empty()) {
+                            if (bash_protocol(kind)) toggle();
+                        } else if (!pending_command.empty() && bash_protocol(kind)) {
                             submit();
                         }
                     } else {
                         observe_prompt(*message);
+                        if (kind == ShellKind::posix) {
+                            flush_output(true);
+                            if (restoring_input) {
+                                restoring_input = false;
+                                if (directory_failed) {
+                                    toggle();
+                                    continue;
+                                }
+                                if (!canonical_input.empty()) write_all(master.value, canonical_input);
+                            }
+                        }
                         if (synchronizing) continue;
                         if (!pending_command.empty()) {
                             submit();
                         } else if (auto_return && !returning) {
-                            write_all(master.value, "\017");
+                            toggle();
                             returning = true;
                         }
                     }
@@ -651,8 +854,19 @@ PROMPT_COMMAND=(__mcpp_before_prompt "${PROMPT_COMMAND[@]}" __mcpp_prompt)
                         flush_output();
                         return {directory, status, false, true};
                     } else {
-                        if (data[static_cast<std::size_t>(index)] == '\r' ||
-                            data[static_cast<std::size_t>(index)] == '\n') ready = false;
+                        const auto character = data[static_cast<std::size_t>(index)];
+                        if (character == '\017' && kind == ShellKind::posix) {
+                            toggle();
+                            continue;
+                        }
+                        if (character == '\r' || character == '\n' || character == '\003') {
+                            ready = false;
+                            input_draft = false;
+                            canonical_input.clear();
+                        } else if (character != '\004' && character != '\014') {
+                            input_draft = true;
+                            if (kind == ShellKind::posix && ready) canonical_input += character;
+                        }
                         write_all(
                             master.value,
                             std::string_view(&data[static_cast<std::size_t>(index)], 1)
@@ -660,10 +874,10 @@ PROMPT_COMMAND=(__mcpp_before_prompt "${PROMPT_COMMAND[@]}" __mcpp_prompt)
                     }
                 }
             }
-            if (!command.empty() && !submitted &&
+            if ((!initialized || (!command.empty() && !submitted)) &&
                 std::chrono::steady_clock::now() - requested_start >
                     std::chrono::seconds(10)) {
-                throw std::runtime_error("Bash did not provide a command prompt");
+                throw std::runtime_error(shell_name + " did not provide a command prompt");
             }
         }
     }
@@ -673,9 +887,7 @@ ShellSession::ShellSession() : impl_(std::make_unique<Impl>()) {}
 ShellSession::~ShellSession() = default;
 
 bool ShellSession::supported() {
-    const auto* shell = std::getenv("SHELL");
-    return shell == nullptr || *shell == '\0' ||
-           std::filesystem::path(shell).filename() == "bash";
+    return selected_shell().has_value();
 }
 
 bool ShellSession::running() const {

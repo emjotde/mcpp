@@ -36,7 +36,7 @@ including Azure Blob Storage and SSH/SFTP, is paused.
 - Creation permissions follow the process umask when permissions are not preserved
 - Mode, owner/group, file information, free-space display, and links
 - Directory comparison plus fixed-width Quick view and live Info panels
-- Local command line, history, and persistent Bash with Ctrl-O switching
+- Local command line, history, and persistent Bash/sh/dash with Ctrl-O switching
 - Persisted panel paths and preferences
 - MC-style visual state cues, a grayscale default, and 16 selectable skins
 - Toggleable syntax colors adapted to dark, light, and monochrome skins
@@ -84,7 +84,7 @@ without starting the UI.
 `--stickchars` uses ASCII frames and Tree branches without changing file text.
 `-b` / `--nocolor` uses terminal-default colors with text emphasis; `-c` /
 `--color` enables at least the basic color palette. `-u` / `--nosubshell` and
-`-U` / `--subshell` override persistent Bash for the current run.
+`-U` / `--subshell` override persistent shell integration for the current run.
 
 ```bash
 build/release/mcpp --nomouse --stickchars --nocolor --nosubshell
@@ -440,9 +440,11 @@ Loading is transactional: a malformed replacement reports an error while
 retaining the current definition and draft. Registry filename and first-line
 expressions use PCRE2, including lookarounds, Unicode properties and case folding.
 
-This is not complete MC syntax compatibility yet. Keyword/context case folding
-is ASCII-oriented and pattern sets are byte-based. Unsupported directives fail
-explicitly. Context `spellcheck` flags
+Complete native directive coverage is not yet claimed. Keyword/context case
+folding and byte-based pattern sets match MC 4.8.30, including byte offsets
+inside UTF-8 text; they are not Unicode word matching. Unknown directives fail
+explicitly. The editor keeps UTF-8 characters intact when byte-oriented syntax
+spans start or end inside them, using the leading byte's style. Context `spellcheck` flags
 filter whole-document results and continuation checks independently of syntax
 colors; explicit word checks remain available outside those contexts. If a
 replacement changes delimiters and makes new text eligible, run another
@@ -460,7 +462,11 @@ VIEWER/PAGER. Native Edit actions run with either editor preference.
 Invalid resources and missing helpers report explicit errors, without executing
 a legacy fallback. Native expressions use PCRE2. External archive commands
 require a local copy; internal `%view` reads the archive provider. Compatibility
-remains bounded by documented macro restrictions and a 16 MiB buffered-filter limit.
+remains bounded by documented macro restrictions. Extension View filters, user
+menu `%view` commands and Filtered view stream stdout to private files instead
+of buffering it or imposing the former 16/64 MiB output limits. Each viewer
+retains its own read-only output until that screen is closed. Command failures
+and storage errors remain visible; partial failed output is not opened.
 
 ## Single-file transformations
 
@@ -549,8 +555,18 @@ An absolute extfs symlink belongs to its container root: choose Follow links
 when exporting it, not an absolute host link. A changed source is not removed
 after a fallback move.
 
-Source-less `+` helpers, `run`, special nodes, link creation or linked-member
-replacement, chmod/chown and native rename are currently unsupported. The public
+Local source-less `+` helpers support read-only `helper://member` and
+`/directory/helper://member` paths. Their mount directory and entry working
+directory are captured separately: `list` gets no source argument, `copyout`
+gets the mount directory, and both run in the captured working directory.
+Leaving the virtual root selects the real mount directory in its parent.
+The listing and first copy of each member remain cached for that view; the
+protocol does not provide a global content revision. The aggregate member cache
+is bounded to 128 MiB and reports exhaustion rather than silently refreshing
+bytes behind open viewers. Replaced origin directories block uncached reads.
+
+`run`, special nodes, link creation or linked-member replacement, chmod/chown
+and native rename are currently unsupported. The public
 listing's single timestamp also supplies atime/ctime; named owners are metadata,
 not host authorization. Container/member data is bounded to 64 MiB, listings to
 16 MiB, with 100,000-member/4,096-byte path and helper time/memory limits.
@@ -584,9 +600,10 @@ Safe delete defaults to No in both initial and recursive confirmations.
 
 ## Shell
 
-With Bash, commander commands and `Ctrl-O` use the same interactive shell.
+With Bash or dash, including `sh` pointing to either, commander commands and
+`Ctrl-O` use the same selected interactive shell.
 Variables, functions, aliases, and the shell PID survive repeated commands and
-screen switches. `Ctrl-O` also hides a running foreground command or Bash
+screen switches. `Ctrl-O` also hides a running foreground command or shell
 `read`; it does not stop the command. Resume it with `Ctrl-O`.
 
 An unfinished shell line or running command prevents a second commander command
@@ -600,16 +617,19 @@ Bash startup uses `$XDG_DATA_HOME/mcpp/bashrc` (normally
 `inputrc` in the same data directory is loaded when present. Existing prompt
 hooks and command status are retained. Logical paths and paths containing
 spaces or newlines are synchronized without shell interpolation.
+Dash and `sh` retain native interactive `ENV` startup rather than loading
+Bash-specific resources. A failed directory change discards its rejected
+command instead of running it later when the shell resumes.
 
-Exiting Bash quits mcpp through its existing confirmation and dirty-editor
+Exiting the shell quits mcpp through its existing confirmation and dirty-editor
 guards. Shell startup and transport errors restore the UI and report the
 failure. Pause-after-run displays the completed command's output before waiting
 for a key; hiding a still-running command does not trigger that pause.
 
 `mcpp -u` / `--nosubshell` selects the earlier one-shot behavior for that run;
-`-U` / `--subshell` enables persistent Bash. These overrides do not replace the
-saved `use_subshell` preference. Non-Bash shells currently retain one-shot
-behavior; persistent ash/dash, ksh, zsh, tcsh, and fish remain compatibility work.
+`-U` / `--subshell` enables persistent shell integration. These overrides do not
+replace the saved `use_subshell` preference. Other shells retain one-shot
+behavior; persistent ash, ksh, zsh, tcsh and fish remain compatibility work.
 
 ## Skins
 

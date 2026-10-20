@@ -16,4 +16,12 @@ namespace mcpp {
     std::optional<std::filesystem::path> input = std::nullopt
 );
 
+[[nodiscard]] CommandOutput capture_shell_to(
+    std::ostream& output,
+    std::string_view command,
+    const std::filesystem::path& directory,
+    const Cancellation& cancellation = {},
+    std::size_t error_limit = 64U * 1024U
+);
+
 }  // namespace mcpp

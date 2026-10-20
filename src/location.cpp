@@ -64,6 +64,12 @@ ProviderPtr ArchiveCache::open_extfs(
         format(source.provider, source.path), helper, cancellation);
 }
 
+ProviderPtr ArchiveCache::open_extfs_source_less(
+    ExtfsOrigin origin, const std::string_view helper, const Cancellation& cancellation
+) {
+    return external_filesystems_.open_source_less(std::move(origin), helper, cancellation);
+}
+
 ProviderPtr ArchiveCache::open(const Location& source, const Cancellation& cancellation) {
     prune();
     if (!source.provider) throw std::invalid_argument("archive source provider is null");
@@ -167,6 +173,7 @@ std::optional<Location> source_location(const Provider& provider) {
         return Location{archive->source_provider(), archive->source_path()};
     }
     if (const auto* external = dynamic_cast<const ExtfsProvider*>(&provider)) {
+        if (external->is_source_less()) return std::nullopt;
         const auto source = external->source();
         return Location{source.provider, source.path};
     }
@@ -175,6 +182,29 @@ std::optional<Location> source_location(const Provider& provider) {
         return Location{source.provider, source.path};
     }
     return std::nullopt;
+}
+
+Location local_execution_directory(Location location) {
+    for (unsigned depth = 0; depth < 16U; ++depth) {
+        if (!location.provider) throw std::invalid_argument("execution provider is null");
+        if (dynamic_cast<const LocalProvider*>(location.provider.get()) != nullptr) {
+            location.path = location.provider->normalize(location.path.empty() ? "." : location.path);
+            return location;
+        }
+        if (const auto* external = dynamic_cast<const ExtfsProvider*>(location.provider.get());
+            external != nullptr && external->is_source_less()) {
+            const auto origin = external->origin();
+            if (!origin) throw std::logic_error("source-less helper has no captured origin");
+            location = {origin->working.provider, origin->working.path};
+            continue;
+        }
+        const auto source = source_location(*location.provider);
+        if (!source || !source->provider) {
+            throw std::runtime_error("virtual location has no local execution directory");
+        }
+        location = {source->provider, source->provider->parent(source->path)};
+    }
+    throw std::runtime_error("too many nested execution directories");
 }
 
 bool is_archive_location(const std::string_view value) noexcept {
@@ -218,12 +248,42 @@ Location open_location_impl(
     const auto marker = value.rfind("://");
     if (marker == std::string_view::npos) return plain_location(value, base);
     const auto slash = value.rfind('/', marker);
+    const auto name = slash == std::string_view::npos ? value.substr(0, marker)
+        : value.substr(slash + 1U, marker - slash - 1U);
+    constexpr std::string_view remote_schemes[]{
+        "az", "azure", "azblob", "blob", "ftp", "sftp", "fish", "ssh",
+        "sh", "smb", "smbfs", "http", "https"
+    };
+    if (std::ranges::any_of(remote_schemes, [name](const auto scheme) { return name == scheme; })) {
+        throw std::invalid_argument("remote providers are not enabled: " + std::string(value));
+    }
+    const auto helper = name == "utar" || name == "ucpio"
+        ? std::optional<ExtfsHelper>{} : find_extfs_helper(name);
+    const auto parameter = value.substr(marker + 3U);
+    if (helper && !helper->requires_source) {
+        const auto outer = slash == std::string_view::npos ? std::string_view(".")
+            : slash == 0U ? std::string_view("/") : value.substr(0, slash);
+        const auto working = local_execution_directory(base);
+        const auto mount = slash == std::string_view::npos ? working
+            : open_location_impl(outer, base, archives, cancellation, depth + 1U);
+        ExtfsOrigin origin{
+            {mount.provider, mount.path, format_location(mount.provider, mount.path)},
+            {working.provider, working.path, format_location(working.provider, working.path)}
+        };
+        ProviderPtr provider;
+        if (archives != nullptr) {
+            provider = archives->open_extfs_source_less(std::move(origin), name, cancellation);
+        } else {
+            ExtfsCache temporary;
+            provider = temporary.open_source_less(std::move(origin), name, cancellation);
+        }
+        const auto member = provider->normalize("/" + std::string(parameter));
+        return {.provider=std::move(provider), .path=member};
+    }
     if (slash == std::string_view::npos || slash == 0U) {
         throw std::invalid_argument("non-local providers are not enabled: " + std::string(value));
     }
-    const auto name = value.substr(slash + 1U, marker - slash - 1U);
     const auto outer = value.substr(0, slash);
-    const auto parameter = value.substr(marker + 3U);
     if (name == "utar" || name == "ucpio") {
         if (dynamic_cast<const LocalProvider*>(base.provider.get()) != nullptr &&
             !is_virtual_location(outer)) {
@@ -242,7 +302,7 @@ Location open_location_impl(
         return {.provider=std::move(provider), .path=member};
     }
     const auto source = open_location_impl(outer, base, archives, cancellation, depth + 1U);
-    if (find_extfs_helper(name)) {
+    if (helper) {
         ProviderPtr provider;
         if (archives != nullptr) provider = archives->open_extfs(source, name, cancellation);
         else {

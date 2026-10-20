@@ -9,6 +9,25 @@ void validate_limits(const ExtfsLimits& limits);
 void validate_helper(const ExtfsHelper& helper);
 [[nodiscard]] std::string identity_part(std::string_view value);
 
+class DirectoryContext {
+public:
+    explicit DirectoryContext(ExtfsDirectory directory, const Cancellation& cancellation);
+    ~DirectoryContext();
+    DirectoryContext(const DirectoryContext&) = delete;
+    DirectoryContext& operator=(const DirectoryContext&) = delete;
+    [[nodiscard]] const ExtfsDirectory& directory() const noexcept { return directory_; }
+    [[nodiscard]] const std::filesystem::path& native_path() const noexcept { return native_; }
+    [[nodiscard]] std::filesystem::path working_path() const;
+    [[nodiscard]] std::string identity() const;
+    void verify(const Cancellation& cancellation) const;
+private:
+    ExtfsDirectory directory_;
+    std::filesystem::path native_;
+    int descriptor_{-1};
+    std::uintmax_t device_{0};
+    std::uintmax_t inode_{0};
+};
+
 class Workspace {
 public:
     explicit Workspace(const ExtfsOpenOptions& options);
@@ -30,7 +49,8 @@ private:
 [[nodiscard]] std::string invoke(
     const ExtfsHelper& helper, const Workspace& workspace,
     std::string_view command, const std::vector<std::string>& arguments,
-    const ExtfsLimits& limits, const Cancellation& cancellation
+    const ExtfsLimits& limits, const Cancellation& cancellation,
+    const std::filesystem::path& working_directory = {}
 );
 
 }  // namespace mcpp::extfs

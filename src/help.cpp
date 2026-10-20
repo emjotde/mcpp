@@ -103,7 +103,7 @@ std::span<const HelpPage> help_pages() {
             link(permissions, "Permissions, ownership and links"),
         }},
         {command_line, "Command line and menus", {
-            paragraph("Type a command in the manager command line and press Enter to run it in the active local directory. Ctrl-O shows or hides the shell. With Bash, commands share a persistent interactive shell."),
+            paragraph("Type a command in the manager command line and press Enter to run it in the active local directory. Ctrl-O shows or hides the shell. With Bash or dash, including sh aliases, commands share a persistent interactive shell."),
             paragraph("The input supports cursor/word movement, selection, kill/yank and history. Alt-Tab completes local paths, shell command names, environment variables, users and hosts without running shell completion hooks or making network lookups."),
             paragraph("F9 opens the main menus; the underlined letters activate categories and enabled items. F2 opens a local user menu when one is configured. Editor menus have their own file and block actions."),
             paragraph("Menu and extension commands can run external programs. Missing tools and unsupported command forms report an error rather than silently choosing a different action."),

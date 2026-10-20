@@ -26,6 +26,86 @@ class ExtensionsUI(unittest.TestCase):
         )
         return root, left, right, config
 
+    def test_streamed_view_output(self):
+        root, left, right, config = self.fixture("streamed")
+        path = left / "source.case"
+        original = b"UNCHANGED SOURCE\n"
+        path.write_bytes(original)
+        (config / "mc.ext.ini").write_text(
+            "[mc.ext.ini]\nVersion=4.0\n[Streamed]\nShell=.case\n"
+            "View=%view{ascii,unform} head -c 16777233 /dev/zero | "
+            "tr '\\\\000' 'x' | fold -w 4096; printf '\\nLARGE-VIEW-TAIL\\n'\n")
+        (left / ".mc.menu").write_text(
+            "v Streamed menu view\n    %view{ascii,unform} printf MENU-VIEW-TAIL\n")
+        with TerminalSession(BINARY, TMUX, root / "ui", [left, right]) as t:
+            t.wait_for("Name")
+            select_file(t, path.name)
+            t.press("F3")
+            t.wait_for("3Quit")
+            t.press("C-End")
+            t.wait_for("LARGE-VIEW-TAIL")
+            t.press("F4", "F2")
+            t.wait_for("command output is read-only")
+            t.press("Enter")
+            t.wait_for("command output is read-only", present=False)
+            t.press("F3")
+            t.wait_for("Name")
+            t.press("F2", "v")
+            t.wait_for("MENU-VIEW-TAIL")
+            t.press("F3")
+            t.wait_for("Name")
+            t.raw(b"\x1b!")
+            t.wait_for("Filter command and arguments:")
+            t.press("C-u")
+            t.type("printf FILTERED-VIEW-TAIL")
+            t.press("Enter")
+            t.wait_for("FILTERED-VIEW-TAIL")
+            t.save("streamed-view-entrypoints")
+        self.assertEqual(path.read_bytes(), original)
+
+    def test_streamed_view_lifetime_and_failure(self):
+        root, left, right, config = self.fixture("streamed-lifetime")
+        path = left / "source.case"
+        original = b"UNCHANGED SOURCE\n"
+        path.write_bytes(original)
+        resource = config / "mc.ext.ini"
+
+        def command(value):
+            resource.write_text(
+                "[mc.ext.ini]\nVersion=4.0\n[Streamed]\nShell=.case\nView=%view " + value + "\n")
+
+        command("printf FIRST-VIEW-OUTPUT")
+        with TerminalSession(BINARY, TMUX, root / "ui", [left, right]) as t:
+            t.wait_for("Name")
+            select_file(t, path.name)
+            t.press("F3")
+            t.wait_for("FIRST-VIEW-OUTPUT")
+            t.raw(b"\x1b`")
+            t.wait_for("Screen list")
+            t.press("Home", "Enter")
+            t.wait_for("Screen list", present=False)
+            t.wait_for("Name")
+            command("printf SECOND-VIEW-OUTPUT")
+            t.press("F3")
+            t.wait_for("SECOND-VIEW-OUTPUT")
+            t.raw(b"\x1b{")
+            t.wait_for("FIRST-VIEW-OUTPUT")
+            t.press("F3")
+            t.wait_for("Name")
+            t.raw(b"\x1b}")
+            t.wait_for("SECOND-VIEW-OUTPUT")
+            t.press("F3")
+            t.wait_for("Name")
+            command("printf BAD-PARTIAL; printf FILTER-FAILED >&2; exit 7")
+            t.press("F3")
+            t.wait_for("FILTER-FAILED")
+            self.assertNotIn("BAD-PARTIAL", t.text())
+            t.wait_for("3View")
+            t.wait(lambda: not list((t.root / "runtime").glob("mcpp-local-*")),
+                   "closed and failed views release their private output")
+            t.save("streamed-view-lifetimes")
+        self.assertEqual(path.read_bytes(), original)
+
     def test_local_actions(self):
         root, left, right, config = self.fixture("actions")
         name = "odd ' $(touch BAD).case"
@@ -165,8 +245,9 @@ if __name__ == "__main__":
             not Path("/review/.operation-regressions-disposable").is_file()):
         raise SystemExit("Extension checks require uid1001 in the approved disposable Docker container")
     BINARY, TMUX = str(Path(sys.argv[1]).resolve()), sys.argv[2]
-    ROOT = Path(sys.argv[3]).resolve()
-    if not ROOT.is_relative_to("/review/cases/mc-extensions"):
+    base = Path(sys.argv[3]).resolve()
+    if not base.is_relative_to("/review/cases/mc-extensions"):
         raise SystemExit("Extension fixtures must stay in /review/cases/mc-extensions")
+    ROOT = base / f"run-{os.getpid()}"
     ROOT.mkdir(parents=True)
     unittest.main(argv=[sys.argv[0], *sys.argv[4:]], verbosity=2)

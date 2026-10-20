@@ -27,6 +27,7 @@
 #include "mcpp/tree_cache.hpp"
 #include "mcpp/diff.hpp"
 #include "mcpp/user_menu.hpp"
+#include "local_tools_stream.hpp"
 
 #include <algorithm>
 #include <array>
@@ -2207,9 +2208,9 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
           left_location(open_location(left_path, local, &archives)),
           right_location(open_location(right_path, local, &archives)),
           left(left_location.provider, left_location.path, nullptr,
-               source_location(*left_location.provider).has_value()),
+               has_container_parent(*left_location.provider)),
           right(right_location.provider, right_location.path, nullptr,
-                source_location(*right_location.provider).has_value()) {
+                has_container_parent(*right_location.provider)) {
         for (const auto& diagnostic : config.diagnostics) std::cerr << "mcpp: configuration: " << diagnostic << '\n';
         prepare_cli_terminal(launch_options.color, launch_options.stickchars);
         initialize_palette();
@@ -2322,37 +2323,62 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
         throw std::logic_error("pane does not belong to this application");
     }
 
-    Location container_file_location(const ProviderPtr& provider) const {
+    static bool has_container_parent(const Provider& provider) {
+        const auto* external = dynamic_cast<const ExtfsProvider*>(&provider);
+        return (external != nullptr && external->is_source_less()) || source_location(provider).has_value();
+    }
+
+    struct ContainerParent {
+        Location directory;
+        std::optional<std::string> selected_path;
+    };
+
+    static void select_parent_entry(Pane& pane, const ContainerParent& parent) {
+        if (!parent.selected_path) return;
+        const auto found = std::ranges::find(pane.entries(), *parent.selected_path, &Entry::path);
+        if (found != pane.entries().end()) {
+            pane.move_cursor(static_cast<int>(found - pane.entries().begin()) - static_cast<int>(pane.cursor()));
+        }
+    }
+
+    ContainerParent container_parent(const ProviderPtr& provider) const {
         if (!provider) throw std::invalid_argument("container provider is null");
+        if (const auto* external = dynamic_cast<const ExtfsProvider*>(provider.get());
+            external != nullptr && external->is_source_less()) {
+            const auto origin = external->origin();
+            if (!origin) throw std::logic_error("source-less helper has no captured origin");
+            const auto& mount = origin->mount;
+            return {{mount.provider, mount.provider->parent(mount.path)}, mount.path};
+        }
         auto source = source_location(*provider);
         for (unsigned depth = 0; depth < 16U; ++depth) {
             if (!source || !source->provider) {
                 throw std::runtime_error("container has no captured parent directory");
             }
             const auto directory = source->provider->parent(source->path);
-            if (source->provider->stat_follow(directory, {}).kind == EntryKind::directory) return *source;
+            if (source->provider->stat_follow(directory, {}).kind == EntryKind::directory) {
+                return {{source->provider, directory}, source->path};
+            }
             source = source_location(*source->provider);
         }
         throw std::runtime_error("too many nested container parents");
     }
 
     Pane make_archive_parent(const Pane& pane) {
-        const auto source = container_file_location(pane.provider());
-        Pane parent(source.provider, source.provider->parent(source.path), &pane,
-                    source_location(*source.provider).has_value());
-        const auto found = std::ranges::find(parent.entries(), source.path, &Entry::path);
-        if (found != parent.entries().end()) {
-            parent.move_cursor(static_cast<int>(found - parent.entries().begin()));
-        }
+        const auto captured = container_parent(pane.provider());
+        const auto& directory = captured.directory;
+        Pane parent(directory.provider, directory.path, &pane,
+                    has_container_parent(*directory.provider));
+        select_parent_entry(parent, captured);
         return parent;
     }
 
     std::vector<Pane> make_archive_parents(const Pane& pane) {
         std::vector<Pane> parents;
-        if (!source_location(*pane.provider())) return parents;
+        if (!has_container_parent(*pane.provider())) return parents;
         for (unsigned depth = 0; depth < 16U; ++depth) {
             auto parent = make_archive_parent(parents.empty() ? pane : parents.back());
-            const bool nested = source_location(*parent.provider()).has_value();
+            const bool nested = has_container_parent(*parent.provider());
             parents.push_back(std::move(parent));
             if (!nested) {
                 std::ranges::reverse(parents);
@@ -2367,19 +2393,11 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
     }
 
     std::string source_execution_directory(Location location) const {
-        for (unsigned depth = 0; depth < 16U; ++depth) {
-            if (!location.provider) throw std::invalid_argument("execution provider is null");
-            if (location.provider == local) return location.path;
-            if (const auto* filesystem = dynamic_cast<const LocalProvider*>(location.provider.get())) {
-                return filesystem->native_path(location.path).string();
-            }
-            const auto source = source_location(*location.provider);
-            if (!source || !source->provider) {
-                throw std::runtime_error("virtual location has no local execution directory");
-            }
-            location = {source->provider, source->provider->parent(source->path)};
-        }
-        throw std::runtime_error("too many nested execution directories");
+        const auto directory = local_execution_directory(std::move(location));
+        if (directory.provider == local) return directory.path;
+        const auto* filesystem = dynamic_cast<const LocalProvider*>(directory.provider.get());
+        if (filesystem == nullptr) throw std::logic_error("execution directory is not local");
+        return filesystem->native_path(directory.path).string();
     }
 
     std::string pane_execution_directory(const Pane& pane) const {
@@ -2391,17 +2409,19 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
             pane.change_directory(std::move(location.path));
             return;
         }
-        const bool archive = source_location(*location.provider).has_value();
+        const bool archive = has_container_parent(*location.provider);
         Pane next(location.provider, std::move(location.path), &pane, archive);
         std::vector<Pane> parents;
         if (archive) {
-            const auto source = container_file_location(next.provider());
-            if (pane.provider() == source.provider && pane.path() == source.provider->parent(source.path)) {
+            const auto captured = container_parent(next.provider());
+            const auto& parent = captured.directory;
+            if (pane.provider() == parent.provider && pane.path() == parent.path) {
                 auto& saved = archive_parents[pane_identity(pane)];
                 saved.reserve(saved.size() + 1U);
                 parents = std::move(saved);
                 parents.push_back(std::move(next));
                 pane.swap_contents(parents.back());
+                select_parent_entry(parents.back(), captured);
             } else {
                 parents = make_archive_parents(next);
                 pane.swap_contents(next);
@@ -2413,7 +2433,7 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
     }
 
     bool panel_up(Pane& pane) {
-        if (!source_location(*pane.provider()) ||
+        if (!has_container_parent(*pane.provider()) ||
             pane.provider()->parent(pane.path()) != pane.path()) return pane.up();
         auto& parents = archive_parents[pane_identity(pane)];
         if (parents.empty()) parents = make_archive_parents(pane);
@@ -2465,7 +2485,7 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
         Location destination;
         if (is_virtual_location(value)) {
             if (std::filesystem::path(value).is_absolute()) {
-                return resolve_location(value);
+                return open_location(value, Location{local, source_execution_directory(base)}, &archives);
             }
             return open_location(value, base, &archives);
         } else if (std::filesystem::path(value).is_absolute()) {
@@ -2476,10 +2496,9 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
                 const auto name = component.generic_string();
                 if (name.empty() || name == ".") continue;
                 if (name == "..") {
-                    if (source_location(*destination.provider) &&
+                    if (has_container_parent(*destination.provider) &&
                         destination.provider->parent(destination.path) == destination.path) {
-                        const auto source = container_file_location(destination.provider);
-                        destination = {source.provider, source.provider->parent(source.path)};
+                        destination = container_parent(destination.provider).directory;
                     } else destination.path = destination.provider->parent(destination.path);
                 } else destination.path = destination.provider->join(destination.path, name);
             }
@@ -2779,7 +2798,7 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
         const std::string& value, const EditorBuffer* source = nullptr
     ) {
         const auto& buffer = source == nullptr ? editor : *source;
-        if (std::filesystem::path(value).is_absolute()) {
+        if (std::filesystem::path(value).is_absolute() && !is_virtual_location(value)) {
             return resolve_location(value);
         }
         if (buffer.open() && !buffer.path().empty() && buffer.provider() != local) {
@@ -3143,13 +3162,14 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
             } else {
                 const auto command = expansion.command;
                 const auto directory = invocation->context.active.directory;
+                const auto temporary = std::make_shared<TemporaryFile>("");
                 start_local_task(invocation->entry.label,
-                    [command, directory](const Cancellation& cancellation) {
-                        return capture_shell(command, directory, cancellation);
-                    }, [this, invocation, expansion](CommandOutput result) {
+                    [command, directory, temporary](const Cancellation& cancellation) {
+                        return capture_view_output(command, directory, *temporary, cancellation);
+                    }, [this, invocation, expansion, temporary](CommandOutput result) {
                         require_command_success(result);
-                        complete_user_menu(invocation, expansion, [this, invocation, expansion, result] {
-                            open_output_viewer(invocation->entry.label, result.output);
+                        complete_user_menu(invocation, expansion, [this, invocation, expansion, result, temporary] {
+                            open_output_viewer(invocation->entry.label, temporary);
                             set_viewer_return_mode(invocation->return_mode);
                             set_user_menu_view_options(expansion);
                             show_command_warnings(result.error);
@@ -3793,13 +3813,15 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
         const auto command = extension_shell_command(*invocation, expansion.command);
         if (expansion.action == NativeMenuAction::view) {
             const auto directory = invocation->context.active.directory;
+            const auto temporary = std::make_shared<TemporaryFile>("");
             start_local_task("Extension " + extension_action_name(invocation->action),
-                [command, directory](const Cancellation& cancellation) {
-                    return capture_shell(command, directory, cancellation, 16U * 1024U * 1024U);
-                }, [this, invocation, expansion](CommandOutput result) {
+                [command, directory, temporary](const Cancellation& cancellation) {
+                    return capture_view_output(command, directory, *temporary, cancellation,
+                                               16U * 1024U * 1024U);
+                }, [this, invocation, expansion, temporary](CommandOutput result) {
                     if (result.status != 0) throw std::runtime_error(extension_failure(*invocation, result.status, result.error));
                     complete_extension_action(invocation, expansion);
-                    open_output_viewer("Extension " + extension_action_name(invocation->action), result.output);
+                    open_output_viewer("Extension " + extension_action_name(invocation->action), temporary);
                     set_viewer_return_mode(invocation->return_mode);
                     set_user_menu_view_options(expansion);
                     show_command_warnings(result.error);
@@ -6304,8 +6326,25 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
         return viewer_display_name.empty() ? archives.format(viewer.provider(), viewer.path()) : viewer_display_name;
     }
 
-    void open_output_viewer(const std::string& label, const std::string& value) {
-        auto temporary = std::make_shared<TemporaryFile>(value);
+    static CommandOutput capture_view_output(
+        const std::string& command, const std::filesystem::path& directory,
+        const TemporaryFile& temporary, const Cancellation& cancellation,
+        const std::size_t error_limit = 64U * 1024U * 1024U
+    ) {
+        try {
+            std::ofstream output;
+            output.exceptions(std::ios::badbit | std::ios::failbit);
+            output.open(temporary.path(), std::ios::binary | std::ios::trunc);
+            auto result = capture_shell_to(output, command, directory, cancellation, error_limit);
+            output.close();
+            return result;
+        } catch (const std::ios_base::failure& error) {
+            throw std::runtime_error("cannot store filtered output: " + std::string(error.what()));
+        }
+    }
+
+    void open_output_viewer(const std::string& label, std::shared_ptr<TemporaryFile> temporary) {
+        if (!temporary) throw std::invalid_argument("viewer output file is missing");
         ViewerSessionState next;
         next.viewer = viewer;
         if (!viewer.open()) next.viewer.set_wrap(config.viewer_wrap);
@@ -6352,12 +6391,13 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
         show_native_input("Filtered view", "Filter command and arguments:", initial,
             [this, directory](const std::string& command) {
             if (command.empty()) throw std::runtime_error("filter command is empty");
+            const auto temporary = std::make_shared<TemporaryFile>("");
             start_local_task("Filtered view",
-                [command, directory](const Cancellation& cancellation) {
-                    return capture_shell(command, directory, cancellation);
-                }, [this, command](CommandOutput result) {
+                [command, directory, temporary](const Cancellation& cancellation) {
+                    return capture_view_output(command, directory, *temporary, cancellation);
+                }, [this, command, temporary](CommandOutput result) {
                     require_command_success(result);
-                    open_output_viewer("Filtered: " + command, result.output);
+                    open_output_viewer("Filtered: " + command, temporary);
                     show_command_warnings(result.error);
                 });
         }, Mode::panels, {}, "command.filtered-view");
@@ -11396,6 +11436,12 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
             );
         }
         if (editor_syntax && index < syntax_spans.size()) {
+            // MC matches bytes; a displayed UTF-8 glyph uses its leading byte's style.
+            const auto glyph_boundary = [&](const std::size_t offset) {
+                return offset < line.size() &&
+                    (static_cast<unsigned char>(line[offset]) & 0xC0U) == 0x80U
+                    ? next_utf8(line, offset) : offset;
+            };
             for (const auto& span : syntax_spans[index]) {
                 if (span.end <= visible_begin) {
                     continue;
@@ -11404,10 +11450,10 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
                     break;
                 }
                 boundaries.push_back(
-                    std::max(span.begin, visible_begin)
+                    glyph_boundary(std::max(span.begin, visible_begin))
                 );
                 boundaries.push_back(
-                    std::min(span.end, visible_end)
+                    glyph_boundary(std::min(span.end, visible_end))
                 );
             }
         }

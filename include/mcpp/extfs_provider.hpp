@@ -22,6 +22,7 @@ struct ExtfsLimits {
     std::size_t memory_bytes{512U * 1024U * 1024U};
     unsigned int cpu_seconds{15U};
     std::chrono::milliseconds elapsed{30000};
+    std::size_t cached_member_bytes{128U * 1024U * 1024U};
 };
 
 struct ExtfsOpenOptions {
@@ -57,11 +58,25 @@ struct ExtfsSource {
     std::string location;
 };
 
+struct ExtfsDirectory {
+    ProviderPtr provider;
+    std::string path;
+    std::string location;
+};
+
+// Source-less helpers have two real local directories, not a fake container.
+// mount is the native URI prefix and copyout's directory argument. working is
+// the directory active at entry, used as cwd for both list and copyout.
+struct ExtfsOrigin {
+    ExtfsDirectory mount;
+    ExtfsDirectory working;
+};
+
 // MC's native container/helper://member protocol: list, copyout, copyin, rm,
-// mkdir and rmdir. Only local, source-based helpers are enabled. Source-less
-// "+" helpers and the undocumented "run" operation are not invoked.
+// mkdir and rmdir. Local source-less "+" helpers use the same member model,
+// but only list/copyout are invoked. The undocumented "run" is never invoked.
 //
-// Every helper receives a private local copy, never a virtual path or the
+// Container helpers receive a private local copy, never a virtual path or the
 // original container. Listings and copied-out regular files are bounded and
 // checked. Writes relist and verify a private candidate, then publish through
 // the captured source provider's expected-revision write. Source snapshots,
@@ -70,13 +85,20 @@ struct ExtfsSource {
 // guarantees; it is not a filesystem compare-and-swap.
 // Absolute symlink targets belong to this virtual root. Callers must not
 // preserve them as absolute host links when copying to another filesystem.
+// A source-less listing and each first copyout are cached for this instance.
+// The native protocol has no global content revision or atomic multi-file
+// snapshot. Copied-out bytes are retained; reaching the cache limit is an error,
+// not permission to reread a possibly changed member behind a retained viewer.
 class ExtfsProvider final : public Provider {
 public:
     ~ExtfsProvider() override;
     ExtfsProvider(const ExtfsProvider&) = delete;
     ExtfsProvider& operator=(const ExtfsProvider&) = delete;
 
+    // source() is container-only; use origin() for a source-less view.
     [[nodiscard]] ExtfsSource source() const;
+    [[nodiscard]] bool is_source_less() const noexcept;
+    [[nodiscard]] std::optional<ExtfsOrigin> origin() const;
     [[nodiscard]] const std::string& helper() const noexcept;
     [[nodiscard]] std::string location(std::string_view path = "/") const;
     void ensure_writable(std::string_view path) const;
@@ -150,6 +172,10 @@ public:
     [[nodiscard]] ProviderPtr open(
         const ProviderPtr& provider, std::string_view path,
         std::string_view source_location, std::string_view helper,
+        const Cancellation& cancellation = {}
+    );
+    [[nodiscard]] ProviderPtr open_source_less(
+        ExtfsOrigin origin, std::string_view helper,
         const Cancellation& cancellation = {}
     );
     void set_timeout(std::chrono::seconds timeout);
