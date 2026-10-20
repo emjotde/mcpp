@@ -68,6 +68,11 @@ void options_and_display() {
     require(editor.normal.foreground == ftxui::Color::White &&
             editor.normal.background == ftxui::Color(static_cast<ftxui::Color::Palette256>(67)),
             "editor-specific colors override only the editor palette");
+    auto menu = mcpp::find_skin("default");
+    mcpp::apply_cli_colors(menu, mcpp::parse_cli_colors(
+        std::array<std::string, 1>{"menuinactive=gray"}), mcpp::CliPaletteContext::panels);
+    require(menu.colors.at("menu").at("menuinactive").background == menu.menu.background,
+            "foreground-only inactive menu colors retain the menu background");
     const std::array<const mcpp::Skin*, 1> palettes{&skin};
     auto screen = ftxui::Screen::Create(ftxui::Dimension::Fixed(12), ftxui::Dimension::Fixed(3));
     const auto content = ftxui::text("┌ café") | ftxui::color(skin.normal.foreground) |

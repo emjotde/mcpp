@@ -68,6 +68,7 @@ const std::vector<Skin>& builtin_skins() {
         Skin gray;
         gray.id = "grayscale";
         gray.label = "gray";
+        gray.disabled = rgb(0x484848);
         Skin classic = gray;
         classic.id = "default";
         classic.label = "< Default >";
@@ -75,6 +76,7 @@ const std::vector<Skin>& builtin_skins() {
         classic.menu = classic.selected = {ftxui::Color::Grey0, rgb(0x00a0a0)};
         classic.popup_selected = {rgb(0x00a0a0), ftxui::Color::Grey0};
         classic.menu_hot = ftxui::Color::Grey0;
+        classic.disabled = rgb(0x242424);
         classic.marked_selected = {ftxui::Color::Grey0, rgb(0x00a0a0)};
         classic.inactive_selected = {ftxui::Color::Grey93, rgb(0x0064a0)};
         classic.inactive_marked_selected = {ftxui::Color::YellowLight, rgb(0x0064a0)};

@@ -6394,12 +6394,13 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
                 const auto content = line && *line < count ? diff_line(buffer.lines()[*line]) : std::string{};
                 const auto begin = editor_offset_for_width(content, diff_horizontal, diff_tab_size);
                 auto element = text(prefix + content.substr(begin));
-                if (aligned.hunk) {
+                const bool search_row = diff_search_match &&
+                    diff_search_match->first == row && side == diff_order;
+                if (search_row) {
+                    element = highlight(std::move(element), palette().search);
+                } else if (aligned.hunk) {
                     element = paint(std::move(element), palette().diff_changed);
                     if (*aligned.hunk == diff_hunk) element = element | bold;
-                }
-                if (diff_search_match && diff_search_match->first == row && side == diff_order) {
-                    element = highlight(std::move(element), palette().search);
                 }
                 rows.push_back(std::move(element) | size(WIDTH, EQUAL, std::max(1, width - 2)));
             }
@@ -7593,6 +7594,13 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
 
     ftxui::Element gray_menu(ftxui::Element element) const {
         return paint(std::move(element), palette().menu);
+    }
+
+    ftxui::Element disabled_menu_label(ftxui::Element element) const {
+        const auto& skin = palette();
+        auto fallback = skin.menu;
+        fallback.foreground = skin.disabled;
+        return paint(std::move(element), skin_color(skin, "menu", "menuinactive", fallback));
     }
 
     ftxui::Element gray_selected(ftxui::Element element, const bool marked, const bool active) const {
@@ -11728,7 +11736,7 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
             auto row = menu_row_label(items[index], selected || items[index].action < 0
                 ? std::nullopt : std::optional<ftxui::Color>{palette().menu_hot});
             if (items[index].action < 0) {
-                row = row | color(palette().disabled) | dim;
+                row = disabled_menu_label(std::move(row));
             }
             if (selected && items[index].action >= 0) {
                 row = highlight(std::move(row), palette().popup_selected) | focus;
@@ -12541,7 +12549,7 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
             auto row = menu_row_label(items[index], selected || items[index].action < 0
                 ? std::nullopt : std::optional<ftxui::Color>{palette().menu_hot});
             if (items[index].action < 0) {
-                row = row | color(palette().disabled) | dim;
+                row = disabled_menu_label(std::move(row));
             }
             if (selected && items[index].action >= 0) {
                 row = highlight(std::move(row), palette().popup_selected) | focus;

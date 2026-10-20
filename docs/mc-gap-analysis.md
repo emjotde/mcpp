@@ -346,10 +346,17 @@ parsed, search and mapping cases pass. The libc POSIX-regex subject limit remain
 
 A separate read-only inspection of frozen `cb38117` visually covered all sixteen
 built-in skins at 110x32 truecolor. Controls/errors, editor menus/syntax, hex/ASCII
-cursor highlights and help looked correct in the captured states. Two issues
-remain unfixed: changed-row comparison searches use the wrong search colors in
-all skins, and disabled dropdown labels have low contrast in Default/Grayscale.
-Other terminal sizes/capabilities and external skins were not covered.
+cursor highlights and help looked correct in the captured states. It found two
+issues: changed-row comparison searches used the wrong search colors in all
+skins, and disabled dropdown labels had low contrast in Default/Grayscale.
+
+Both are now corrected: search styling takes priority over hunk styling;
+disabled main/editor menu labels use the full native inactive-menu role without
+forced faint text, with readable Default/Grayscale fallback colors. Four focused
+terminal situations verify exact search colors on changed/unchanged rows and
+inactive-label contrast of at least 4.5:1 without faint styling. A related CLI
+override check preserves menu backgrounds. Other terminal sizes/capabilities
+were not swept again. External skins are under a separate follow-up inspection.
 
 ### Additional compatibility gaps
 

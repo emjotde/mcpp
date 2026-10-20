@@ -609,6 +609,9 @@ upgrading does not prevent startup or require rewriting the configuration.
 Dropdown selections, shortcut letters, the F2 user menu, focused controls, and
 popup lists also use skin colors; highlights do not merely invert a near-white
 label color shared by several palettes.
+Search highlights take priority over changed-row colors in comparisons.
+Disabled menu labels use the skin's inactive-menu colors and attributes without
+extra forced dimming; the Default and Grayscale fallbacks remain readable.
 
 User-provided MC-format skins can also be selected by name or file path.
 Appearance lists discovered skin files alongside the sixteen original palettes;

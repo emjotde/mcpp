@@ -287,7 +287,8 @@ void apply_cli_colors(
         for (const auto& override : overrides) {
             const auto& role = color_role(override.role);
             if (role.context.has_value() != specific || (role.context && *role.context != context)) continue;
-            auto pair = role.pair ? skin.*role.pair : skin.normal;
+            auto pair = role.pair ? skin.*role.pair
+                : role.section == "menu" ? skin.menu : skin.normal;
             if (role.foreground) pair.foreground = skin.*role.foreground;
             const auto group = skin.colors.find(role.section);
             if (group != skin.colors.end()) {

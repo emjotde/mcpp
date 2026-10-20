@@ -609,6 +609,19 @@ if(MCPP_BUILD_TESTS)
             )
             set_tests_properties(mcpp_cli_frontends_ui PROPERTIES TIMEOUT 150)
             add_test(
+                NAME mcpp_skin_visual_fixes_ui
+                COMMAND
+                    ${MCPP_PYTHON_EXECUTABLE}
+                    -B
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_skins_ui.py
+                    $<TARGET_FILE:mcpp>
+                    ${MCPP_TMUX_EXECUTABLE}
+                    /review/cases/skin-visual-fixes
+                    SkinsUI.test_diff_search_uses_skin_colors_on_changed_rows
+                    SkinsUI.test_disabled_dropdown_labels_stay_readable
+            )
+            set_tests_properties(mcpp_skin_visual_fixes_ui PROPERTIES TIMEOUT 90)
+            add_test(
                 NAME mcpp_concurrent_jobs_ui
                 COMMAND
                     ${MCPP_PYTHON_EXECUTABLE}

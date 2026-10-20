@@ -7,7 +7,7 @@ import sys
 import unittest
 from unittest.mock import patch
 
-from terminal_session import TerminalSession
+from terminal_session import TerminalSession, style_sgr
 from test_audit_ui import click, select_file
 
 
@@ -54,17 +54,20 @@ def color256(index):
     return levels[index // 36], levels[index // 6 % 6], levels[index % 6]
 
 
-def cells(terminal):
+def cells(terminal, include_dim=False):
     foreground = background = None
     inverted = False
+    faint = False
     rows = []
     for line in terminal.text(ansi=True).splitlines():
         row = []
         for token in SGR.split(line):
             if not token.startswith("\x1b["):
                 pair = (background, foreground) if inverted else (foreground, background)
-                row.extend((character, *pair) for character in token)
+                attributes = (*pair, faint) if include_dim else pair
+                row.extend((character, *attributes) for character in token)
                 continue
+            faint = style_sgr(faint, token, 2, 22)
             parameters = token[2:-1].replace(":", ";").split(";")
             index = 0
             while index < len(parameters):
@@ -148,6 +151,52 @@ class SkinsUI(unittest.TestCase):
         self.assertIsNotNone(pair[0])
         self.assertIsNotNone(pair[1])
         self.assertGreaterEqual(contrast(*pair), 4.5)
+
+    def text_cell(self, terminal, value, include_dim=False):
+        for row in cells(terminal, include_dim):
+            column = "".join(cell[0] for cell in row).find(value)
+            if column >= 0:
+                return row[column]
+        self.fail(f"Text not visible: {value}")
+
+    def test_diff_search_uses_skin_colors_on_changed_rows(self):
+        for skin, foreground, background in (
+            ("midnight", "08111d", "79b8ff"), ("paper", "ffffff", "365f91")
+        ):
+            with self.subTest(skin=skin):
+                root, left, right = self.fixture(skin, skin)
+                first, second = left / "sample.cpp", right / "sample.cpp"
+                first.write_bytes(b"return value;\nshared marker;\n")
+                second.write_bytes(b"return other;\nshared marker;\n")
+                with TerminalSession(DIFF, TMUX, root / "ui", ["--skin", skin, first, second],
+                                     width=110, height=32) as terminal:
+                    terminal.wait_for("Dif ")
+                    for needle in ("return value", "shared marker"):
+                        terminal.press("F7")
+                        terminal.wait_for("Enter search string:")
+                        terminal.press("C-u")
+                        terminal.type(needle)
+                        terminal.press("Enter")
+                        terminal.wait_for("Enter search string:", present=False)
+                        terminal.wait(
+                            lambda: self.text_cell(terminal, needle)[1:] ==
+                            (rgb(foreground), rgb(background)),
+                            "changed and unchanged search rows use the skin search colors")
+                        terminal.save(needle.replace(" ", "-"))
+
+    def test_disabled_dropdown_labels_stay_readable(self):
+        for skin in ("default", "grayscale"):
+            with self.subTest(skin=skin):
+                root, left, right = self.fixture(skin, skin)
+                with TerminalSession(MANAGER, TMUX, root / "ui", ["--skin", skin, left, right],
+                                     width=110, height=32) as terminal:
+                    self.panels(terminal)
+                    click(terminal, "Left", row=0)
+                    terminal.wait_for("FTP link...")
+                    cell = self.text_cell(terminal, "FTP link...", include_dim=True)
+                    self.assert_readable(cell[1:3])
+                    self.assertFalse(cell[3], "inactive role must not gain forced faint styling")
+                    terminal.save("disabled-menu")
 
     def appearance(self, terminal):
         click(terminal, "Options", row=0)
