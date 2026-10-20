@@ -486,6 +486,8 @@ Config Config::load(const std::filesystem::path& path) {
             result.torben_fj_mode = parse_bool(value, key);
         } else if (key == "xtree_mode") {
             result.xtree_mode = parse_bool(value, key);
+        } else if (key == "fast_reload_msg_shown") {
+            result.fast_reload_msg_shown = parse_bool(value, key);
         } else if (key == "alternate_plus_minus" || key == "only_leading_plus_minus") {
             const auto setting = parse_bool(value, key);
             (key == "alternate_plus_minus" ? result.alternate_plus_minus : result.only_leading_plus_minus) = setting;
@@ -867,6 +869,9 @@ void Config::save(const std::filesystem::path& path) const {
     if (select_flags) output << "select_flags=" << *select_flags << '\n';
     if (torben_fj_mode) output << "torben_fj_mode=" << (*torben_fj_mode ? "true" : "false") << '\n';
     if (xtree_mode) output << "xtree_mode=" << (*xtree_mode ? "true" : "false") << '\n';
+    if (fast_reload_msg_shown) {
+        output << "fast_reload_msg_shown=" << (*fast_reload_msg_shown ? "true" : "false") << '\n';
+    }
     if (alternate_plus_minus) {
         output << "alternate_plus_minus=" << (*alternate_plus_minus ? "true" : "false") << '\n';
     }

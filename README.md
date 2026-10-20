@@ -106,6 +106,9 @@ Pristine text and blank fill keep the unchanged style across blur; accepted
 interaction makes the field changed even if its bytes later match the original.
 Manual selection keeps its mark style when unfocused. Missing roles preserve
 the earlier fallback. The manager command line is excluded from these roles.
+Its selected text instead uses the independent `commandlinemark` pair, including
+foreground, background and attributes across focus changes; normal command
+text remains unchanged.
 Native backend controls `-x/-X/-g/-t/-s/-k` remain unavailable;
 `--help-terminal` explains why. ASCII frames do not implement non-UTF-8 terminal
 output or 7-bit input.
@@ -375,6 +378,10 @@ remain available regardless of the draft; explicit user key bindings win.
 Native `torben_fj_mode` makes Home/End visit the visible midpoint, then the
 visible edge, then the directory edge. It does not change ordinary arrow/page
 scrolling. Missing keys retain the earlier routing and navigation.
+Explicit `[Panels] fast_reload_msg_shown=false` requests the fast-reload warning
+on a successful panel-options apply, then records true after the warning is
+shown. True suppresses repeats. An absent key retains the old per-launch state
+without creating a new saved key; startup and Cancel do not warn.
 Explicit `xtree_mode` controls whether changing the focused tree selection also
 changes the listing; F4 traversal and tree focus remain independent. Missing
 keys retain the previous dynamic-tree choice, and same-directory following does
@@ -766,7 +773,12 @@ Original user-provided GNU `.mo` catalogs can translate the main manager menu
 captions, common native input/message buttons, and Quit/Error titles and exit
 choices. Only explicit built-in label IDs are looked up: filenames, file
 contents, paths, custom menus and resource text are never translation inputs.
-Dialog bodies, most other labels, help and localized accelerators remain English
+The Delete caption and selected-item question additionally support exact GNU
+context `delete-dialog` and plural forms through fixed built-in message IDs.
+Count forms require exactly one literal `{count}`; only its decimal value is
+substituted. A missing contextual entry does not use a context-free translation.
+Without a translation, the previous English question stays unchanged.
+Most dialog bodies, other labels, help and localized accelerators remain English
 or retain their existing shortcuts. **L26 is not complete.**
 
 The absolute catalog root is `MCPP_LOCALEDIR`, otherwise
@@ -779,10 +791,14 @@ C/POSIX, including `C.UTF-8`, keeps English even with `LANGUAGE` set.
 Catalogs use GNU revision 0, either byte order, with UTF-8 or ASCII labels.
 Requested non-C message locales need not be installed; no locale or environment
 is changed. Missing catalogs/labels keep English. Invalid catalogs are rejected
-atomically, and invalid labels, plural/context entries and limits produce
-startup diagnostics rather than guessed translations. Plural forms are not
-evaluated. Input is bounded to 4 MiB per catalog and 512 bytes per label, with
-entry/reference/preference limits. No translation catalog is bundled.
+atomically. Invalid labels, unsupported message keys and limits produce
+startup diagnostics rather than guessed translations. Plural-Forms supports
+checked 64-bit arithmetic, comparisons, short-circuit logic and conditional
+expressions; overflow, division and index errors retain English with a
+diagnostic reported once per catalog/issue. Formulas are bounded to 1024 bytes,
+256 nodes and 64 levels, with at most 16 forms. Input remains bounded to 4 MiB
+per catalog and 512 bytes per label, with entry/reference/preference limits.
+No translation catalog is bundled.
 
 ## Skins
 

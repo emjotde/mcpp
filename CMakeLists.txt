@@ -289,6 +289,18 @@ if(MCPP_BUILD_TESTS)
     target_include_directories(mcpp_extension_view_checkout_tests PRIVATE src)
     target_link_libraries(mcpp_extension_view_checkout_tests PRIVATE mcpp_core)
     mcpp_target_defaults(mcpp_extension_view_checkout_tests)
+    add_executable(mcpp_panel_reload_warning_tests tests/test_panel_reload_warning.cpp)
+    target_include_directories(mcpp_panel_reload_warning_tests PRIVATE src)
+    target_link_libraries(mcpp_panel_reload_warning_tests PRIVATE mcpp_core)
+    mcpp_target_defaults(mcpp_panel_reload_warning_tests)
+    add_executable(mcpp_translation_plural_tests tests/test_translation_plural.cpp)
+    target_include_directories(mcpp_translation_plural_tests PRIVATE src)
+    target_link_libraries(mcpp_translation_plural_tests PRIVATE mcpp_core)
+    mcpp_target_defaults(mcpp_translation_plural_tests)
+    add_executable(mcpp_commandline_mark_tests tests/test_commandline_mark.cpp)
+    target_include_directories(mcpp_commandline_mark_tests PRIVATE src)
+    target_link_libraries(mcpp_commandline_mark_tests PRIVATE mcpp_ui)
+    mcpp_target_defaults(mcpp_commandline_mark_tests)
     add_executable(mcpp_translation_tests tests/test_translation.cpp)
     target_link_libraries(mcpp_translation_tests PRIVATE mcpp_core)
     mcpp_target_defaults(mcpp_translation_tests)
@@ -396,6 +408,23 @@ if(MCPP_BUILD_TESTS)
                         /review/cases/l21-view-checkout/model
             )
         endforeach()
+        foreach(reload_warning_case IN ITEMS native legacy)
+            add_test(
+                NAME mcpp_panel_reload_warning_${reload_warning_case}
+                COMMAND mcpp_panel_reload_warning_tests ${reload_warning_case}
+                        /review/cases/native-refresh-preferences-555658a/models/${reload_warning_case}-ctest
+            )
+        endforeach()
+        foreach(translation_plural_case IN ITEMS context plural failure)
+            add_test(
+                NAME mcpp_translation_plural_${translation_plural_case}
+                COMMAND mcpp_translation_plural_tests ${translation_plural_case}
+            )
+        endforeach()
+        add_test(
+            NAME mcpp_native_commandline_mark
+            COMMAND mcpp_commandline_mark_tests /review/cases/commandline-mark/model/ctest
+        )
         add_test(
             NAME mcpp_archive_tests
             COMMAND mcpp_archive_tests /review/cases/agent-archives

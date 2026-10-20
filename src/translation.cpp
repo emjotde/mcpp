@@ -1,5 +1,7 @@
 #include "mcpp/translation.hpp"
 
+#include "translation_plural.hpp"
+
 #include <algorithm>
 #include <cerrno>
 #include <cstdint>
@@ -19,6 +21,20 @@ constexpr std::array<std::string_view, ui_label_count> english_labels{
     "Left", "File", "Command", "Options", "Right", "OK", "Cancel",
     "Yes", "No", "Error", "Warning", "Confirmation", "Confirm", "Quit",
 };
+
+constexpr std::array<std::string_view, ui_caption_count> english_captions{"Delete"};
+constexpr std::array<std::string_view, ui_caption_count> caption_keys{"delete-dialog\004Delete"};
+
+struct CountMessage {
+    std::string_view key;
+    std::string_view singular;
+    std::string_view plural;
+};
+
+constexpr std::array<CountMessage, ui_count_message_count> count_messages{{
+    {"delete-dialog\004Delete {count} selected item?",
+     "Delete {count} selected item?", "Delete {count} selected items?"},
+}};
 
 using Diagnostics = std::vector<TranslationDiagnostic>;
 
@@ -341,8 +357,138 @@ bool valid_label(const std::string_view label, const Encoding charset) {
 }
 
 using Labels = std::array<std::string, ui_label_count>;
+using Captions = std::array<std::string, ui_caption_count>;
 
-std::optional<Labels> decode_catalog(
+struct PluralForms {
+    std::size_t count;
+    detail::PluralExpression expression;
+};
+
+TranslationDiagnostic plural_diagnostic(
+    const detail::PluralError error, const std::filesystem::path& path
+) {
+    using detail::PluralError;
+    switch (error) {
+        case PluralError::limit:
+            return {TranslationIssue::limit_exceeded, path,
+                    "Plural-Forms exceeds the supported byte, node or nesting limit."};
+        case PluralError::overflow:
+            return {TranslationIssue::plural_arithmetic_overflow, path,
+                    "Plural-Forms arithmetic is outside the supported uint64_t range."};
+        case PluralError::division_by_zero:
+            return {TranslationIssue::plural_division_by_zero, path,
+                    "Plural-Forms evaluated division or remainder by zero."};
+        case PluralError::index:
+            return {TranslationIssue::plural_index_out_of_range, path,
+                    "Plural-Forms evaluated an index outside nplurals."};
+        default:
+            return {TranslationIssue::invalid_plural_forms, path,
+                    "Invalid GNU Plural-Forms expression."};
+    }
+}
+
+bool parse_plural_forms(
+    const std::string_view header, const std::filesystem::path& path,
+    Diagnostics& diagnostics, std::optional<PluralForms>& result
+) {
+    std::optional<std::string_view> declaration;
+    auto remaining = header;
+    while (!remaining.empty()) {
+        const auto newline = remaining.find('\n');
+        const auto line = remaining.substr(0, newline);
+        const auto colon = line.find(':');
+        if (colon != std::string_view::npos &&
+            lowercase(trim(line.substr(0, colon))) == "plural-forms") {
+            if (declaration) {
+                diagnose(diagnostics, TranslationIssue::invalid_plural_forms, path,
+                         "Duplicate Plural-Forms metadata.");
+                return false;
+            }
+            declaration = trim(line.substr(colon + 1U));
+        }
+        if (newline == std::string_view::npos) break;
+        remaining.remove_prefix(newline + 1U);
+    }
+    if (!declaration) return true;
+    std::optional<std::string_view> form_count;
+    std::optional<std::string_view> expression;
+    remaining = *declaration;
+    const auto invalid = [&diagnostics, &path]() {
+        diagnose(diagnostics, TranslationIssue::invalid_plural_forms, path,
+                 "Plural-Forms requires one nplurals and one plural expression.");
+        return false;
+    };
+    while (!remaining.empty()) {
+        const auto semicolon = remaining.find(';');
+        const auto field = trim(remaining.substr(0, semicolon));
+        if (!field.empty()) {
+            const auto equals = field.find('=');
+            if (equals == std::string_view::npos) return invalid();
+            const auto name = trim(field.substr(0, equals));
+            const auto value = trim(field.substr(equals + 1U));
+            if (name == "nplurals" && !form_count) form_count = value;
+            else if (name == "plural" && !expression) expression = value;
+            else return invalid();
+        }
+        if (semicolon == std::string_view::npos) break;
+        remaining.remove_prefix(semicolon + 1U);
+    }
+    if (!form_count || form_count->empty() || !expression || expression->empty()) return invalid();
+    std::size_t count = 0U;
+    for (const char character : *form_count) {
+        if (character < '0' || character > '9') return invalid();
+        const auto digit = static_cast<std::size_t>(character - '0');
+        if (count > (UiTranslations::max_plural_forms - digit) / 10U ||
+            digit > UiTranslations::max_plural_forms) {
+            diagnose(diagnostics, TranslationIssue::limit_exceeded, path,
+                     "nplurals exceeds the supported form-count limit.");
+            return false;
+        }
+        count = count * 10U + digit;
+    }
+    if (count == 0U || count > UiTranslations::max_plural_forms) return invalid();
+    detail::PluralError error{};
+    auto parsed = detail::PluralExpression::parse(*expression, error);
+    if (!parsed) {
+        diagnostics.push_back(plural_diagnostic(error, path));
+        return false;
+    }
+    if (!parsed->uses_count()) {
+        const auto value = parsed->evaluate(0U, count);
+        if (value.error != detail::PluralError::none) {
+            diagnostics.push_back(plural_diagnostic(value.error, path));
+            return false;
+        }
+    }
+    result = PluralForms{count, std::move(*parsed)};
+    return true;
+}
+
+bool valid_count_format(const std::string_view text) {
+    constexpr std::string_view token = "{count}";
+    const auto marker = text.find(token);
+    return marker != std::string_view::npos &&
+           text.substr(0U, marker).find_first_of("{}") == std::string_view::npos &&
+           text.substr(marker + token.size()).find_first_of("{}") == std::string_view::npos;
+}
+
+std::string substitute_count(const std::string_view text, const std::uint64_t count) {
+    constexpr std::string_view token = "{count}";
+    const auto marker = text.find(token);
+    std::string result(text.substr(0U, marker));
+    result += std::to_string(count);
+    result += text.substr(marker + token.size());
+    return result;
+}
+
+struct DecodedCatalog {
+    Labels labels;
+    Captions captions;
+    std::array<std::vector<std::string>, ui_count_message_count> counts;
+    std::optional<PluralForms> plural;
+};
+
+std::optional<DecodedCatalog> decode_catalog(
     const std::filesystem::path& path, const std::vector<unsigned char>& data,
     Diagnostics& diagnostics
 ) {
@@ -397,34 +543,104 @@ std::optional<Labels> decode_catalog(
                  "Only UTF-8 and ASCII catalogs are supported; no charset conversion is performed.");
         return std::nullopt;
     }
-    Labels result;
+    DecodedCatalog result;
+    if (!parse_plural_forms(header.value_or(std::string_view{}), path, diagnostics, result.plural)) {
+        return std::nullopt;
+    }
     std::array<bool, ui_label_count> seen{};
+    std::array<bool, ui_caption_count> seen_captions{};
+    std::array<bool, ui_count_message_count> seen_counts{};
     std::size_t plurals = 0;
     std::size_t contexts = 0;
     std::size_t invalid_labels = 0;
     for (std::size_t index = 0; index < count; ++index) {
         const auto original = *view.entry(originals + index * 8U);
         const auto translation = *view.entry(translations + index * 8U);
-        if (original.find('\0') != std::string_view::npos) { ++plurals; continue; }
-        if (original.find('\004') != std::string_view::npos) { ++contexts; continue; }
+        const auto separator = original.find('\0');
+        if (separator != std::string_view::npos) {
+            const auto key = original.substr(0U, separator);
+            const auto found = std::find_if(count_messages.begin(), count_messages.end(),
+                [key](const auto& message) { return message.key == key; });
+            if (found == count_messages.end()) { ++plurals; continue; }
+            const auto message = static_cast<std::size_t>(found - count_messages.begin());
+            if (seen_counts[message]) return invalid("Duplicate built-in plural message in GNU .mo catalog.");
+            seen_counts[message] = true;
+            if (separator + 1U == original.size() ||
+                original.find('\0', separator + 1U) != std::string_view::npos) {
+                return invalid("Invalid GNU .mo plural original.");
+            }
+            if (!result.plural) {
+                diagnose(diagnostics, TranslationIssue::invalid_plural_forms, path,
+                         "A built-in plural translation requires explicit Plural-Forms metadata.");
+                return std::nullopt;
+            }
+            std::vector<std::string> forms;
+            auto remaining = translation;
+            std::size_t invalid_forms = 0U;
+            std::size_t invalid_formats = 0U;
+            for (;;) {
+                const auto next = remaining.find('\0');
+                const auto form = remaining.substr(0U, next);
+                if (!valid_label(form, charset)) ++invalid_forms;
+                else if (!form.empty() && !valid_count_format(form)) ++invalid_formats;
+                forms.emplace_back(form);
+                if (next == std::string_view::npos || forms.size() > result.plural->count) break;
+                remaining.remove_prefix(next + 1U);
+            }
+            if (forms.size() != result.plural->count ||
+                (forms.size() == result.plural->count && remaining.find('\0') != std::string_view::npos)) {
+                diagnose(diagnostics, TranslationIssue::invalid_plural_forms, path,
+                         "The number of translated plural forms does not equal nplurals.");
+                return std::nullopt;
+            }
+            if (invalid_formats != 0U) {
+                diagnose(diagnostics, TranslationIssue::invalid_count_format, path,
+                         "Each nonempty count form must contain exactly one {count} and no other braces.",
+                         invalid_formats);
+                return std::nullopt;
+            }
+            invalid_labels += invalid_forms;
+            if (invalid_forms == 0U) result.counts[message] = std::move(forms);
+            continue;
+        }
+        if (original.find('\004') != std::string_view::npos) {
+            const auto found = std::find(caption_keys.begin(), caption_keys.end(), original);
+            if (found == caption_keys.end()) { ++contexts; continue; }
+            const auto caption = static_cast<std::size_t>(found - caption_keys.begin());
+            if (seen_captions[caption]) return invalid("Duplicate built-in caption in GNU .mo catalog.");
+            seen_captions[caption] = true;
+            if (!valid_label(translation, charset)) { ++invalid_labels; continue; }
+            result.captions[caption] = translation;
+            continue;
+        }
         const auto found = std::find(english_labels.begin(), english_labels.end(), original);
         if (found == english_labels.end()) continue;
         const auto label = static_cast<std::size_t>(found - english_labels.begin());
         if (seen[label]) return invalid("Duplicate built-in label in GNU .mo catalog.");
         seen[label] = true;
         if (!valid_label(translation, charset)) { ++invalid_labels; continue; }
-        result[label] = translation;
+        result.labels[label] = translation;
     }
     if (plurals != 0U) diagnose(diagnostics, TranslationIssue::skipped_plural_entries, path,
-        "Plural entries were skipped; this loader never evaluates Plural-Forms.", plurals);
+        "Plural entries outside the fixed built-in message set were skipped.", plurals);
     if (contexts != 0U) diagnose(diagnostics, TranslationIssue::skipped_context_entries, path,
-        "Contextual entries were skipped; only the fixed context-free UI labels are supported.", contexts);
+        "Contextual entries outside the fixed built-in caption set were skipped.", contexts);
     if (invalid_labels != 0U) diagnose(diagnostics, TranslationIssue::invalid_label, path,
         "Labels with invalid encoding, control characters or excessive length were skipped.", invalid_labels);
     return result;
 }
 
 }  // namespace
+
+struct UiTranslations::CountData {
+    struct Catalog {
+        std::filesystem::path path;
+        detail::PluralExpression expression;
+        std::vector<std::string> forms;
+    };
+
+    std::array<std::vector<Catalog>, ui_count_message_count> messages;
+};
 
 std::string_view english_ui_label(const UiLabel label) noexcept {
     const auto index = static_cast<std::size_t>(label);
@@ -433,6 +649,7 @@ std::string_view english_ui_label(const UiLabel label) noexcept {
 
 UiTranslations::UiTranslations() {
     std::copy(english_labels.begin(), english_labels.end(), labels_.begin());
+    std::copy(english_captions.begin(), english_captions.end(), captions_.begin());
 }
 
 UiTranslations UiTranslations::load(
@@ -464,20 +681,32 @@ UiTranslations UiTranslations::load(
         return result;
     }
     const auto candidates = locale_candidates(environment, result.diagnostics_);
+    auto count_data = std::make_shared<CountData>();
     for (const auto& locale : candidates) {
         const auto path = root / locale / "LC_MESSAGES" / (std::string(domain) + ".mo");
         const auto bytes = read_catalog(path, result.diagnostics_);
         if (!bytes) continue;
-        auto labels = decode_catalog(path, *bytes, result.diagnostics_);
-        if (!labels) continue;
+        auto decoded = decode_catalog(path, *bytes, result.diagnostics_);
+        if (!decoded) continue;
         result.catalogs_.push_back(path);
         for (std::size_t index = 0; index < ui_label_count; ++index) {
-            if (result.translated_[index] || (*labels)[index].empty()) continue;
-            result.labels_[index] = std::move((*labels)[index]);
+            if (result.translated_[index] || decoded->labels[index].empty()) continue;
+            result.labels_[index] = std::move(decoded->labels[index]);
             result.translated_[index] = true;
         }
-        if (result.translated_labels() == ui_label_count) break;
+        for (std::size_t index = 0U; index < ui_caption_count; ++index) {
+            if (result.captions_translated_[index] || decoded->captions[index].empty()) continue;
+            result.captions_[index] = std::move(decoded->captions[index]);
+            result.captions_translated_[index] = true;
+        }
+        for (std::size_t index = 0U; index < ui_count_message_count; ++index) {
+            if (decoded->counts[index].empty()) continue;
+            count_data->messages[index].push_back({
+                path, decoded->plural->expression, std::move(decoded->counts[index]),
+            });
+        }
     }
+    result.count_data_ = std::move(count_data);
     return result;
 }
 
@@ -494,6 +723,47 @@ bool UiTranslations::translated(const UiLabel label) const noexcept {
 
 std::size_t UiTranslations::translated_labels() const noexcept {
     return static_cast<std::size_t>(std::count(translated_.begin(), translated_.end(), true));
+}
+
+const std::string& UiTranslations::caption(const UiCaption caption) const noexcept {
+    const auto index = static_cast<std::size_t>(caption);
+    static const std::string empty;
+    return index < captions_.size() ? captions_[index] : empty;
+}
+
+bool UiTranslations::translated(const UiCaption caption) const noexcept {
+    const auto index = static_cast<std::size_t>(caption);
+    return index < captions_translated_.size() && captions_translated_[index];
+}
+
+UiCountText UiTranslations::count_text(
+    const UiCountMessage message, const std::uint64_t count
+) const {
+    const auto index = static_cast<std::size_t>(message);
+    if (index >= count_messages.size()) {
+        return {{}, false, TranslationDiagnostic{
+            TranslationIssue::invalid_label, {}, "Invalid built-in count message.",
+        }};
+    }
+    const auto& original = count_messages[index];
+    UiCountText result{
+        substitute_count(count == 1U ? original.singular : original.plural, count),
+        false, std::nullopt,
+    };
+    if (!count_data_) return result;
+    for (const auto& catalog : count_data_->messages[index]) {
+        const auto value = catalog.expression.evaluate(count, catalog.forms.size());
+        if (value.error != detail::PluralError::none) {
+            result.diagnostic = plural_diagnostic(value.error, catalog.path);
+            return result;
+        }
+        const auto& form = catalog.forms[static_cast<std::size_t>(value.value)];
+        if (form.empty()) continue;
+        result.text = substitute_count(form, count);
+        result.translated = true;
+        return result;
+    }
+    return result;
 }
 
 std::span<const std::filesystem::path> UiTranslations::loaded_catalogs() const noexcept {

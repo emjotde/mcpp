@@ -34,6 +34,7 @@
 #include "extension_view_checkout.hpp"
 #include "shell_display.hpp"
 #include "panel_selection_keys.hpp"
+#include "panel_reload_warning.hpp"
 #include "tree_navigation.hpp"
 #include "viewer_help_styles.hpp"
 
@@ -1599,6 +1600,7 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
     Config config;
     AppOptions launch_options;
     UiTranslations ui_translations;
+    std::set<std::pair<std::filesystem::path, TranslationIssue>> translation_runtime_issues;
     std::vector<std::vector<CliColorOverride>> configured_colors;
     struct PaletteSet {
         Skin panels;
@@ -2240,6 +2242,13 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
         return active_index == 0 ? right : left;
     }
 
+    void report_translation_diagnostic(const TranslationDiagnostic& diagnostic, const bool runtime = false) {
+        if (runtime && !translation_runtime_issues.emplace(diagnostic.catalog, diagnostic.issue).second) return;
+        std::cerr << "mcpp: translations: " << diagnostic.message;
+        if (!diagnostic.catalog.empty()) std::cerr << " [" << diagnostic.catalog << ']';
+        std::cerr << " (count " << diagnostic.count << ")\n";
+    }
+
     void initialize_translations() {
         std::filesystem::path root;
         if (const auto* configured_root = std::getenv("MCPP_LOCALEDIR"); configured_root && *configured_root) {
@@ -2256,9 +2265,7 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
         }
         ui_translations = UiTranslations::load(root);
         for (const auto& diagnostic : ui_translations.diagnostics()) {
-            std::cerr << "mcpp: translations: " << diagnostic.message;
-            if (!diagnostic.catalog.empty()) std::cerr << " [" << diagnostic.catalog << ']';
-            std::cerr << " (count " << diagnostic.count << ")\n";
+            report_translation_diagnostic(diagnostic);
         }
     }
 
@@ -8858,7 +8865,7 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
 
     void apply_panel_options() try {
         const auto& values = panel_option_values;
-        const bool warn_fast_reload = !config.fast_reload && values[5];
+        const bool previously_fast_reload = config.fast_reload;
         config.show_mini_status = values[0]; config.use_si_units = values[1];
         config.directories_first = !values[2]; config.show_backups = values[3];
         config.show_hidden = values[4]; config.fast_reload = values[5];
@@ -8880,11 +8887,12 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
         store_panel_options_in_config();
         mode = Mode::panels;
         status = "Panel options changed";
-        if (warn_fast_reload && !fast_reload_warning_shown) {
-            fast_reload_warning_shown = true;
-            show_native_message("Information",
-                "Fast directory reload can miss changes to existing files. Use Rescan or Ctrl-R when a full reload is needed.");
-        }
+        detail::maybe_show_fast_reload_warning(
+            previously_fast_reload, config.fast_reload, config.fast_reload_msg_shown,
+            fast_reload_warning_shown, [this] {
+                show_native_message("Information",
+                    "Fast directory reload can miss changes to existing files. Use Rescan or Ctrl-R when a full reload is needed.");
+            });
     } catch (const std::exception& error) {
         mode = Mode::panels;
         set_error(error);
@@ -9912,9 +9920,13 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
                     : display_text(std::string_view(value).substr(offset, next - offset))
             );
             if (offset >= selected.first && offset < selected.second) {
-                cell = use_input_roles
-                    ? detail::input_selection_style(std::move(cell), palette(), input.pristine)
-                    : std::move(cell) | bold | underlined;
+                if (&input == &command_input) {
+                    cell = detail::command_input_selection_style(std::move(cell), palette(), active);
+                } else {
+                    cell = use_input_roles
+                        ? detail::input_selection_style(std::move(cell), palette(), input.pristine)
+                        : std::move(cell) | bold | underlined;
+                }
             }
             if (offset == input.cursor) {
                 cell = std::move(cell) | reflect(input.cursor_box);
@@ -13829,6 +13841,12 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
     ftxui::Element render_delete_dialog() {
         using namespace ftxui;
         const auto entries = current_operation_sources();
+        auto question = ui_translations.count_text(
+            UiCountMessage::delete_selected_items, static_cast<std::uint64_t>(entries.size()));
+        if (question.diagnostic) report_translation_diagnostic(*question.diagnostic, true);
+        if (!question.translated) {
+            question.text = "Delete " + std::to_string(entries.size()) + " selected item(s)?";
+        }
         const auto focused = [&](Element element, const std::size_t index) {
             if (dialog_focus == index) {
                 element = focus_dialog(std::move(element));
@@ -13836,12 +13854,9 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
             return element | reflect(delete_button_boxes[index]);
         };
         return vbox({
-                   text("Delete") | bold | center,
+                   text(ui_translations.caption(UiCaption::delete_confirmation)) | bold | center,
                    separator(),
-                   text(
-                       "Delete " + std::to_string(entries.size()) +
-                       " selected item(s)?"
-                   ),
+                   text(question.text),
                    text(
                        entries.size() == 1U
                            ? display_text(entries.front().name)

@@ -79,6 +79,7 @@ struct Config {
     bool use_si_units{false};
     bool show_backups{true};
     bool fast_reload{false};
+    std::optional<bool> fast_reload_msg_shown;
     bool mark_moves_down{true};
     bool simple_swap{false};
     bool auto_save_panels_setup{false};

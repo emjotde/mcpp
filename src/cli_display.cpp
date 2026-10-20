@@ -39,6 +39,8 @@ constexpr std::array roles{
     ColorRole{"inputmark", "core", "inputmark", {}, nullptr, nullptr, false,
               &Skin::dialog_focus, nullptr, SkinPair::bold | SkinPair::underline},
     ColorRole{"inputunchanged", "core", "inputunchanged", {}, nullptr, nullptr, false, &Skin::dialog_focus},
+    ColorRole{"commandlinemark", "core", "commandlinemark", {}, nullptr, nullptr, false,
+              &Skin::dialog_focus, nullptr, SkinPair::bold | SkinPair::underline},
     ColorRole{"errors", "error", "_default_", {}, &Skin::error},
     ColorRole{"dnormal", "dialog", "_default_", {}, &Skin::dialog},
     ColorRole{"dfocus", "dialog", "dfocus", {}, &Skin::dialog_focus},

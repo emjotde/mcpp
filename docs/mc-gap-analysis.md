@@ -449,8 +449,10 @@ dialog/error title and error-focus pairs. Inactive menus accept their complete
 pair while omitted fields preserve the current background and disabled contrast.
 Native skins and CLI overrides share color/attribute parsing, including hex RGB
 and `inverse`. The earlier `errdhotfocus` alias still paints the whole focus;
-unrendered command-line-mark, statusbar, mnemonic and editor-window roles remain
-explicit errors. Dialog input fields now use full `input`, `inputmark` and
+unrendered statusbar, mnemonic and editor-window roles remain explicit errors.
+The independent `commandlinemark` pair now styles selected manager input across
+focus changes without altering normal text or the three dialog-input roles.
+Dialog input fields now use full `input`, `inputmark` and
 `inputunchanged` pairs, including pristine blank fill and blurred selection.
 Handled interaction clears pristine state rather than comparing the current
 bytes to the original; command input remains excluded.
@@ -543,10 +545,14 @@ filename or file content can be looked up. All rejected catalog/label and
 unsupported plural/context entries produce startup diagnostics; missing labels
 retain later-language or English fallback.
 
-Only revision-0 UTF-8/ASCII catalogs are supported, with explicit size, entry,
-label and locale-preference limits. Most UI text, message bodies, help, plural
-and contextual messages and localized accelerators remain outside this initial
-delivery. **L26 remains partial.**
+Revision-0 UTF-8/ASCII catalogs now support exact context and checked plural
+rules for typed Delete-caption/count messages. Locale fallback, eager catalog
+validation and explicit expression/form/index/placeholder limits remain;
+runtime arithmetic errors keep English and report once instead of once per
+render. Untranslated Delete questions retain their exact previous wording,
+and filenames/buttons stay literal.
+Most UI text, message bodies, help, other contextual/plural message IDs and
+localized accelerators remain untranslated. **L26 remains partial.**
 
 ### Additional compatibility gaps
 

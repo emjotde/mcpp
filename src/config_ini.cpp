@@ -127,6 +127,7 @@ constexpr NativeOption native_options[]{
     {"Panels", "panel_scroll_pages", "scroll_pages"},
     {"Panels", "panel_scroll_center", "scroll_center"},
     {"Panels", "torben_fj_mode", "torben_fj_mode"},
+    {"Panels", "fast_reload_msg_shown", "fast_reload_msg_shown"},
     {"Panels", "mouse_move_pages", "mouse_page_scrolling"},
     {"Panels", "filetype_mode", "highlight_file_types"},
     {"Panels", "permission_mode", "highlight_permissions"},

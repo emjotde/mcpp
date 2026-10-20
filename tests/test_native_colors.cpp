@@ -174,10 +174,10 @@ void invalid(const fs::path& root) {
             "invalid active colors report their source without replacing accepted state or rewriting input");
     rejected = false;
     try {
-        static_cast<void>(mcpp::parse_config_colors(retained, "xterm-256color", "commandlinemark=red"));
+        static_cast<void>(mcpp::parse_config_colors(retained, "xterm-256color", "statusbar=red"));
     } catch (const std::exception& error) {
         const std::string diagnostic(error.what());
-        rejected = diagnostic.find("MC_COLOR_TABLE: unsupported color role: commandlinemark") != std::string::npos;
+        rejected = diagnostic.find("MC_COLOR_TABLE: unsupported color role: statusbar") != std::string::npos;
     }
     require(rejected, "unsupported environment roles are diagnosed rather than accepted as no-ops");
     write(bad, "[Colors]\ncolor_terminals=vt100,,xterm\n");
