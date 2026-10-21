@@ -116,6 +116,11 @@ active and move/resize contours use `editbg`, `editframe`, `editframeactive` and
 `editframedrag`; stationary resize corners use the drag pair too. File text,
 status content, controls and geometry remain separate; explicit `none` does
 not gain forced emphasis.
+Independent `dhotnormal`, `dhotfocus`, `errdhotnormal` and `menuhotsel` pairs
+style the existing dialog/error/menu mnemonic glyphs. Explicit pairs retain
+their attributes through focused-button and selected-row inversion; missing
+roles keep the earlier emphasis. Translated captions remain whole strings
+without invented accelerators, and the legacy `errdhotfocus` alias is unchanged.
 Native backend controls `-x/-X/-g/-t/-s/-k` remain unavailable;
 `--help-terminal` explains why. ASCII frames do not implement non-UTF-8 terminal
 output or 7-bit input.

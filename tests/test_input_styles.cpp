@@ -174,7 +174,7 @@ dfocus=black;lightgray;none
         check(mcpp::cli_color_roles().find(role) != std::string_view::npos,
               "CLI color help must advertise the three consumed input roles");
     }
-    for (const auto role : {"dhotnormal", "dhotfocus"}) {
+    for (const auto role : {"inputhistory", "commandhistory"}) {
         bool rejected = false;
         try {
             static_cast<void>(mcpp::parse_cli_colors(std::array<std::string, 1>{

@@ -143,7 +143,7 @@ void preservation() {
             help.error_focus.attributes == mcpp::SkinPair::italic,
             "the existing error-hot-focus spelling remains a whole-focus alias");
     for (const auto& [specification, diagnostic] : std::array{
-            std::pair{"dhotnormal=red", "unsupported color role"},
+            std::pair{"inputhistory=red", "unsupported color role"},
             std::pair{"header=red,blue", "only a foreground"},
             std::pair{"normal=color256", "invalid color index"}}) {
         bool rejected = false;

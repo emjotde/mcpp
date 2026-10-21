@@ -309,6 +309,10 @@ if(MCPP_BUILD_TESTS)
     target_include_directories(mcpp_editor_window_style_tests PRIVATE src)
     target_link_libraries(mcpp_editor_window_style_tests PRIVATE mcpp_ui)
     mcpp_target_defaults(mcpp_editor_window_style_tests)
+    add_executable(mcpp_mnemonic_style_tests tests/test_mnemonic_styles.cpp)
+    target_include_directories(mcpp_mnemonic_style_tests PRIVATE src)
+    target_link_libraries(mcpp_mnemonic_style_tests PRIVATE mcpp_ui)
+    mcpp_target_defaults(mcpp_mnemonic_style_tests)
     add_executable(mcpp_translation_tests tests/test_translation.cpp)
     target_link_libraries(mcpp_translation_tests PRIVATE mcpp_core)
     mcpp_target_defaults(mcpp_translation_tests)
@@ -440,6 +444,10 @@ if(MCPP_BUILD_TESTS)
             )
         endforeach()
         add_test(NAME mcpp_editor_window_styles COMMAND mcpp_editor_window_style_tests)
+        add_test(
+            NAME mcpp_native_mnemonic_styles
+            COMMAND mcpp_mnemonic_style_tests /review/cases/mnemonic-roles-96b2/model/ctest
+        )
         add_test(
             NAME mcpp_native_statusbar_styles
             COMMAND mcpp_viewer_help_style_tests statusbar

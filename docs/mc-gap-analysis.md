@@ -454,7 +454,12 @@ dialog/error title and error-focus pairs. Inactive menus accept their complete
 pair while omitted fields preserve the current background and disabled contrast.
 Native skins and CLI overrides share color/attribute parsing, including hex RGB
 and `inverse`. The earlier `errdhotfocus` alias still paints the whole focus;
-Unrendered mnemonic roles remain explicit errors. Native statusbar pairs now
+Native `dhotnormal`, `dhotfocus`, `errdhotnormal` and `menuhotsel` pairs now
+have independent existing hot-glyph consumers. Explicit glyph attributes
+compensate only the surrounding focused/selected inversion; ordinary pairs,
+missing-role emphasis and translated whole captions remain unchanged.
+The earlier whole-error-focus CLI `errdhotfocus` alias is preserved rather than
+silently redefined as an independent focused glyph. Native statusbar pairs now
 style existing viewer/editor/Quick View/diff status text, not progress dialogs.
 Native editor desktop, inactive/active frame and move/resize/corner roles now
 have independent consumers, preserving text, status, hitboxes and geometry.

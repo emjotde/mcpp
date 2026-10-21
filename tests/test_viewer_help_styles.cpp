@@ -348,11 +348,11 @@ void cli(const std::filesystem::path& root) {
     }
     bool rejected = false;
     try {
-        static_cast<void>(mcpp::parse_cli_colors(std::array<std::string, 1>{"dhotnormal=red"}));
+        static_cast<void>(mcpp::parse_cli_colors(std::array<std::string, 1>{"inputhistory=red"}));
     } catch (const std::invalid_argument&) {
         rejected = true;
     }
-    check(rejected, "the separate unimplemented dialog mnemonic role remains rejected");
+    check(rejected, "the separate unimplemented input history role remains rejected");
     check(std::filesystem::is_directory(root), "the CLI model stays in its owned case directory");
 }
 

@@ -174,10 +174,10 @@ void invalid(const fs::path& root) {
             "invalid active colors report their source without replacing accepted state or rewriting input");
     rejected = false;
     try {
-        static_cast<void>(mcpp::parse_config_colors(retained, "xterm-256color", "dhotnormal=red"));
+        static_cast<void>(mcpp::parse_config_colors(retained, "xterm-256color", "inputhistory=red"));
     } catch (const std::exception& error) {
         const std::string diagnostic(error.what());
-        rejected = diagnostic.find("MC_COLOR_TABLE: unsupported color role: dhotnormal") != std::string::npos;
+        rejected = diagnostic.find("MC_COLOR_TABLE: unsupported color role: inputhistory") != std::string::npos;
     }
     require(rejected, "unsupported environment roles are diagnosed rather than accepted as no-ops");
     write(bad, "[Colors]\ncolor_terminals=vt100,,xterm\n");

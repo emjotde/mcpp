@@ -32,6 +32,7 @@
 #include "editor_window_styles.hpp"
 #include "input_styles.hpp"
 #include "local_tools_stream.hpp"
+#include "mnemonic_styles.hpp"
 #include "builtin_menu_captions.hpp"
 #include "extension_view_checkout.hpp"
 #include "shell_display.hpp"
@@ -1292,9 +1293,15 @@ ButtonInput handle_button_input(
 ftxui::Element dialog_button(
     const std::string& label,
     const bool focused,
-    ftxui::Box& box
+    ftxui::Box& box,
+    const SkinPair* mnemonic_colors = nullptr,
+    const bool mnemonic_outer_inverted = false
 ) {
-    auto element = glyph_text("[ " + label + " ]");
+    auto element = mnemonic_colors && (label == "OK" || label == "Cancel")
+        ? ftxui::hbox({glyph_text("[ "),
+            detail::render_mnemonic_label(label, 0, mnemonic_colors, false,
+                std::nullopt, mnemonic_outer_inverted), glyph_text(" ]")})
+        : glyph_text("[ " + label + " ]");
     if (focused) {
         element = element | ftxui::inverted | ftxui::focus;
     }
@@ -1302,9 +1309,16 @@ ftxui::Element dialog_button(
 }
 
 ftxui::Element native_button(
-    const std::string& label, const bool primary, const bool focused, ftxui::Box& box
+    const std::string& label, const bool primary, const bool focused, ftxui::Box& box,
+    const SkinPair* mnemonic_colors = nullptr,
+    const bool mnemonic_outer_inverted = false
 ) {
-    auto element = glyph_text(primary ? "[< " + label + " >]" : "[ " + label + " ]");
+    auto element = mnemonic_colors && (label == "OK" || label == "Cancel")
+        ? ftxui::hbox({glyph_text(primary ? "[< " : "[ "),
+            detail::render_mnemonic_label(label, 0, mnemonic_colors, false,
+                std::nullopt, mnemonic_outer_inverted),
+            glyph_text(primary ? " >]" : " ]")})
+        : glyph_text(primary ? "[< " + label + " >]" : "[ " + label + " ]");
     if (focused) element = element | ftxui::inverted | ftxui::focus;
     return element | ftxui::reflect(box);
 }
@@ -1373,19 +1387,11 @@ bool can_open_file(const Entry& entry) {
 ftxui::Element mnemonic_label(
     const std::string& label,
     const std::size_t index,
-    const std::optional<ftxui::Color> foreground = std::nullopt
+    const std::optional<ftxui::Color> foreground = std::nullopt,
+    const SkinPair* colors = nullptr,
+    const bool outer_inverted = false
 ) {
-    using namespace ftxui;
-    if (index >= label.size()) {
-        return glyph_text(label);
-    }
-    auto mnemonic = glyph_text(label.substr(index, 1U)) | underlined | bold;
-    if (foreground) mnemonic = mnemonic | color(*foreground);
-    return hbox({
-        glyph_text(label.substr(0, index)),
-        std::move(mnemonic),
-        glyph_text(label.substr(index + 1U)),
-    });
+    return detail::render_mnemonic_label(label, index, colors, true, foreground, outer_inverted);
 }
 
 const std::array<std::string, 5> top_menu_names{
@@ -1449,7 +1455,11 @@ struct MenuRow {
     char mnemonic{0};
 };
 
-ftxui::Element menu_row_label(const MenuRow& row, const std::optional<ftxui::Color> foreground = std::nullopt) {
+ftxui::Element menu_row_label(
+    const MenuRow& row, const std::optional<ftxui::Color> foreground = std::nullopt,
+    const SkinPair* colors = nullptr,
+    const bool outer_inverted = false
+) {
     std::size_t index = std::string::npos;
     if (row.mnemonic != 0) {
         for (std::size_t offset = 0; offset < row.label.size(); ++offset) {
@@ -1459,7 +1469,8 @@ ftxui::Element menu_row_label(const MenuRow& row, const std::optional<ftxui::Col
             }
         }
     }
-    return ftxui::hbox({glyph_text(" "), mnemonic_label(row.label, index, foreground)});
+    return ftxui::hbox({glyph_text(" "),
+        mnemonic_label(row.label, index, foreground, colors, outer_inverted)});
 }
 
 struct TreeNode {
@@ -3308,7 +3319,9 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
         Elements rows;
         for (std::size_t index = 0; index < labels.size(); ++index) {
             auto row = hbox({text(" "), text(save_mode_choice == index ? "(*) " : "( ) "),
-                             mnemonic_label(labels[index], 0)}) | reflect(save_mode_boxes[index]);
+                             dialog_mnemonic_label(labels[index], 0,
+                                 save_mode_focus == 0U && save_mode_choice == index)}) |
+                       reflect(save_mode_boxes[index]);
             if (save_mode_focus == 0U && save_mode_choice == index) row = focus_dialog(std::move(row));
             rows.push_back(std::move(row));
         }
@@ -3317,7 +3330,8 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
         rows.push_back(hbox({text(" "), std::move(extension) | reflect(save_mode_boxes[3]), text(" ")}));
         rows.push_back(separator());
         auto check = hbox({text(save_mode_check_newline ? " [x] " : " [ ] "),
-                           mnemonic_label("Check POSIX new line", 6)}) | reflect(save_mode_boxes[4]);
+                           dialog_mnemonic_label("Check POSIX new line", 6, save_mode_focus == 2U)}) |
+                     reflect(save_mode_boxes[4]);
         if (save_mode_focus == 2U) check = focus_dialog(std::move(check));
         rows.push_back(std::move(check));
         return native_window("Edit Save Mode", vbox({
@@ -7835,7 +7849,8 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
     }
 
     ftxui::Element dialog_button(const std::string& label, const bool focused, ftxui::Box& box) const {
-        auto button = ::mcpp::dialog_button(label, false, box);
+        auto button = ::mcpp::dialog_button(label, false, box,
+            detail::dialog_mnemonic_style(palette(), focused, mode == Mode::editor_error), focused);
         if (!focused) return button;
         return highlight(std::move(button), mode == Mode::editor_error ? palette().error_focus
                                                                      : palette().dialog_focus) | ftxui::focus;
@@ -7844,8 +7859,16 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
     ftxui::Element native_button(
         const std::string& label, const bool primary, const bool focused, ftxui::Box& box
     ) const {
-        auto button = ::mcpp::native_button(label, primary, false, box);
+        auto button = ::mcpp::native_button(label, primary, false, box,
+            detail::dialog_mnemonic_style(palette(), focused), focused);
         return focused ? focus_dialog(std::move(button)) : button;
+    }
+
+    ftxui::Element dialog_mnemonic_label(
+        const std::string& label, const std::size_t index, const bool focused
+    ) const {
+        return ::mcpp::mnemonic_label(label, index, std::nullopt,
+            detail::dialog_mnemonic_style(palette(), focused), focused);
     }
 
     ftxui::Element gray_dialog(ftxui::Element element) const {
@@ -8204,7 +8227,8 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
         Elements rows;
         for (std::size_t index = 0; index < labels.size(); ++index) {
             auto label = hbox({text(listing_choice == index ? "(*) " : "( ) "),
-                               mnemonic_label(labels[index], 0)});
+                               dialog_mnemonic_label(labels[index], 0,
+                                   listing_focus == 0U && listing_choice == index)});
             if (listing_focus == 0U && listing_choice == index) label = focus_dialog(std::move(label));
             label = label | reflect(listing_boxes[index]);
             if (index == 1U) {
@@ -8225,7 +8249,7 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
         rows.push_back(hbox({text(" "), std::move(user) | reflect(listing_boxes[5]), text(" ")}));
         rows.push_back(separator());
         auto mini = hbox({text(listing_user_mini ? "[x] " : "[ ] "),
-                          mnemonic_label("User mini status", 5)});
+                          dialog_mnemonic_label("User mini status", 5, listing_focus == 3U)});
         if (listing_focus == 3U) mini = focus_dialog(std::move(mini));
         rows.push_back(hbox({text(" "), std::move(mini) | reflect(listing_boxes[6])}));
         auto mini_input = render_input(listing_status_values[listing_choice], listing_status_input,
@@ -8381,7 +8405,8 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
         Elements rows;
         for (std::size_t index = 0; index < names.size(); ++index) {
             auto radio = hbox({text(sort_choice == index ? "(*) " : "( ) "),
-                               mnemonic_label(names[index], mnemonics[index])}) |
+                               dialog_mnemonic_label(names[index], mnemonics[index],
+                                   sort_focus == 0U && sort_choice == index)}) |
                          size(WIDTH, EQUAL, 21) | reflect(sort_boxes[index]);
             if (sort_focus == 0U && sort_choice == index) radio = focus_dialog(std::move(radio));
             Element checkbox = text("");
@@ -8389,7 +8414,9 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
                 const bool checked = index == 0U ? sort_executable_first : index == 1U ? sort_case_sensitive : sort_reverse;
                 const std::string label = index == 0U ? "Executable first" : index == 1U ? "Case sensitive" : "Reverse";
                 checkbox = hbox({text(checked ? "[x] " : "[ ] "),
-                                  mnemonic_label(label, index == 0U ? 11U : index == 1U ? 3U : 0U)}) |
+                                  dialog_mnemonic_label(label,
+                                      index == 0U ? 11U : index == 1U ? 3U : 0U,
+                                      sort_focus == index + 1U)}) |
                            reflect(sort_boxes[9U + index]);
                 if (sort_focus == index + 1U) checkbox = focus_dialog(std::move(checkbox));
             }
@@ -8552,7 +8579,8 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
         };
         static constexpr std::array<std::size_t, 18> keys{0,12,11,4,0,1,16,16,1,6,0,1,2,10,14,2,99,1};
         const auto check = [&](const std::size_t index) {
-            auto row = hbox({text(configure_values[index] ? " [x] " : " [ ] "), mnemonic_label(names[index], keys[index])}) |
+            auto row = hbox({text(configure_values[index] ? " [x] " : " [ ] "),
+                            dialog_mnemonic_label(names[index], keys[index], configure_focus == index)}) |
                        reflect(configure_boxes[index]);
             if (configure_focus == index) row = focus_dialog(std::move(row));
             return row;
@@ -8569,7 +8597,8 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
         static constexpr std::array<std::size_t, 3> pause_keys{0,6,4};
         for (std::size_t index = 0; index < 3U; ++index) {
             auto row = hbox({text(configure_pause == index ? " (*) " : " ( ) "),
-                             mnemonic_label(pause_labels[index], pause_keys[index])}) |
+                             dialog_mnemonic_label(pause_labels[index], pause_keys[index],
+                                 configure_focus == 19U && configure_pause == index)}) |
                        reflect(configure_boxes[19U + index]);
             if (configure_focus == 19U && configure_pause == index) row = focus_dialog(std::move(row));
             pause.push_back(std::move(row));
@@ -8698,7 +8727,8 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
         auto skin = text("[ " + fit_listing_text(appearance_skin, 25, ListingAlignment::left) + " ]") |
                     reflect(appearance_boxes[0]);
         if (appearance_focus == 0U) skin = focus_dialog(std::move(skin));
-        auto shadows = hbox({text(appearance_shadows ? " [x] " : " [ ] "), mnemonic_label("Shadows", 0)}) |
+        auto shadows = hbox({text(appearance_shadows ? " [x] " : " [ ] "),
+                             dialog_mnemonic_label("Shadows", 0, appearance_focus == 1U)}) |
                        reflect(appearance_boxes[1]);
         if (appearance_focus == 1U) shadows = focus_dialog(std::move(shadows));
         return native_window("Appearance", vbox({
@@ -8829,7 +8859,8 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
         static constexpr std::array<std::size_t, 16> hotkeys{7, 9, 2, 5, 5, 0, 2, 2, 8, 1, 1, 2, 7, 0, 5, 0};
         const auto check = [&](const std::size_t index) {
             auto row = hbox({text(panel_option_values[index] ? " [x] " : " [ ] "),
-                             mnemonic_label(names[index], hotkeys[index])}) | reflect(panel_option_boxes[index]);
+                             dialog_mnemonic_label(names[index], hotkeys[index], panel_option_focus == index)}) |
+                       reflect(panel_option_boxes[index]);
             if (panel_option_focus == index) row = focus_dialog(std::move(row));
             return row;
         };
@@ -8845,7 +8876,8 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
         static constexpr std::array<std::size_t, 3> search_hotkeys{5, 3, 17};
         for (std::size_t index = 0; index < 3U; ++index) {
             auto row = hbox({text(panel_option_search == index ? " (*) " : " ( ) "),
-                             mnemonic_label(search_names[index], search_hotkeys[index])}) |
+                             dialog_mnemonic_label(search_names[index], search_hotkeys[index],
+                                 panel_option_focus == 16U && panel_option_search == index)}) |
                        reflect(panel_option_boxes[16U + index]);
             if (panel_option_focus == 16U && panel_option_search == index) row = focus_dialog(std::move(row));
             search.push_back(std::move(row));
@@ -8947,13 +8979,15 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
         using namespace ftxui;
         const auto check = [&](const std::string& label, const std::size_t mnemonic,
                                const bool value, const std::size_t focus_index, const std::size_t box) {
-            auto row = hbox({text(value ? " [x] " : " [ ] "), mnemonic_label(label, mnemonic)}) |
+            auto row = hbox({text(value ? " [x] " : " [ ] "),
+                            dialog_mnemonic_label(label, mnemonic, layout_focus == focus_index)}) |
                        reflect(layout_boxes[box]);
             if (layout_focus == focus_index) row = focus_dialog(std::move(row));
             return row;
         };
         const auto radio = [&](const std::string& label, const bool horizontal, const std::size_t box) {
-            auto row = hbox({text(layout_horizontal == horizontal ? " (*) " : " ( ) "), mnemonic_label(label, 0)}) |
+            auto row = hbox({text(layout_horizontal == horizontal ? " (*) " : " ( ) "),
+                            dialog_mnemonic_label(label, 0, layout_focus == 0U && layout_horizontal == horizontal)}) |
                        reflect(layout_boxes[box]);
             if (layout_focus == 0U && layout_horizontal == horizontal) row = focus_dialog(std::move(row));
             return row;
@@ -9113,7 +9147,7 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
         Elements rows;
         for (std::size_t index = 0; index < labels.size(); ++index) {
             auto row = hbox({text(confirmation_values[index] ? " [x] " : " [ ] "),
-                             mnemonic_label(labels[index], mnemonics[index])}) |
+                             dialog_mnemonic_label(labels[index], mnemonics[index], confirmation_focus == index)}) |
                        reflect(confirmation_boxes[index]);
             if (confirmation_focus == index) row = focus_dialog(std::move(row));
             rows.push_back(std::move(row));
@@ -11900,7 +11934,8 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
             auto item = caption == english_ui_caption(caption_id)
                 ? mnemonic_label(
                     editor_menu_names[index], editor_menu_mnemonics[index],
-                    selected ? std::nullopt : std::optional<ftxui::Color>{palette().menu_hot})
+                    selected ? std::nullopt : std::optional<ftxui::Color>{palette().menu_hot},
+                    detail::menu_mnemonic_style(palette(), selected))
                 : glyph_text(caption + editor_menu_names[index].substr(english_ui_caption(caption_id).size()));
             if (selected) {
                 item = paint(std::move(item), palette().menu_selected) | bold;
@@ -12170,7 +12205,9 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
             }
             const bool selected = index == editor_menu_item;
             auto row = menu_row_label(items[index], selected || items[index].action < 0
-                ? std::nullopt : std::optional<ftxui::Color>{palette().menu_hot});
+                ? std::nullopt : std::optional<ftxui::Color>{palette().menu_hot},
+                items[index].action < 0 ? nullptr : detail::menu_mnemonic_style(palette(), selected),
+                selected && items[index].action >= 0);
             if (items[index].action < 0) {
                 row = disabled_menu_label(std::move(row));
             }
@@ -12460,10 +12497,11 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
         };
         static constexpr std::array<std::size_t, 13> hotkeys{0,0,15,0,6,10,0,8,5,1,4,9,0};
         const auto check = [&](const std::size_t index) {
-            auto row = hbox({text(editor_options_values[index] ? " [x] " : " [ ] "),
-                             mnemonic_label(names[index], hotkeys[index])}) |
-                       reflect(editor_options_boxes[index + 3U]);
             const auto focus_index = index < 3U ? index + 1U : index + 2U;
+            auto row = hbox({text(editor_options_values[index] ? " [x] " : " [ ] "),
+                             dialog_mnemonic_label(names[index], hotkeys[index],
+                                 editor_options_focus == focus_index)}) |
+                       reflect(editor_options_boxes[index + 3U]);
             if (editor_options_focus == focus_index) row = focus_dialog(std::move(row));
             return row;
         };
@@ -12472,7 +12510,8 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
         Elements wrap;
         for (std::size_t index = 0; index < 3U; ++index) {
             auto row = hbox({text(editor_options_wrap == index ? " (*) " : " ( ) "),
-                             mnemonic_label(wrap_names[index], wrap_keys[index])}) |
+                             dialog_mnemonic_label(wrap_names[index], wrap_keys[index],
+                                 editor_options_focus == 0U && editor_options_wrap == index)}) |
                        reflect(editor_options_boxes[index]);
             if (editor_options_focus == 0U && editor_options_wrap == index) row = focus_dialog(std::move(row));
             wrap.push_back(std::move(row));
@@ -12995,7 +13034,9 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
             }
             const bool selected = index == pulldown_item;
             auto row = menu_row_label(items[index], selected || items[index].action < 0
-                ? std::nullopt : std::optional<ftxui::Color>{palette().menu_hot});
+                ? std::nullopt : std::optional<ftxui::Color>{palette().menu_hot},
+                items[index].action < 0 ? nullptr : detail::menu_mnemonic_style(palette(), selected),
+                selected && items[index].action >= 0);
             const auto& mapped = captions[index];
             if (mapped.id != UiCaption::count) {
                 const auto& caption = ui_translations.caption(mapped.id);
@@ -14082,7 +14123,13 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
         if (!error) rows.push_back(text("Overwrite this file?") | center);
         Elements buttons;
         for (std::size_t index = 0; index < choices.size(); ++index) {
-            auto button = text(" [ " + std::string(choices[index].label) + " ] ");
+            const auto* mnemonic_colors = error
+                ? detail::dialog_mnemonic_style(palette(), dialog_focus == index, true) : nullptr;
+            auto button = mnemonic_colors
+                ? hbox({text(" [ "),
+                    detail::render_mnemonic_label(std::string(choices[index].label), 0, mnemonic_colors, false),
+                    text(" ] ")})
+                : text(" [ " + std::string(choices[index].label) + " ] ");
             if (dialog_focus == index) {
                 button = focus_dialog(std::move(button));
             }
@@ -14887,7 +14934,8 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
             auto item = caption == english_ui_label(menu_labels[index])
                 ? mnemonic_label(
                     top_menu_names[index], top_menu_mnemonics[index],
-                    selected ? std::nullopt : std::optional<ftxui::Color>{palette().menu_hot})
+                    selected ? std::nullopt : std::optional<ftxui::Color>{palette().menu_hot},
+                    detail::menu_mnemonic_style(palette(), selected))
                 : glyph_text(std::string(index == 0U ? "  " : "") + caption +
                              (index == 4U ? " " : "     "));
             if (selected) {
