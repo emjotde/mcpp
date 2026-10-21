@@ -521,7 +521,7 @@ if(MCPP_BUILD_TESTS)
             COMMAND mcpp_streamed_command_tests /review/cases/streamed-view-filters-model
         )
         set_tests_properties(mcpp_streamed_command_tests PROPERTIES TIMEOUT 15)
-        foreach(incremental_case IN ITEMS browse guards)
+        foreach(incremental_case IN ITEMS browse guards volume-label)
             add_test(
                 NAME mcpp_archive_incremental_${incremental_case}
                 COMMAND mcpp_archive_incremental_tests

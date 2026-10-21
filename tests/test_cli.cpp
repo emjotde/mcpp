@@ -51,6 +51,26 @@ void options_and_display() {
                 !parsed.keymap_disabled && parsed.subshell == false && parsed.print_directory == "result",
                 "common flags and last-option precedence work in every frontend");
     }
+    const auto viewer_edit = mcpp::parse_cli(
+        std::array{"--edit=first:9"sv, "+7"sv, "second"sv}, mcpp::CliFrontend::viewer
+    );
+    require(viewer_edit.edit && viewer_edit.first_line == 7U &&
+            viewer_edit.paths == std::vector<std::string>{"first:9", "second"},
+            "--edit switches the standalone viewer to multi-file editor mode");
+    const auto diff_edit = mcpp::parse_cli(
+        std::array{"-e"sv, "one"sv, "two"sv, "three"sv}, mcpp::CliFrontend::diff
+    );
+    require(diff_edit.edit &&
+            diff_edit.paths == std::vector<std::string>{"one", "two", "three"},
+            "-e switches the standalone diff frontend without its two-file limit");
+    for (const auto frontend : {mcpp::CliFrontend::editor, mcpp::CliFrontend::viewer,
+                                mcpp::CliFrontend::diff}) {
+        auto help = mcpp::parse_cli(std::array{"--help"sv}, frontend);
+        std::ostringstream output;
+        mcpp::print_cli_action(help, output);
+        require(output.str().find("-e, --edit[=FILE]") != std::string::npos,
+                "standalone frontend help advertises editor mode");
+    }
     ftxui::Terminal::SetColorSupport(ftxui::Terminal::TrueColor);
     const std::vector<std::string> specifications{
         "normal=brightcyan,blue,bold+underline:selected=black,yellow,none",

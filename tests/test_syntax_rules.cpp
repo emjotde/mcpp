@@ -143,7 +143,37 @@ context default lightgray black
     const auto spelling = highlighter.spelling_ranges("original.consume", lines);
     check(spelling && *spelling == std::vector<mcpp::SyntaxSpellingRange>{{0U, 19U}},
           "empty keyword matches preserve original spelling byte offsets and newlines");
-    std::cout << "PASS cached MC-native repetition-only colors, byte progress and spelling offsets\n";
+
+    write(registry, R"(file . Original\sTerminal\sWildcard
+wholechars abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ
+context default lightgray black
+ keyword whole sentinel yellow
+ keyword a* brightred
+ keyword wholeright b* brightgreen
+)");
+    highlighter.load_registry(registry, root / "syntax.d");
+    const std::vector<std::string> terminal_lines{
+        "sentinel", "a tail btail!", "btail", ""
+    };
+    const auto terminal_spans = highlighter.highlight("original.consume", terminal_lines);
+    const auto check_color = [&](const std::size_t row, const std::string_view text, const int color) {
+        const auto begin = terminal_lines[row].find(text);
+        check(begin != std::string::npos, "terminal wildcard fixture substring exists");
+        for (auto byte = begin; byte < begin + text.size(); ++byte) {
+            check(color_at(terminal_spans[row], byte).foreground == color,
+                  "terminal wildcard colors match native right-boundary behavior");
+        }
+    };
+    check_color(1U, "a tail", 7);
+    check_color(1U, "btail!", 10);
+    check_color(2U, "btail", 10);
+    for (std::size_t row = 0; row < terminal_spans.size(); ++row) {
+        for (const auto& span : terminal_spans[row]) {
+            check(span.begin < span.end && span.end <= terminal_lines[row].size(),
+                  "terminal wildcard spans remain positive and byte bounded");
+        }
+    }
+    std::cout << "PASS cached MC-native repetition-only and terminal-wildcard consumption\n";
 }
 
 void test_native_bytes(const std::filesystem::path& root) {

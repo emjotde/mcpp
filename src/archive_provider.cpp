@@ -385,6 +385,7 @@ struct ParseState {
     std::uint64_t next_object{1};
     std::set<std::string, std::less<>> explicit_names;
     bool incremental{false};
+    bool volume_label{false};
     explicit ParseState() {
         auto root = new_node(EntryKind::directory, next_object++);
         root.implicit = true;
@@ -757,6 +758,15 @@ ParseState parse_tar(
                 if (destination) invalid("duplicate GNU long name header");
                 destination = std::move(value);
             }
+            continue;
+        }
+        if (type == 'V') {
+            if (records != 1U || ustar || size != 0U || !link.empty() || pending_extension ||
+                !fields.empty() || long_name || long_link || !local_sparse.empty() ||
+                (!gnu && !all_zero(header.substr(157)))) {
+                invalid("invalid GNU volume label record");
+            }
+            state.volume_label = true;
             continue;
         }
         if (long_name) name = *long_name;
@@ -1667,8 +1677,9 @@ public:
             resolve_hardlinks(parsed, cancellation);
         }
         validate_model(parsed.model, bounds, cancellation);
-        // Restore-only dumpdir names and renames must not be lost by a normal archive rewrite.
+        // Restore-only dumpdir metadata and archive labels must not be lost by a normal rewrite.
         if (options.writable && parsed.incremental) invalid("GNU incremental archives are read-only");
+        if (options.writable && parsed.volume_label) invalid("GNU volume-label archives are read-only");
         model = std::move(parsed.model);
         update_links();
         next_object = parsed.next_object;

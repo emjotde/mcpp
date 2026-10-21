@@ -85,6 +85,9 @@ without starting the UI.
 `-b` / `--nocolor` uses terminal-default colors with text emphasis; `-c` /
 `--color` enables at least the basic color palette. `-u` / `--nosubshell` and
 `-U` / `--subshell` override persistent shell integration for the current run.
+All four frontends accept `-e` / `--edit[=FILE]` to select editor mode for the
+current run; standalone viewer and diff invocations then accept the editor's
+multi-file, `+line`, and `file:line` operands without changing saved settings.
 
 ```bash
 build/release/mcpp --nomouse --stickchars --nocolor --nosubshell
@@ -548,6 +551,9 @@ format. Definitions are bounded to 8 MiB combined input, 64 active includes,
 64 active macro names and 512 pattern atoms. Repetition-only keywords are
 supported; a zero-byte keyword match colors and advances at least one byte.
 Empty compiled keywords follow the native priority and line-tail behavior.
+Trailing-wildcard keywords with a right-word boundary consume through the
+terminating punctuation or line end; an unbounded trailing wildcard remains
+inactive, while a lone `*` retains its existing catch-all behavior.
 Context matching retains original leading tokens and accepts edge-star patterns,
 including native marker-byte, NUL and right-word-boundary behavior. Applied
 context borders always consume bytes; empty context delimiters remain inactive.
@@ -660,9 +666,11 @@ GNU incremental `D` directories and local PAX `GNU.dumpdir` metadata support
 read-only browsing and copying. Dump names and rename/deletion records are
 validated as restore metadata, not exposed as members or replayed on the
 destination. Contents omitted from an earlier backup are not reconstructed.
-Writable incremental archives, ambiguous PWB/vendor cpio, multivolume tar and
-unsupported PAX extensions fail explicitly. No archive is blindly extracted into
-a host directory.
+An initial, zero-sized GNU `V` volume label is retained as archive metadata
+rather than exposed as a member; labeled archives are read-only so a rewrite
+cannot silently drop the label. Writable incremental archives, true multivolume
+continuations, ambiguous PWB/vendor cpio and unsupported PAX extensions fail
+explicitly. No archive is blindly extracted into a host directory.
 
 ## External filesystem helpers
 

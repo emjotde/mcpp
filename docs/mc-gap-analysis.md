@@ -273,8 +273,10 @@ names/renames are validated metadata, not destination operations; omitted prior
 backup contents are not invented. The native MC control navigated directories
 but returned next-header bytes for the regular member, so mcpp's actual payload
 was checked against GNU tar instead of reproducing that bug.
-Ambiguous PWB/vendor cpio, writable incremental archives, multivolume tar and
-unsupported PAX extensions remain explicit
+Initial zero-sized GNU `V` volume labels are now validated metadata rather than
+virtual members. Labeled archives remain read-only so publication cannot discard
+the label. Ambiguous PWB/vendor cpio, writable incremental archives, true
+multivolume continuation records and unsupported PAX extensions remain explicit
 format limits; the zstd command path was not runtime-checked in this environment.
 
 `image/undel://member` now provides read-only deleted regular inode recovery from
@@ -393,6 +395,10 @@ behavior; edge-star contexts retain original marker dispatch and NUL/right-word
 boundary consumption. Empty context delimiters are inactive, and successful
 context borders always consume input. Native caches and matching actual UI
 cover the previously rejected forms without changing file bytes.
+Trailing `*` keywords now follow the same right-word-boundary consumption:
+bounded forms include their terminating punctuation or virtual line end,
+unbounded forms remain inactive, and the existing lone-`*` catch-all is
+unchanged.
 Aggregate input/include/macro/atom bounds remain explicit. Native MC 4.8.30 controls
 confirm the existing ASCII-only case folding and byte-based sets, including
 partial UTF-8-byte matches; those are baseline behavior, not compatibility gaps.
@@ -444,10 +450,11 @@ fallback.
 The four frontends now share CLI parsing and launch-only mouse, ASCII-frame,
 monochrome/color, color-role and subshell controls. Informational options return
 without opening the UI, and literal-colon/process-cwd handling and saved setup
-remain intact. A titled-help ASCII corner defect was fixed without changing
-ordinary file-text glyphs. **L03 remains partial** for renderer-specific native
-backend controls and unavailable color-role fields; non-UTF-8 terminal handling
-remains L24.
+remain intact. Native `-e` / `--edit[=FILE]` now switches every standalone
+frontend into the existing multi-file editor role for that run. A titled-help
+ASCII corner defect was fixed without changing ordinary file-text glyphs.
+**L03 remains partial** for renderer-specific native backend controls and
+unavailable color-role fields; non-UTF-8 terminal handling remains L24.
 
 CLI overrides now reach the already-rendered popup normal/title, editor gutter,
 dialog/error title and error-focus pairs. Inactive menus accept their complete

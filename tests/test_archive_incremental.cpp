@@ -299,6 +299,38 @@ void guards() {
     check(get("sentinel") == "untouched\n", "metadata handling never touches a host restore path");
     std::cout << "PASS incremental guards: framing, bounds, cancellation, unsupported metadata, revision and nested snapshots\n";
 }
+
+void volume_label() {
+    fs::create_directory("source");
+    put("source/payload", payload);
+    const auto generated = mcpp::capture_command(
+        {"/usr/bin/tar", "--format=gnu", "--label=mcpp L28 label", "-cf", "labeled.tar",
+         "-C", "source", "payload"}, fs::current_path());
+    check(generated.status == 0, "generate GNU volume-label fixture: " + generated.error);
+    const auto original = get("labeled.tar");
+    check(original.size() >= 1536U && original[156] == 'V', "GNU tar emitted a volume-label record");
+
+    mcpp::ArchiveProvider archive("labeled.tar", options());
+    const auto entries = archive.list("/", {}, {});
+    check(entries.size() == 1U && entries.front().name == "payload" &&
+          read(archive, "/payload") == payload, "volume label is metadata and member bytes remain exact");
+
+    rejects([&] { mcpp::ArchiveProvider denied("labeled.tar", options(true)); },
+            "volume-label archives are read-only");
+    check(get("labeled.tar") == original && (!fs::exists("drafts") || fs::is_empty("drafts")),
+          "unsupported rewrite leaves the labeled archive unchanged");
+
+    const auto label = original.substr(0, 512);
+    put("late-label.tar", record("payload", '0', payload) + label + terminator);
+    rejects([&] { mcpp::ArchiveProvider denied("late-label.tar", options()); }, "volume label");
+
+    auto data_label = label;
+    octal(data_label, 124, 12, 1);
+    checksum(data_label);
+    put("data-label.tar", data_label + "x" + std::string(511, '\0') + terminator);
+    rejects([&] { mcpp::ArchiveProvider denied("data-label.tar", options()); }, "volume label");
+    std::cout << "PASS GNU volume label: native fixture, hidden metadata, read-only guard, placement and size checks\n";
+}
 }  // namespace
 
 int main(const int argc, char** argv) {
@@ -307,7 +339,8 @@ int main(const int argc, char** argv) {
               "use the owned UID1001 review container and one focused selector");
         const auto base = fs::absolute(argv[1]).lexically_normal();
         check(base.parent_path() == "/review/cases" &&
-              base.filename().string().starts_with("archive-incremental-") &&
+              (base.filename().string().starts_with("archive-incremental-") ||
+               base.filename().string().starts_with("archive-l28-")) &&
               !fs::is_symlink(fs::symlink_status(base)), "unexpected incremental archive test workspace");
         static_cast<void>(::umask(0077));
         fs::create_directory(base);
@@ -316,6 +349,7 @@ int main(const int argc, char** argv) {
         fs::current_path(root);
         if (std::string_view(argv[2]) == "browse") browse();
         else if (std::string_view(argv[2]) == "guards") guards();
+        else if (std::string_view(argv[2]) == "volume-label") volume_label();
         else throw std::runtime_error("unknown incremental archive selector");
         fs::current_path(base);
         fs::remove_all(root);

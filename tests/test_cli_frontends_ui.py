@@ -9,6 +9,19 @@ from terminal_session import TerminalSession
 
 
 class CliFrontendsUI(unittest.TestCase):
+    def test_edit_option_switches_viewer_to_editor(self):
+        ui = ROOT / "edit-role"
+        ui.mkdir()
+        document = ui / "document.txt"
+        document.write_text("CLI_EDIT_ROLE\n")
+        with TerminalSession(BINARY.parent / "mcppview", TMUX, ui / "terminal",
+                             ["--edit", document], record_exit=True) as terminal:
+            terminal.wait_editor(offset=0, dirty=False)
+            terminal.wait_for("CLI_EDIT_ROLE")
+            self.assertIn("2Save", terminal.text())
+            terminal.press("F10")
+            terminal.wait_file(terminal.exit_file, b"0\n")
+
     def deferred_copy(self):
         left, right, ui = ROOT / "copy-left", ROOT / "copy-right", ROOT / "copy-ui"
         left.mkdir()
@@ -195,8 +208,10 @@ if __name__ == "__main__":
     BINARY = Path(sys.argv[1]).resolve()
     TMUX = sys.argv[2]
     parent = Path(sys.argv[3]).resolve()
-    if not parent.is_relative_to("/review/cases") or not parent.name.startswith("cli-remaining-"):
-        raise SystemExit("Use an owned /review/cases/cli-remaining-* directory")
+    if not parent.is_relative_to("/review/cases") or not parent.name.startswith(
+        ("cli-remaining-", "cli-l03-")
+    ):
+        raise SystemExit("Use an owned /review/cases/cli-remaining-* or cli-l03-* directory")
     ROOT = parent / f"frontends-{os.getpid()}"
     ROOT.mkdir(parents=True)
     ASCII_ONLY = "--ascii-only" in sys.argv[4:]

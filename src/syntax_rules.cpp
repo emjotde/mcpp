@@ -268,7 +268,11 @@ std::optional<std::size_t> match(
             return accepts ? self(self, index + 1U, cursor + 1U) : std::optional<std::size_t>{};
         }
         if (failed.contains({index, cursor})) return {};
-        if (delimiter && atom.kind == AtomKind::any && index + 1U == pattern.atoms.size()) {
+        const auto terminal_wildcard =
+            atom.kind == AtomKind::any && index + 1U == pattern.atoms.size();
+        // Native keeps a lone '*' as a zero-width catch-all, but guards a trailing
+        // wildcard after another atom with the pattern's right-word boundary.
+        if (terminal_wildcard && (delimiter || pattern.atoms.size() > 1U)) {
             if (!atom.terminal_wildcard) return {};
             auto end = cursor;
             while (end < text.size()) {

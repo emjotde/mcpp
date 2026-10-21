@@ -164,9 +164,6 @@ CliOptions parse_cli(
             return arguments[index];
         };
         const auto edit = [&](const std::optional<std::string_view> attached) {
-            if (frontend != CliFrontend::manager && frontend != CliFrontend::editor) {
-                throw std::invalid_argument("--edit is available in mcpp and mcppedit");
-            }
             result.edit = true;
             if (attached) result.paths.push_back(nonempty(*attached, "file name"));
         };
@@ -280,10 +277,10 @@ CliOptions parse_cli(
     if (frontend == CliFrontend::manager && !result.edit && result.paths.size() > 2U) {
         throw std::invalid_argument("expected at most two pane paths");
     }
-    if (frontend == CliFrontend::viewer && result.paths.size() != 1U) {
+    if (frontend == CliFrontend::viewer && !result.edit && result.paths.size() != 1U) {
         throw std::invalid_argument("expected one file; use --help for usage");
     }
-    if (frontend == CliFrontend::diff && result.paths.size() != 2U) {
+    if (frontend == CliFrontend::diff && !result.edit && result.paths.size() != 2U) {
         throw std::invalid_argument("expected two files; use --help for usage");
     }
     return result;
@@ -349,13 +346,11 @@ void print_cli_action(const CliOptions& options, std::ostream& output) {
            << "  -U, --subshell        Use persistent Bash during this run\n"
            << "  -u, --nosubshell      Do not use persistent Bash during this run\n";
     if (options.frontend == CliFrontend::manager) {
-        output << "  -v, --view FILE       Open a file in the viewer\n"
-               << "  -e, --edit[=FILE]     Edit remaining files, or an unnamed buffer\n";
+        output << "  -v, --view FILE       Open a file in the viewer\n";
     }
-    if (options.frontend == CliFrontend::manager || options.frontend == CliFrontend::editor) {
-        output << "Editor files accept file:line and file:line:; an existing literal name wins.\n"
-               << "+line selects the first editor file's starting line.\n";
-    }
+    output << "  -e, --edit[=FILE]     Open editor mode for the remaining files\n"
+           << "Editor files accept file:line and file:line:; an existing literal name wins.\n"
+           << "+line selects the first editor file's starting line.\n";
     if (options.frontend == CliFrontend::viewer) {
         output << "Use /dev/stdin to view redirected input.\n";
     }
