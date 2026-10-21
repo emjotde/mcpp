@@ -12195,6 +12195,10 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
         using namespace ftxui;
         Elements rows;
         const auto& items = editor_menu_items()[editor_menu_category];
+        const auto captions = detail::builtin_editor_dropdown_captions[editor_menu_category];
+        if (captions.size() != items.size()) {
+            throw std::logic_error("builtin editor menu caption map is out of sync");
+        }
         editor_menu_item_boxes.assign(items.size(), {});
         for (std::size_t index = 0; index < items.size(); ++index) {
             if (items[index].action == -2) {
@@ -12208,6 +12212,16 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
                 ? std::nullopt : std::optional<ftxui::Color>{palette().menu_hot},
                 items[index].action < 0 ? nullptr : detail::menu_mnemonic_style(palette(), selected),
                 selected && items[index].action >= 0);
+            const auto& mapped = captions[index];
+            if (mapped.id != UiCaption::count) {
+                const auto& caption = ui_translations.caption(mapped.id);
+                if (caption != english_ui_caption(mapped.id)) {
+                    row = hbox({
+                        glyph_text(" "), glyph_text(caption) | flex,
+                        glyph_text(std::string(mapped.shortcut)),
+                    });
+                }
+            }
             if (items[index].action < 0) {
                 row = disabled_menu_label(std::move(row));
             }

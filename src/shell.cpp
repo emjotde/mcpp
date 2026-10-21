@@ -95,7 +95,7 @@ int parse_number(const std::string& value) {
     return result;
 }
 
-enum class ShellKind { bash, bash_sh, posix, zsh };
+enum class ShellKind { bash, bash_sh, posix, zsh, ksh };
 
 bool editor_protocol(const ShellKind kind) {
     return kind != ShellKind::posix;
@@ -144,6 +144,7 @@ std::optional<ShellExecutable> selected_shell() {
     }
     if (identity == "dash") return ShellExecutable{resolved.string(), name, ShellKind::posix};
     if (identity == "zsh") return ShellExecutable{resolved.string(), name, ShellKind::zsh};
+    if (identity == "ksh93") return ShellExecutable{resolved.string(), name, ShellKind::ksh};
     for (const auto& [known, kind] : {
              std::pair{"/bin/bash", ShellKind::bash},
              std::pair{"/usr/bin/bash", ShellKind::bash},
@@ -151,6 +152,8 @@ std::optional<ShellExecutable> selected_shell() {
              std::pair{"/usr/bin/dash", ShellKind::posix},
              std::pair{"/bin/zsh", ShellKind::zsh},
              std::pair{"/usr/bin/zsh", ShellKind::zsh},
+             std::pair{"/bin/ksh93", ShellKind::ksh},
+             std::pair{"/usr/bin/ksh93", ShellKind::ksh},
          }) {
         error.clear();
         if (std::filesystem::equivalent(resolved, known, error) && !error) {
@@ -265,6 +268,10 @@ struct ShellSession::Impl {
                 std::cerr << "mcpp: cannot remove shell startup file: "
                           << std::generic_category().message(errno) << '\n';
             }
+            if (unlink((temporary / "kshrc").c_str()) != 0 && errno != ENOENT) {
+                std::cerr << "mcpp: cannot remove shell startup file: "
+                          << std::generic_category().message(errno) << '\n';
+            }
             if (unlink((temporary / "command").c_str()) != 0 && errno != ENOENT) {
                 std::cerr << "mcpp: cannot remove shell command file: "
                           << std::generic_category().message(errno) << '\n';
@@ -327,7 +334,8 @@ struct ShellSession::Impl {
         const bool prompt = fields[0] == "P";
         Message message{fields[0][0], fields[prompt ? 2U : 1U], parse_number(fields[prompt ? 1U : 2U])};
         if (message.directory.empty() || !std::filesystem::path(message.directory).is_absolute() ||
-            message.value < 0 || message.value > 255 || (message.kind == 'H' && message.value > 1)) {
+            message.value < 0 || (kind != ShellKind::ksh && message.value > 255) ||
+            (message.kind == 'H' && message.value > 1)) {
             throw std::runtime_error("invalid shell control response");
         }
         return message;
@@ -378,7 +386,25 @@ struct ShellSession::Impl {
 
     bool submit_pending_command() {
         if (pending_command.empty()) return false;
-        if (editor_protocol(kind)) {
+        if (kind == ShellKind::ksh) {
+            termios settings{};
+            if (tcgetattr(slave_control.value, &settings) != 0) fail("read ksh input settings");
+            const auto literal = settings.c_cc[VLNEXT] == _POSIX_VDISABLE
+                ? '\026' : static_cast<char>(settings.c_cc[VLNEXT]);
+            std::string input;
+            input.reserve(pending_command.size());
+            for (const unsigned char character : pending_command) {
+                if (character == '\0') throw std::runtime_error("shell command contains a NUL byte");
+                if (character < 32U || character == 127U || character == static_cast<unsigned char>(literal) ||
+                    std::find(std::begin(settings.c_cc), std::end(settings.c_cc), character) !=
+                        std::end(settings.c_cc)) {
+                    input += literal;
+                }
+                input += static_cast<char>(character);
+            }
+            input += '\r';
+            write_all(master.value, input);
+        } else if (editor_protocol(kind)) {
             write_all(master.value, "\033[200~" + pending_command + "\033[201~\r");
         } else {
             const auto path = temporary / "command";
@@ -499,7 +525,8 @@ struct ShellSession::Impl {
         temporary = created;
         const auto sync_token = temporary.filename().string();
         sync_marker = "\033]777;mcpp-sync:" + sync_token + "\007";
-        const auto startup = temporary / (kind == ShellKind::zsh ? "zshrc" : "bashrc");
+        const auto startup = temporary /
+            (kind == ShellKind::zsh ? "zshrc" : kind == ShellKind::ksh ? "kshrc" : "bashrc");
         Fd rc(open(startup.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600));
         if (rc.value < 0) {
             fail("create shell startup file");
@@ -598,6 +625,38 @@ builtin bindkey -M emacs '^O' __mcpp_toggle
 builtin bindkey -M viins '^O' __mcpp_toggle
 builtin bindkey -M vicmd '^O' __mcpp_toggle
 precmd_functions+=(__mcpp_prompt)
+)";
+        }
+        if (kind == ShellKind::ksh) {
+            script = R"(if ! IFS= command read -r -d '' __mcpp_initial_directory <&@IN@; then command exit 125; fi
+command cd -- "$__mcpp_initial_directory" || command exit 126
+unset __mcpp_initial_directory
+if [[ ! -o emacs && ! -o vi ]]; then set -o emacs; fi
+function __mcpp_prompt {
+    command printf 'P\0%d\0%s\0' "$1" "$PWD" >&@OUT@
+    return "$1"
+}
+function __mcpp_toggle {
+    typeset __mcpp_path __mcpp_changed=0 __mcpp_draft=0
+    typeset __mcpp_mode=${.sh.edmode} __mcpp_column=${.sh.edcol}
+    [[ -n ${.sh.edtext} ]] && __mcpp_draft=1
+    .sh.edchar=
+    if ! command printf '\033]777;mcpp-sync:@SYNC@\007' > /dev/tty; then command exit 125; fi
+    command printf 'H\0%s\0%d\0' "$PWD" "$__mcpp_draft" >&@OUT@
+    if ! IFS= command read -r -d '' __mcpp_path <&@IN@; then command exit; fi
+    if [[ "$PWD" != "$__mcpp_path" ]]; then
+        command cd -- "$__mcpp_path" || __mcpp_changed=$?
+    fi
+    command printf 'R\0%s\0%d\0' "$PWD" "$__mcpp_changed" >&@OUT@
+    if [[ -o vi ]]; then
+        if [[ -n $__mcpp_mode ]]; then
+            if (( __mcpp_column > 0 )); then .sh.edchar=$'\033\014a'
+            else .sh.edchar=$'\033\014i'; fi
+        else .sh.edchar=$'\014i'; fi
+    else .sh.edchar=$'\014'; fi
+}
+trap '[[ ${.sh.edchar} == $'\''\017'\'' ]] && __mcpp_toggle' KEYBD
+PS1='$(__mcpp_prompt "$?")'"${PS1-\$ }"
 )";
         }
         for (const auto& [token, value] : {

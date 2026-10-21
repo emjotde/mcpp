@@ -30,7 +30,7 @@ using Bytes = std::vector<unsigned char>;
 using Messages = std::vector<std::pair<std::string, std::string>>;
 
 static_assert(static_cast<std::size_t>(UiCaption::delete_confirmation) == 0U);
-static_assert(mcpp::ui_caption_count == 70U);
+static_assert(static_cast<std::size_t>(UiCaption::editor_menu_options) == 69U);
 static_assert(!std::is_invocable_v<decltype(&UiTranslations::caption),
                                  const UiTranslations&, std::string_view>);
 static_assert(!std::is_invocable_v<decltype(&UiTranslations::caption),

@@ -36,7 +36,7 @@ including Azure Blob Storage and SSH/SFTP, is paused.
 - Creation permissions follow the process umask when permissions are not preserved
 - Mode, owner/group, file information, free-space display, and links
 - Directory comparison plus fixed-width Quick view and live Info panels
-- Local command line, history, and persistent Bash/sh/dash/zsh with Ctrl-O switching
+- Local command line, history, and persistent Bash/sh/dash/zsh/ksh93 with Ctrl-O switching
 - Persisted panel paths and preferences
 - MC-style visual state cues, a grayscale default, and 16 selectable skins
 - Toggleable syntax colors adapted to dark, light, and monochrome skins
@@ -746,8 +746,8 @@ without writing to the filesystem being recovered.
 
 ## Shell
 
-With Bash, dash or zsh, including `sh` pointing to Bash/dash, commander commands and
-`Ctrl-O` use the same selected interactive shell.
+With Bash, dash, zsh or ksh93, including `sh` pointing to Bash/dash, commander
+commands and `Ctrl-O` use the same selected interactive shell.
 Variables, functions, aliases, and the shell PID survive repeated commands and
 screen switches. `Ctrl-O` also hides a running foreground command or shell
 `read`; it does not stop the command. Resume it with `Ctrl-O`.
@@ -769,6 +769,10 @@ command instead of running it later when the shell resumes.
 Zsh retains native `ZDOTDIR` startup, prompt hooks and ZLE editing. It uses the
 selected zsh process for persistent state; a missing ZLE module reports a startup
 failure rather than substituting Bash.
+Ksh93 retains native `ENV` startup and its selected editing mode. Its `KEYBD`
+hook preserves unfinished input across `Ctrl-O`, and command status values are
+not truncated to eight bits. Other ksh implementations are not treated as
+ksh93.
 
 Exiting the shell quits mcpp through its existing confirmation and dirty-editor
 guards. Shell startup and transport errors restore the UI and report the
@@ -784,7 +788,8 @@ the previous mcpp behavior, including draft, cwd and running-command handling.
 `mcpp -u` / `--nosubshell` selects the earlier one-shot behavior for that run;
 `-U` / `--subshell` enables persistent shell integration. These overrides do not
 replace the saved `use_subshell` preference. Other shells retain one-shot
-behavior; persistent ash, ksh, tcsh and fish remain compatibility work.
+behavior; persistent ash, other ksh variants, tcsh and fish remain compatibility
+work.
 
 ## UI translations
 
@@ -792,9 +797,9 @@ Original user-provided GNU `.mo` catalogs can translate the main manager menu
 captions, common native input/message buttons, and Quit/Error titles and exit
 choices. Only explicit built-in label IDs are looked up: filenames, file
 contents, paths, custom menus and resource text are never translation inputs.
-An additional 62 manager pulldown captions and seven editor menubar captions
-use typed contextual IDs under `manager-panel-menu`, `manager-file-menu`,
-`manager-command-menu`, `manager-options-menu` and `editor-menubar`.
+An additional 62 manager pulldown captions, seven editor menubar captions and
+68 editor-dropdown captions use typed contextual IDs under the manager menu,
+`editor-menubar`, and seven `editor-*-menu` contexts.
 Shortcut text, separators, category/action IDs and disabled states stay
 unchanged. English captions retain the original mnemonic rendering; translated
 captions render as complete UTF-8 strings without guessing new accelerators.

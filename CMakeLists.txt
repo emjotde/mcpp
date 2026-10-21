@@ -305,6 +305,10 @@ if(MCPP_BUILD_TESTS)
     target_include_directories(mcpp_builtin_menu_caption_tests PRIVATE src)
     target_link_libraries(mcpp_builtin_menu_caption_tests PRIVATE mcpp_core)
     mcpp_target_defaults(mcpp_builtin_menu_caption_tests)
+    add_executable(mcpp_editor_menu_caption_tests tests/test_editor_menu_captions.cpp)
+    target_include_directories(mcpp_editor_menu_caption_tests PRIVATE src)
+    target_link_libraries(mcpp_editor_menu_caption_tests PRIVATE mcpp_core)
+    mcpp_target_defaults(mcpp_editor_menu_caption_tests)
     add_executable(mcpp_editor_window_style_tests tests/test_editor_window_styles.cpp)
     target_include_directories(mcpp_editor_window_style_tests PRIVATE src)
     target_link_libraries(mcpp_editor_window_style_tests PRIVATE mcpp_ui)
@@ -441,6 +445,10 @@ if(MCPP_BUILD_TESTS)
             add_test(
                 NAME mcpp_builtin_menu_caption_${menu_caption_case}
                 COMMAND mcpp_builtin_menu_caption_tests ${menu_caption_case}
+            )
+            add_test(
+                NAME mcpp_editor_menu_caption_${menu_caption_case}
+                COMMAND mcpp_editor_menu_caption_tests ${menu_caption_case}
             )
         endforeach()
         add_test(NAME mcpp_editor_window_styles COMMAND mcpp_editor_window_style_tests)

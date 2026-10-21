@@ -571,12 +571,18 @@ and seven editor menubar names, with shared Left/Right panel entries and
 separators excluded from lookup. Original English arrays, row/category/action
 identity, shortcuts, disabled entries and dispatch are unchanged; translated
 UTF-8 labels do not enter the byte-indexed English mnemonic renderer.
+Another 68 typed IDs cover every non-separator row in the seven built-in editor
+dropdowns. English rendering, literal shortcut spacing, action IDs, disabled
+states, separator dispatch and original mnemonic dispatch remain unchanged.
+Custom editor menus and document data are never catalog keys. Dialog bodies,
+help, other static labels and localized accelerators still remain, so L26 is
+partial.
 
 ### Additional compatibility gaps
 
 | ID | Remaining work | Evidence |
 |---|---|---|
-| L35 | Partial: remaining persistent shell variants | Bash, dash, zsh and `sh` resolving to Bash/dash retain the selected executable, native startup, state, cwd, drafts and running commands. Zsh uses native ZDOTDIR/ZLE/prompt hooks and a persistent process, not Bash substitution. A cwd error discards the rejected command rather than executing it later on resume. Persistent ash, ksh, tcsh and fish remain unsupported; no full shell-family parity is claimed. |
+| L35 | Partial: remaining persistent shell variants | Bash, dash, zsh, ksh93 and `sh` resolving to Bash/dash retain the selected executable, native startup, state, cwd, drafts and running commands. Zsh uses native ZDOTDIR/ZLE/prompt hooks; ksh93 retains native `ENV`, `KEYBD` editing and statuses above 255. Neither substitutes Bash or starts one process per command. A cwd error discards the rejected command rather than executing it later on resume. Persistent ash, other ksh variants, tcsh and fish remain unsupported; no full shell-family parity is claimed. |
 
 ## Audit fix delivery
 
