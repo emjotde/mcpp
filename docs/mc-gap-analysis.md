@@ -449,7 +449,10 @@ dialog/error title and error-focus pairs. Inactive menus accept their complete
 pair while omitted fields preserve the current background and disabled contrast.
 Native skins and CLI overrides share color/attribute parsing, including hex RGB
 and `inverse`. The earlier `errdhotfocus` alias still paints the whole focus;
-unrendered statusbar, mnemonic and editor-window roles remain explicit errors.
+Unrendered mnemonic roles remain explicit errors. Native statusbar pairs now
+style existing viewer/editor/Quick View/diff status text, not progress dialogs.
+Native editor desktop, inactive/active frame and move/resize/corner roles now
+have independent consumers, preserving text, status, hitboxes and geometry.
 The independent `commandlinemark` pair now styles selected manager input across
 focus changes without altering normal text or the three dialog-input roles.
 Dialog input fields now use full `input`, `inputmark` and
@@ -553,6 +556,11 @@ render. Untranslated Delete questions retain their exact previous wording,
 and filenames/buttons stay literal.
 Most UI text, message bodies, help, other contextual/plural message IDs and
 localized accelerators remain untranslated. **L26 remains partial.**
+The next caption subset adds typed IDs for 62 distinct manager pulldown rows
+and seven editor menubar names, with shared Left/Right panel entries and
+separators excluded from lookup. Original English arrays, row/category/action
+identity, shortcuts, disabled entries and dispatch are unchanged; translated
+UTF-8 labels do not enter the byte-indexed English mnemonic renderer.
 
 ### Additional compatibility gaps
 

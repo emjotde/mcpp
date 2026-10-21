@@ -17,6 +17,9 @@ namespace mcpp::detail {
 enum class HelpTextStyle { bold, italic };
 
 [[nodiscard]] ftxui::Element paint_skin_style(ftxui::Element element, const SkinPair& colors);
+[[nodiscard]] ftxui::Element render_statusbar(
+    ftxui::Element element, const Skin& skin, const SkinPair& fallback
+);
 [[nodiscard]] ftxui::Element render_viewer_text(
     const Skin& skin, const std::string& row,
     std::optional<std::pair<std::size_t, std::size_t>> highlight,

@@ -29,8 +29,10 @@
 #include "mcpp/diff.hpp"
 #include "mcpp/user_menu.hpp"
 #include "editor_display.hpp"
+#include "editor_window_styles.hpp"
 #include "input_styles.hpp"
 #include "local_tools_stream.hpp"
+#include "builtin_menu_captions.hpp"
 #include "extension_view_checkout.hpp"
 #include "shell_display.hpp"
 #include "panel_selection_keys.hpp"
@@ -6568,12 +6570,12 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
             const auto count = DiffModel::line_count(buffer);
             const auto status_text = side == diff_order ? " Col " + std::to_string(diff_horizontal)
                 : " Dif " + std::to_string(file_diff.hunks().size());
-            headers.push_back(gray_menu(hbox({
+            headers.push_back(detail::render_statusbar(hbox({
                 text(std::string(buffer.dirty() ? "* " : "  ") +
                     path_label(display_text(archives.format(buffer.provider(), buffer.path())),
                     static_cast<std::size_t>(std::max(1, width - static_cast<int>(status_text.size()) - 3)))) | flex,
                 text(status_text + " ")
-            })) | size(WIDTH, EQUAL, width));
+            }), palette(), palette().menu) | size(WIDTH, EQUAL, width));
             Elements rows;
             for (std::size_t row = diff_top; row < file_diff.rows().size() && row - diff_top < diff_visible_rows(); ++row) {
                 const auto& aligned = file_diff.rows()[row];
@@ -11379,7 +11381,7 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
             });
         }
         return vbox({
-            paint(std::move(header), palette().viewer_cursor),
+            detail::render_statusbar(std::move(header), palette(), palette().viewer_cursor),
             vbox(std::move(elements)) | flex,
             hbox({
                 text(" "),
@@ -11893,11 +11895,13 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
         Elements menu;
         for (std::size_t index = 0; index < editor_menu_names.size(); ++index) {
             const bool selected = mode == Mode::editor_menu && index == editor_menu_category;
-            auto item = mnemonic_label(
-                editor_menu_names[index],
-                editor_menu_mnemonics[index],
-                selected ? std::nullopt : std::optional<ftxui::Color>{palette().menu_hot}
-            );
+            const auto caption_id = detail::builtin_editor_menu_caption_ids[index];
+            const auto& caption = ui_translations.caption(caption_id);
+            auto item = caption == english_ui_caption(caption_id)
+                ? mnemonic_label(
+                    editor_menu_names[index], editor_menu_mnemonics[index],
+                    selected ? std::nullopt : std::optional<ftxui::Color>{palette().menu_hot})
+                : glyph_text(caption + editor_menu_names[index].substr(english_ui_caption(caption_id).size()));
             if (selected) {
                 item = paint(std::move(item), palette().menu_selected) | bold;
             }
@@ -11964,14 +11968,19 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
         ));
         const auto status_filename = config.editor_state_full_filename || editor.path().empty()
             ? editor_location(editor) : std::filesystem::path(editor.path()).filename().string();
+        auto filename_label = text(path_label(
+            display_text(status_filename), filename_width
+        )) | flex;
+        const auto* statusbar_colors = find_skin_color(palette(), "statusbar", "_default_");
+        if (!statusbar_colors || !statusbar_colors->explicit_style) {
+            filename_label = std::move(filename_label) | bold;
+        }
         auto status_header = hbox({
-                      text(path_label(
-                          display_text(status_filename), filename_width
-                      )) | bold | flex,
+                      std::move(filename_label),
                       text(editor_flags),
                       text(position_status),
                   });
-        status_header = gray_menu(std::move(status_header)) |
+        status_header = detail::render_statusbar(std::move(status_header), palette(), palette().menu) |
                         size(WIDTH, EQUAL, header_width);
         auto menubar = gray_menu(hbox(std::move(menu))) | reflect(editor_header_box);
         auto header = mode == Mode::editor_menu ? menubar : status_header | reflect(editor_header_box);
@@ -12000,28 +12009,36 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
         auto body = vbox(std::move(elements)) | flex;
         if (editor.fullscreen) return vbox({header, std::move(body), keybar});
         const auto bounds = editor_window_bounds();
+        const bool window_focused = mode != Mode::editor_menu;
+        const bool window_dragging = editor_window_action != 0;
         Elements caption{filler() | size(WIDTH, EQUAL, 1), status_header};
         if (editor_window_widgets_visible) {
-            caption.push_back(gray_menu(hbox({
+            caption.push_back(detail::editor_window_controls(hbox({
                 text("[" + std::string(skin_glyph(palette().glyphs, SkinGlyph::window_state,
                                                  "*", launch_options.stickchars)) + "]") |
                     reflect(editor_window_widget_boxes[0]),
                 text("[" + std::string(skin_glyph(palette().glyphs, SkinGlyph::window_close,
                                                  "X", launch_options.stickchars)) + "]") |
                     reflect(editor_window_widget_boxes[1]),
-            })));
+            }), palette(), window_focused, window_dragging));
         }
         caption.push_back(filler() | size(WIDTH, EQUAL, 1));
         auto framed = dbox({
-            std::move(body) | borderStyled(LIGHT),
+            detail::editor_window_frame(
+                std::move(body) | borderStyled(LIGHT), palette(), window_focused, window_dragging),
             vbox({hbox(std::move(caption)), filler()}),
         }) | size(WIDTH, EQUAL, bounds[2]) | size(HEIGHT, EQUAL, bounds[3]);
         return vbox({
             menubar,
             vbox({
-                filler() | size(HEIGHT, EQUAL, std::max(0, bounds[1] - 1)),
-                hbox({filler() | size(WIDTH, EQUAL, bounds[0]), std::move(framed), filler()}),
-                filler(),
+                detail::editor_desktop(
+                    filler() | size(HEIGHT, EQUAL, std::max(0, bounds[1] - 1)), palette()),
+                hbox({
+                    detail::editor_desktop(filler() | size(WIDTH, EQUAL, bounds[0]), palette()),
+                    std::move(framed),
+                    detail::editor_desktop(filler(), palette()),
+                }),
+                detail::editor_desktop(filler(), palette()),
             }) | flex,
             keybar,
         });
@@ -12967,6 +12984,8 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
         };
         Elements rows;
         const auto& items = pulldown_items()[pulldown_category];
+        const auto captions = detail::builtin_manager_menu_captions[pulldown_category];
+        if (captions.size() != items.size()) throw std::logic_error("builtin menu caption map is out of sync");
         pulldown_item_boxes.clear();
         pulldown_item_boxes.resize(items.size());
         for (std::size_t index = 0; index < items.size(); ++index) {
@@ -12977,6 +12996,16 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
             const bool selected = index == pulldown_item;
             auto row = menu_row_label(items[index], selected || items[index].action < 0
                 ? std::nullopt : std::optional<ftxui::Color>{palette().menu_hot});
+            const auto& mapped = captions[index];
+            if (mapped.id != UiCaption::count) {
+                const auto& caption = ui_translations.caption(mapped.id);
+                if (caption != english_ui_caption(mapped.id)) {
+                    row = hbox({
+                        glyph_text(" "), glyph_text(caption) | flex,
+                        glyph_text(std::string(mapped.shortcut)),
+                    });
+                }
+            }
             if (items[index].action < 0) {
                 row = disabled_menu_label(std::move(row));
             }
@@ -14335,6 +14364,22 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
                               quick_viewer.size()
                       )
                   );
+        auto quick_status = hbox({
+            filler(),
+            text(
+                std::to_string(quick_viewer.view_end()) +
+                "/" +
+                std::to_string(quick_viewer.size()) +
+                "  " +
+                std::to_string(percent) + "%"
+            ),
+        });
+        if (find_skin_color(active_palette->viewer, "statusbar", "_default_")) {
+            quick_status = detail::render_statusbar(
+                std::move(quick_status), active_palette->viewer, active_palette->viewer.normal);
+        } else {
+            quick_status = std::move(quick_status) | color(palette().dim);
+        }
         return frame(
             hbox({
                 text(" "),
@@ -14343,17 +14388,7 @@ struct App::Impl : ViewerSessionState, DiffSessionState {
             }),
             vbox({
                 vbox(std::move(rows)) | yframe | flex,
-                hbox({
-                    filler(),
-                    text(
-                        std::to_string(quick_viewer.view_end()) +
-                        "/" +
-                        std::to_string(quick_viewer.size()) +
-                        "  " +
-                        std::to_string(percent) + "%"
-                    ),
-                }) |
-                    color(palette().dim),
+                std::move(quick_status),
             })
         );
     }

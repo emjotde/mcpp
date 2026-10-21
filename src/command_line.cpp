@@ -129,11 +129,12 @@ std::string_view cli_program_name(const CliFrontend frontend) {
 }
 
 std::string_view cli_color_roles() {
-    return "Color pairs: normal, selected, markselect, reverse, gauge, errors,\n"
+    return "Color pairs: normal, selected, markselect, reverse, gauge, errors, statusbar,\n"
            "input, inputmark, inputunchanged, commandlinemark,\n"
            "dnormal, dfocus, dtitle, errdtitle, errdfocus, errdhotfocus,\n"
            "menunormal, menusel, menuinactive, pmenunormal, pmenusel, pmenutitle,\n"
            "bbarhotkey, bbarbutton, editnormal, editbold, editmarked, editlinestate, editrightmargin,\n"
+           "editbg, editframe, editframeactive, editframedrag,\n"
            "viewnormal, viewbold, viewunderline, viewselected,\n"
            "helpnormal, helpbold, helpitalic, helplink, helpslink.\n"
            "Foreground-only roles: marked, disabled, header, menuhot, editwhitespace.\n"

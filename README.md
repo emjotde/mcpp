@@ -109,6 +109,13 @@ the earlier fallback. The manager command line is excluded from these roles.
 Its selected text instead uses the independent `commandlinemark` pair, including
 foreground, background and attributes across focus changes; normal command
 text remains unchanged.
+Native `statusbar` maps to `[statusbar] _default_` for existing viewer position,
+editor status, Quick View numeric and diff filename/position headers. It does
+not recolor operation-progress dialogs. Windowed editor desktop, inactive,
+active and move/resize contours use `editbg`, `editframe`, `editframeactive` and
+`editframedrag`; stationary resize corners use the drag pair too. File text,
+status content, controls and geometry remain separate; explicit `none` does
+not gain forced emphasis.
 Native backend controls `-x/-X/-g/-t/-s/-k` remain unavailable;
 `--help-terminal` explains why. ASCII frames do not implement non-UTF-8 terminal
 output or 7-bit input.
@@ -773,6 +780,12 @@ Original user-provided GNU `.mo` catalogs can translate the main manager menu
 captions, common native input/message buttons, and Quit/Error titles and exit
 choices. Only explicit built-in label IDs are looked up: filenames, file
 contents, paths, custom menus and resource text are never translation inputs.
+An additional 62 manager pulldown captions and seven editor menubar captions
+use typed contextual IDs under `manager-panel-menu`, `manager-file-menu`,
+`manager-command-menu`, `manager-options-menu` and `editor-menubar`.
+Shortcut text, separators, category/action IDs and disabled states stay
+unchanged. English captions retain the original mnemonic rendering; translated
+captions render as complete UTF-8 strings without guessing new accelerators.
 The Delete caption and selected-item question additionally support exact GNU
 context `delete-dialog` and plural forms through fixed built-in message IDs.
 Count forms require exactly one literal `{count}`; only its decimal value is

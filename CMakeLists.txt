@@ -301,6 +301,14 @@ if(MCPP_BUILD_TESTS)
     target_include_directories(mcpp_commandline_mark_tests PRIVATE src)
     target_link_libraries(mcpp_commandline_mark_tests PRIVATE mcpp_ui)
     mcpp_target_defaults(mcpp_commandline_mark_tests)
+    add_executable(mcpp_builtin_menu_caption_tests tests/test_builtin_menu_captions.cpp)
+    target_include_directories(mcpp_builtin_menu_caption_tests PRIVATE src)
+    target_link_libraries(mcpp_builtin_menu_caption_tests PRIVATE mcpp_core)
+    mcpp_target_defaults(mcpp_builtin_menu_caption_tests)
+    add_executable(mcpp_editor_window_style_tests tests/test_editor_window_styles.cpp)
+    target_include_directories(mcpp_editor_window_style_tests PRIVATE src)
+    target_link_libraries(mcpp_editor_window_style_tests PRIVATE mcpp_ui)
+    mcpp_target_defaults(mcpp_editor_window_style_tests)
     add_executable(mcpp_translation_tests tests/test_translation.cpp)
     target_link_libraries(mcpp_translation_tests PRIVATE mcpp_core)
     mcpp_target_defaults(mcpp_translation_tests)
@@ -424,6 +432,18 @@ if(MCPP_BUILD_TESTS)
         add_test(
             NAME mcpp_native_commandline_mark
             COMMAND mcpp_commandline_mark_tests /review/cases/commandline-mark/model/ctest
+        )
+        foreach(menu_caption_case IN ITEMS positive fallback failure)
+            add_test(
+                NAME mcpp_builtin_menu_caption_${menu_caption_case}
+                COMMAND mcpp_builtin_menu_caption_tests ${menu_caption_case}
+            )
+        endforeach()
+        add_test(NAME mcpp_editor_window_styles COMMAND mcpp_editor_window_style_tests)
+        add_test(
+            NAME mcpp_native_statusbar_styles
+            COMMAND mcpp_viewer_help_style_tests statusbar
+                    /review/cases/viewer-help-colors/statusbar-ctest
         )
         add_test(
             NAME mcpp_archive_tests

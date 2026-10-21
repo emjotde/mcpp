@@ -52,6 +52,13 @@ ftxui::Element paint_skin_style(ftxui::Element element, const SkinPair& colors) 
     return std::move(element) | ftxui::color(colors.foreground) | ftxui::bgcolor(colors.background);
 }
 
+ftxui::Element render_statusbar(
+    ftxui::Element element, const Skin& skin, const SkinPair& fallback
+) {
+    const auto* colors = find_skin_color(skin, "statusbar", "_default_");
+    return paint_skin_style(std::move(element), colors ? *colors : fallback);
+}
+
 ftxui::Element render_viewer_text(
     const Skin& skin, const std::string& row,
     const std::optional<std::pair<std::size_t, std::size_t>> highlight,

@@ -209,7 +209,7 @@ dfocus=black;lightgray;bold+italic+underline+reverse+blink
           "launch-only CLI colors override native and environment layers without changing other fields");
     rendered(configured, source);
     preserved_roles(configured, source);
-    for (const auto specification : {"statusbar=red", "commandlinemark=", "commandlinemark=not-a-color",
+    for (const auto specification : {"dhotnormal=red", "commandlinemark=", "commandlinemark=not-a-color",
                                       "commandlinemark=red,,,none", "commandlinemark=,,unknown"}) {
         bool rejected = false;
         try {

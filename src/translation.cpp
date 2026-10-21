@@ -1,5 +1,6 @@
 #include "mcpp/translation.hpp"
 
+#include "builtin_menu_captions.hpp"
 #include "translation_plural.hpp"
 
 #include <algorithm>
@@ -21,9 +22,6 @@ constexpr std::array<std::string_view, ui_label_count> english_labels{
     "Left", "File", "Command", "Options", "Right", "OK", "Cancel",
     "Yes", "No", "Error", "Warning", "Confirmation", "Confirm", "Quit",
 };
-
-constexpr std::array<std::string_view, ui_caption_count> english_captions{"Delete"};
-constexpr std::array<std::string_view, ui_caption_count> caption_keys{"delete-dialog\004Delete"};
 
 struct CountMessage {
     std::string_view key;
@@ -604,9 +602,11 @@ std::optional<DecodedCatalog> decode_catalog(
             continue;
         }
         if (original.find('\004') != std::string_view::npos) {
-            const auto found = std::find(caption_keys.begin(), caption_keys.end(), original);
-            if (found == caption_keys.end()) { ++contexts; continue; }
-            const auto caption = static_cast<std::size_t>(found - caption_keys.begin());
+            const auto found = std::find_if(
+                detail::builtin_caption_messages.begin(), detail::builtin_caption_messages.end(),
+                [original](const auto& message) { return message.key == original; });
+            if (found == detail::builtin_caption_messages.end()) { ++contexts; continue; }
+            const auto caption = static_cast<std::size_t>(found->id);
             if (seen_captions[caption]) return invalid("Duplicate built-in caption in GNU .mo catalog.");
             seen_captions[caption] = true;
             if (!valid_label(translation, charset)) { ++invalid_labels; continue; }
@@ -647,9 +647,15 @@ std::string_view english_ui_label(const UiLabel label) noexcept {
     return index < english_labels.size() ? english_labels[index] : std::string_view{};
 }
 
+std::string_view english_ui_caption(const UiCaption caption) noexcept {
+    return detail::builtin_english_caption(caption);
+}
+
 UiTranslations::UiTranslations() {
     std::copy(english_labels.begin(), english_labels.end(), labels_.begin());
-    std::copy(english_captions.begin(), english_captions.end(), captions_.begin());
+    for (const auto& message : detail::builtin_caption_messages) {
+        captions_[static_cast<std::size_t>(message.id)] = message.english();
+    }
 }
 
 UiTranslations UiTranslations::load(

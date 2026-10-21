@@ -182,6 +182,100 @@ helpitalic=#ffaa88;#4a2535;none
           "formatting and role rendering never rewrite source or skin bytes");
 }
 
+void statusbar_styles(const std::filesystem::path& root) {
+    using namespace ftxui;
+    const auto resource = root / "original-statusbar.ini";
+    write(resource, R"([skin]
+description=Original independent statusbar fixture
+[core]
+_default_=lightgray;black;bold+italic+underline+reverse+blink
+statusbar=red;green;none
+[menu]
+_default_=cyan;blue;none
+[statusbar]
+_default_=color35;color53;none
+)");
+    auto skin = mcpp::load_skin(resource.string(), root);
+    const auto bytes = read(resource);
+    const auto original_normal = skin.normal;
+    const auto original_menu = skin.menu;
+    const auto original_cursor = skin.viewer_cursor;
+    const auto draw = [&](const SkinPair& fallback, const bool native) {
+        auto filename = mcpp::glyph_text("original-Ω:17.txt") | flex;
+        const auto* colors = mcpp::find_skin_color(skin, "statusbar", "_default_");
+        if (!native || !colors || !colors->explicit_style) filename = std::move(filename) | bold;
+        auto header = hbox({
+            std::move(filename), mcpp::glyph_text("0/37  100%"),
+        });
+        header = native ? mcpp::detail::render_statusbar(std::move(header), skin, fallback)
+                        : mcpp::detail::paint_skin_style(std::move(header), fallback);
+        auto selected = mcpp::detail::paint_skin_style(mcpp::glyph_text("selected Ω"), skin.selected) |
+            inverted | bold | focusCursorBlock;
+        auto screen = Screen::Create(Dimension::Fixed(60), Dimension::Fixed(2));
+        Render(screen, mcpp::detail::paint_skin_style(vbox({
+            std::move(header),
+            hbox({mcpp::glyph_text("literal _$(x) ':17 中 "), std::move(selected)}),
+        }), skin.normal));
+        return screen;
+    };
+    const auto same_cell = [&](const Cell& first, const Cell& second) {
+        check(first.character == second.character &&
+              first.foreground_color == second.foreground_color &&
+              first.background_color == second.background_color &&
+              first.bold == second.bold && first.italic == second.italic &&
+              first.underlined == second.underlined && first.inverted == second.inverted &&
+              first.blink == second.blink && first.dim == second.dim &&
+              first.underlined_double == second.underlined_double &&
+              first.strikethrough == second.strikethrough,
+              "statusbar styling must preserve every unrelated data and selection cell");
+    };
+    const auto baseline = draw(skin.menu, false);
+    for (const auto attributes : std::array{
+             0U, SkinPair::bold, SkinPair::italic, SkinPair::underline,
+             SkinPair::reverse, SkinPair::blink, all_attributes}) {
+        auto& colors = skin.colors.at("statusbar").at("_default_");
+        colors.attributes = attributes;
+        const auto screen = draw(skin.menu, true);
+        for (int column = 0; column < screen.dimx(); ++column) {
+            pair(screen.CellAt(column, 0), colors,
+                 "the full status row honors its own foreground, background and exact attributes");
+            same_cell(screen.CellAt(column, 1), baseline.CellAt(column, 1));
+        }
+        check(screen.CellAt(9, 0).character == "Ω" &&
+              screen.CellAt(10, 0).character == ":" &&
+              screen.cursor().x == baseline.cursor().x && screen.cursor().y == baseline.cursor().y &&
+              screen.cursor().shape == baseline.cursor().shape,
+              "statusbar painting preserves literal UTF-8 and the existing data cursor");
+    }
+    skin.colors.erase("statusbar");
+    for (const auto& fallback : std::array{
+             skin.menu, skin.viewer_cursor,
+             SkinPair{skin.dim, skin.normal.background},
+             SkinPair{Color::White, Color::Red, all_attributes, true}}) {
+        const auto actual = draw(fallback, true);
+        const auto legacy = draw(fallback, false);
+        for (int row = 0; row < actual.dimy(); ++row) {
+            for (int column = 0; column < actual.dimx(); ++column) {
+                same_cell(actual.CellAt(column, row), legacy.CellAt(column, row));
+            }
+        }
+    }
+    skin.colors["statusbar"]["_default_"] =
+        SkinPair{Color::Cyan, Color::Magenta, 0U, false};
+    const auto nonexplicit = draw(skin.menu, true);
+    check(nonexplicit.CellAt(0, 0).bold,
+          "a nonexplicit pair must not suppress the legacy editor filename emphasis");
+    check(skin.normal.foreground == original_normal.foreground &&
+          skin.normal.background == original_normal.background &&
+          skin.normal.attributes == original_normal.attributes &&
+          skin.menu.foreground == original_menu.foreground &&
+          skin.menu.background == original_menu.background &&
+          skin.viewer_cursor.foreground == original_cursor.foreground &&
+          skin.viewer_cursor.background == original_cursor.background &&
+          read(resource) == bytes,
+          "statusbar styles do not rewrite the skin or replace normal, menu and cursor roles");
+}
+
 void cli(const std::filesystem::path& root) {
     const auto options = mcpp::parse_cli(std::array<std::string_view, 4>{
         "-C", "viewbold=#abc,,none:helpbold=white,blue,none",
@@ -254,11 +348,11 @@ void cli(const std::filesystem::path& root) {
     }
     bool rejected = false;
     try {
-        static_cast<void>(mcpp::parse_cli_colors(std::array<std::string, 1>{"statusbar=red"}));
+        static_cast<void>(mcpp::parse_cli_colors(std::array<std::string, 1>{"dhotnormal=red"}));
     } catch (const std::invalid_argument&) {
         rejected = true;
     }
-    check(rejected, "the separate unimplemented statusbar role remains rejected");
+    check(rejected, "the separate unimplemented dialog mnemonic role remains rejected");
     check(std::filesystem::is_directory(root), "the CLI model stays in its owned case directory");
 }
 
@@ -277,6 +371,7 @@ int main(const int argc, char** argv) {
         ftxui::Terminal::SetColorSupport(ftxui::Terminal::TrueColor);
         const std::string_view selector(argv[1]);
         if (selector == "styles") styles(root);
+        else if (selector == "statusbar") statusbar_styles(root);
         else if (selector == "cli") cli(root);
         else throw std::runtime_error("unknown widget-style model selector");
         std::cout << selector << ": passed\n";
