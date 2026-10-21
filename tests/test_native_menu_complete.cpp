@@ -131,6 +131,94 @@ void contexts(const std::filesystem::path& root) {
           "requirements must use the same shell contexts as expansion");
 }
 
+void ansi_heredocs(const std::filesystem::path& root) {
+    auto captured = context(root);
+    captured.active.file = file("Original ' \" \\ $(printf DATA) `printf DATA`\n* %f");
+    captured.active.tagged = {
+        file("tag one ' \" $(printf DATA)"),
+        file("tag two \\ `printf DATA`\n? %f"),
+    };
+    captured.editor = true;
+    captured.block_file = "block ' \" \\ $(printf DATA)";
+    captured.error_file = "error `printf DATA`\n%f";
+    const std::string answer = "Original answer ' \" \\ $(printf DATA) `printf DATA`\n%f";
+    const auto name = captured.active.file->name;
+    const auto tagged = captured.active.tagged[0].name + " " + captured.active.tagged[1].name + " ";
+    const std::string command = R"MENU(cat <<$'L20_\x41NSI'
+Original $HOME $(printf DATA) `printf DATA` \
+%f
+%{ANSI bytes}
+%t
+%b
+%e
+%0f
+L20_ANSI
+cat <<"pre"$'\105OF\\\'\"\?'"post"
+%f
+preEOF\'"?post
+cat <<-$'L20_TABS'
+	%f
+	L20_TABS
+printf '%%s\0' "$(cat <<$'L20_NESTED'
+%f
+L20_NESTED
+)"
+)MENU";
+    const auto requirements = mcpp::native_menu_requirements(command, true);
+    check(requirements.prompts == std::vector<std::string>{"ANSI bytes"} &&
+              requirements.block_file && requirements.error_file,
+          "ANSI delimiter requirements must share literal-body and editor macro contexts");
+    output(command, captured,
+           "Original $HOME $(printf DATA) `printf DATA` \\\n" +
+               name + "\n" + answer + "\n" + tagged + "\n" +
+               captured.block_file + "\n" + captured.error_file + "\n" + name + "\n" +
+               name + "\n" + name + "\n" + name + '\0',
+           {answer});
+    const auto parsed = mcpp::parse_native_menu(
+        "a ANSI source\n    cat <<$'L20_END'\n    %f\n    L20_END\n", "ansi-source.menu");
+    check(parsed.size() == 1U && parsed[0].source == "ansi-source.menu" && parsed[0].line == 1U,
+          "ANSI menu parsing must retain its error source");
+    output(parsed[0].command, captured, name + "\n");
+
+    const auto reason = [](auto&& function, const std::string_view expected) {
+        try {
+            function();
+        } catch (const std::invalid_argument& error) {
+            check(std::string_view(error.what()).find(expected) != std::string_view::npos,
+                  "ANSI delimiter failed for an unexpected reason");
+            return;
+        }
+        throw std::runtime_error("an invalid ANSI delimiter was accepted");
+    };
+    for (const auto& [source, expected] : std::vector<std::pair<std::string, std::string>>{
+             {"cat <<$'EOF", "unfinished ANSI-C"},
+             {"cat <<$'EOF\\", "unfinished escape"},
+             {"cat <<$'EOF\\x'", "hexadecimal escape needs a digit"},
+             {"cat <<$'EOF\\q'", "unsupported escape"},
+             {"cat <<$'EOF\\u0041'", "unsupported escape"},
+             {"cat <<$'EOF\\0'", "NUL and line breaks"},
+             {"cat <<$'EOF\\400'", "NUL and line breaks"},
+             {"cat <<$'EOF\\n'", "NUL and line breaks"},
+             {"cat <<$'EOF\\r'", "NUL and line breaks"},
+             {"cat <<$'EOF%f'", "menu macros in here-document delimiters"},
+             {"cat <<$'EOF%var{DELIMITER:END}'", "menu macros in here-document delimiters"},
+             {"cat <<$\"EOF\"", "locale quoted here-document delimiters"},
+         }) {
+        reason([&] { static_cast<void>(mcpp::native_menu_requirements(source, true)); }, expected);
+        reason([&] { static_cast<void>(mcpp::expand_native_menu(source, captured)); }, expected);
+    }
+    reason([&] { static_cast<void>(mcpp::expand_native_menu(command, captured)); },
+           "prompt has not been answered");
+    captured.active.file = file("L20_END");
+    reason([&] {
+        static_cast<void>(mcpp::expand_native_menu("cat <<$'L20\\x5fEND'\n%f\nL20_END\n", captured));
+    }, "would terminate a here-document");
+    captured.active.file = file("\tOriginal");
+    reason([&] {
+        static_cast<void>(mcpp::expand_native_menu("cat <<-$'L20_TABS'\n%f\nL20_TABS\n", captured));
+    }, "would lose leading tabs");
+}
+
 void backticks(const std::filesystem::path& root) {
     const auto legacy = [](const std::string_view body) {
         std::string result = "`";
@@ -388,13 +476,14 @@ int main(int argc, char** argv) {
         return 1;
     }
     try {
-        check(argc == 3, "usage: native-menu-complete words|contexts|backticks|numbers|cases|extglobs|directories /review/cases/menu-complete-*");
+        check(argc == 3, "usage: native-menu-complete words|contexts|ansi-heredocs|backticks|numbers|cases|extglobs|directories /review/cases/menu-complete-*");
         const auto root = std::filesystem::path(argv[2]).lexically_normal();
         check(root.string().starts_with("/review/cases/menu-complete-"), "invalid disposable menu fixture root");
         std::filesystem::create_directories(root);
         const std::string_view selected = argv[1];
         if (selected == "words") words(root);
         else if (selected == "contexts") contexts(root);
+        else if (selected == "ansi-heredocs") ansi_heredocs(root);
         else if (selected == "backticks") backticks(root);
         else if (selected == "numbers") numbers(root);
         else if (selected == "cases") cases(root);

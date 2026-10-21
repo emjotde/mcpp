@@ -95,9 +95,9 @@ int parse_number(const std::string& value) {
     return result;
 }
 
-enum class ShellKind { bash, bash_sh, posix };
+enum class ShellKind { bash, bash_sh, posix, zsh };
 
-bool bash_protocol(const ShellKind kind) {
+bool editor_protocol(const ShellKind kind) {
     return kind != ShellKind::posix;
 }
 
@@ -143,11 +143,14 @@ std::optional<ShellExecutable> selected_shell() {
         return ShellExecutable{resolved.string(), name, name == "sh" ? ShellKind::bash_sh : ShellKind::bash};
     }
     if (identity == "dash") return ShellExecutable{resolved.string(), name, ShellKind::posix};
+    if (identity == "zsh") return ShellExecutable{resolved.string(), name, ShellKind::zsh};
     for (const auto& [known, kind] : {
              std::pair{"/bin/bash", ShellKind::bash},
              std::pair{"/usr/bin/bash", ShellKind::bash},
              std::pair{"/bin/dash", ShellKind::posix},
              std::pair{"/usr/bin/dash", ShellKind::posix},
+             std::pair{"/bin/zsh", ShellKind::zsh},
+             std::pair{"/usr/bin/zsh", ShellKind::zsh},
          }) {
         error.clear();
         if (std::filesystem::equivalent(resolved, known, error) && !error) {
@@ -258,6 +261,10 @@ struct ShellSession::Impl {
                 std::cerr << "mcpp: cannot remove shell startup file: "
                           << std::generic_category().message(errno) << '\n';
             }
+            if (unlink((temporary / "zshrc").c_str()) != 0 && errno != ENOENT) {
+                std::cerr << "mcpp: cannot remove shell startup file: "
+                          << std::generic_category().message(errno) << '\n';
+            }
             if (unlink((temporary / "command").c_str()) != 0 && errno != ENOENT) {
                 std::cerr << "mcpp: cannot remove shell command file: "
                           << std::generic_category().message(errno) << '\n';
@@ -338,7 +345,7 @@ struct ShellSession::Impl {
     }
 
     void send_directory(const std::string& value) {
-        write_all(requests.value, bash_protocol(kind) ? value + '\0' : encode_directory(value), true);
+        write_all(requests.value, editor_protocol(kind) ? value + '\0' : encode_directory(value), true);
     }
 
     void write_canonical_control(const std::string_view value, const bool discard_input = false) {
@@ -365,13 +372,13 @@ struct ShellSession::Impl {
     }
 
     void toggle() {
-        if (bash_protocol(kind)) write_all(master.value, "\017");
+        if (editor_protocol(kind)) write_all(master.value, "\017");
         else write_canonical_control("__mcpp_toggle\n", true);
     }
 
     bool submit_pending_command() {
         if (pending_command.empty()) return false;
-        if (bash_protocol(kind)) {
+        if (editor_protocol(kind)) {
             write_all(master.value, "\033[200~" + pending_command + "\033[201~\r");
         } else {
             const auto path = temporary / "command";
@@ -492,7 +499,7 @@ struct ShellSession::Impl {
         temporary = created;
         const auto sync_token = temporary.filename().string();
         sync_marker = "\033]777;mcpp-sync:" + sync_token + "\007";
-        const auto startup = temporary / "bashrc";
+        const auto startup = temporary / (kind == ShellKind::zsh ? "zshrc" : "bashrc");
         Fd rc(open(startup.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600));
         if (rc.value < 0) {
             fail("create shell startup file");
@@ -556,6 +563,41 @@ __mcpp_toggle() {
     return "$__mcpp_saved_status"
 }
 PS1='$(__mcpp_prompt "$?")'"${PS1-\$ }"'@MARK@'
+)";
+        }
+        if (kind == ShellKind::zsh) {
+            script = R"(if [[ ! -o zle ]] || ! builtin zmodload zsh/zle; then
+    builtin print -u2 'mcpp: persistent zsh requires ZLE'
+    builtin exit 125
+fi
+if ! IFS= builtin read -r -d '' __mcpp_initial_directory <&@IN@; then builtin exit 125; fi
+builtin cd -- "$__mcpp_initial_directory" || builtin exit 126
+unset __mcpp_initial_directory
+__mcpp_prompt() {
+    local __mcpp_last_status=$?
+    emulate -L zsh
+    builtin printf 'P\0%d\0%s\0' "$__mcpp_last_status" "$PWD" >&@OUT@
+    return "$__mcpp_last_status"
+}
+__mcpp_toggle() {
+    emulate -L zsh
+    local __mcpp_path __mcpp_changed=0 __mcpp_draft=0
+    [[ -n $BUFFER ]] && __mcpp_draft=1
+    if ! builtin printf '\033]777;mcpp-sync:@SYNC@\007' > /dev/tty; then builtin exit 125; fi
+    builtin printf 'H\0%s\0%d\0' "$PWD" "$__mcpp_draft" >&@OUT@
+    if ! IFS= builtin read -r -d '' __mcpp_path <&@IN@; then builtin exit; fi
+    if [[ "$PWD" != "$__mcpp_path" ]]; then
+        builtin cd -- "$__mcpp_path" || __mcpp_changed=$?
+    fi
+    builtin printf 'R\0%s\0%d\0' "$PWD" "$__mcpp_changed" >&@OUT@
+    builtin zle reset-prompt
+}
+builtin zle -N __mcpp_toggle
+builtin bindkey '^O' __mcpp_toggle
+builtin bindkey -M emacs '^O' __mcpp_toggle
+builtin bindkey -M viins '^O' __mcpp_toggle
+builtin bindkey -M vicmd '^O' __mcpp_toggle
+precmd_functions+=(__mcpp_prompt)
 )";
         }
         for (const auto& [token, value] : {
@@ -813,8 +855,8 @@ PS1='$(__mcpp_prompt "$?")'"${PS1-\$ }"'@MARK@'
                         restoring_input = kind == ShellKind::posix;
                         if (message->value != 0) {
                             directory_failed = true;
-                            if (bash_protocol(kind)) toggle();
-                        } else if (!pending_command.empty() && bash_protocol(kind)) {
+                            if (editor_protocol(kind)) toggle();
+                        } else if (!pending_command.empty() && editor_protocol(kind)) {
                             submit();
                         }
                     } else {

@@ -492,7 +492,7 @@ if(MCPP_BUILD_TESTS)
                         /review/cases/native-regex-${regex_case}
             )
         endforeach()
-        foreach(menu_case IN ITEMS words contexts numbers cases extglobs backticks directories)
+        foreach(menu_case IN ITEMS words contexts numbers cases extglobs backticks ansi-heredocs directories)
             add_test(
                 NAME mcpp_native_menu_${menu_case}
                 COMMAND mcpp_native_menu_complete_tests ${menu_case}

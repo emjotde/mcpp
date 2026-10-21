@@ -703,6 +703,81 @@ private:
         } while (index_ < command_.size() && original_index(index_) < value.end);
     }
 
+    void ansi_delimiter(HereDocument& document) {
+        const auto append = [&](const char character) {
+            if (character == '\0' || character == '\n' || character == '\r') {
+                throw std::invalid_argument("NUL and line breaks are unavailable in ANSI-C here-document delimiters");
+            }
+            document.delimiter += character;
+        };
+        const auto hexadecimal = [](const char character) {
+            if (character >= '0' && character <= '9') return static_cast<unsigned>(character - '0');
+            if (character >= 'a' && character <= 'f') return static_cast<unsigned>(character - 'a') + 10U;
+            if (character >= 'A' && character <= 'F') return static_cast<unsigned>(character - 'A') + 10U;
+            return 16U;
+        };
+        document.literal = true;
+        index_ += 2U;
+        while (index_ < command_.size()) {
+            if (backtick_end(index_) != 0U) {
+                throw std::invalid_argument("unfinished ANSI-C here-document delimiter inside menu backticks");
+            }
+            const auto character = command_[index_++];
+            if (character == '\'') return;
+            if (character == '%') {
+                throw std::invalid_argument("menu macros in here-document delimiters are unavailable; use a literal delimiter");
+            }
+            if (character != '\\') {
+                append(character);
+                continue;
+            }
+            if (index_ == command_.size() || backtick_end(index_) != 0U) {
+                throw std::invalid_argument("unfinished escape in ANSI-C here-document delimiter");
+            }
+            const auto escaped = command_[index_++];
+            switch (escaped) {
+                case 'a': append('\a'); break;
+                case 'b': append('\b'); break;
+                case 'e':
+                case 'E': append('\x1b'); break;
+                case 'f': append('\f'); break;
+                case 'n': append('\n'); break;
+                case 'r': append('\r'); break;
+                case 't': append('\t'); break;
+                case 'v': append('\v'); break;
+                case '\\':
+                case '\'':
+                case '"':
+                case '?': append(escaped); break;
+                case 'x': {
+                    unsigned value = 0U;
+                    unsigned digits = 0U;
+                    while (digits < 2U && index_ < command_.size() && hexadecimal(command_[index_]) < 16U) {
+                        value = value * 16U + hexadecimal(command_[index_++]);
+                        ++digits;
+                    }
+                    if (digits == 0U) {
+                        throw std::invalid_argument("an ANSI-C here-document hexadecimal escape needs a digit");
+                    }
+                    append(static_cast<char>(value));
+                    break;
+                }
+                default:
+                    if (escaped < '0' || escaped > '7') {
+                        throw std::invalid_argument("unsupported escape in ANSI-C here-document delimiter");
+                    }
+                    unsigned value = static_cast<unsigned>(escaped - '0');
+                    for (unsigned digits = 1U; digits < 3U && index_ < command_.size() &&
+                         command_[index_] >= '0' && command_[index_] <= '7'; ++digits) {
+                        value = value * 8U + static_cast<unsigned>(command_[index_++] - '0');
+                    }
+                    append(static_cast<char>(value & 0xffU));
+                    break;
+            }
+        }
+        throw std::invalid_argument("unfinished ANSI-C here-document delimiter");
+    }
+
     HereDocument delimiter() {
         HereDocument result;
         index_ += 2U;
@@ -725,7 +800,11 @@ private:
             }
             if (character == '$' && quote == '\0' && index_ + 1U < command_.size() &&
                 (command_[index_ + 1U] == '\'' || command_[index_ + 1U] == '"')) {
-                throw std::invalid_argument("ANSI or locale quoted here-document delimiters are unavailable; use ordinary quotes");
+                if (command_[index_ + 1U] == '"') {
+                    throw std::invalid_argument("locale quoted here-document delimiters are unavailable; use ordinary quotes");
+                }
+                ansi_delimiter(result);
+                continue;
             }
             if ((character == '\'' || character == '"') && (quote == '\0' || quote == character)) {
                 quote = quote == '\0' ? character : '\0';

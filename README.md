@@ -36,7 +36,7 @@ including Azure Blob Storage and SSH/SFTP, is paused.
 - Creation permissions follow the process umask when permissions are not preserved
 - Mode, owner/group, file information, free-space display, and links
 - Directory comparison plus fixed-width Quick view and live Info panels
-- Local command line, history, and persistent Bash/sh/dash with Ctrl-O switching
+- Local command line, history, and persistent Bash/sh/dash/zsh with Ctrl-O switching
 - Persisted panel paths and preferences
 - MC-style visual state cues, a grayscale default, and 16 selectable skins
 - Toggleable syntax colors adapted to dark, light, and monochrome skins
@@ -520,6 +520,10 @@ scanner bound and normal shell splitting/newline removal. Raw `%0` remains
 trusted source rather than a second parsed grammar. Unsupported heredoc
 delimiters, and values that would terminate a heredoc or lose tabs with `<<-`,
 fail explicitly.
+Constant ANSI-C-quoted heredoc delimiters, including concatenated literal
+segments, use Bash quote removal. Dynamic delimiters, locale-quoted delimiters,
+unsupported escapes and decoded NUL/CR/LF remain explicit errors. This does not
+relax delimiter-collision or tab-loss checks.
 
 ## External syntax definitions
 
@@ -737,7 +741,7 @@ without writing to the filesystem being recovered.
 
 ## Shell
 
-With Bash or dash, including `sh` pointing to either, commander commands and
+With Bash, dash or zsh, including `sh` pointing to Bash/dash, commander commands and
 `Ctrl-O` use the same selected interactive shell.
 Variables, functions, aliases, and the shell PID survive repeated commands and
 screen switches. `Ctrl-O` also hides a running foreground command or shell
@@ -757,6 +761,9 @@ spaces or newlines are synchronized without shell interpolation.
 Dash and `sh` retain native interactive `ENV` startup rather than loading
 Bash-specific resources. A failed directory change discards its rejected
 command instead of running it later when the shell resumes.
+Zsh retains native `ZDOTDIR` startup, prompt hooks and ZLE editing. It uses the
+selected zsh process for persistent state; a missing ZLE module reports a startup
+failure rather than substituting Bash.
 
 Exiting the shell quits mcpp through its existing confirmation and dirty-editor
 guards. Shell startup and transport errors restore the UI and report the
@@ -772,7 +779,7 @@ the previous mcpp behavior, including draft, cwd and running-command handling.
 `mcpp -u` / `--nosubshell` selects the earlier one-shot behavior for that run;
 `-U` / `--subshell` enables persistent shell integration. These overrides do not
 replace the saved `use_subshell` preference. Other shells retain one-shot
-behavior; persistent ash, ksh, zsh, tcsh and fish remain compatibility work.
+behavior; persistent ash, ksh, tcsh and fish remain compatibility work.
 
 ## UI translations
 

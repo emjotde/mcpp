@@ -374,6 +374,11 @@ balance patterns, alternatives, nested cases and Bash fallthrough while keeping
 ordinary macro values literal. Requirements and expansion use the same scanner.
 Nested extended case patterns also work with an explicit extglob-enabled Bash
 runner; mcpp does not change the selected shell's options.
+Constant ANSI-C heredoc delimiters now decode and concatenate literal segments
+without changing body macro quoting. Dynamic/locale forms, unsupported escapes,
+decoded line-ending/NUL bytes, collisions and tab-loss remain bounded errors.
+The combined native terminator-tab control normalized a tab and failed; that
+reference failure is retained rather than claimed as a successful native case.
 
 External `Syntax` registries and definitions now feed the actual editor chooser
 and color renderer, with transactional reload, saved selections and legacy-file
@@ -566,7 +571,7 @@ UTF-8 labels do not enter the byte-indexed English mnemonic renderer.
 
 | ID | Remaining work | Evidence |
 |---|---|---|
-| L35 | Partial: remaining persistent shell variants | Bash, dash and `sh` resolving to either now retain the selected executable, native startup, state, cwd, drafts and running commands. A cwd error discards the rejected command rather than executing it later on resume. Four small owned-container workflows cover Bash, sh/dash, async builtins/shutdown, and identity/error recovery. Persistent ash, ksh, zsh, tcsh and fish remain unsupported. |
+| L35 | Partial: remaining persistent shell variants | Bash, dash, zsh and `sh` resolving to Bash/dash retain the selected executable, native startup, state, cwd, drafts and running commands. Zsh uses native ZDOTDIR/ZLE/prompt hooks and a persistent process, not Bash substitution. A cwd error discards the rejected command rather than executing it later on resume. Persistent ash, ksh, tcsh and fish remain unsupported; no full shell-family parity is claimed. |
 
 ## Audit fix delivery
 
